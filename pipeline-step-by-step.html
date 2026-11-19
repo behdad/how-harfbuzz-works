@@ -1,0 +1,729 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The pipeline, step by step · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part V · The pipeline</p>
+<h1 id="the-pipeline-step-by-step">16. The pipeline, step by step</h1>
+<p id="ix-1">When <code>hb_shape</code> reaches the <code>ot</code> backend, the expensive decisions have been made. The plan holds the map of features and lookups, the script shaper and a few dozen settings, all worked out once for this font, script, language and direction (<a href="shape-plans-and-their-cache.html">Shape plans and their cache</a>). What is left is to run it: to take one buffer of characters and turn it into positioned glyphs.</p>
+<p id="ix-2">That is the job of one short function, <code>hb_ot_shape_internal</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L1171"><code>hb-ot-shape.cc:1171</code></a>). Everything the <code>ot</code> shaper does to a buffer happens inside it, in a fixed order, and most of the rest of this part of the book is about one step or another of it. This chapter goes through the whole function once, in order: what each step does, why it comes where it does, which fields of the buffer it reads and writes, and where the step is explained in depth.</p>
+<p id="ix-3">It follows one run all the way, using <code>hb-shape --trace</code> (<a href="command-line-tools.html#traces">The command-line tools</a>). The test font, <code>pipeline.ttf</code>, is built from <code>fonts/pipeline-step-by-step/pipeline.fea</code>. It has Arabic beh, lam and alef in their joining forms, the lam-alef ligature, a fatha that GPOS attaches to beh, a pair of parentheses, and the digits and fraction slash for an automatic fraction. Its glyphs are boxes. Every result and trace on this page was produced by running HarfBuzz 15.1.0 on it when the page was built.</p>
+<h2 id="the-whole-function">The whole function</h2>
+<p>Here it is, with its comments left out:</p>
+<pre><code class="language-c++">static void
+hb_ot_shape_internal (hb_ot_shape_context_t *c)
+{
+  c-&gt;target_direction = c-&gt;buffer-&gt;props.direction;
+
+  _hb_buffer_allocate_unicode_vars (c-&gt;buffer);
+
+  hb_set_unicode_props (c-&gt;buffer, c-&gt;plan-&gt;map.get_global_mask ());
+  hb_insert_dotted_circle (c-&gt;buffer, c-&gt;font);
+
+  hb_form_clusters (c-&gt;buffer);
+
+  hb_ensure_native_direction (c-&gt;buffer);
+
+  if (c-&gt;plan-&gt;shaper-&gt;preprocess_text &amp;&amp;
+      c-&gt;buffer-&gt;message(c-&gt;font, &quot;start preprocess-text&quot;))
+  {
+    c-&gt;plan-&gt;shaper-&gt;preprocess_text (c-&gt;plan, c-&gt;buffer, c-&gt;font);
+    (void) c-&gt;buffer-&gt;message(c-&gt;font, &quot;end preprocess-text&quot;);
+  }
+
+  hb_ot_substitute_pre (c);
+  hb_ot_position (c);
+  hb_ot_substitute_post (c);
+
+  hb_propagate_flags (c-&gt;buffer);
+
+  _hb_buffer_deallocate_unicode_vars (c-&gt;buffer);
+
+  c-&gt;buffer-&gt;props.direction = c-&gt;target_direction;
+}
+</code></pre>
+<p id="ix-4">It falls into five parts. The first five calls prepare the characters: they give each one its Unicode properties, group them into clusters and put them in the order the script is written in. <code>hb_ot_substitute_pre</code> turns characters into glyphs and runs GSUB. <code>hb_ot_position</code> gives the glyphs advances and runs GPOS. <code>hb_ot_substitute_post</code>, despite its name, comes <em>after</em> positioning: it is where invisible characters are finally hidden. And the last three lines tidy up.</p>
+<p id="ix-5">The <code>hb_ot_shape_context_t</code> that every step is passed holds the plan, the font, its face, the buffer and the user’s features, and one field of its own, <code>target_direction</code>: the direction the caller asked for, saved because the buffer’s direction may be flipped while shaping and is put back at the end.</p>
+<h2 id="the-run">The run</h2>
+<p>The text is an opening parenthesis, a zero-width joiner, beh with a fatha, lam and alef, and a closing parenthesis, shaped as Arabic, right to left:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">pipeline.ttf</td><td class="in"><span class="txt">(⟨ZWJ⟩بَلا)</span><span class="cps">U+0028 U+200D U+0628 U+064E U+0644 U+0627 U+0029</span></td><td class="opt">--language=ar</td><td class="out"><code>[parenleft=6+300|lam_alef.fina=4+500|fatha=2@100,50+0|beh.medi=2+400|space=0+0|parenright=0+300]</code></td></tr></tbody></table></div>
+<p id="ix-6">Read the result from the right, because <code>hb-shape</code> lists glyphs in visual order. The opening parenthesis comes out as the <code>parenright</code> glyph, mirrored. The joiner has become a <code>space</code> with no advance. Beh is medial, because the joiner before it asks it to join, and the fatha sits on it with no advance of its own. Lam and alef have become one glyph, <code>lam_alef.fina</code>. Every one of those changes was made by a different step. (The font gives the fatha an advance of 200, which a real font wouldn’t, so that one of the steps has something to do. It has no glyph for the joiner.)</p>
+<h2 id="the-steps-at-a-glance">The steps at a glance</h2>
+<p id="ix-7">Line numbers are in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>hb-ot-shape.cc</code></a> unless another file is named; where there are two, the first is the call and the second the function.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Step</th>
+<th>Source</th>
+<th>What it changes</th>
+<th>In depth</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td id="ix-8">save the direction; allocate <code>unicode_props</code></td>
+<td>:1174, :1176</td>
+<td id="ix-9"><code>target_direction</code>; bytes 4–5 of each glyph</td>
+<td><a href="buffers.html#who-has-which-byte-and-when">Buffers</a></td>
+</tr>
+<tr>
+<td>2</td>
+<td id="ix-10"><code>hb_set_unicode_props</code></td>
+<td>:1178, :471</td>
+<td id="ix-11"><code>mask</code> (to the global mask), <code>unicode_props</code>, scratch flags</td>
+<td><a href="unicode-inside-harfbuzz.html#the-properties-each-glyph-carries">Unicode inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td>3</td>
+<td id="ix-12"><code>hb_insert_dotted_circle</code></td>
+<td>:1179, :552</td>
+<td id="ix-13">may add one character</td>
+<td id="ix-14"><a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></td>
+</tr>
+<tr>
+<td>4</td>
+<td id="ix-15"><code>hb_form_clusters</code></td>
+<td>:1181, :581</td>
+<td><code>cluster</code></td>
+<td><a href="buffers.html#merging-clusters">Buffers</a></td>
+</tr>
+<tr>
+<td>5</td>
+<td id="ix-16"><code>hb_ensure_native_direction</code></td>
+<td>:1183, :591</td>
+<td>order; <code>props.direction</code></td>
+<td>below</td>
+</tr>
+<tr>
+<td>6</td>
+<td>shaper’s <code>preprocess_text</code></td>
+<td>:1185</td>
+<td id="ix-17">characters</td>
+<td id="ix-18">the script chapters</td>
+</tr>
+<tr>
+<td>7</td>
+<td id="ix-19"><code>hb_ot_rotate_chars</code></td>
+<td>:886, :655</td>
+<td id="ix-20"><code>codepoint</code> (mirrors, vertical forms); <code>rtlm</code> mask bit</td>
+<td><a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a>, <a href="vertical-text.html">Vertical text</a></td>
+</tr>
+<tr>
+<td>8</td>
+<td id="ix-21">normalization, with the <code>cmap</code> lookup</td>
+<td id="ix-22">:890, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc#L280"><code>hb-ot-shape-normalize.cc:280</code></a></td>
+<td id="ix-23">characters; <code>normalizer_glyph_index</code> (bytes 0–3)</td>
+<td id="ix-24"><a href="normalization.html">Normalization</a></td>
+</tr>
+<tr>
+<td>9</td>
+<td id="ix-25"><code>hb_ot_shape_setup_masks</code></td>
+<td>:892, :750</td>
+<td id="ix-26"><code>mask</code>: fractions, shaper, ranged user features</td>
+<td id="ix-27"><a href="from-features-to-lookups.html#mask-bits">From features to lookups</a></td>
+</tr>
+<tr>
+<td>10</td>
+<td id="ix-28">recategorize marks, if fallback positioning will run</td>
+<td>:896</td>
+<td>combining classes in <code>unicode_props</code></td>
+<td id="ix-29"><a href="fallbacks.html">Fallbacks</a></td>
+</tr>
+<tr>
+<td>11</td>
+<td id="ix-30"><code>hb_ot_map_glyphs_fast</code></td>
+<td>:898, :844</td>
+<td id="ix-31"><code>codepoint</code> becomes a glyph ID; content type</td>
+<td><a href="buffers.html#content-types">Buffers</a></td>
+</tr>
+<tr>
+<td>12</td>
+<td id="ix-32">allocate <code>glyph_props</code>, <code>lig_props</code>; GDEF classes and digest, or synthesized classes</td>
+<td>:940, :926, :929</td>
+<td>bytes 0–2; the buffer’s digest</td>
+<td id="ix-33"><a href="gsub.html#glyph-properties">GSUB</a></td>
+</tr>
+<tr>
+<td>13</td>
+<td id="ix-34">GSUB, with the shaper’s pauses; or <code>morx</code></td>
+<td>:931, :916</td>
+<td id="ix-35">glyphs, clusters</td>
+<td id="ix-36"><a href="gsub.html">GSUB</a>, <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td>14</td>
+<td><code>clear_positions</code></td>
+<td>:1096</td>
+<td id="ix-37"><code>pos</code> becomes positions</td>
+<td><a href="buffers.html#the-buffers-three-arrays">Buffers</a></td>
+</tr>
+<tr>
+<td>15</td>
+<td id="ix-38">default advances; origins; space widths</td>
+<td>:1098, :1002</td>
+<td id="ix-39">advances, offsets</td>
+<td id="ix-40"><a href="where-metrics-come-from.html">Where metrics come from</a>, <a href="fallbacks.html">Fallbacks</a></td>
+</tr>
+<tr>
+<td>16</td>
+<td><code>position_start</code>; zero marks early</td>
+<td>:1049, :1055</td>
+<td id="ix-41"><code>attach_chain</code>, <code>attach_type</code>; advances</td>
+<td id="ix-42"><a href="gpos.html">GPOS: positioning glyphs</a></td>
+</tr>
+<tr>
+<td>17</td>
+<td id="ix-43">GPOS, or <code>kerx</code>; <code>kern</code> or fallback kerning; <code>trak</code></td>
+<td>:1064, :271</td>
+<td id="ix-44">advances, offsets</td>
+<td id="ix-45">GPOS, <a href="legacy-kern.html">Legacy kern</a>, <a href="aat-positioning.html">AAT positioning</a></td>
+</tr>
+<tr>
+<td>18</td>
+<td>zero marks late</td>
+<td>:1070</td>
+<td id="ix-46">advances</td>
+<td id="ix-47">GPOS</td>
+</tr>
+<tr>
+<td>19</td>
+<td id="ix-48">finish advances; zero default ignorables; finish offsets</td>
+<td>:1080–:1082</td>
+<td id="ix-49">advances, offsets</td>
+<td id="ix-50">GPOS, <a href="fonts-and-font-functions.html#slant">Fonts and font functions</a></td>
+</tr>
+<tr>
+<td>20</td>
+<td>fallback mark positioning</td>
+<td>:1089</td>
+<td id="ix-51">offsets</td>
+<td id="ix-52"><a href="fallbacks.html">Fallbacks</a></td>
+</tr>
+<tr>
+<td>21</td>
+<td>reverse into visual order; free bytes 0–2</td>
+<td>:1103, :1105</td>
+<td>order</td>
+<td>below</td>
+</tr>
+<tr>
+<td>22</td>
+<td id="ix-53">remove glyphs <code>morx</code> deleted</td>
+<td>:946 or :955</td>
+<td id="ix-54">glyphs</td>
+<td><a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td>23</td>
+<td id="ix-55">variation selectors not found</td>
+<td>:958, :795</td>
+<td><code>codepoint</code></td>
+<td><a href="unicode-inside-harfbuzz.html#variation-selectors">Unicode inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td>24</td>
+<td id="ix-56"><code>hb_ot_hide_default_ignorables</code></td>
+<td>:959, :817</td>
+<td id="ix-57"><code>codepoint</code>, or removes glyphs</td>
+<td><a href="unicode-inside-harfbuzz.html#hidden-preserved-or-removed">Unicode inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td>25</td>
+<td>shaper’s <code>postprocess_glyphs</code></td>
+<td>:961</td>
+<td>anything</td>
+<td id="ix-58">the script chapters</td>
+</tr>
+<tr>
+<td>26</td>
+<td id="ix-59"><code>hb_propagate_flags</code></td>
+<td>:1196, :1109</td>
+<td id="ix-60">glyph flags in <code>mask</code></td>
+<td><a href="buffers.html#glyph-flags">Buffers</a></td>
+</tr>
+<tr>
+<td>27</td>
+<td id="ix-61">free <code>unicode_props</code>; restore the direction</td>
+<td>:1198, :1200</td>
+<td><code>props.direction</code></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-62">Only some steps send a message to <code>--trace</code>: preprocess-text, the three rounds of normalization, GSUB and GPOS and their lookups, <code>morx</code> and <code>kerx</code>, legacy <code>kern</code>, fallback kerning and mark positioning, and postprocess-glyphs. The others show only in what the buffer looks like at the next message.</p>
+<h2 id="preparing-the-characters">Preparing the characters</h2>
+<h3 id="properties-and-clusters">Properties and clusters</h3>
+<p>Steps 1 to 4 have no messages, so the first line of the trace already shows their work:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape pipeline.ttf "(⟨ZWJ⟩بَلا)" --language=ar --trace</code></div><table><tbody><tr><td class="what">start decompose</td><td class="buf"><code>&lt;U+0029=0|U+200D=0|U+0628=2|U+064E=2|U+0644=4|U+0627=5|U+0028=6&gt;</code></td></tr></tbody></table></div>
+<p id="ix-63"><code>hb-shape</code> numbers clusters by character, so the seven characters arrived as clusters 0 to 6. Now the joiner is in cluster 0, with the parenthesis, and the fatha is in cluster 2, with the beh.</p>
+<p id="ix-64">That is step 4. Step 2, <code>hb_set_unicode_props</code>, set every glyph’s mask to the plan’s global mask, worked out its Unicode properties, and marked some characters as <strong>continuations</strong> of the one before: marks, and also a zero-width joiner, which belongs with what precedes it, as in emoji sequences. It also set <strong>scratch flags</strong> on the buffer, one-bit notes such as “has continuations”, “has default ignorables” and “has a fraction slash”, which let later steps skip themselves when there is nothing to do. <a href="unicode-inside-harfbuzz.html#continuations-just-enough-of-graphemes">Unicode inside HarfBuzz</a> has the details of both. Step 4, <code>hb_form_clusters</code>, then merges each base with its continuations into one cluster, with <code>merge_grapheme_clusters</code>. It only merges at the cluster levels that work by graphemes, 0 (the default) and 3. At level 1 every character keeps its own cluster:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">pipeline.ttf</td><td class="in"><span class="txt">(⟨ZWJ⟩بَلا)</span><span class="cps">U+0028 U+200D U+0628 U+064E U+0644 U+0627 U+0029</span></td><td class="opt">--language=ar --cluster-level=1</td><td class="out"><code>[parenleft=6+300|lam_alef.fina=4+500|fatha=3@100,50+0|beh.medi=2+400|space=1+0|parenright=0+300]</code></td></tr></tbody></table></div>
+<p id="ix-65">Step 3 inserts a dotted circle before a mark that begins the text. Only when the buffer says it is the beginning of the text, with no pre-context, and only if the font has U+25CC. This run doesn’t qualify on any count.</p>
+<h3 id="native-direction">Native direction</h3>
+<p id="ix-66">Step 5, <code>hb_ensure_native_direction</code>, compares the buffer’s direction with the script’s own. If a script written right to left is given as left to right, or the other way round, it reverses the buffer and flips <code>props.direction</code>, so that everything after it sees the text in the order the script is read. It reverses by graphemes, using the continuation bits, so a mark stays after its base. Vertical text always becomes top to bottom.</p>
+<p id="ix-67">Our run is Arabic, right to left, so nothing happens. Given as left to right, the same kind of text is taken to be in visual order, and reversed:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape pipeline.ttf "بَل" --language=ar --direction=ltr --trace</code></div><table><tbody><tr><td class="what">start decompose</td><td class="buf"><code>&lt;U+0644=2|U+0628=0|U+064E=0&gt;</code></td></tr></tbody></table></div>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">pipeline.ttf</td><td class="in"><span class="txt">بَل</span><span class="cps">U+0628 U+064E U+0644</span></td><td class="opt">--language=ar --direction=ltr</td><td class="out"><code>[fatha=0@100,50+0|beh.fina=0+600|lam.init=2+250]</code></td></tr><tr><td class="font">pipeline.ttf</td><td class="in"><span class="txt">لبَ</span><span class="cps">U+0644 U+0628 U+064E</span></td><td class="opt">--language=ar</td><td class="out"><code>[fatha=1@100,50+0|beh.fina=1+600|lam.init=0+250]</code></td></tr></tbody></table></div>
+<p id="ix-68">Lam comes first, with beh and its fatha after it, and lam takes the initial form. The glyphs and positions are the same as for lam, beh, fatha shaped right to left; only the cluster numbers differ, because they count the characters as they were given. (A left-to-right run in a right-to-left script is left alone if it has digits or regional indicators but no letters, so that numbers keep their order: HarfBuzz issues #501 and #3314.)</p>
+<p id="ix-69">Why reverse at all, rather than let every lookup run backwards? Because fonts are written for the script’s own order: an Arabic font’s contextual rules say what comes <em>after</em> a letter in reading order. From here until step 21, HarfBuzz works in that order.</p>
+<h3 id="preprocessing">Preprocessing</h3>
+<p id="ix-70">Step 6 is the first of the script shaper’s hooks to run on the text. <code>preprocess_text</code> changes the characters before anything else looks at them: Thai and Lao split SARA AM, Hangul composes and decomposes jamo, and the Indic shaper and USE insert dotted circles where vowel signs mustn’t follow each other. The Arabic shaper has no such hook, so this run has no “start preprocess-text” in its trace.</p>
+<h2 id="characters-to-glyphs">Characters to glyphs</h2>
+<p id="ix-71"><code>hb_ot_substitute_pre</code> (<code>:936</code>) first calls <code>hb_ot_substitute_default</code> (<code>:882</code>), steps 7 to 11, which end with a buffer of glyphs.</p>
+<h3 id="mirroring">Mirroring</h3>
+<p id="ix-72">Step 7, <code>hb_ot_rotate_chars</code>, is why the trace above starts with U+0029 where the text has U+0028. When the <em>target</em> direction is backward, each character with a Bidi_Mirroring_Glyph is replaced by its mirror, if the font has a glyph for it. Every other character gets the mask bit of <code>rtlm</code>, the feature a font can use to mirror glyphs itself. It reads <code>target_direction</code>, not the buffer’s direction: what matters is how the text will be displayed, so the left-to-right run above, reversed into right to left, is not mirrored. In vertical text, if the plan found no <code>vert</code> feature, characters are replaced by their vertical presentation forms instead (U+FE10 and the rest, <code>vertical_char_for</code>), a subject for <a href="vertical-text.html">Vertical text</a>.</p>
+<p id="ix-73">Mirroring is done on characters, before the <code>cmap</code> is consulted, so a font needs only the two glyphs it has anyway.</p>
+<h3 id="normalization">Normalization</h3>
+<p id="ix-74">Step 8 claims all of <code>var1</code> for <code>normalizer_glyph_index</code> and runs normalization: decompose, reorder marks, recompose. Normalization is where the <code>cmap</code> is read: whether a character decomposes depends on which glyphs the font has, so each character’s glyph is looked up there and kept in <code>normalizer_glyph_index</code>. The shaper’s <code>decompose</code>, <code>compose</code> and <code>reorder_marks</code> hooks are called from inside it. All of that is the subject of <a href="normalization.html">Normalization</a>. In this run nothing changes:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape pipeline.ttf "(⟨ZWJ⟩بَلا)" --language=ar --trace</code></div><table><tbody><tr><td class="what">start decompose</td><td class="buf"><code>&lt;U+0029=0|U+200D=0|U+0628=2|U+064E=2|U+0644=4|U+0627=5|U+0028=6&gt;</code></td></tr><tr><td class="what">end decompose</td><td class="buf"><code>&lt;U+0029=0|U+200D=0|U+0628=2|U+064E=2|U+0644=4|U+0627=5|U+0028=6&gt;</code></td></tr><tr><td class="what">start reorder</td><td class="buf"><code>&lt;U+0029=0|U+200D=0|U+0628=2|U+064E=2|U+0644=4|U+0627=5|U+0028=6&gt;</code></td></tr><tr><td class="what">end reorder</td><td class="buf"><code>&lt;U+0029=0|U+200D=0|U+0628=2|U+064E=2|U+0644=4|U+0627=5|U+0028=6&gt;</code></td></tr><tr><td class="what">start compose</td><td class="buf"><code>&lt;U+0029=0|U+200D=0|U+0628=2|U+064E=2|U+0644=4|U+0627=5|U+0028=6&gt;</code></td></tr><tr><td class="what">end compose</td><td class="buf"><code>&lt;U+0029=0|U+200D=0|U+0628=2|U+064E=2|U+0644=4|U+0627=5|U+0028=6&gt;</code></td></tr></tbody></table></div>
+<h3 id="masks">Masks</h3>
+<p id="ix-75">Step 9, <code>hb_ot_shape_setup_masks</code>, sets the feature bits of each glyph’s mask that aren’t simply on everywhere. Mask bits were handed out when the plan was made (<a href="from-features-to-lookups.html#mask-bits">From features to lookups</a>); every glyph has had the global ones since step 2. Three things add more, in this order:</p>
+<ol>
+<li id="ix-76"><strong>Fractions.</strong> If step 2 saw a U+2044 FRACTION SLASH and the font has <code>frac</code>, or both <code>numr</code> and <code>dnom</code>, each run of digits before a fraction slash gets <code>numr</code> (and <code>frac</code>), the slash <code>frac</code>, and the digits after it <code>dnom</code> (and <code>frac</code>). The range is marked unsafe to break.</li>
+<li id="ix-77"><strong>The shaper’s <code>setup_masks</code>.</strong> The Arabic shaper works out each letter’s joining form here and sets the bit for <code>init</code>, <code>medi</code>, <code>fina</code> or <code>isol</code>. It is why the beh in our run will be medial: the joiner before it is join-causing.</li>
+<li id="ix-78"><strong>User features with a range</strong>, such as <code>--features=dnom[2:3]</code>. Their start and end are compared with cluster values, not glyph positions.</li>
+</ol>
+<p id="ix-79">The fraction needs no feature to be asked for:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">pipeline.ttf</td><td class="in"><span class="txt">1⁄2</span><span class="cps">U+0031 U+2044 U+0032</span></td><td class="opt">--language=en</td><td class="out"><code>[one.numr=0+350|fraction=1+200|two.dnom=2+350]</code></td></tr><tr><td class="font">pipeline.ttf</td><td class="in"><span class="txt">1/2</span><span class="cps">U+0031 U+002F U+0032</span></td><td class="opt">--language=en</td><td class="out"><code>[one=0+500|slash=1+300|two=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-80">Masks are set on characters, before any glyph exists, because they are about the text: which character starts a word, which digit is a numerator. Lookups that change the glyphs later keep the masks of the glyphs they replace.</p>
+<h3 id="glyphs-at-last">Glyphs at last</h3>
+<p id="ix-81">Step 10 only runs when the plan will position marks without GPOS or <code>kerx</code>: it changes combining classes into the few positional classes the fallback positioner understands (<a href="fallbacks.html">Fallbacks</a>). It has to come after normalization, which needs the real classes.</p>
+<p id="ix-82">Step 11, <code>hb_ot_map_glyphs_fast</code>, copies each <code>normalizer_glyph_index</code> into <code>codepoint</code>, sets the content type to glyphs, and gives <code>var1</code> back. The next line of the trace prints square brackets instead of angle brackets: these are glyph names now, and the joiner, which the font has no glyph for, is <code>.notdef</code>.</p>
+<h2 id="substituting">Substituting</h2>
+<p id="ix-83">Step 12 claims three of the bytes <code>normalizer_glyph_index</code> just gave back, for <code>glyph_props</code> and <code>lig_props</code> (<code>_hb_buffer_allocate_gsubgpos_vars</code>, <code>:940</code>). <code>hb_ot_layout_substitute_start_with_digest</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L1631"><code>hb-ot-layout.cc:1631</code></a>) reads each glyph’s class from GDEF into <code>glyph_props</code>, clears <code>lig_props</code>, and builds the buffer’s digest of glyph IDs, which lets GSUB skip lookups that can’t match. If the font has no GDEF glyph classes, they are made up from the Unicode general categories instead (<a href="gsub.html#glyph-properties">GSUB</a>).</p>
+<p id="ix-84">Step 13 is GSUB itself, <code>hb_ot_map_t::substitute</code>, which runs the plan’s GSUB lookups stage by stage and calls the shaper’s pause functions between stages (<a href="from-features-to-lookups.html#stages-and-pauses">From features to lookups</a>):</p>
+<div class="trace"><div class="trace-head"><code>hb-shape pipeline.ttf "(⟨ZWJ⟩بَلا)" --language=ar --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;arab&#x27;</td><td class="buf"><code>[parenright=0|.notdef=0|beh=2|fatha=2|lam=4|alef=5|parenleft=6]</code></td></tr><tr><td class="what">start lookup 2 feature &#x27;fina&#x27;</td><td class="buf"><code>[parenright=0|.notdef=0|beh=2|fatha=2|lam=4|alef=5|parenleft=6]</code></td></tr><tr><td class="what">replacing glyph at 5 (single substitution)</td><td class="buf"><code>[parenright=0|.notdef=0|beh=2|fatha=2|lam=4|alef=5|parenleft=6]</code></td></tr><tr><td class="what">replaced glyph at 5 (single substitution)</td><td class="buf"><code>[parenright=0|.notdef=0|beh=2|fatha=2|lam=4|alef.fina=5|parenleft=6]</code></td></tr><tr><td class="what">end lookup 2 feature &#x27;fina&#x27;</td><td class="buf"><code>[parenright=0|.notdef=0|beh=2|fatha=2|lam=4|alef.fina=5|parenleft=6]</code></td></tr><tr><td class="what">start lookup 1 feature &#x27;medi&#x27;</td><td class="buf"><code>[parenright=0|.notdef=0|beh=2|fatha=2|lam=4|alef.fina=5|parenleft=6]</code></td></tr><tr><td class="what">replacing glyph at 2 (single substitution)</td><td class="buf"><code>[parenright=0|.notdef=0|beh=2|fatha=2|lam=4|alef.fina=5|parenleft=6]</code></td></tr><tr><td class="what">replaced glyph at 2 (single substitution)</td><td class="buf"><code>[parenright=0|.notdef=0|beh.medi=2|fatha=2|lam=4|alef.fina=5|parenleft=6]</code></td></tr><tr><td class="what">replacing glyph at 4 (single substitution)</td><td class="buf"><code>[parenright=0|.notdef=0|beh.medi=2|fatha=2|lam=4|alef.fina=5|parenleft=6]</code></td></tr><tr><td class="what">replaced glyph at 4 (single substitution)</td><td class="buf"><code>[parenright=0|.notdef=0|beh.medi=2|fatha=2|lam.medi=4|alef.fina=5|parenleft=6]</code></td></tr><tr><td class="what">end lookup 1 feature &#x27;medi&#x27;</td><td class="buf"><code>[parenright=0|.notdef=0|beh.medi=2|fatha=2|lam.medi=4|alef.fina=5|parenleft=6]</code></td></tr><tr><td class="what">start lookup 0 feature &#x27;init&#x27;</td><td class="buf"><code>[parenright=0|.notdef=0|beh.medi=2|fatha=2|lam.medi=4|alef.fina=5|parenleft=6]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;init&#x27;</td><td class="buf"><code>[parenright=0|.notdef=0|beh.medi=2|fatha=2|lam.medi=4|alef.fina=5|parenleft=6]</code></td></tr><tr><td class="what">start lookup 3 feature &#x27;rlig&#x27;</td><td class="buf"><code>[parenright=0|.notdef=0|beh.medi=2|fatha=2|lam.medi=4|alef.fina=5|parenleft=6]</code></td></tr><tr><td class="what">ligating glyphs at 4,5</td><td class="buf"><code>[parenright=0|.notdef=0|beh.medi=2|fatha=2|lam.medi=4|alef.fina=5|parenleft=6]</code></td></tr><tr><td class="what">ligated glyph at 4</td><td class="buf"><code>[parenright=0|.notdef=0|beh.medi=2|fatha=2|lam_alef.fina=4|parenleft=6]</code></td></tr><tr><td class="what">end lookup 3 feature &#x27;rlig&#x27;</td><td class="buf"><code>[parenright=0|.notdef=0|beh.medi=2|fatha=2|lam_alef.fina=4|parenleft=6]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;arab&#x27;</td><td class="buf"><code>[parenright=0|.notdef=0|beh.medi=2|fatha=2|lam_alef.fina=4|parenleft=6]</code></td></tr></tbody></table></div>
+<p id="ix-85">The order is the Arabic shaper’s, not the font’s: <code>fina</code> (lookup 2), <code>medi</code> (1), <code>init</code> (0), each in a stage of its own, then <code>rlig</code> (3). The <code>init</code> lookup runs, because its glyphs are in the buffer, but changes nothing: the masks set in step 9 gave its bit to no glyph. <code>rlig</code> makes the ligature, passing over nothing here, and the ligature takes cluster 4. How each lookup runs is the <a href="gsub.html">GSUB chapter</a>’s subject.</p>
+<p id="ix-86">If the plan uses <code>morx</code> instead, step 13 is <code>hb_aat_layout_substitute</code>, and GSUB isn’t used at all (<a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a>). Glyphs that <code>morx</code> deletes are only marked as deleted, and removed later: here, if GPOS is to follow, or after positioning if not (step 22).</p>
+<h2 id="positioning">Positioning</h2>
+<p id="ix-87"><code>hb_ot_position</code> (<code>:1094</code>) holds steps 14 to 21.</p>
+<h3 id="advances">Advances</h3>
+<p id="ix-88">Step 14, <code>clear_positions</code>, zeroes the positions array. Until now it was free for GSUB to use as its output buffer (<a href="buffers.html#the-buffers-three-arrays">Buffers</a>); from now on it holds positions.</p>
+<p id="ix-89">Step 15, <code>hb_ot_position_default</code>, asks the font funcs for every glyph’s advance, in one batch call, from <code>hmtx</code> with the default funcs (<a href="where-metrics-come-from.html">Where metrics come from</a>). In horizontal text, it subtracts each glyph’s horizontal origin only if the font funcs provide origins, which the default funcs don’t. In vertical text it fetches vertical advances, and always subtracts the vertical origins, because those default to something other than zero. Last, if normalization mapped a space character that the font lacks to the space glyph, it gives that glyph the right width now: an em-space an em, a thin space a fifth of one, and so on (<a href="fallbacks.html">Fallbacks</a>).</p>
+<p id="ix-90">The trace shows the advances at the start of GPOS. The joiner’s <code>.notdef</code> has the full 500 units of <code>.notdef</code>, and the fatha has its 200:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape pipeline.ttf "(⟨ZWJ⟩بَلا)" --language=ar --trace</code></div><table><tbody><tr><td class="what">start table GPOS script tag &#x27;arab&#x27;</td><td class="buf"><code>[parenright=0+300|.notdef=0+500|beh.medi=2+400|fatha=2+200|lam_alef.fina=4+500|parenleft=6+300]</code></td></tr><tr><td class="what">start lookup 0 feature &#x27;mark&#x27;</td><td class="buf"><code>[parenright=0+300|.notdef=0+500|beh.medi=2+400|fatha=2+200|lam_alef.fina=4+500|parenleft=6+300]</code></td></tr><tr><td class="what">attaching mark glyph at 3 to glyph at 2</td><td class="buf"><code>[parenright=0+300|.notdef=0+500|beh.medi=2+400|fatha=2+200|lam_alef.fina=4+500|parenleft=6+300]</code></td></tr><tr><td class="what">attached mark glyph at 3 to glyph at 2</td><td class="buf"><code>[parenright=0+300|.notdef=0+500|beh.medi=2+400|fatha=2@100,50+200|lam_alef.fina=4+500|parenleft=6+300]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;mark&#x27;</td><td class="buf"><code>[parenright=0+300|.notdef=0+500|beh.medi=2+400|fatha=2@100,50+200|lam_alef.fina=4+500|parenleft=6+300]</code></td></tr><tr><td class="what">end table GPOS script tag &#x27;arab&#x27;</td><td class="buf"><code>[parenright=0+300|.notdef=0+500|beh.medi=2+400|fatha=2@100,50+200|lam_alef.fina=4+500|parenleft=6+300]</code></td></tr></tbody></table></div>
+<h3 id="gpos-and-what-surrounds-it">GPOS, and what surrounds it</h3>
+<p id="ix-91"><code>hb_ot_position_plan</code> (<code>:1029</code>) runs GPOS with a sequence of steps around it whose order is fixed:</p>
+<ul>
+<li id="ix-92">If the font funcs provide horizontal origins, they are added back, because GPOS works from the horizontal origin.</li>
+<li id="ix-93">Step 16: <code>GPOS::position_start</code> clears each glyph’s <code>attach_chain</code> and <code>attach_type</code>, which GPOS keeps in the spare field of the positions. If the shaper zeroes marks “early”, before GPOS, it sets every GDEF mark’s advance to zero now. USE and the Myanmar shaper do.</li>
+<li id="ix-94">Step 17: <code>plan-&gt;position</code> (<code>:271</code>) runs GPOS, or <code>kerx</code>. Then, if the plan says so, legacy <code>kern</code> (<a href="legacy-kern.html">Legacy kern</a>) or fallback kerning, and <code>trak</code> (<a href="aat-positioning.html">AAT positioning</a>). Which of them the plan uses was decided when it was made, from the tables the font has. Here, the fatha is attached to beh at offset (100, 50).</li>
+<li id="ix-95">Step 18: shapers that zero marks “late” do it now. The default, Arabic, Hebrew and Thai shapers are among them; the Indic, Khmer and Hangul shapers don’t zero marks at all. If the plan has neither GPOS nor <code>kerx</code> and the run is forward, the mark’s offset is moved back by its old advance at the same time, so that it hangs over the glyph before it.</li>
+<li id="ix-96">Step 19: <code>position_finish_advances</code>, which does nothing in 15.1.0; then <code>hb_ot_zero_width_default_ignorables</code>, which gives every default ignorable no advance and no offset along the line; then <code>position_finish_offsets</code>, which resolves attachments. GPOS stores a mark’s offset relative to its base, and this adds up the base’s offset and the advances between them. Then, for a synthetically slanted font, each glyph with a vertical offset is moved sideways to match (<a href="fonts-and-font-functions.html#slant">Fonts and font functions</a>).</li>
+<li>Horizontal origins are subtracted again, if there are any.</li>
+<li id="ix-97">Step 20: if the plan has neither GPOS nor <code>kerx</code>, and the shaper allows it, marks are placed from glyph extents (“start fallback mark” in a trace; <a href="fallbacks.html">Fallbacks</a>).</li>
+</ul>
+<p id="ix-98">The order in step 19 is the one the source comment insists on: “Has to follow a certain order.” Resolving an attachment adds up advances, so the advances must be final first. In a right-to-left run, the advances added to a mark’s offset include the mark’s own (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/GPOS.hh#L126"><code>OT/Layout/GPOS/GPOS.hh:126</code></a>). The fatha’s 200 was zeroed in step 18, so its offset stays at 100. In the other order it would have moved 200 units (read from the code).</p>
+<h3 id="into-visual-order">Into visual order</h3>
+<p id="ix-99">Step 21: if the buffer’s direction is now backward, <code>hb_buffer_reverse</code> reverses the whole buffer. In practice that means right to left: a bottom-to-top run was turned top to bottom at step 5, so it isn’t backward any more, and is never reversed back. Its glyphs come out in top-to-bottom order (<a href="vertical-text.html">Vertical text</a>). This is the only place HarfBuzz turns its output into visual order, and it is why <code>hb-shape</code> lists the parenthesis that was typed first last. The reversal is of glyphs, not graphemes: the fatha, typed after the beh, now comes before it, as it would be drawn in a left-to-right list. <code>glyph_props</code> and <code>lig_props</code> are given back.</p>
+<h2 id="after-positioning">After positioning</h2>
+<p id="ix-100"><code>hb_ot_substitute_post</code> (<code>:951</code>) changes glyph IDs, which is why it is called “substitute”, but runs after positioning. Each of its steps needs positioning to have happened first.</p>
+<p id="ix-101">Step 22 removes glyphs that <code>morx</code> deleted, if they weren’t removed before GPOS. Step 23 replaces any variation selector that the <code>cmap</code> didn’t consume with the buffer’s <code>not_found_variation_selector</code> glyph, if the application set one, with no advance or offset (<a href="unicode-inside-harfbuzz.html#variation-selectors">Unicode inside HarfBuzz</a>).</p>
+<p id="ix-102">Step 24, <code>hb_ot_hide_default_ignorables</code>, replaces each default ignorable with the buffer’s invisible glyph, or the font’s space glyph, or deletes it if there is neither, or if the buffer asks for that. Until now the joiner was an ordinary glyph, <code>.notdef</code>, which GSUB and GPOS could see and match, and had an advance until step 19. Hiding it this late is what lets invisible characters take part in shaping (<a href="unicode-inside-harfbuzz.html#default-ignorables">Unicode inside HarfBuzz</a>).</p>
+<p id="ix-103">Step 25 is the shaper’s <code>postprocess_glyphs</code>, the last of its hooks. For Arabic it stretches glyphs for <code>stch</code>. Its message is the last in the trace, and shows the buffer as it will be returned, in visual order, with the joiner hidden and the fatha’s advance gone:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape pipeline.ttf "(⟨ZWJ⟩بَلا)" --language=ar --trace</code></div><table><tbody><tr><td class="what">start postprocess-glyphs</td><td class="buf"><code>[parenleft=6+300|lam_alef.fina=4+500|fatha=2@100,50+0|beh.medi=2+400|space=0+0|parenright=0+300]</code></td></tr><tr><td class="what">end postprocess-glyphs</td><td class="buf"><code>[parenleft=6+300|lam_alef.fina=4+500|fatha=2@100,50+0|beh.medi=2+400|space=0+0|parenright=0+300]</code></td></tr></tbody></table></div>
+<h2 id="finishing">Finishing</h2>
+<p id="ix-104">Step 26, <code>hb_propagate_flags</code>, makes the glyph flags the same on every glyph of a cluster, by OR-ing them together. It also clears <code>UNSAFE_TO_CONCAT</code> unless the buffer asked for it, and reconciles <code>SAFE_TO_INSERT_TATWEEL</code> with <code>UNSAFE_TO_BREAK</code> (<a href="buffers.html#glyph-flags">Buffers</a>). The flags were set, glyph by glyph, by the steps that looked across a boundary between glyphs. After this, an application can read any glyph of a cluster and get the same answer:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">pipeline.ttf</td><td class="in"><span class="txt">(⟨ZWJ⟩بَلا)</span><span class="cps">U+0028 U+200D U+0628 U+064E U+0644 U+0627 U+0029</span></td><td class="opt">--language=ar --show-flags</td><td class="out"><code>[parenleft=6+300|lam_alef.fina=4+500#1|fatha=2@100,50+0#1|beh.medi=2+400#1|space=0+0|parenright=0+300]</code></td></tr></tbody></table></div>
+<p id="ix-105">The <code>#1</code> is <code>UNSAFE_TO_BREAK</code>. Step 27 gives back <code>unicode_props</code>, the last of the scratch bytes, and puts back the direction the caller asked for, which step 5 may have flipped.</p>
+<h2 id="where-the-shapers-hooks-run">Where the shaper’s hooks run</h2>
+<p id="ix-106"><a href="choosing-a-script-shaper.html#what-the-choice-decides">Choosing a script shaper</a> lists a shaper’s hooks and settings. This is where each takes effect:</p>
+<table>
+<thead>
+<tr>
+<th>Hook or setting</th>
+<th>Where</th>
+<th>Step</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>collect_features</code>, <code>override_features</code>, <code>gpos_tag</code></td>
+<td id="ix-107">planning, <code>hb_ot_shape_collect_features</code> and <code>compile</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>data_create</code></td>
+<td>the end of planning (<code>:240</code>)</td>
+<td></td>
+</tr>
+<tr>
+<td><code>preprocess_text</code></td>
+<td id="ix-108">after the native direction (<code>:1185</code>)</td>
+<td>6</td>
+</tr>
+<tr>
+<td><code>decompose</code>, <code>compose</code>, <code>reorder_marks</code>, <code>normalization_preference</code></td>
+<td id="ix-109">inside normalization</td>
+<td>8</td>
+</tr>
+<tr>
+<td><code>setup_masks</code></td>
+<td id="ix-110">after the fraction masks, before ranged user features (<code>:758</code>)</td>
+<td>9</td>
+</tr>
+<tr>
+<td id="ix-111">pause functions</td>
+<td id="ix-112">between GSUB stages</td>
+<td>13</td>
+</tr>
+<tr>
+<td><code>zero_width_marks</code></td>
+<td id="ix-113">before or after GPOS</td>
+<td>16, 18</td>
+</tr>
+<tr>
+<td><code>fallback_position</code></td>
+<td id="ix-114">whether steps 10 and 20, and legacy <code>kern</code>, may happen</td>
+<td>10, 17, 20</td>
+</tr>
+<tr>
+<td><code>postprocess_glyphs</code></td>
+<td>after hiding default ignorables (<code>:961</code>)</td>
+<td>25</td>
+</tr>
+</tbody>
+</table>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>src/hb-ot-shape.cc</code></a></td>
+<td><code>hb_ot_shape_internal</code> and every step it calls; the planner decisions (<code>compile</code>) that switch steps on and off</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc"><code>src/hb-ot-shape-normalize.cc</code></a></td>
+<td>normalization and the <code>cmap</code> lookup</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>src/hb-ot-layout.cc</code></a></td>
+<td>glyph properties and the digest, <code>hb_ot_map_t::apply</code>, GSUB and GPOS entry points</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/GPOS.hh"><code>src/OT/Layout/GPOS/GPOS.hh</code></a></td>
+<td><code>position_start</code>, <code>position_finish_offsets</code> and <code>propagate_attachment_offsets</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-fallback.cc"><code>src/hb-ot-shape-fallback.cc</code></a></td>
+<td>fallback mark positioning, kerning and space widths</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh"><code>src/hb-ot-shaper.hh</code></a></td>
+<td>the shaper hooks</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc"><code>src/hb-ot-shaper-arabic.cc</code></a></td>
+<td>the Arabic shaper this run used</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li><code>hb_ot_shape_internal</code> prepares the characters, maps and substitutes them, positions the glyphs, hides the invisible ones, and propagates flags, in that order.</li>
+<li>The text is put into the script’s native order at the start, and into visual order only after positioning.</li>
+<li>Mirroring and masks are worked out on characters, before the <code>cmap</code> is read; the <code>cmap</code> is read during normalization.</li>
+<li>GSUB sees glyphs without positions; positions start from the font’s advances, then GPOS, then the zeroing of marks and default ignorables, then attachments.</li>
+<li>Default ignorables are ordinary glyphs until after positioning, so lookups can match them.</li>
+<li>The shaper’s hooks run at fixed points: preprocess before normalization, masks after it, pauses inside GSUB, postprocess at the end.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="choosing-a-script-shaper.html">← Choosing a script shaper</a><a rel="next" href="normalization.html">Normalization →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

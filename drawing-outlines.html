@@ -1,0 +1,815 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Drawing outlines · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part IX · Drawing</p>
+<h1 id="drawing-outlines">35. Drawing outlines</h1>
+<p id="ix-1">Shaping ends with glyph IDs and positions. Something still has to turn each glyph ID into a shape, and HarfBuzz can do that too. Its draw API hands a glyph’s outline to the client one segment at a time, as moves, lines and curves, with variations, synthetic bold and slant, and the font’s scale already applied. It doesn’t rasterize anything, and it doesn’t hint: as the manual says, the outlines are “as they are defined in the font, without applying hinting to fit the curves to the pixel grid” (<code>docs/usermanual-fonts-and-faces.xml</code>).</p>
+<p id="ix-2">This chapter starts with the API as a client sees it, then takes the outline formats in the order HarfBuzz tries them: <code>glyf</code>, with its quadratic curves, composites and, in the newer <code>GLYF</code> table, cubic curves; then the CFF and CFF2 charstring interpreter. It ends with the limits that stop a hostile font from making one glyph take forever, and the budget shared between them. How gvar moves the points is in <a href="varying-outlines.html">Varying outlines</a>, VARC is in <a href="variable-components.html">Variable components</a>, and color glyphs, which are painted rather than drawn, are in <a href="color.html">Color</a>. The figures are drawn by <code>hb-vector</code>, itself a client of the draw API, from test fonts in <code>fonts/drawing-outlines/</code>.</p>
+<h2 id="the-draw-api">The draw API</h2>
+<p id="ix-3">A client asks for an outline with <code>hb_font_draw_glyph_or_fail (font, glyph, dfuncs, draw_data)</code>. The <strong>draw funcs</strong>, an <code>hb_draw_funcs_t</code>, are a table of five callbacks: <code>move_to</code>, <code>line_to</code>, <code>quadratic_to</code>, <code>cubic_to</code> and <code>close_path</code>. <code>draw_data</code> is the client’s own pointer, passed back to each of them. The function returns false if the font has no outline for the glyph. It has had that name since 11.2.0; the older <code>hb_font_draw_glyph</code> does the same and returns nothing (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L1637"><code>hb-font.cc:1637</code></a>).</p>
+<p id="ix-4">Every callback also gets an <code>hb_draw_state_t</code>, the <strong>draw state</strong>: whether a path is open, where it started, and the current point. A callback can read the current point from it, since a segment doesn’t repeat its start:</p>
+<pre><code class="language-c">typedef struct hb_draw_state_t {
+  hb_bool_t path_open;
+
+  float path_start_x;
+  float path_start_y;
+
+  float current_x;
+  float current_y;
+
+  /*&lt; private &gt;*/
+  hb_var_num_t   reserved1;
+  /* … reserved2 to reserved7 */
+} hb_draw_state_t;
+</code></pre>
+<p id="ix-5">(trimmed). Coordinates are floats, in the font’s scale, with y pointing up. They aren’t rounded.</p>
+<h3 id="what-the-client-sees">What the client sees</h3>
+<p id="ix-6">Every outline source draws through <code>hb_draw_funcs_t</code>’s inline methods (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-draw.hh#L113-L189"><code>hb-draw.hh:113–189</code></a>), which keep the draw state and tidy the path on the way:</p>
+<ul>
+<li id="ix-7"><code>move_to</code> sends nothing. It only records the point. The client’s <code>move_to</code> is sent by the first line or curve after it (<code>start_path</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-draw.hh#L182"><code>hb-draw.hh:182</code></a>). So a contour that is only a move never reaches the client, and two moves in a row reach it as one.</li>
+<li>A move while a path is open closes that path first.</li>
+<li><code>close_path</code> sends a <code>line_to</code> back to the start of the contour if the last segment ended anywhere else, and then the client’s <code>close_path</code>. Every contour the client sees ends where it began, and is explicitly closed.</li>
+</ul>
+<p id="ix-8">Each outline source works through an <code>hb_draw_session_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-draw.hh#L193"><code>hb-draw.hh:193</code></a>), an internal helper that holds the funcs, the client’s data and a fresh draw state for one glyph. Its destructor closes whatever path is still open, so even a glyph whose data ends mid-contour reaches the client closed.</p>
+<p id="ix-9">These rules don’t remove degenerate contours. A <code>glyf</code> contour of one point, which old fonts used as anchors, arrives as a <code>move_to</code>, a <code>line_to</code> to the same point, and a <code>close_path</code>: the path builder draws a line back to the contour’s first point (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/path-builder.hh#L168"><code>OT/glyf/path-builder.hh:168</code></a>), and that line opens the path. A client that fills will draw nothing there; a client that strokes, or counts contours, will see it.</p>
+<h3 id="callbacks-a-client-leaves-out">Callbacks a client leaves out</h3>
+<p id="ix-10">A new <code>hb_draw_funcs_t</code> starts with every callback set to a “nil” function, and setting one to <code>NULL</code> puts the nil one back. All but one of the nil functions do nothing. The exception is <code>quadratic_to</code>, whose nil version converts the curve to a cubic and calls <code>cubic_to</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-draw.cc#L62"><code>hb-draw.cc:62</code></a>):</p>
+<pre><code class="language-c++">#define HB_TWO_THIRD 0.66666666666666666666666667
+dfuncs-&gt;emit_cubic_to (draw_data, *st,
+                       (float) (current_x + (cx - current_x) * HB_TWO_THIRD),
+                       (float) (current_y + (cy - current_y) * HB_TWO_THIRD),
+                       (float) (tx + (cx - tx) * HB_TWO_THIRD),
+                       (float) (ty + (cy - ty) * HB_TWO_THIRD),
+                       to_x, to_y);
+</code></pre>
+<p>(trimmed). The two cubic control points lie two thirds of the way from each end toward the quadratic one, which gives exactly the same curve. It is computed in doubles, so that, says the comment, “the result does not depend on how the compiler evaluates float expressions”.</p>
+<table>
+<thead>
+<tr>
+<th>The client leaves out</th>
+<th>What happens</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>quadratic_to</code></td>
+<td>quadratic curves arrive as cubics</td>
+</tr>
+<tr>
+<td><code>cubic_to</code></td>
+<td>cubic curves are lost, and so are quadratics if <code>quadratic_to</code> is missing too</td>
+</tr>
+<tr>
+<td><code>move_to</code>, <code>line_to</code>, <code>close_path</code></td>
+<td>those calls are lost</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-11">Nothing converts the other way: a client that can only draw quadratics has to approximate cubics itself. <code>hb-vector</code>’s PDF output relies on the conversion (“No quadratic_to: null fallback auto-promotes to cubic”, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.cc#L184"><code>hb-vector-draw.cc:184</code></a>).</p>
+<blockquote>
+<p id="ix-12">For programmers: a client that sets <code>move_to</code>, <code>line_to</code>, <code>cubic_to</code> and <code>close_path</code> gets every outline HarfBuzz can draw. Set <code>quadratic_to</code> as well only if quadratic segments are worth keeping, for instance to write them out unchanged.</p>
+</blockquote>
+<p id="ix-13">Since 14.2.0 the API also has <code>hb_draw_line</code>, <code>hb_draw_rectangle</code> and <code>hb_draw_circle</code>, which draw those shapes through any draw funcs. The outline code doesn’t use them.</p>
+<h3 id="above-the-outline-sources">Above the outline sources</h3>
+<p id="ix-14">Between the client and the outline is the font layer (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L690"><code>hb-font.hh:690</code></a>), which passes the request to the font funcs, rescales it through any parent fonts, and applies synthetic slant and bold, as <a href="fonts-and-font-functions.html#synthetic-bold-and-slant">Fonts and font functions</a> explains. The rest of this chapter is hb-ot’s side of that callback.</p>
+<h2 id="where-the-outline-comes-from">Where the outline comes from</h2>
+<p id="ix-15">hb-ot tries four sources, in a fixed order, and the first that says it has the glyph wins (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L900"><code>hb-ot-font.cc:900</code></a>):</p>
+<pre><code class="language-c++">hb_draw_session_t draw_session {draw_funcs, draw_data};
+…
+if (font-&gt;face-&gt;table.VARC-&gt;get_path (font, glyph, draw_session)) return true;
+// Keep the following in synch with VARC::get_path_at()
+if (font-&gt;face-&gt;table.glyf-&gt;get_path (font, glyph, draw_session, gvar_cache,
+                                      &amp;draw_session.get_budget ())) return true;
+if (font-&gt;face-&gt;table.cff2-&gt;get_path (font, glyph, draw_session,
+                                      &amp;draw_session.get_budget ())) return true;
+if (font-&gt;face-&gt;table.cff1-&gt;get_path (font, glyph, draw_session,
+                                      &amp;draw_session.get_budget ())) return true;
+return false;
+</code></pre>
+<p id="ix-16">(trimmed of <code>#ifdef</code>s). <a href="variable-components.html">VARC</a> comes first, so a glyph it covers is drawn from it whatever <code>glyf</code> or CFF holds. Then <code>glyf</code>, then CFF2, then CFF. A font with both <code>glyf</code> and CFF outlines is drawn from <code>glyf</code>.</p>
+<p id="ix-17">“Has the glyph” means a glyph ID within the table’s range. A <code>glyf</code> glyph with no contours, like a space, counts: <code>glyf</code> draws nothing and returns true, and CFF isn’t asked. So does a glyph whose <code>loca</code> entry is broken, which <code>glyf</code> treats as empty (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh#L574"><code>OT/glyf/glyf.hh:574</code></a>). Only a glyph past the end of <code>loca</code> falls through to the next table.</p>
+<p id="ix-18">Bitmaps and color glyphs aren’t on this list. They are painted, through a different callback; when a color glyph has no paint data, painting falls back to the outline. <a href="color.html">Color</a> covers that side. <a href="where-metrics-come-from.html#glyph-extents">Glyph extents</a> are found in yet another order, with bitmaps and color first.</p>
+<h2 id="glyf-from-points-to-a-path">glyf: from points to a path</h2>
+<p id="ix-19">A <code>glyf</code> glyph is either simple, a list of contours made of points, or composite, a list of other glyphs placed with transforms. For both, <code>glyf_accelerator_t::get_points</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh#L288"><code>OT/glyf/glyf.hh:288</code></a>) first gathers every point of the whole glyph into one array, with gvar’s deltas applied and the four phantom points at the end, as <a href="varying-outlines.html#a-glyphs-points-and-four-more">Varying outlines</a> describes. Only then are the points turned into draw calls, by <code>path_builder_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/path-builder.hh"><code>OT/glyf/path-builder.hh</code></a>), which scales each point to the font’s size as it reads it. So a broken glyph fails before anything is drawn: a <code>glyf</code> glyph is drawn whole or not at all.</p>
+<h3 id="simple-glyphs">Simple glyphs</h3>
+<p id="ix-20">A simple glyph stores the last point number of each contour, its hinting instructions, then a flag byte per point, then the x coordinates and the y coordinates, as deltas from the previous point. The flags say how each coordinate is stored (a byte or two, with a sign, or the same as the last), whether the flag repeats, and whether the point is <strong>on-curve</strong>, a point the outline passes through, or <strong>off-curve</strong>, a control point of a quadratic curve. <code>SimpleGlyph::get_contour_points</code> reads them (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/SimpleGlyph.hh#L186"><code>OT/glyf/SimpleGlyph.hh:186</code></a>). It skips the instructions without looking at them: HarfBuzz has no TrueType interpreter. The <code>OVERLAP_SIMPLE</code> flag is read and kept but means nothing to drawing.</p>
+<p id="ix-21">Two off-curve points in a row have an <strong>implied on-curve point</strong> halfway between them. That is what lets a TrueType outline chain quadratic curves without storing the points where they join, and it is most of what the path builder does. Its comment credits ttf-parser’s version of the same loop (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/path-builder.hh#L34"><code>path-builder.hh:34</code></a>). For each point:</p>
+<ul>
+<li id="ix-22">after an on-curve point, an on-curve point is a <code>line_to</code>, and an off-curve one is remembered;</li>
+<li id="ix-23">after an off-curve point, an on-curve point ends a <code>quadratic_to</code>, and another off-curve point ends one at the midpoint of the two, which becomes the start of the next.</li>
+</ul>
+<p id="ix-24">A contour can be entirely off-curve. Then every point is a control point and every midpoint is on the outline. The test font has three glyphs made of the same four points, the corners of a square: in <code>oncurve</code> they are on-curve, in <code>offcurve</code> off-curve, and <code>b</code> is a stem and a bowl whose bowl has two off-curve points in a row, with the implied point between them at the bowl’s right-hand extreme:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -1140 2280 1480" role="img" aria-label="b12 at default">
+<g transform="scale(1,-1)">
+<path d="M100,0L100,750L200,750L200,0L100,0ZM150,0L150,450Q500,450 500,225Q500,0 150,0ZM200,100Q400,100 400,225Q400,350 200,350L200,100Z" fill="currentColor"/>
+<path d="M700,100L700,700L1300,700L1300,100L700,100Z" fill="currentColor"/>
+<path d="M1800,100Q1500,100 1500,400Q1500,700 1800,700Q2100,700 2100,400Q2100,100 1800,100Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[b=0+600|oncurve=1+800|offcurve=2+800]</code></div></div><figcaption><code>hb-vector outlines.ttf "b12"</code></figcaption></figure>
+<p id="ix-25">The <code>offcurve</code> glyph is a rounded square through the midpoints of the square’s sides, four quadratic curves with the corners as their control points.</p>
+<p id="ix-26">One detail decides where a contour starts. If its first point is off-curve, HarfBuzz starts with the last point, and if that is off-curve too, at the midpoint of the two (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh#L334-L385"><code>glyf.hh:334–385</code></a>). The simpler loop that would just take points in order is still in the source, under <code>if (false)</code>, with the comment “FreeType and CoreText do it differently, so we match those”. It makes no difference to the shape, but it does to a client that looks at where each contour begins.</p>
+<h3 id="composite-glyphs">Composite glyphs</h3>
+<p id="ix-27">A composite glyph is a list of components, each another glyph with flags, two arguments and, optionally, a scale, a pair of scales, or a 2×2 matrix (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/CompositeGlyph.hh"><code>OT/glyf/CompositeGlyph.hh</code></a>). Usually the arguments are an x and y offset. HarfBuzz loads each component’s points recursively, transforms them, and adds them to the composite’s array. As far as drawing is concerned, a composite is the simple glyph its components add up to.</p>
+<p id="ix-28">The test font’s <code>d</code>, <code>p</code> and <code>q</code> are all <code>b</code>, transformed: <code>d</code> is mirrored with the matrix (−1, 0, 0, 1), <code>p</code> with (1, 0, 0, −1), and <code>q</code> turned half round with (−1, 0, 0, −1), each with an offset that puts it back in place:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -1140 2480 1480" role="img" aria-label="bdpq at default">
+<g transform="scale(1,-1)">
+<path d="M100,0L100,750L200,750L200,0L100,0ZM150,0L150,450Q500,450 500,225Q500,0 150,0ZM200,100Q400,100 400,225Q400,350 200,350L200,100Z" fill="currentColor"/>
+<path d="M1100,0L1100,750L1000,750L1000,0L1100,0ZM1050,0L1050,450Q700,450 700,225Q700,0 1050,0ZM1000,100Q800,100 800,225Q800,350 1000,350L1000,100Z" fill="currentColor"/>
+<path d="M1300,450L1300,-300L1400,-300L1400,450L1300,450ZM1350,450L1350,0Q1700,0 1700,225Q1700,450 1350,450ZM1400,350Q1600,350 1600,225Q1600,100 1400,100L1400,350Z" fill="currentColor"/>
+<path d="M2300,450L2300,-300L2200,-300L2200,450L2300,450ZM2250,450L2250,0Q1900,0 1900,225Q1900,450 2250,450ZM2200,350Q2000,350 2000,225Q2000,100 2200,100L2200,350Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[b=0+600|d=1+600|p=2+600|q=3+600]</code></div></div><figcaption><code>hb-vector outlines.ttf "bdpq"</code></figcaption></figure>
+<p>Most of the component flags change nothing in HarfBuzz’s drawing:</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>In HarfBuzz’s drawing</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ARGS_ARE_XY_VALUES</code></td>
+<td id="ix-29">set: the arguments are an offset; clear: they are point numbers to match (below)</td>
+</tr>
+<tr>
+<td><code>WE_HAVE_A_SCALE</code>, <code>WE_HAVE_AN_X_AND_Y_SCALE</code>, <code>WE_HAVE_A_TWO_BY_TWO</code></td>
+<td id="ix-30">the transform, in F2Dot14</td>
+</tr>
+<tr>
+<td><code>SCALED_COMPONENT_OFFSET</code>, <code>UNSCALED_COMPONENT_OFFSET</code></td>
+<td id="ix-31">whether the offset is transformed too (below)</td>
+</tr>
+<tr>
+<td><code>USE_MY_METRICS</code></td>
+<td id="ix-32">the composite takes this component’s phantom points, so its metrics, and so the left-side-bearing shift (<a href="varying-outlines.html#composites">Varying outlines</a>)</td>
+</tr>
+<tr>
+<td><code>ROUND_XY_TO_GRID</code></td>
+<td>ignored: nothing is rounded</td>
+</tr>
+<tr>
+<td><code>WE_HAVE_INSTRUCTIONS</code>, <code>OVERLAP_COMPOUND</code></td>
+<td>ignored</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-33">Two flags decide the order of the transform and the offset. With <code>SCALED_COMPONENT_OFFSET</code> alone, the offset is added first and transformed with the points; otherwise, with neither flag or both, the points are transformed and then moved by the offset (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/CompositeGlyph.hh#L129"><code>CompositeGlyph.hh:129</code></a>). <code>outlines-scaled.ttf</code> is <code>outlines.ttf</code> with <code>SCALED_COMPONENT_OFFSET</code> set on the components of <code>d</code>, <code>p</code> and <code>q</code>:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -1140 2480 2380" role="img" aria-label="bdpq at default">
+<g transform="scale(1,-1)">
+<path d="M100,0L100,750L200,750L200,0L100,0ZM150,0L150,450Q500,450 500,225Q500,0 150,0ZM200,100Q400,100 400,225Q400,350 200,350L200,100Z" fill="currentColor"/>
+<path d="M1100,0L1100,750L1000,750L1000,0L1100,0ZM1050,0L1050,450Q700,450 700,225Q700,0 1050,0ZM1000,100Q800,100 800,225Q800,350 1000,350L1000,100Z" fill="currentColor"/>
+<path d="M1300,-450L1300,-1200L1400,-1200L1400,-450L1300,-450ZM1350,-450L1350,-900Q1700,-900 1700,-675Q1700,-450 1350,-450ZM1400,-550Q1600,-550 1600,-675Q1600,-800 1400,-800L1400,-550Z" fill="currentColor"/>
+<path d="M2300,-450L2300,-1200L2200,-1200L2200,-450L2300,-450ZM2250,-450L2250,-900Q1900,-900 1900,-675Q1900,-450 2250,-450ZM2200,-550Q2000,-550 2000,-675Q2000,-800 2200,-800L2200,-550Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[b=0+600|d=1+600|p=2+600|q=3+600]</code></div></div><figcaption><code>hb-vector outlines-scaled.ttf "bdpq"</code></figcaption></figure>
+<p id="ix-34"><code>p</code> and <code>q</code> drop a long way below the baseline: their offset of 450 has been flipped to −450 along with the outline. The flipped x offsets of <code>d</code> and <code>q</code> don’t show, because of the left-side-bearing shift: HarfBuzz moves every outline so that its left edge is where <code>hmtx</code> says it should be, and the font’s <code>hmtx</code> was made for the other flag.</p>
+<h3 id="matching-points">Matching points</h3>
+<p id="ix-35">A component whose <code>ARGS_ARE_XY_VALUES</code> flag is clear is placed by <strong>point matching</strong>: its two arguments are point numbers, one in the composite so far and one in the component, and the component is moved so that the two points meet (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/Glyph.hh#L539"><code>OT/glyf/Glyph.hh:539</code></a>). This is how TrueType attached accents before GPOS existed, and because it works on points after gvar has moved them, an accent placed this way follows its base through a variable font.</p>
+<p id="ix-36">The test font’s <code>i</code> is a <code>dotlessi</code> and a <code>dotaccent</code>. The dot glyph has a second contour of a single point 150 units below the dot, and the composite matches that point, number 4, with point 1 of <code>dotlessi</code>, the top of its stem. The test font’s <code>x</code> is a composite of <code>b</code> and that <code>i</code>, side by side:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -1140 1880 1480" role="img" aria-label="bix at default">
+<g transform="scale(1,-1)">
+<path d="M100,0L100,750L200,750L200,0L100,0ZM150,0L150,450Q500,450 500,225Q500,0 150,0ZM200,100Q400,100 400,225Q400,350 200,350L200,100Z" fill="currentColor"/>
+<path d="M700,0L700,500L800,500L800,0L700,0ZM700,650L700,750L800,750L800,650L700,650ZM700,500L700,500Z" fill="currentColor"/>
+<path d="M1000,0L1000,750L1100,750L1100,0L1000,0ZM1050,0L1050,450Q1400,450 1400,225Q1400,0 1050,0ZM1100,100Q1300,100 1300,225Q1300,350 1100,350L1100,100ZM1600,0L1600,500L1700,500L1700,0L1600,0ZM1600,900L1600,1000L1700,1000L1700,900L1600,900ZM1600,750L1600,750Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[b=0+600|i=1+300|b_i=2+900]</code></div></div><figcaption><code>hb-vector outlines.ttf "bix"</code></figcaption></figure>
+<p id="ix-37">In <code>i</code> the dot is 150 units above the stem, as intended. In <code>x</code> it is 250 units higher. The point numbers are meant to count the points of the composite being built, here <code>i</code>, but HarfBuzz counts from the start of the whole glyph’s array, which is the same thing only at the top level. Inside <code>x</code>, point 1 is the top of <code>b</code>’s stem, at 750, not the top of <code>dotlessi</code>’s, at 500. fontTools, asked for the same glyph’s coordinates, puts the dot where it is in <code>i</code>. This is a bug in 15.1.0, found while writing this chapter. It affects only composites that match points and are themselves used as components, which are rare.</p>
+<h2 id="cubic-curves-in-glyf">Cubic curves in glyf</h2>
+<p id="ix-38">TrueType outlines are quadratic, and CFF outlines cubic. A proposal for HarfBuzz’s “boring expansion” of OpenType adds cubic curves to <code>glyf</code>, and HarfBuzz supports it: experimentally since 7.0.0, whose <code>NEWS</code> points to the specification (<code>glyf1-cubicOutlines.md</code> in the <code>boring-expansion-spec</code> repository), and by default since 15.0.0, as part of the ISO standard’s new tables.</p>
+<p id="ix-39">The extension uses bit 7 of a point’s flag byte, which was reserved: <code>FLAG_CUBIC</code>, 0x80 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/SimpleGlyph.hh#L23"><code>SimpleGlyph.hh:23</code></a>). An off-curve point with that bit set is a control point of a cubic curve, and two in a row are the two controls of one cubic. Between two such pairs there is an implied on-curve point, at the midpoint of the second control of one pair and the first of the next, just as between two quadratic control points. The path builder handles both kinds in one pass: it holds up to two control points, draws a <code>cubic_to</code> when it has two cubic ones, and a <code>quadratic_to</code> when it has one. A cubic control point on its own, or the third of three in a row, is drawn as a quadratic one (inferred from <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/path-builder.hh#L41-L127"><code>path-builder.hh:41–127</code></a>). The contour-start rotation above is skipped for a contour that starts and ends with cubic control points, since moving one point to the front would pair the controls differently (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh#L362-L371"><code>glyf.hh:362–371</code></a>).</p>
+<p id="ix-40">HarfBuzz reads the bit only in the <code>GLYF</code> table, the one the ISO standard introduces for fonts with more than 65,535 glyphs (<a href="fonts-as-bytes.html#smalltypes-and-mediumtypes">Fonts as bytes</a>). In <code>glyf</code> it masks it off (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/SimpleGlyph.hh#L138"><code>SimpleGlyph.hh:138</code></a>):</p>
+<pre><code class="language-c++">uint8_t flag = *p++;
+if (!extended)
+  flag &amp;= ~FLAG_CUBIC;
+</code></pre>
+<p id="ix-41"><code>extended</code> is true only when the face has both <code>GLYF</code> and <code>LOCA</code>, which are then used instead of <code>glyf</code> and <code>loca</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh#L224-L240"><code>glyf.hh:224–240</code></a>). The test font’s <code>cubic</code> glyph is the same four corners again, with the cubic bit set. <code>outlines.ttf</code> stores it in <code>glyf</code>, and <code>outlines-GLYF.ttf</code> stores exactly the same bytes in <code>GLYF</code>:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -1140 2480 1480" role="img" aria-label="123 at default">
+<g transform="scale(1,-1)">
+<path d="M100,100L100,700L700,700L700,100L100,100Z" fill="currentColor"/>
+<path d="M1200,100Q900,100 900,400Q900,700 1200,700Q1500,700 1500,400Q1500,100 1200,100Z" fill="currentColor"/>
+<path d="M2000,100Q1700,100 1700,400Q1700,700 2000,700Q2300,700 2300,400Q2300,100 2000,100Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[oncurve=0+800|offcurve=1+800|cubic=2+800]</code></div></div><figcaption><code>hb-vector outlines.ttf "123"</code></figcaption></figure>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -1140 2480 1480" role="img" aria-label="123 at default">
+<g transform="scale(1,-1)">
+<path d="M100,100L100,700L700,700L700,100L100,100Z" fill="currentColor"/>
+<path d="M1200,100Q900,100 900,400Q900,700 1200,700Q1500,700 1500,400Q1500,100 1200,100Z" fill="currentColor"/>
+<path d="M2000,700C2300,700 2300,100 2000,100C1700,100 1700,700 2000,700Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[oncurve=0+800|offcurve=1+800|cubic=2+800]</code></div></div><figcaption><code>hb-vector outlines-GLYF.ttf "123"</code></figcaption></figure>
+<p id="ix-42">In <code>glyf</code>, <code>cubic</code> is drawn like <code>offcurve</code>, with quadratics. In <code>GLYF</code>, its four corners are two pairs of cubic controls, the implied points are the middles of the top and bottom edges, and it is drawn as two cubic curves: narrower, since a cubic doesn’t get as close to its controls as a quadratic does, and touching only the top and bottom of the square. A font that wants cubic outlines in HarfBuzz 15.1.0 has to use <code>GLYF</code>, whatever its glyph count.</p>
+<h2 id="cff-and-cff2-running-charstrings">CFF and CFF2: running charstrings</h2>
+<p id="ix-43">A CFF glyph is a <strong>charstring</strong>, a small program in Adobe’s Type 2 format: numbers pushed on a stack, and operators that use them to move, draw lines and draw cubic curves. HarfBuzz runs it with an interpreter built from templates, shared between drawing, extents and subsetting. The CFF and CFF2 code was contributed by Adobe, and merged in 2.3.0, mostly for the subsetter but also for glyph extents (<code>NEWS</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Where</th>
+<th>What it adds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>interp_env_t</code></td>
+<td id="ix-44"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-common.hh#L574"><code>hb-cff-interp-common.hh:574</code></a></td>
+<td>the byte cursor, and the argument stack: 513 numbers, as doubles</td>
+</tr>
+<tr>
+<td><code>cs_interp_env_t</code></td>
+<td id="ix-45"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-cs-common.hh#L113"><code>hb-cff-interp-cs-common.hh:113</code></a></td>
+<td>the current point, the subroutines, a call stack 10 deep, hint counts, the budget</td>
+</tr>
+<tr>
+<td><code>cs_opset_t</code></td>
+<td id="ix-46"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-cs-common.hh#L247"><code>hb-cff-interp-cs-common.hh:247</code></a></td>
+<td id="ix-47">what each charstring operator does</td>
+</tr>
+<tr>
+<td><code>path_procs_t</code></td>
+<td id="ix-48"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-cs-common.hh#L459"><code>hb-cff-interp-cs-common.hh:459</code></a></td>
+<td id="ix-49">the path operators, turned into <code>moveto</code>, <code>line</code> and <code>curve</code></td>
+</tr>
+<tr>
+<td><code>cff1_…</code>, <code>cff2_…</code></td>
+<td id="ix-50"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff1-interp-cs.hh"><code>hb-cff1-interp-cs.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff2-interp-cs.hh"><code>hb-cff2-interp-cs.hh</code></a></td>
+<td>the differences between the two formats</td>
+</tr>
+<tr>
+<td><code>cff1_path_param_t</code>, <code>cff2_path_param_t</code></td>
+<td id="ix-51"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cff1-table.cc#L453"><code>hb-ot-cff1-table.cc:453</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cff2-table.cc#L164"><code>hb-ot-cff2-table.cc:164</code></a></td>
+<td>the draw session, and scaling to the font’s size</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-52">With other parameters, the same templates collect a bounding box for <a href="where-metrics-come-from.html#glyph-extents">extents</a>.</p>
+<p id="ix-53">The path operators, from <code>rlineto</code> to <code>vhcurveto</code>, differ only in how they pack their coordinates, and <code>path_procs_t</code> unpacks each into lines and cubic curves. The four flex operators, which a hinting rasterizer may flatten at small sizes, are always drawn as their two curves. A charstring never produces a quadratic: CFF outlines reach the client entirely as <code>move_to</code>, <code>line_to</code>, <code>cubic_to</code> and <code>close_path</code>.</p>
+<p id="ix-54">Much of a charstring is for hinting, and HarfBuzz reads it only to get past it. The stem operators, <code>hstem</code>, <code>vstem</code> and their <code>hm</code> forms, only count their stems, because the count says how many bytes of mask follow each <code>hintmask</code> and <code>cntrmask</code>, which are then skipped. <code>dotsection</code> does nothing. The width, which can come before the first stack-clearing operator, is noticed and dropped: advances come from <code>hmtx</code>. An operator HarfBuzz doesn’t know, including the arithmetic operators that Type 2 inherited from PostScript and few fonts use, clears the stack and is otherwise ignored (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-common.hh#L646"><code>hb-cff-interp-common.hh:646</code></a>; “Ignore unknown CFF operators”, <code>NEWS</code> 10.4.0).</p>
+<h3 id="subroutines">Subroutines</h3>
+<p id="ix-55">Shared pieces of outline are stored once, as subroutines, global or local to a font dict, and called with <code>callgsubr</code> or <code>callsubr</code>. The number on the stack is biased, so that small numbers, which cost fewer bytes, can reach the whole list: by 107 if there are fewer than 1,240 subroutines, 1,131 if fewer than 33,900, and otherwise 32,768 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-cs-common.hh#L63"><code>hb-cff-interp-cs-common.hh:63</code></a>). A call pushes the current position on the call stack; <code>return</code>, or the end of a CFF2 subroutine, pops it. A call that would nest more than 10 deep, or a subroutine number out of range, is an error.</p>
+<h3 id="seac">seac</h3>
+<p id="ix-56">A CFF (version 1) charstring can end with <code>endchar</code> and four extra numbers. That is the <strong>seac</strong> form, inherited from Type 1’s “standard encoding accented character”: draw the glyph for one StandardEncoding code, then the glyph for another, moved by an offset. The codes are looked up through the font’s charset, so it works only for glyphs with standard names. <code>process_seac</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cff1-table.cc#L528"><code>hb-ot-cff1-table.cc:528</code></a>) draws both glyphs into the same session, and refuses a seac inside a seac. In <code>cff.otf</code>, <code>odieresis</code> is the charstring <code>600 150 600 111 200 endchar</code>: a width of 600, then an offset of (150, 600), <code>o</code> (code 111) and <code>dieresis</code> (code 200):</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 1280 1280" role="img" aria-label="oö at default">
+<g transform="scale(1,-1)">
+<path d="M300,0C190,0 100,112 100,250C100,388 190,500 300,500C410,500 500,388 500,250C500,112 410,0 300,0ZM300,80C355,80 400,156 400,250C400,344 355,420 300,420C245,420 200,344 200,250C200,156 245,80 300,80Z" fill="currentColor"/>
+<path d="M900,0C790,0 700,112 700,250C700,388 790,500 900,500C1010,500 1100,388 1100,250C1100,112 1010,0 900,0ZM900,80C955,80 1000,156 1000,250C1000,344 955,420 900,420C845,420 800,344 800,250C800,156 845,80 900,80ZM750,600L850,600L850,700L750,700L750,600ZM950,600L1050,600L1050,700L950,700L950,600Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[o=0+600|odieresis=1+600]</code></div></div><figcaption><code>hb-vector cff.otf "oö"</code></figcaption></figure>
+<h3 id="cff2-blend-and-vsindex">CFF2: blend and vsindex</h3>
+<p id="ix-57">CFF2 charstrings vary. Each varying number is given with a delta for each region of the variation store, followed by the <code>blend</code> operator, which replaces them with the value at the font’s position. Which of the store’s lists of regions applies is set by the Private DICT, or, for one charstring, by a <code>vsindex</code> operator at its start. HarfBuzz computes the region scalars at the first <code>blend</code> and adds the deltas without rounding (<code>hb-cff2-interp-cs.hh:142–162, 314</code>), as <a href="varying-outlines.html#cff2">Varying outlines</a> says. A <code>vsindex</code> after a <code>blend</code>, or a second one, is an error, and the glyph fails (<code>:168</code>).</p>
+<p id="ix-58">HarfBuzz’s test font <code>AdobeVFPrototype_vsindex.otf</code> has an <code>A</code> and a <code>B</code> whose charstrings are the same except that <code>B</code>’s starts with <code>1 vsindex</code>. The second list of regions swaps two of the first list’s regions, which peak at the heaviest weight, for ones that peak halfway there, in normalized coordinates:</p>
+<figure class="draw slider"><div class="frames"><div class="frame print" data-value="200" hidden><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=200">
+<g transform="scale(1,-1)">
+<path d="M12,0L210,0L210,20L113,26L99,26L12,20L12,0ZM85,0L114,0L325,667L308,657L524,0L556,0L327,684L307,684L85,0ZM173,247L468,247L460,267L182,267L173,247ZM403,0L651,0L651,20L537,26L523,26L403,20L403,0Z" fill="currentColor"/>
+<path d="M689,0L887,0L887,20L790,26L776,26L689,20L689,0ZM762,0L791,0L1002,667L985,657L1201,0L1233,0L1004,684L984,684L762,0ZM850,247L1145,247L1137,267L859,267L850,247ZM1080,0L1328,0L1328,20L1214,26L1200,26L1080,20L1080,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=200</div><code class="frame-shape">[gid1=0+677|gid2=1+591]</code></div><div class="frame" data-value="250" hidden><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=250">
+<g transform="scale(1,-1)">
+<path d="M10.57,0L215.09,0L215.09,24.08L115.45,31.91L100.22,31.91L10.57,24.08L10.57,0ZM82.15,0L114.82,0L324.39,653.14L306.17,645.18L519.11,0L563.54,0L334.34,682.17L306.18,682.17L82.15,0ZM172.39,241.29L468.82,241.29L459.18,266.59L182.82,266.59L172.39,241.29ZM398.92,0L651.41,0L651.41,24.08L535.37,31.91L520.15,31.91L398.92,24.08L398.92,0Z" fill="currentColor"/>
+<path d="M684.57,0L889.09,0L889.09,24.08L789.45,31.91L774.22,31.91L684.57,24.08L684.57,0ZM756.15,0L788.82,0L998.39,653.14L980.17,645.18L1193.11,0L1237.54,0L1008.34,682.17L980.18,682.17L756.15,0ZM846.39,241.29L1142.82,241.29L1133.18,266.59L856.82,266.59L846.39,241.29ZM1072.92,0L1325.41,0L1325.41,24.08L1209.37,31.91L1194.15,31.91L1072.92,24.08L1072.92,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=250</div><code class="frame-shape">[gid1=0+674|gid2=1+599]</code></div><div class="frame" data-value="300" hidden><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=300">
+<g transform="scale(1,-1)">
+<path d="M9.15,0L220.19,0L220.19,28.15L117.89,37.82L101.45,37.82L9.15,28.15L9.15,0ZM79.29,0L115.63,0L323.78,639.28L304.33,633.36L514.22,0L571.08,0L341.67,680.33L305.37,680.33L79.29,0ZM171.78,235.59L469.63,235.59L458.37,266.18L183.63,266.18L171.78,235.59ZM394.85,0L651.82,0L651.82,28.15L533.74,37.82L517.29,37.82L394.85,28.15L394.85,0Z" fill="currentColor"/>
+<path d="M680.15,0L891.19,0L891.19,28.15L788.89,37.82L772.45,37.82L680.15,28.15L680.15,0ZM750.29,0L786.63,0L994.78,639.28L975.33,633.36L1185.22,0L1242.08,0L1012.67,680.33L976.37,680.33L750.29,0ZM842.78,235.59L1140.63,235.59L1129.37,266.18L854.63,266.18L842.78,235.59ZM1065.85,0L1322.82,0L1322.82,28.15L1204.74,37.82L1188.29,37.82L1065.85,28.15L1065.85,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=300</div><code class="frame-shape">[gid1=0+671|gid2=1+606]</code></div><div class="frame" data-value="350" hidden><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=350">
+<g transform="scale(1,-1)">
+<path d="M6.83,0L228.48,0L228.48,34.78L121.87,47.43L103.43,47.43L6.83,34.78L6.83,0ZM74.65,0L116.96,0L322.78,616.74L301.35,614.13L506.26,0L583.35,0L353.61,677.35L304.04,677.35L74.65,0ZM170.78,226.3L470.96,226.3L457.04,265.52L184.96,265.52L170.78,226.3ZM388.22,0L652.48,0L652.48,34.78L531.09,47.43L512.65,47.43L388.22,34.78L388.22,0Z" fill="currentColor"/>
+<path d="M673.83,0L895.48,0L895.48,34.78L788.87,47.43L770.43,47.43L673.83,34.78L673.83,0ZM741.65,0L783.96,0L989.78,616.74L968.35,614.13L1173.26,0L1250.35,0L1020.61,677.35L971.04,677.35L741.65,0ZM837.78,226.3L1137.96,226.3L1124.04,265.52L851.96,265.52L837.78,226.3ZM1055.22,0L1319.48,0L1319.48,34.78L1198.09,47.43L1179.65,47.43L1055.22,34.78L1055.22,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=350</div><code class="frame-shape">[gid1=0+667|gid2=1+618]</code></div><div class="frame print" data-value="400"><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=400">
+<g transform="scale(1,-1)">
+<path d="M5.21,0L234.38,0L234.38,40.78L125.25,55.78L105.37,55.78L5.21,40.78L5.21,0ZM70.75,0L118.45,0L321.71,598.34L297.89,595.46L497.16,0L594.6,0L364.89,674.05L302.42,674.05L70.75,0ZM169.92,217.4L472.33,217.4L455.96,264.09L185.96,264.09L169.92,217.4ZM381.31,0L653.49,0L653.49,40.66L529.25,55.66L506.57,55.66L381.31,40.66L381.31,0Z" fill="currentColor"/>
+<path d="M667.41,0L895.77,0L895.77,41.56L787.49,56.56L767.74,56.56L667.41,41.56L667.41,0ZM732.51,0L780.91,0L983.42,597.68L958.78,591.92L1156.32,0L1258.21,0L1028.78,673.11L963.85,673.11L732.51,0ZM831.84,215.79L1134.66,215.79L1117.92,263.19L847.92,263.19L831.84,215.79ZM1041.63,0L1315.99,0L1315.99,41.32L1191.49,56.32L1166.15,56.32L1041.63,41.32L1041.63,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=400</div><code class="frame-shape">[gid1=0+662|gid2=1+631]</code></div><div class="frame" data-value="450" hidden><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=450">
+<g transform="scale(1,-1)">
+<path d="M5.61,0L233.16,0L233.16,42.33L125.74,57.33L106.1,57.33L5.61,42.33L5.61,0ZM70.26,0L119.35,0L321.14,597.04L295.69,588.45L491.54,0L597.78,0L368.64,672.18L301.28,672.18L70.26,0ZM169.75,214.22L472.98,214.22L455.88,262.3L185.88,262.3L169.75,214.22ZM377.97,0L654.47,0L654.47,41.96L529.74,56.96L501.77,56.96L377.97,41.96L377.97,0Z" fill="currentColor"/>
+<path d="M666.23,0L891.32,0L891.32,44.66L786.47,59.66L767.21,59.66L666.23,44.66L666.23,0ZM729.53,0L780.7,0L980.28,595.08L952.38,577.91L1143.08,0L1262.56,0L1034.28,669.36L959.57,669.36L729.53,0ZM829.51,209.44L1133.96,209.44L1115.75,259.6L845.75,259.6L829.51,209.44ZM1032.95,0L1315.94,0L1315.94,43.92L1190.47,58.92L1154.53,58.92L1032.95,43.92L1032.95,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=450</div><code class="frame-shape">[gid1=0+660|gid2=1+638]</code></div><div class="frame" data-value="500" hidden><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=500">
+<g transform="scale(1,-1)">
+<path d="M6.02,0L231.94,0L231.94,43.88L126.22,58.88L106.84,58.88L6.02,43.88L6.02,0ZM69.78,0L120.25,0L320.57,595.73L293.49,581.45L485.92,0L600.96,0L372.39,670.31L300.14,670.31L69.78,0ZM169.59,211.04L473.63,211.04L455.8,260.51L185.8,260.51L169.59,211.04ZM374.63,0L655.45,0L655.45,43.27L530.22,58.27L496.96,58.27L374.63,43.27L374.63,0Z" fill="currentColor"/>
+<path d="M664.04,0L885.88,0L885.88,47.76L784.45,62.76L765.67,62.76L664.04,47.76L664.04,0ZM725.55,0L779.49,0L976.14,592.47L944.98,563.89L1128.83,0L1265.92,0L1038.78,665.61L954.29,665.61L725.55,0ZM826.18,203.08L1132.27,203.08L1112.59,256.02L842.59,256.02L826.18,203.08ZM1023.26,0L1314.9,0L1314.9,46.53L1188.45,61.53L1141.92,61.53L1023.26,46.53L1023.26,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=500</div><code class="frame-shape">[gid1=0+657|gid2=1+645]</code></div><div class="frame" data-value="550" hidden><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=550">
+<g transform="scale(1,-1)">
+<path d="M6.43,0L230.72,0L230.72,45.43L126.71,60.43L107.57,60.43L6.43,45.43L6.43,0ZM69.29,0L121.14,0L320,594.43L291.29,574.44L480.29,0L604.14,0L376.14,668.43L299,668.43L69.29,0ZM169.43,207.86L474.28,207.86L455.71,258.72L185.71,258.72L169.43,207.86ZM371.29,0L656.43,0L656.43,44.57L530.71,59.57L492.15,59.57L371.29,44.57L371.29,0Z" fill="currentColor"/>
+<path d="M662.86,0L881.43,0L881.43,50.85L783.43,65.85L765.14,65.85L662.86,50.85L662.86,0ZM722.57,0L779.28,0L973,589.86L938.58,549.88L1115.59,0L1270.28,0L1044.27,661.86L950,661.86L722.57,0ZM823.86,196.72L1131.57,196.72L1110.43,252.43L840.43,252.43L823.86,196.72ZM1014.58,0L1314.85,0L1314.85,49.14L1187.43,64.14L1130.3,64.14L1014.58,49.14L1014.58,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=550</div><code class="frame-shape">[gid1=0+655|gid2=1+652]</code></div><div class="frame" data-value="600" hidden><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=600">
+<g transform="scale(1,-1)">
+<path d="M6.84,0L229.49,0L229.49,46.97L127.2,61.97L108.3,61.97L6.84,46.97L6.84,0ZM68.8,0L122.04,0L319.43,593.13L289.09,567.43L474.67,0L607.32,0L379.89,666.56L297.86,666.56L68.8,0ZM169.27,204.68L474.94,204.68L455.63,256.92L185.63,256.92L169.27,204.68ZM367.95,0L657.4,0L657.4,45.87L531.2,60.87L487.34,60.87L367.95,45.87L367.95,0Z" fill="currentColor"/>
+<path d="M661.67,0L876.99,0L876.99,53.95L782.4,68.95L764.61,68.95L661.67,53.95L661.67,0ZM719.6,0L779.08,0L969.86,587.25L932.18,535.86L1102.34,0L1274.63,0L1049.77,658.11L945.72,658.11L719.6,0ZM821.53,190.37L1130.87,190.37L1108.27,248.85L838.27,248.85L821.53,190.37ZM1005.9,0L1314.81,0L1314.81,51.75L1186.4,66.75L1118.69,66.75L1005.9,51.75L1005.9,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=600</div><code class="frame-shape">[gid1=0+653|gid2=1+659]</code></div><div class="frame print" data-value="650" hidden><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=650">
+<g transform="scale(1,-1)">
+<path d="M7.72,0L226.84,0L226.84,50.34L128.27,65.34L109.9,65.34L7.72,50.34L7.72,0ZM67.73,0L123.99,0L318.19,590.29L284.3,552.19L462.44,0L614.23,0L388.04,662.48L295.38,662.48L67.73,0ZM168.91,197.77L476.35,197.77L455.46,253.03L185.46,253.03L168.91,197.77ZM360.68,0L659.53,0L659.53,48.71L532.27,63.71L476.89,63.71L360.68,48.71L360.68,0Z" fill="currentColor"/>
+<path d="M657.56,0L869.33,0L869.33,57.32L778.47,72.32L761.2,72.32L657.56,57.32L657.56,0ZM713.53,0L776.03,0L963.62,584.42L922.39,520.62L1085.11,0L1276.54,0L1052.92,654.04L938.24,654.04L713.53,0ZM816.18,183.46L1127.29,183.46L1103.09,244.95L833.09,244.95L816.18,183.46ZM993.63,0L1311.94,0L1311.94,54.58L1182.47,69.58L1103.23,69.58L993.63,54.58L993.63,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=650</div><code class="frame-shape">[gid1=0+648|gid2=1+674]</code></div><div class="frame" data-value="700" hidden><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=700">
+<g transform="scale(1,-1)">
+<path d="M8.61,0L224.18,0L224.18,53.71L129.33,68.71L111.49,68.71L8.61,53.71L8.61,0ZM66.67,0L125.94,0L316.95,587.46L279.52,536.95L450.22,0L621.14,0L396.19,658.41L292.9,658.41L66.67,0ZM168.56,190.86L477.77,190.86L455.28,249.13L185.28,249.13L168.56,190.86ZM353.42,0L661.66,0L661.66,51.54L533.33,66.54L466.43,66.54L353.42,51.54L353.42,0Z" fill="currentColor"/>
+<path d="M650.79,0L869.64,0L869.64,50.58L771.34,65.58L753.01,65.58L650.79,50.58L650.79,0ZM710.66,0L767.13,0L961.1,590.09L926.96,551.1L1104.57,0L1257.72,0L1031.62,662.19L938.2,662.19L710.66,0ZM811.89,197.28L1119.46,197.28L1098.44,252.75L828.44,252.75L811.89,197.28ZM1003.16,0L1302.68,0L1302.68,48.91L1175.34,63.91L1119.14,63.91L1003.16,48.91L1003.16,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=700</div><code class="frame-shape">[gid1=0+643|gid2=1+689]</code></div><div class="frame" data-value="750" hidden><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=750">
+<g transform="scale(1,-1)">
+<path d="M8.96,0L223.13,0L223.13,55.03L129.75,70.03L112.12,70.03L8.96,55.03L8.96,0ZM66.25,0L126.7,0L316.46,586.34L277.64,530.96L445.41,0L623.85,0L399.39,656.8L291.92,656.8L66.25,0ZM168.42,188.15L478.33,188.15L455.21,247.59L185.21,247.59L168.42,188.15ZM350.56,0L662.49,0L662.49,52.66L533.75,67.66L462.32,67.66L350.56,52.66L350.56,0Z" fill="currentColor"/>
+<path d="M648.09,0L869.73,0L869.73,47.94L768.51,62.94L749.76,62.94L648.09,47.94L648.09,0ZM709.49,0L763.59,0L960.08,592.32L928.72,563.08L1112.18,0L1250.29,0L1023.22,665.39L938.15,665.39L709.49,0ZM810.16,202.71L1116.34,202.71L1096.58,255.81L826.58,255.81L810.16,202.71ZM1006.87,0L1299.01,0L1299.01,46.68L1172.51,61.68L1125.35,61.68L1006.87,46.68L1006.87,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=750</div><code class="frame-shape">[gid1=0+641|gid2=1+694]</code></div><div class="frame" data-value="800" hidden><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=800">
+<g transform="scale(1,-1)">
+<path d="M9.3,0L222.09,0L222.09,56.35L130.16,71.35L112.75,71.35L9.3,56.35L9.3,0ZM65.84,0L127.47,0L315.97,585.23L275.76,524.97L440.61,0L626.57,0L402.6,655.2L290.95,655.2L65.84,0ZM168.28,185.43L478.89,185.43L455.14,246.06L185.14,246.06L168.28,185.43ZM347.71,0L663.33,0L663.33,53.77L534.16,68.77L458.21,68.77L347.71,53.77L347.71,0Z" fill="currentColor"/>
+<path d="M645.39,0L869.82,0L869.82,45.29L765.67,60.29L746.51,60.29L645.39,45.29L645.39,0ZM708.33,0L760.06,0L959.05,594.54L930.48,575.05L1119.79,0L1242.86,0L1014.81,668.6L938.1,668.6L708.33,0ZM808.44,208.14L1113.23,208.14L1094.72,258.87L824.72,258.87L808.44,208.14ZM1010.58,0L1295.34,0L1295.34,44.46L1169.67,59.46L1131.57,59.46L1010.58,44.46L1010.58,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=800</div><code class="frame-shape">[gid1=0+639|gid2=1+700]</code></div><div class="frame" data-value="850" hidden><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=850">
+<g transform="scale(1,-1)">
+<path d="M9.65,0L221.04,0L221.04,57.68L130.58,72.68L113.37,72.68L9.65,57.68L9.65,0ZM65.42,0L128.23,0L315.49,584.11L273.88,518.99L435.81,0L629.28,0L405.8,653.6L289.97,653.6L65.42,0ZM168.14,182.72L479.44,182.72L455.07,244.53L185.07,244.53L168.14,182.72ZM344.86,0L664.16,0L664.16,54.89L534.58,69.89L454.11,69.89L344.86,54.89L344.86,0Z" fill="currentColor"/>
+<path d="M642.7,0L869.91,0L869.91,42.65L762.84,57.65L743.25,57.65L642.7,42.65L642.7,0ZM707.16,0L756.53,0L958.03,596.77L932.24,587.02L1127.39,0L1235.43,0L1006.41,671.8L938.05,671.8L707.16,0ZM806.72,213.57L1110.11,213.57L1092.86,261.94L822.86,261.94L806.72,213.57ZM1014.29,0L1291.67,0L1291.67,42.23L1166.84,57.23L1137.78,57.23L1014.29,42.23L1014.29,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=850</div><code class="frame-shape">[gid1=0+637|gid2=1+706]</code></div><div class="frame print" data-value="900" hidden><svg viewBox="-40 -958 1427 1333" role="img" aria-label="AB at wght=900">
+<g transform="scale(1,-1)">
+<path d="M10,0L220,0L220,59L131,74L114,74L10,59L10,0ZM65,0L129,0L315,583L272,513L431,0L632,0L409,652L289,652L65,0ZM168,180L480,180L455,243L185,243L168,180ZM342,0L665,0L665,56L535,71L450,71L342,56L342,0Z" fill="currentColor"/>
+<path d="M640,0L870,0L870,40L760,55L740,55L640,40L640,0ZM706,0L753,0L957,599L934,599L1135,0L1228,0L998,675L938,675L706,0ZM805,219L1107,219L1091,265L821,265L805,219ZM1018,0L1288,0L1288,40L1164,55L1144,55L1018,40L1018,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=900</div><code class="frame-shape">[gid1=0+635|gid2=1+712]</code></div></div><label class="control"><span>wght</span><input type="range" min="200" max="900" step="50" value="400"><output>400</output></label><figcaption><code>hb-vector hb:test/api/fonts/AdobeVFPrototype_vsindex.otf "AB" --variations=wght=…</code>, drawn at every 50 from 200 to 900</figcaption></figure>
+<p id="ix-59">Up to the default weight, about 389, the two are identical. Above it they part: <code>A</code> keeps getting heavier, while <code>B</code> is heaviest at about 640 (halfway, once <code>avar</code> has been applied) and is back to its default outline at 900. (Their advances differ throughout: they come from <code>hmtx</code> and <code>HVAR</code>, which this test font didn’t change. And <code>hb-shape</code> calls them <code>gid1</code> and <code>gid2</code>, since the font has no glyph names.)</p>
+<p id="ix-60">CFF2 also drops <code>endchar</code>: a charstring simply ends. HarfBuzz’s CFF2 interpreter makes one up when it runs out of bytes, and a <code>return</code> at the end of a subroutine (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff2-interp-cs.hh#L125"><code>hb-cff2-interp-cs.hh:125</code></a>).</p>
+<h3 id="when-a-charstring-fails">When a charstring fails</h3>
+<p id="ix-61">Unlike a <code>glyf</code> glyph, a charstring is drawn as it is run. If it fails half-way, by overflowing the stack, calling a subroutine that doesn’t exist, or running out of budget, the part already drawn has reached the client by the time <code>hb_font_draw_glyph_or_fail</code> returns false.</p>
+<p id="ix-62">A CFF (version 1) charstring that ends without <code>endchar</code> shows another side of this. Running off the end isn’t an error in CFF: the interpreter reads an invalid operator, ignores it, and carries on until it has counted 200,000 operators. In a test font made while writing this chapter, such a glyph was drawn, and then reported as a failure. Each one also used 200,000 units of the budget described next, so in <code>hb-vector</code> a line of about 80 of them used all of it, and the glyphs after them weren’t drawn. It is probably a bug, though only a malformed font can trigger it.</p>
+<h2 id="limits-and-the-shared-budget">Limits, and the shared budget</h2>
+<p id="ix-63"><a href="trust-nothing-the-sanitizer.html#checks-that-wait">The sanitizer</a> leaves <code>glyf</code> and charstrings to be checked as they are used. Composites nest, charstrings call subroutines, and VARC components can be composites, so a small font could ask for an enormous amount of work. Each format has its own limits (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>hb-limits.hh</code></a> unless noted):</p>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Value</th>
+<th>What it bounds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-64"><code>HB_MAX_NESTING_LEVEL</code></td>
+<td>64</td>
+<td>how deep composites nest</td>
+</tr>
+<tr>
+<td id="ix-65"><code>HB_MAX_GRAPH_EDGE_COUNT</code></td>
+<td>16,384</td>
+<td id="ix-66">how many glyphs one composite loads, counting repeats</td>
+</tr>
+<tr>
+<td id="ix-67"><code>HB_GLYF_MAX_POINTS</code></td>
+<td>200,000</td>
+<td>points in one composite</td>
+</tr>
+<tr>
+<td id="ix-68"><code>HB_CFF_MAX_OPS</code></td>
+<td>200,000</td>
+<td id="ix-69">operators in one charstring, subroutines included</td>
+</tr>
+<tr>
+<td><code>kMaxCallLimit</code></td>
+<td>10</td>
+<td id="ix-70">subroutine nesting (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-cs-common.hh#L59"><code>hb-cff-interp-cs-common.hh:59</code></a>)</td>
+</tr>
+<tr>
+<td>argument stack</td>
+<td>513</td>
+<td id="ix-71">numbers on a charstring’s stack (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-common.hh#L443"><code>hb-cff-interp-common.hh:443</code></a>)</td>
+</tr>
+<tr>
+<td id="ix-72"><code>HB_BUDGET_GLYPH</code></td>
+<td>2²⁴</td>
+<td id="ix-73">the work budget, below</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-74">A composite that contains itself, directly or further down, is caught by a cycle detector, and the component that closes the cycle is skipped while the rest of the glyph is drawn (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/Glyph.hh#L470"><code>Glyph.hh:470</code></a>). The other limits fail the glyph. In <code>limits.ttf</code>, <code>spiral64</code> is a square and <code>spiral63</code>, turned 15° and shrunk; <code>spiral63</code> is a square and <code>spiral62</code>, and so on down to <code>spiral0</code>, a plain square. So <code>spiralN</code> nests N composites deep:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 1880 1280" role="img" aria-label="12 at default">
+<g transform="scale(1,-1)">
+<path d="M700,300L700,400L800,400L800,300L700,300ZM691.57,365.38L666.98,457.14L758.74,481.72L783.33,389.96L691.57,365.38ZM667.76,423.29L622.64,501.45L700.79,546.56L745.91,468.41L667.76,423.29ZM631.67,470.58L571.05,531.2L631.68,591.82L692.29,531.2L631.67,470.58ZM586.93,505.1L516.4,545.83L557.13,616.35L627.65,575.63L586.93,505.1ZM537.39,525.78L462.66,545.81L482.69,620.54L557.42,600.5L537.39,525.78ZM486.85,532.57L413.35,532.58L413.36,606.08L486.86,606.07L486.85,532.57ZM438.8,526.38L371.36,508.32L353.3,575.76L420.74,593.82L438.8,526.38ZM396.23,508.89L338.79,475.74L305.64,533.18L363.08,566.33L396.23,508.89ZM361.47,482.37L316.91,437.83L272.37,482.39L316.93,526.93L361.47,482.37ZM336.1,449.49L306.16,397.66L254.33,427.6L284.27,479.43L336.1,449.49ZM320.9,413.08L306.17,358.17L251.25,372.9L265.98,427.81L320.9,413.08ZM315.9,375.94L315.89,321.93L261.87,321.94L261.89,375.95L315.9,375.94ZM320.45,340.63L333.71,291.06L284.15,277.8L270.88,327.36L320.45,340.63ZM333.3,309.34L357.66,267.12L315.44,242.76L291.08,284.98L333.3,309.34ZM352.78,283.79L385.52,251.04L352.76,218.31L320.03,251.06L352.78,283.79ZM376.94,265.14L415.03,243.14L393.02,205.05L354.94,227.06L376.94,265.14ZM403.7,253.97L444.06,243.14L433.23,202.78L392.87,213.61L403.7,253.97ZM431,250.29L470.69,250.28L470.68,210.58L430.98,210.59L431,250.29ZM456.95,253.63L493.38,263.37L503.13,226.94L466.7,217.2L456.95,253.63ZM479.95,263.07L510.98,280.97L528.88,249.94L497.84,232.04L479.95,263.07ZM498.72,277.39L522.8,301.44L546.85,277.37L522.78,253.31L498.72,277.39ZM512.43,295.14L528.61,323.13L556.6,306.96L540.42,278.97L512.43,295.14ZM520.65,314.81L528.61,344.47L558.27,336.5L550.31,306.84L520.65,314.81ZM523.35,334.87L523.37,364.04L552.54,364.03L552.53,334.85L523.35,334.87ZM520.9,353.94L513.74,380.72L540.52,387.88L547.68,361.1L520.9,353.94ZM513.97,370.84L500.81,393.65L523.62,406.8L536.77,383.99L513.97,370.84ZM503.44,384.64L485.77,402.34L503.47,420.01L521.14,402.32L503.44,384.64ZM490.4,394.72L469.83,406.61L481.72,427.18L502.29,415.29L490.4,394.72ZM475.95,400.76L454.15,406.62L460.01,428.42L481.8,422.56L475.95,400.76ZM461.2,402.75L439.76,402.77L439.78,424.21L461.22,424.19L461.2,402.75ZM447.18,400.95L427.51,395.69L422.25,415.37L441.93,420.63L447.18,400.95ZM434.76,395.86L418,386.19L408.34,402.96L425.1,412.62L434.76,395.86ZM424.62,388.12L411.61,375.14L398.62,388.14L411.63,401.13L424.62,388.12ZM417.21,378.54L408.47,363.42L393.35,372.16L402.1,387.28L417.21,378.54ZM412.77,367.92L408.47,351.9L392.45,356.2L396.75,372.22L412.77,367.92ZM411.31,357.08L411.3,341.32L395.54,341.34L395.55,357.09L411.31,357.08ZM412.63,346.78L416.49,332.32L402.03,328.45L398.17,342.92L412.63,346.78ZM416.37,337.65L423.47,325.33L411.15,318.23L404.05,330.55L416.37,337.65ZM422.05,330.19L431.6,320.63L422.04,311.09L412.49,320.65L422.05,330.19ZM429.1,324.75L440.21,318.32L433.78,307.21L422.67,313.64L429.1,324.75ZM436.9,321.48L448.68,318.32L445.51,306.55L433.74,309.71L436.9,321.48ZM444.87,320.41L456.45,320.4L456.44,308.82L444.86,308.83L444.87,320.41ZM452.44,321.38L463.07,324.21L465.91,313.59L455.28,310.75L452.44,321.38ZM459.15,324.13L468.21,329.35L473.42,320.29L464.37,315.07L459.15,324.13ZM464.63,328.3L471.66,335.32L478.67,328.29L471.64,321.28L464.63,328.3ZM468.63,333.48L473.36,341.64L481.52,336.92L476.8,328.76L468.63,333.48ZM471.03,339.22L473.36,347.87L482.01,345.54L479.68,336.89L471.03,339.22ZM471.82,345.07L471.83,353.58L480.34,353.57L480.34,345.06L471.82,345.07ZM471.11,350.63L469.03,358.45L476.84,360.53L478.92,352.72L471.11,350.63ZM469.09,355.56L465.26,362.22L471.91,366.05L475.75,359.4L469.09,355.56ZM466.02,359.59L460.87,364.76L466.03,369.91L471.19,364.75L466.02,359.59ZM462.22,362.54L456.22,366.01L459.69,372.01L465.69,368.53L462.22,362.54ZM458,364.3L451.65,366.01L453.36,372.37L459.72,370.66L458,364.3ZM453.7,364.88L447.45,364.89L447.45,371.14L453.71,371.14L453.7,364.88ZM449.61,364.36L443.87,362.83L442.34,368.57L448.08,370.1L449.61,364.36ZM445.99,362.87L441.1,360.06L438.28,364.95L443.17,367.77L445.99,362.87ZM443.03,360.62L439.23,356.83L435.44,360.63L439.24,364.42L443.03,360.62ZM440.86,357.82L438.31,353.42L433.9,355.97L436.46,360.38L440.86,357.82ZM439.57,354.73L438.31,350.05L433.64,351.31L434.89,355.99L439.57,354.73ZM439.14,351.57L439.13,346.97L434.54,346.97L434.54,351.57L439.14,351.57ZM439.52,348.56L440.65,344.34L436.43,343.21L435.3,347.43L439.52,348.56ZM440.61,345.9L442.68,342.3L439.09,340.23L437.02,343.83L440.61,345.9ZM442.27,343.72L445.05,340.93L442.26,338.15L439.48,340.94L442.27,343.72ZM444.32,342.13L447.56,340.25L445.69,337.01L442.45,338.89L444.32,342.13Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[spiral64=0+900|spiral65=1+900]</code></div></div><figcaption><code>hb-vector limits.ttf "12"</code></figcaption></figure>
+<p id="ix-75"><code>spiral64</code>, on the <code>1</code>, is drawn: 64 levels, 65 squares. <code>spiral65</code>, on the <code>2</code>, is one level too deep, and nothing is drawn. Its extents still come from its header, so to <code>hb-shape</code> and to layout it looks like any other glyph.</p>
+<h3 id="the-budget">The budget</h3>
+<p id="ix-76">Each limit bounds one table, but tables drive each other: VARC loads <code>glyf</code> and CFF outlines, COLR paints outlines, and a renderer draws thousands of glyphs. Limits that are safe one at a time multiply. So since 14.5.0 every drawing session also carries one <strong>work budget</strong>, a count that every piece of work subtracts from and nothing adds back to (<code>NEWS</code>; <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L197"><code>hb-limits.hh:197</code></a>):</p>
+<pre><code class="language-c++">/* The common finite default for one top-level glyph rendering session.
+ * Nested outline and paint work shares the same live counter. */
+#define HB_BUDGET_GLYPH ((int64_t) 1 &lt;&lt; 24)
+
+static HB_ALWAYS_INLINE bool
+hb_budget_spend (int64_t &amp;budget, unsigned int cost, unsigned int mult = 1)
+{
+  budget -= (int64_t) cost * mult;
+  return budget &gt;= 0;
+}
+</code></pre>
+<p id="ix-77">The units are rough weights. <code>glyf</code> charges 16 for each glyph it loads and each component it prepares, 1 for each point it reads, 1 for each point each time a composite level transforms it, and 1 for each point at the end (<code>Glyph.hh:350, 378, 523</code>; <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/SimpleGlyph.hh#L198"><code>SimpleGlyph.hh:198</code></a>; <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh#L309"><code>glyf.hh:309</code></a>). gvar charges 1 per point for each tuple that applies (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-gvar-table.hh#L825"><code>hb-ot-var-gvar-table.hh:825</code></a>). The charstring interpreter charges 1 per operator, and <code>blend</code> 1 per delta. It caps its own operator count at whatever budget is left, so it can’t overshoot (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-cs-common.hh#L892"><code>hb-cff-interp-cs-common.hh:892</code></a>). VARC charges for its components and axis values. When the budget runs out, the work in hand fails, and so does everything after it in the session.</p>
+<p id="ix-78">Where the budget lives depends on the client. The draw funcs have three more callbacks, added with it: <code>set_budget</code>, <code>get_budget</code>, and <code>get_budget_remaining</code>, which returns a pointer to a live count. If the client’s funcs provide that pointer, the draw session uses it, and the count carries over from one glyph to the next until the client resets it. If not, each call to <code>hb_font_draw_glyph_or_fail</code> gets its own budget of 2²⁴ (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-draw.hh#L195-L201"><code>hb-draw.hh:195–201</code></a>). <code>hb_draw_set_budget</code> sets a client’s policy: a number, <code>HB_BUDGET_DEFAULT</code> for 2²⁴, or <code>HB_BUDGET_UNLIMITED</code>, which leaves only the structural limits. For funcs that don’t track a budget, <code>hb_draw_get_budget_remaining</code> reports “unlimited”, though each call is still limited to 2²⁴.</p>
+<p id="ix-79">HarfBuzz’s own renderers track it, and <code>hb-vector</code> keeps one budget for its whole output. In <code>limits.ttf</code>, <code>heavy</code> is a square and 120 components, each of them 120 components of an empty glyph. That is 14,521 glyphs to load, inside the edge limit, and about half a million units of budget, for one square. Here are 34 of them, then <code>s</code>, a plain square:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 5330 1280" role="img" aria-label="hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhs at default">
+<g transform="scale(1,-1)">
+<path d="M0,0L0,100L100,100L100,0L0,0Z" fill="currentColor"/>
+<path d="M150,0L150,100L250,100L250,0L150,0Z" fill="currentColor"/>
+<path d="M300,0L300,100L400,100L400,0L300,0Z" fill="currentColor"/>
+<path d="M450,0L450,100L550,100L550,0L450,0Z" fill="currentColor"/>
+<path d="M600,0L600,100L700,100L700,0L600,0Z" fill="currentColor"/>
+<path d="M750,0L750,100L850,100L850,0L750,0Z" fill="currentColor"/>
+<path d="M900,0L900,100L1000,100L1000,0L900,0Z" fill="currentColor"/>
+<path d="M1050,0L1050,100L1150,100L1150,0L1050,0Z" fill="currentColor"/>
+<path d="M1200,0L1200,100L1300,100L1300,0L1200,0Z" fill="currentColor"/>
+<path d="M1350,0L1350,100L1450,100L1450,0L1350,0Z" fill="currentColor"/>
+<path d="M1500,0L1500,100L1600,100L1600,0L1500,0Z" fill="currentColor"/>
+<path d="M1650,0L1650,100L1750,100L1750,0L1650,0Z" fill="currentColor"/>
+<path d="M1800,0L1800,100L1900,100L1900,0L1800,0Z" fill="currentColor"/>
+<path d="M1950,0L1950,100L2050,100L2050,0L1950,0Z" fill="currentColor"/>
+<path d="M2100,0L2100,100L2200,100L2200,0L2100,0Z" fill="currentColor"/>
+<path d="M2250,0L2250,100L2350,100L2350,0L2250,0Z" fill="currentColor"/>
+<path d="M2400,0L2400,100L2500,100L2500,0L2400,0Z" fill="currentColor"/>
+<path d="M2550,0L2550,100L2650,100L2650,0L2550,0Z" fill="currentColor"/>
+<path d="M2700,0L2700,100L2800,100L2800,0L2700,0Z" fill="currentColor"/>
+<path d="M2850,0L2850,100L2950,100L2950,0L2850,0Z" fill="currentColor"/>
+<path d="M3000,0L3000,100L3100,100L3100,0L3000,0Z" fill="currentColor"/>
+<path d="M3150,0L3150,100L3250,100L3250,0L3150,0Z" fill="currentColor"/>
+<path d="M3300,0L3300,100L3400,100L3400,0L3300,0Z" fill="currentColor"/>
+<path d="M3450,0L3450,100L3550,100L3550,0L3450,0Z" fill="currentColor"/>
+<path d="M3600,0L3600,100L3700,100L3700,0L3600,0Z" fill="currentColor"/>
+<path d="M3750,0L3750,100L3850,100L3850,0L3750,0Z" fill="currentColor"/>
+<path d="M3900,0L3900,100L4000,100L4000,0L3900,0Z" fill="currentColor"/>
+<path d="M4050,0L4050,100L4150,100L4150,0L4050,0Z" fill="currentColor"/>
+<path d="M4200,0L4200,100L4300,100L4300,0L4200,0Z" fill="currentColor"/>
+<path d="M4350,0L4350,100L4450,100L4450,0L4350,0Z" fill="currentColor"/>
+<path d="M4500,0L4500,100L4600,100L4600,0L4500,0Z" fill="currentColor"/>
+<path d="M4650,0L4650,100L4750,100L4750,0L4650,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[heavy=0+150|heavy=1+150|heavy=2+150|heavy=3+150|heavy=4+150|heavy=5+150|heavy=6+150|heavy=7+150|heavy=8+150|heavy=9+150|heavy=10+150|heavy=11+150|heavy=12+150|heavy=13+150|heavy=14+150|heavy=15+150|heavy=16+150|heavy=17+150|heavy=18+150|heavy=19+150|heavy=20+150|heavy=21+150|heavy=22+150|heavy=23+150|heavy=24+150|heavy=25+150|heavy=26+150|heavy=27+150|heavy=28+150|heavy=29+150|heavy=30+150|heavy=31+150|heavy=32+150|heavy=33+150|square=34+150]</code></div></div><figcaption><code>hb-vector limits.ttf "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhs"</code></figcaption></figure>
+<p id="ix-80">Thirty-two are drawn. The thirty-third runs the budget out, and from there on nothing is drawn, not even the plain square, which on its own costs almost nothing. The shaping beneath is unaffected: the budget belongs to drawing.</p>
+<blockquote>
+<p id="ix-81">For programmers: a client with its own draw funcs gets a fresh budget for every glyph, which is safe and usually what it wants. A renderer that draws whole pages from untrusted fonts can provide <code>get_budget_remaining</code> to bound the page as a whole, and then has to recharge it, with <code>set_budget</code>, at whatever unit of work it thinks right.</p>
+</blockquote>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-draw.h"><code>src/hb-draw.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-draw.cc"><code>src/hb-draw.cc</code></a></td>
+<td>the public API; the nil callbacks, and the quadratic-to-cubic conversion, 62; the line, rectangle and circle helpers</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-draw.hh"><code>src/hb-draw.hh</code></a></td>
+<td><code>hb_draw_funcs_t</code>’s lazy <code>move_to</code> and closing <code>close_path</code>, 113–189; <code>hb_draw_session_t</code>, 193</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh"><code>src/hb-font.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc"><code>src/hb-font.cc</code></a></td>
+<td><code>draw_glyph_or_fail</code>, with synthetic slant and bold, 690; the sub-font adaptor, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L770"><code>hb-font.cc:770</code></a></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc"><code>src/hb-ot-font.cc</code></a></td>
+<td><code>hb_ot_draw_glyph_or_fail</code>, 900: VARC, <code>glyf</code>, CFF2, CFF</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh"><code>src/OT/glyf/glyf.hh</code></a></td>
+<td><code>get_points</code>, 288, and the contour-start rotation; <code>GLYF</code> and <code>LOCA</code>, 224</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/Glyph.hh"><code>src/OT/glyf/Glyph.hh</code></a></td>
+<td>loading composites, 326: limits, cycles, transforms, point matching</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/SimpleGlyph.hh"><code>src/OT/glyf/SimpleGlyph.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/CompositeGlyph.hh"><code>src/OT/glyf/CompositeGlyph.hh</code></a></td>
+<td>flags and points; component flags and transforms</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/path-builder.hh"><code>src/OT/glyf/path-builder.hh</code></a></td>
+<td>points to draw calls: implied points, cubic pairs</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-common.hh"><code>src/hb-cff-interp-common.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-cs-common.hh"><code>src/hb-cff-interp-cs-common.hh</code></a></td>
+<td>the charstring interpreter: stacks, operators, subroutines, <code>interpret</code>, 887</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff1-interp-cs.hh"><code>src/hb-cff1-interp-cs.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cff1-table.cc"><code>src/hb-ot-cff1-table.cc</code></a></td>
+<td>CFF: width, <code>seac</code>, 528; drawing, 453</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff2-interp-cs.hh"><code>src/hb-cff2-interp-cs.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cff2-table.cc"><code>src/hb-ot-cff2-table.cc</code></a></td>
+<td>CFF2: <code>blend</code>, <code>vsindex</code>, the made-up <code>endchar</code>; drawing, 164</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>src/hb-limits.hh</code></a></td>
+<td>the limits, and the budget, 197</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A client gets an outline as <code>move_to</code>, <code>line_to</code>, <code>quadratic_to</code>, <code>cubic_to</code> and <code>close_path</code> calls, scaled and unrounded, unhinted. Moves are sent lazily, every contour is closed back to its start, and a missing <code>quadratic_to</code> becomes <code>cubic_to</code>.</li>
+<li>hb-ot draws from VARC, then <code>glyf</code>, then CFF2, then CFF. An empty <code>glyf</code> glyph still counts as drawn.</li>
+<li><code>glyf</code> points become curves through implied on-curve points between off-curve ones. Composites are transformed and flattened before anything is drawn; <code>ROUND_XY_TO_GRID</code> and the overlap flags are ignored. Point matching inside a nested composite counts points from the wrong place in 15.1.0.</li>
+<li>Cubic <code>glyf</code> curves use flag bit 0x80, in pairs, and HarfBuzz reads the bit only in <code>GLYF</code>, not <code>glyf</code>.</li>
+<li>CFF and CFF2 charstrings run in one templated interpreter that ignores hints, follows subroutines 10 deep, draws <code>seac</code> accents, and applies CFF2 blends unrounded. A charstring that fails half-way has already drawn part of its glyph.</li>
+<li>Nesting, components, points and operators each have a limit, and since 14.5.0 a shared budget of 2²⁴ units bounds a whole drawing session, per glyph for most clients, and per output for HarfBuzz’s own renderers, like <code>hb-vector</code>. Those renderers are the subjects of <a href="hb-raster.html">hb-raster</a>, <a href="hb-vector.html">hb-vector</a> and <a href="hb-gpu.html">hb-gpu</a>.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="variable-components.html">← VARC: variable components</a><a rel="next" href="color.html">Color →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

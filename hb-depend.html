@@ -1,0 +1,644 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>hb-depend: the glyph dependency graph · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part X · Writing fonts</p>
+<h1 id="hb-depend-the-glyph-dependency-graph">43. hb-depend: the glyph dependency graph</h1>
+<p id="ix-1">When HarfBuzz subsets a font, it works out which glyphs the subset must keep: the glyphs the requested characters map to, and everything those glyphs can turn into or are built from. <a href="subsetting.html">Subsetting</a> describes that glyph closure. It is computed for one request, from one set of characters, and thrown away when the subset is written.</p>
+<p id="ix-2"><strong>hb-depend</strong> computes the relationships themselves, once, as a graph. Each node is a glyph. Each edge says that one glyph can lead to another: through a substitution, as a component, as a color layer, or as a mathematical variant. With the graph in hand, a program can compute a closure for any set of characters by walking it, without running the subsetter at all. The API arrived in HarfBuzz 14.3.0 and is still experimental: it is compiled only when HarfBuzz is built with <code>-Dexperimental_api=true</code>.</p>
+<p id="ix-3">This chapter covers what the graph holds, how HarfBuzz builds it, how a closure is computed from it, and where that closure differs from the subsetter’s. The book’s own HarfBuzz build doesn’t enable experimental APIs, so nothing on this page is a live block except one shaping result. The graph and closures shown were produced by a small program, <code>fonts/hb-depend/depend-graph.cc</code>, compiled against the same HarfBuzz 15.1.0 source with the API switched on.</p>
+<h2 id="who-needs-a-graph">Who needs a graph</h2>
+<p id="ix-4">A closure answers “starting from these glyphs, what can be reached?”. A <strong>glyph dependency graph</strong> answers the question behind it, for every glyph at once. Take a ligature rule, <code>f i → f_i</code>. The closure of <code>{f}</code> is just <code>{f}</code>: the <code>i</code> is missing, so the ligature can’t form (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/Ligature.hh#L35"><code>Ligature.hh:35</code></a>). The graph records two edges, <code>f → f_i</code> and <code>i → f_i</code>, and remembers that both are needed. It doesn’t depend on any starting set.</p>
+<p id="ix-5">Building the graph costs one pass over the font. After that, each closure costs only the edges it follows. That trade is worth making for a program that needs many closures of the same font. The documentation names the uses it has in mind (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/depend-api.md"><code>docs/depend-api.md</code></a>): deciding what a subset must keep; finding which glyphs each feature or script needs; <strong>font segmentation</strong>, splitting a font into pieces that each hold the glyphs reachable from some set of characters, “enabling more efficient font delivery for web applications”; and checking that an edit to a font hasn’t broken a substitution chain. NEWS for 14.3.0 describes it as an API “that applications can use to compute glyph closures themselves without running the subsetter”. Incremental font transfer, which serves a font in segments, is the obvious client of segmentation, though HarfBuzz’s documents for the API don’t name it (inferred).</p>
+<h2 id="nodes-and-edges">Nodes and edges</h2>
+<p id="ix-6">The graph’s nodes are glyph IDs and nothing else. There are no character nodes: <code>cmap</code> isn’t in the graph, and a program maps its characters to glyphs itself, with <code>hb_font_get_nominal_glyph()</code>. Variation sequences are left out too (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-depend.cc#L77"><code>hb-depend.cc:77</code></a>). Whoever walks the graph adds the glyph for each base character and variation selector with <code>hb_font_get_variation_glyph()</code>.</p>
+<p id="ix-7">The public header is <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-depend.h"><code>hb-subset-depend.h</code></a>, included through <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.h"><code>hb-subset.h</code></a>. It has four functions:</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>hb_subset_depend_from_face_or_fail (face)</code></td>
+<td>builds the graph for a face, or returns <code>NULL</code></td>
+</tr>
+<tr>
+<td><code>hb_subset_depend_lookup_glyph (depend, gid, start, &amp;count, entries)</code></td>
+<td id="ix-8">a glyph’s outgoing edges, in the usual HarfBuzz array-getter form; returns how many there are</td>
+</tr>
+<tr>
+<td><code>hb_subset_depend_lookup_set (depend, index, set)</code></td>
+<td id="ix-9">copies one of the graph’s glyph sets into an <code>hb_set_t</code></td>
+</tr>
+<tr>
+<td><code>hb_subset_depend_destroy (depend)</code></td>
+<td>frees it</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-10">Each edge comes back as an <code>hb_subset_depend_entry_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-depend.h#L102"><code>hb-subset-depend.h:102</code></a>):</p>
+<pre><code class="language-c">typedef struct {
+  hb_tag_t table_tag;                     /* the table the edge comes from */
+  hb_codepoint_t dependent;               /* the glyph it leads to */
+  hb_tag_t layout_tag;                    /* GSUB: the feature */
+  hb_codepoint_t ligature_set_index;      /* GSUB ligatures: the components */
+  hb_codepoint_t context_set_index;       /* GSUB contexts: what must be around */
+  hb_subset_depend_edge_flags_t flags;
+} hb_subset_depend_entry_t;
+</code></pre>
+<p id="ix-11">The edge runs from the glyph asked about to <code>dependent</code>. What “leads to” means depends on the table:</p>
+<table>
+<thead>
+<tr>
+<th><code>table_tag</code></th>
+<th>Edge from → to</th>
+<th>Where it’s made</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-12"><code>GSUB</code></td>
+<td id="ix-13">a glyph a lookup can act on → a glyph it can produce</td>
+<td id="ix-14"><code>OT/Layout/GSUB/*.hh</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh"><code>hb-ot-layout-gsubgpos.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-15"><code>glyf</code> (or <code>GLYF</code>)</td>
+<td id="ix-16">a composite glyph → each of its components</td>
+<td id="ix-17"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh#L273"><code>OT/glyf/glyf.hh:273</code></a></td>
+</tr>
+<tr>
+<td id="ix-18"><code>CFF </code></td>
+<td id="ix-19">a glyph drawn with the <code>seac</code> operator → its base and accent</td>
+<td id="ix-20"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cff1-table.hh#L1566"><code>hb-ot-cff1-table.hh:1566</code></a></td>
+</tr>
+<tr>
+<td id="ix-21"><code>COLR</code></td>
+<td id="ix-22">a color glyph → each v0 layer glyph, each glyph a v1 <code>PaintGlyph</code> fills, and each glyph a <code>PaintColrGlyph</code> reuses</td>
+<td id="ix-23"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L2698"><code>OT/Color/COLR/COLR.hh:2698</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/colrv1-depend.hh"><code>colrv1-depend.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-24"><code>MATH</code></td>
+<td id="ix-25">a glyph → its size variants and the parts of its assembly</td>
+<td id="ix-26"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-math-table.hh#L1216"><code>hb-ot-math-table.hh:1216</code></a></td>
+</tr>
+<tr>
+<td><code>VARC</code></td>
+<td id="ix-27">a glyph → each of its variable components</td>
+<td id="ix-28"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc#L194"><code>OT/Var/VARC/VARC.cc:194</code></a></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-29">Only GSUB edges use the other fields. <code>layout_tag</code> is the feature whose lookup made the edge. A lookup that several features use gets one edge for each feature (<code>add_gsub_lookup</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-depend-data.hh#L559"><code>hb-depend-data.hh:559</code></a>), so a program can drop edges for features it doesn’t want. For the other tables <code>layout_tag</code> is <code>HB_CODEPOINT_INVALID</code>, 0xFFFFFFFF.</p>
+<p id="ix-30">The two set indices point into one array of glyph sets that the graph owns. A <strong>ligature set</strong> is every glyph a ligature’s components use, the first glyph included (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/Ligature.hh#L41"><code>Ligature.hh:41</code></a>). Each component gets an edge to the ligature, and all those edges carry the same set: the ligature belongs in a closure only once every glyph in its set is there. A <strong>context set</strong> is what a contextual rule needs around the glyph: its backtrack, its lookahead and its other input positions. Its members are of two kinds, told apart by the top bit (<code>HB_DEPEND_CONTEXT_SET_FLAG</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-depend-data.hh#L55"><code>hb-depend-data.hh:55</code></a>). A plain glyph ID must itself be present. A value with the top bit set is the index of another set in the same array, of which any one glyph will do. The context is satisfied when every member is. Ignoring context sets is allowed, and gives a closure that is larger but never too small.</p>
+<p>The flags mark edges that a static graph can’t get exactly right, which <a href="#where-the-graph-is-approximate">below</a> explains.</p>
+<h2 id="the-graph-of-one-small-font">The graph of one small font</h2>
+<p id="ix-31">The font for this chapter is the <a href="gsub.html">GSUB chapter’s</a> test font, <code>ligatures.ttf</code>, with one glyph added: <code>aacute</code>, mapped to U+00E1, a TrueType composite of <code>a</code> and <code>acutecomb</code> (<code>fonts/hb-depend/build-font.py</code>). Its GSUB comes from this feature file (an excerpt of <code>fonts/gsub/ligatures.fea</code>, trimmed):</p>
+<pre><code class="language-fea">feature liga {
+  lookupflag IgnoreMarks;
+  sub f i by f_i;
+  sub f f i by f_f_i;
+  sub f l by f_l;
+  sub f f by f_f;
+} liga;
+
+feature salt {
+  sub a from [a.alt1 a.alt2 a.alt3];
+} salt;
+
+lookup INIT {
+  sub e by e.init;
+} INIT;
+
+feature calt {
+  sub [space e.init] e' lookup INIT;
+} calt;
+
+feature ccmp {
+  sub x by f i;
+} ccmp;
+</code></pre>
+<p id="ix-32">This is the whole graph, as <code>depend-graph</code> prints it. It isn’t a live block: it was produced by <code>fonts/hb-depend/run.sh</code>, which compiles <code>depend-graph.cc</code> against HarfBuzz 15.1.0 with <code>HB_EXPERIMENTAL_API</code>. Its format is that of HarfBuzz’s <code>hb-subset-depend</code> utility: each source glyph, then one line for each edge, with the table, the feature for GSUB, the dependent glyph, the ligature set and its members, and the context set in brackets, where <code>(a|b)</code> means either glyph.</p>
+<pre><code>2 (a):
+  GSUB salt -&gt; a.alt1
+  GSUB salt -&gt; a.alt2
+  GSUB salt -&gt; a.alt3
+
+3 (e):
+  GSUB calt -&gt; e.init  ((space|e.init))
+
+4 (f):
+  GSUB liga -&gt; f_f_i  lig[0]
+    lig[0]: f i
+  GSUB liga -&gt; f_i  lig[0]
+  GSUB liga -&gt; f_l  lig[1]
+    lig[1]: f l
+  GSUB liga -&gt; f_f  lig[2]
+    lig[2]: f
+
+5 (i):
+  GSUB liga -&gt; f_f_i  lig[0]
+  GSUB liga -&gt; f_i  lig[0]
+
+6 (l):
+  GSUB liga -&gt; f_l  lig[1]
+
+7 (x):
+  GSUB ccmp -&gt; f
+  GSUB ccmp -&gt; i
+
+17 (aacute):
+  glyf -&gt; a
+  glyf -&gt; acutecomb
+</code></pre>
+<p id="ix-33">Seven of the eighteen glyphs have edges. The others lead nowhere: <code>.notdef</code>, <code>space</code>, <code>acutecomb</code>, the ligatures and the alternates are ends of paths. Four things in this output are worth a closer look.</p>
+<p id="ix-34"><strong>The alternates.</strong> An alternate substitution gives an edge to every alternate. A closure can’t know which one an application will choose.</p>
+<p id="ix-35"><strong>The nested lookup.</strong> <code>e → e.init</code> is tagged <code>calt</code>, though the lookup that does it, <code>INIT</code>, belongs to no feature. HarfBuzz walks only lookups that some feature uses (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsub-table.hh#L196"><code>hb-ot-layout-gsub-table.hh:196</code></a>). It reaches <code>INIT</code> through <code>calt</code>’s chained rule, and an edge found inside a rule takes the feature of the lookup the walk started from. The edge also carries the rule’s backtrack, <code>[space e.init]</code>, as a context set with one member: a set of two glyphs, either of which will do.</p>
+<p id="ix-36"><strong>The ligature sets.</strong> A ligature set is a set, not a sequence. <code>f f i → f_f_i</code> needs <code>{f, i}</code>, the same set as <code>f i → f_i</code>, so the two share <code>lig[0]</code>. Sets are stored once, by content. <code>f f → f_f</code> needs only <code>{f}</code>, so one <code>f</code> in a closure brings <code>f_f</code> with it. A closure works with which glyphs are present, never how many, and the subsetter’s does the same.</p>
+<p id="ix-37"><strong>The composite.</strong> <code>aacute</code> depends on <code>a</code> and <code>acutecomb</code> through <code>glyf</code>, with no feature and no conditions.</p>
+<p id="ix-38">The <code>ccmp</code> rule <code>x → f i</code> gives <code>x</code> two edges. Together with the ligature edges, they say that <code>x</code> can lead to <code>f_i</code>. In this font it never does, as shaping shows:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">depend.ttf</td><td class="in"><span class="txt">x</span><span class="cps">U+0078</span></td><td class="opt">--language=en</td><td class="out"><code>[f=0+500|i=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-39">The <code>liga</code> lookup comes before the <code>ccmp</code> lookup in the LookupList, so it has already run when <code>x</code> becomes <code>f i</code> (<a href="gsub.html#the-order-lookups-run-in">The order lookups run in</a> has the details). The graph doesn’t record lookup order, so this is one way it errs on the side of keeping a glyph. The subsetter’s closure, which follows substitutions without simulating shaping, keeps <code>f_i</code> too, as the next section shows.</p>
+<h2 id="how-the-graph-is-built">How the graph is built</h2>
+<p id="ix-40"><code>hb_subset_depend_from_face_or_fail()</code> makes one vector of edges for each glyph in the face and asks each table to fill it in (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-depend.cc#L74"><code>hb-depend.cc:74</code></a>, trimmed):</p>
+<pre><code class="language-cpp">bool
+hb_depend_data_builder_t::compile (hb_face_t *face)
+{
+  if (hb_ot_layout_has_substitution (face))
+    face-&gt;table.GSUB.get_relaxed ()-&gt;depend (this, face);
+  face-&gt;table.MATH-&gt;depend (this);
+  face-&gt;table.COLR-&gt;depend (this);
+  face-&gt;table.glyf-&gt;depend (this);
+  OT::cff1_subset_accelerator_t (face).depend (this);
+  face-&gt;table.VARC-&gt;depend (this);
+  return successful;
+}
+</code></pre>
+<p id="ix-41">The non-GSUB tables are simple walks. <code>glyf</code> goes through every glyph and records each composite’s components; CFF asks each glyph for <code>seac</code> components; <code>MATH</code> walks its vertical and horizontal constructions; <code>VARC</code> decodes each glyph’s component records. <code>COLR</code> records every v0 layer, then walks each v1 base glyph’s paint graph. Its context counts operations against a budget proportional to the table’s size, limits nesting to <code>HB_MAX_NESTING_LEVEL</code>, and skips paints it has already visited for this base glyph. A <code>PaintGlyph</code> that fills the base glyph’s own outline isn’t recorded, since that is a use of geometry, not a dependency (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/colrv1-depend.hh#L54"><code>colrv1-depend.hh:54</code></a>). A <code>PaintColrGlyph</code> is recorded even when it points at itself. The specification forbids cycles in paint graphs, but a broken font can have them, and the graph reports what the font says. Anything that walks it has to guard against cycles (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/depend-api.md"><code>docs/depend-api.md</code></a>).</p>
+<p id="ix-42">GSUB is where the work is. It comes in two steps (<code>GSUB_accelerator_t::depend</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsub-table.hh#L119"><code>hb-ot-layout-gsub-table.hh:119</code></a>).</p>
+<p id="ix-43"><strong>Features to lookups.</strong> For each feature tag, HarfBuzz collects that feature’s lookups under every script and language system, and under every FeatureVariations record, and stores a map from each lookup to the tags that use it. Scripts and languages are merged here: the graph says which feature an edge belongs to, never which script.</p>
+<p id="ix-44"><strong>Each lookup, with every glyph active.</strong> Each lookup that some feature uses is then walked by dispatching a <strong>depend context</strong>, <code>hb_depend_context_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L402"><code>hb-ot-layout-gsubgpos.hh:402</code></a>), over it: one more visitor in the dispatch family that <a href="fonts-as-bytes.html">Fonts as bytes</a> describes. Each subtable type has a <code>depend()</code> method beside its <code>closure()</code> method, built the same way. The difference is the starting set. A closure starts from the request’s glyphs. A depend walk starts from every glyph in the font (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsub-table.hh#L186"><code>hb-ot-layout-gsub-table.hh:186</code></a>), so every rule that could ever match is visited, and each records an edge for each glyph it covers.</p>
+<p id="ix-45">Contextual rules need more care. When a Context or ChainContext rule calls a lookup at some position, the walk narrows the active glyphs to what can be at that position, as the closure does, and builds a context set from what must surround it (<code>context_depend_recurse_lookups</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L2472"><code>hb-ot-layout-gsubgpos.hh:2472</code></a>). The context set gathers the backtrack and lookahead, and the glyphs the rule’s other input positions require. A position that needs one particular glyph adds that glyph; a position that any of several glyphs can fill adds a set reference. Every edge recorded inside the called lookup carries that context set. Rules longer than <code>HB_MAX_CONTEXT_LENGTH</code> (64) are skipped, since they can never apply.</p>
+<p id="ix-46">The walk doesn’t do what HarfBuzz’s own closure does inside a rule. The closure feeds each lookup’s output to the lookups after it in the same rule; the depend walk records every lookup’s edges independently, from what the rule’s coverage allows at each position (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/depend-implementation.md"><code>docs/depend-implementation.md</code></a>). Recursion is guarded against loops: a lookup already on the call stack isn’t entered again (<code>recurse</code>, <code>:517</code>). Finished walks are memoized by lookup, active glyphs, call path and context, so a shared lookup isn’t walked twice in the same state.</p>
+<p id="ix-47">Every edge goes through a deduplicating hash table before it is stored, and sets are stored once by content (<code>add_edge</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-depend-data.hh#L508"><code>hb-depend-data.hh:508</code></a>). The hash table and the feature map are temporary: they belong to a builder that is freed when the graph is done, leaving only the edge lists and the sets.</p>
+<h2 id="from-graph-to-closure">From graph to closure</h2>
+<p id="ix-48"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/depend-for-closure.md"><code>docs/depend-for-closure.md</code></a> describes how to compute a closure from the graph, and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/fuzzing/hb-depend-closure-parity.cc"><code>test/fuzzing/hb-depend-closure-parity.cc</code></a> holds HarfBuzz’s reference implementation, <code>compute_depend_closure()</code>. The steps:</p>
+<ol>
+<li id="ix-49">Map the characters to glyphs through <code>cmap</code>, add the glyphs of any variation sequences, and add <code>.notdef</code>.</li>
+<li id="ix-50">Follow GSUB edges until nothing changes. Skip an edge whose feature isn’t wanted; skip a ligature edge until all of its ligature set is present; skip an edge whose context set isn’t satisfied.</li>
+<li id="ix-51">Follow MATH edges once, from the glyphs present before this step only.</li>
+<li id="ix-52">Follow COLR, VARC, <code>glyf</code> and CFF edges to the end, with no conditions.</li>
+</ol>
+<p id="ix-53">There is no going back to GSUB after the components: a component glyph is part of a drawing, not an input to shaping. <code>depend-graph --closure</code> does exactly this, with the subsetter’s default feature list, and prints the result beside the glyphs <code>hb_subset_plan_create_or_fail()</code> keeps for the same text. This is its output (<code>fonts/hb-depend/closures.txt</code>, made by <code>run.sh</code>; not live):</p>
+<pre><code>text &quot;xe&quot;:
+from the graph: .notdef e f i x f_i f_f f_f_i
+the subsetter: .notdef e f i x f_i f_f f_f_i
+text &quot; e&quot;:
+from the graph: .notdef space e e.init
+the subsetter: .notdef space e e.init
+text &quot;á&quot;:
+from the graph: .notdef a acutecomb aacute
+the subsetter: .notdef a acutecomb aacute
+text &quot;xe&quot;, contexts ignored:
+from the graph: .notdef e f i x f_i f_f f_f_i e.init
+the subsetter: .notdef e f i x f_i f_f f_f_i
+</code></pre>
+<p id="ix-54">The two agree on every text. For “xe”, <code>x</code> brings <code>f</code> and <code>i</code>, and with both present the ligature sets let in <code>f_i</code>, <code>f_f</code> and <code>f_f_i</code>. <code>salt</code> isn’t among the subsetter’s default features, so no alternates come in. <code>e.init</code> stays out, because neither <code>space</code> nor <code>e.init</code> is present to satisfy the context. For “ e” the space is there, and <code>e.init</code> comes in. For “á”, the composite brings its components. The last run follows edges whatever their context, and <code>e.init</code> comes in where it isn’t needed: larger, but still safe.</p>
+<h2 id="where-the-graph-is-approximate">Where the graph is approximate</h2>
+<p id="ix-55">Two kinds of edge can’t be modeled exactly by a graph built once from the font’s structure, and HarfBuzz flags them so that a program comparing its closure with the subsetter’s can tell an expected difference from a bug (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-depend.h"><code>hb-subset-depend.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L2641"><code>hb-ot-layout-gsubgpos.hh:2641</code></a>):</p>
+<ul>
+<li id="ix-56"><strong><code>FROM_CONTEXT_POSITION</code>.</strong> The edge comes from a contextual rule with more than one input position. The graph assumes each position can hold anything its coverage allows. In shaping, an earlier lookup in the rule may already have changed the glyph there.</li>
+<li id="ix-57"><strong><code>FROM_NESTED_CONTEXT</code>.</strong> The edge comes from a contextual rule called from inside another contextual rule. It carries the inner rule’s context, but the outer rule’s is lost.</li>
+</ul>
+<p id="ix-58">HarfBuzz’s notes name two more places where a closure from the graph can come out larger than the subsetter’s (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/depend-implementation.md"><code>docs/depend-implementation.md</code></a>). A lookup whose output is in its own coverage makes a chain, <code>A → B → C</code>, that the graph follows to the end, while the subsetter stops after a fixed number of rounds. And MATH edges have to be followed only once, as step 3 does, because the subsetter keeps a variant’s glyph but drops that variant’s own MATH data.</p>
+<h2 id="how-the-two-closures-differ">How the two closures differ</h2>
+<p id="ix-59">Both closures answer the same question, and on valid fonts HarfBuzz tests that they give the same answer: the parity test builds both and compares them. They get there differently.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th id="ix-60">The subsetter</th>
+<th id="ix-61">A closure from the graph</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Work for each request</td>
+<td>walks the font’s tables again</td>
+<td>follows edges in a graph built once</td>
+</tr>
+<tr>
+<td id="ix-62">Characters</td>
+<td id="ix-63"><code>cmap</code>, variation sequences, bidi mirroring, all inside the plan</td>
+<td>the caller’s job</td>
+</tr>
+<tr>
+<td id="ix-64">GSUB inside a rule</td>
+<td id="ix-65">feeds each lookup’s output to the next</td>
+<td id="ix-66">every lookup’s edges recorded independently</td>
+</tr>
+<tr>
+<td id="ix-67">GSUB rounds</td>
+<td id="ix-68">until stable, but at most <code>HB_CLOSURE_MAX_STAGES</code> + 2 = 14 passes (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L1700"><code>hb-ot-layout.cc:1700</code></a>)</td>
+<td>until stable</td>
+</tr>
+<tr>
+<td id="ix-69">Scripts and languages</td>
+<td>can be limited, in the subset input</td>
+<td>merged when the graph is built</td>
+</tr>
+<tr>
+<td id="ix-70">Features</td>
+<td>the requested list</td>
+<td id="ix-71">any list: each GSUB edge carries its feature</td>
+</tr>
+<tr>
+<td id="ix-72">Order of stages</td>
+<td id="ix-73"><code>.notdef</code>, <code>cmap</code>, MATH, GSUB, COLR, VARC, then <code>glyf</code> or CFF (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan.cc#L448"><code>hb-subset-plan.cc:448</code></a>)</td>
+<td id="ix-74">whatever the caller does; the reference does GSUB before MATH</td>
+</tr>
+<tr>
+<td>Composites</td>
+<td id="ix-75"><code>glyf</code> within a byte budget</td>
+<td>edges, with no budget</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-76">The last two rows are where differences could appear. The subsetter runs its MATH stage before GSUB, so a glyph that GSUB adds doesn’t get its math variants. The reference closure, in the parity test, runs MATH after GSUB, and its comments say that this mirrors the subsetter’s order (<code>hb-depend-closure-parity.cc:27</code>), which it doesn’t. A font where a substitution produces a glyph with math variants would give the graph’s closure more glyphs (inferred from the code; not tried). Neither closure models lookup order, so both can keep glyphs that shaping never produces, as <code>f_i</code> above shows.</p>
+<blockquote>
+<p id="ix-77">Since 15.1.0: changed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/0209ec2865b55e892897966e95dfb8915a1309e9"><code>0209ec2</code></a> (17 November 2026): <code>HB_CLOSURE_MAX_STAGES</code> is 16, so the subsetter’s GSUB rounds (the table’s fourth row) stop at 18 passes.</p>
+</blockquote>
+<h2 id="status-and-limits">Status and limits</h2>
+<p id="ix-78">The API is experimental. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh#L38"><code>hb-config.hh:38</code></a> defines <code>HB_NO_SUBSET_DEPEND</code> unless <code>HB_EXPERIMENTAL_API</code> is defined, and the Meson option <code>experimental_api</code> (off by default; <a href="building-harfbuzz.html#a-build-for-development">Building HarfBuzz</a>) defines it. Only the public functions are guarded: the <code>depend()</code> methods are compiled into <code>libharfbuzz-subset</code> either way, and the book’s build has them, but not the functions that call them. The command-line <code>hb-subset-depend</code> utility (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-subset-depend.cc"><code>util/hb-subset-depend.cc</code></a>) is built only with the same option. The documentation warns that the API “may change significantly in future releases”. In 14.4.0, NEWS records only “faster extraction of the experimental glyph dependency graph”. The code’s copyright line is Adobe’s, 2024, with Skef Iterum as author.</p>
+<p>What the graph leaves out:</p>
+<ul>
+<li id="ix-79"><strong>No GPOS and no AAT tables.</strong> Positioning doesn’t add glyphs, and <code>morx</code> isn’t walked. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/depend-implementation.md"><code>docs/depend-implementation.md</code></a> lists both as possible additions.</li>
+<li><strong>No CFF2.</strong> CFF2 has no <code>seac</code>, so there is nothing to record. Only CFF1 <code>seac</code> edges appear.</li>
+<li id="ix-80"><strong>No character-level information.</strong> No <code>cmap</code>, no variation sequences, no script.</li>
+<li id="ix-81"><strong>No reference counting.</strong> <code>hb_subset_depend_t</code> has <code>destroy</code> but no <code>reference</code> and no user data.</li>
+<li id="ix-82"><strong>No partial failure.</strong> If memory runs out while the graph is built, <code>hb_subset_depend_from_face_or_fail()</code> returns <code>NULL</code> rather than a partial graph.</li>
+</ul>
+<p id="ix-83">A few of HarfBuzz’s own descriptions don’t match the code, which this chapter follows. The header says that <code>layout_tag</code> is 0 for edges from tables other than GSUB, but it is <code>HB_CODEPOINT_INVALID</code>, as <code>depend-api.md</code> says and the program above confirms. <code>depend-implementation.md</code> shows each edge taking only the first feature that uses its lookup, where the code makes one edge for each such feature. It names the header <code>hb-depend.h</code>, which is now <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-depend.h"><code>hb-subset-depend.h</code></a>, and calls the utility “TODO”, though it exists. And <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/fuzzing/README.md"><code>test/fuzzing/README.md</code></a> asks for a meson option <code>depend_api</code>, which doesn’t exist: the option is <code>experimental_api</code>.</p>
+<blockquote>
+<p id="ix-84">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/88bb79a408620943fb475857777c2eceabb76ffb"><code>88bb79a</code></a> and <a href="https://github.com/harfbuzz/harfbuzz/commit/202b3e2c282a36f710834e61f460d8f48e6a10b9"><code>202b3e2</code></a> (17 November 2026), so main’s header, <code>depend-implementation.md</code> and fuzzing README match the code.</p>
+</blockquote>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-depend.h"><code>src/hb-subset-depend.h</code></a></td>
+<td>the public API: the entry struct, the edge flags, four functions</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-depend.cc"><code>src/hb-depend.cc</code></a></td>
+<td><code>compile</code>, which calls each table, and the public functions</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-depend-data.hh"><code>src/hb-depend-data.hh</code></a></td>
+<td>the graph (<code>hb_depend_data_t</code>), and the builder: deduplication, sets, context sets, the lookup-to-feature map</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsub-table.hh"><code>src/hb-ot-layout-gsub-table.hh</code></a></td>
+<td><code>GSUB_accelerator_t::depend</code>: features to lookups, then each lookup</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh"><code>src/hb-ot-layout-gsubgpos.hh</code></a></td>
+<td><code>hb_depend_context_t</code>; contextual rules (<code>context_depend_recurse_lookups</code>)</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src/OT/Layout/GSUB"><code>src/OT/Layout/GSUB/*.hh</code></a></td>
+<td>each subtable type’s <code>depend()</code>, beside its <code>closure()</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh"><code>src/OT/glyf/glyf.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cff1-table.hh"><code>src/hb-ot-cff1-table.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-math-table.hh"><code>src/hb-ot-math-table.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc"><code>src/OT/Var/VARC/VARC.cc</code></a></td>
+<td>the other tables’ <code>depend()</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh"><code>src/OT/Color/COLR/COLR.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/colrv1-depend.hh"><code>src/OT/Color/COLR/colrv1-depend.hh</code></a></td>
+<td>COLR v0 layers and the v1 paint walk</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-subset-depend.cc"><code>util/hb-subset-depend.cc</code></a></td>
+<td>the command-line utility</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/fuzzing/hb-depend-closure-parity.cc"><code>test/fuzzing/hb-depend-closure-parity.cc</code></a></td>
+<td>the reference closure, <code>compute_depend_closure()</code>, checked against the subsetter</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/depend-api.md"><code>docs/depend-api.md</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/depend-implementation.md"><code>docs/depend-implementation.md</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/depend-for-closure.md"><code>docs/depend-for-closure.md</code></a></td>
+<td>HarfBuzz’s own notes</td>
+</tr>
+</tbody>
+</table>
+<p>The program that made this chapter’s output is <code>fonts/hb-depend/depend-graph.cc</code>. <code>fonts/hb-depend/run.sh</code> compiles it with HarfBuzz’s amalgamated <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz-subset.cc"><code>src/harfbuzz-subset.cc</code></a> and <code>HB_EXPERIMENTAL_API</code>, because the book’s libraries don’t export the functions.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>hb-depend builds a font’s glyph dependency graph once. Its nodes are glyphs, and its edges come from GSUB, <code>glyf</code>, CFF <code>seac</code>, COLR, MATH and VARC. <code>cmap</code> and variation sequences are left to the caller.</li>
+<li>GSUB edges carry the feature that made them, the components a ligature needs, and the context a rule needs. A closure follows an edge only when those are met, or ignores the context and keeps a little more.</li>
+<li>The graph is built by a depend context dispatched over every lookup that a feature uses, with every glyph active, recording each lookup’s edges independently.</li>
+<li>A closure from the graph matches the subsetter’s on HarfBuzz’s tests. Flags mark the edges where it may come out larger.</li>
+<li>The API is experimental, compiled only with <code>-Dexperimental_api=true</code>, and may change.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="instancing.html">← Instancing</a><a rel="next" href="for-applications.html">For applications →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

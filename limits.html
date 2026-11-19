@@ -1,0 +1,1036 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Limits · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Appendix D</p>
+<h1 id="limits">Limits</h1>
+<p id="ix-1">A font is data, but much of it behaves like a program: lookups call lookups, composites contain composites, state machines loop, paint graphs branch. A small file can ask for an enormous amount of work or memory. HarfBuzz’s answer is a set of fixed limits, most of them in one header, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>hb-limits.hh</code></a>, and the rest beside the code they guard.</p>
+<p id="ix-2">This appendix lists them by area, with each one’s value, what it bounds, and what happens when a font or a text reaches it. That last column is the point. Reaching a limit never crashes, but the consequences differ a great deal: a table can be rejected whole, a buffer can be left half shaped, a rule can quietly not apply, a glyph can come out blank. Some of these an application can detect, and many it can’t. Where a chapter shows a limit being reached, the table links to it.</p>
+<p id="ix-3">Two kinds of limit appear. A <strong>structural limit</strong> bounds one thing in one subsystem: points in a glyph, nesting depth, subtables in a table. A work budget is a count that every piece of work subtracts from, shared by everything a session does, so that limits which are safe one at a time can’t multiply (<a href="drawing-outlines.html#the-budget">Drawing outlines</a> introduces them). The buffer’s <code>max_ops</code> and the sanitizer’s <code>max_ops</code> are older budgets of the same kind.</p>
+<h2 id="what-reaching-a-limit-looks-like">What reaching a limit looks like</h2>
+<table>
+<thead>
+<tr>
+<th>What happens</th>
+<th>How an application can tell</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-4">A table is rejected by the sanitizer</td>
+<td id="ix-5">Only indirectly: the face behaves as if it had no such table, so <code>hb_ot_layout_has_substitution</code> and the like return false. <code>hb_face_reference_table</code> still returns the raw bytes.</td>
+</tr>
+<tr>
+<td>The buffer is marked unsuccessful</td>
+<td id="ix-6"><code>hb_buffer_allocation_successful</code> returns false. <code>hb_shape</code> returns nothing, and <code>hb_shape_full</code> still returns true for the <code>ot</code> backend (<a href="hb_shape-and-its-backends.html#running-the-plan-and-failing">hb_shape and its backends</a>).</td>
+</tr>
+<tr>
+<td>A rule, action or step is skipped</td>
+<td>It can’t: the output is a correct result for a font without that rule.</td>
+</tr>
+<tr>
+<td id="ix-7">A glyph fails to draw or paint</td>
+<td id="ix-8"><code>hb_font_draw_glyph_or_fail</code> and <code>hb_font_paint_glyph_or_fail</code> return false; the GPU encoders return <code>NULL</code>.</td>
+</tr>
+<tr>
+<td>A subset fails</td>
+<td id="ix-9"><code>hb_subset_or_fail</code> returns <code>NULL</code>.</td>
+</tr>
+<tr>
+<td id="ix-10">A closure stops early</td>
+<td id="ix-11">It can’t: the subset is missing glyphs, which shows only when the subset font is used.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="buffers-and-shaping">Buffers and shaping</h2>
+<p id="ix-12">The buffer limits are set by <code>enter</code> when shaping starts and taken away by <code>leave</code> when it ends (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L326"><code>hb-buffer.cc:326</code></a>), and they scale with the length of the text. <a href="buffers.html#limits">Buffers</a> describes them.</p>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Value</th>
+<th>What it bounds</th>
+<th>When reached</th>
+<th>Chapter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-13"><code>HB_BUFFER_MAX_LEN_FACTOR</code>, <code>_MIN</code></td>
+<td>256, 65,536</td>
+<td id="ix-14">glyphs the buffer may grow to, as a multiple of its length at the start, and at least this</td>
+<td id="ix-15"><code>enlarge</code> fails and the buffer is marked unsuccessful (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L161"><code>hb-buffer.cc:161</code></a>)</td>
+<td><a href="buffers.html#limits">Buffers</a></td>
+</tr>
+<tr>
+<td id="ix-16"><code>HB_BUFFER_MAX_LEN_DEFAULT</code></td>
+<td>0x3FFFFFFF</td>
+<td>the same, outside shaping, and during it when the multiplication overflows</td>
+<td>the same</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-17"><code>HB_BUFFER_MAX_OPS_FACTOR</code>, <code>_MIN</code></td>
+<td>4,096, 65,536</td>
+<td id="ix-18"><code>max_ops</code>, the shaping work budget, per glyph, and at least this</td>
+<td id="ix-19">the buffer is marked unsuccessful; remaining lookups do nothing</td>
+<td id="ix-20"><a href="buffers.html#limits">Buffers</a>, <a href="gsub.html#context-and-chained-context">GSUB</a></td>
+</tr>
+<tr>
+<td id="ix-21"><code>HB_BUFFER_MAX_OPS_DEFAULT</code></td>
+<td>0x1FFFFFFF</td>
+<td>the same, outside shaping</td>
+<td>the same</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-22"><code>HB_MAX_NESTING_LEVEL</code></td>
+<td>64</td>
+<td id="ix-23">lookups nested inside contextual lookups</td>
+<td id="ix-24">the buffer is marked unsuccessful (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L1145"><code>hb-ot-layout-gsubgpos.hh:1145</code></a>)</td>
+<td id="ix-25"><a href="gsub.html#context-and-chained-context">GSUB</a></td>
+</tr>
+<tr>
+<td id="ix-26"><code>HB_MAX_NESTING_LEVEL</code></td>
+<td>64</td>
+<td id="ix-27">chains of GPOS attachments, cursive or mark, resolved after positioning</td>
+<td id="ix-28">the offset stops propagating; later glyphs in the chain are misplaced</td>
+<td id="ix-29"><a href="gpos.html#a-limit-on-the-depth">GPOS</a></td>
+</tr>
+<tr>
+<td id="ix-30"><code>HB_MAX_CONTEXT_LENGTH</code></td>
+<td>64</td>
+<td id="ix-31">glyphs in a ligature, or in a context rule’s input</td>
+<td id="ix-32">the rule never matches (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/Ligature.hh#L139"><code>Ligature.hh:139</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L1963"><code>hb-ot-layout-gsubgpos.hh:1963</code></a>)</td>
+<td id="ix-33"><a href="gsub.html#context-and-chained-context">GSUB</a></td>
+</tr>
+<tr>
+<td id="ix-34"><code>HB_MAX_CONTEXT_LENGTH</code></td>
+<td>64</td>
+<td id="ix-35">a context match that nested lookups have lengthened</td>
+<td id="ix-36">the rule’s remaining nested lookups are skipped (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L2843"><code>hb-ot-layout-gsubgpos.hh:2843</code></a>)</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-37"><code>HB_MAX_SYLLABLE_LENGTH</code></td>
+<td>64</td>
+<td id="ix-38">glyphs in one syllable, for the Indic, Khmer, Myanmar and USE shapers</td>
+<td id="ix-39">the syllable is reordered in pieces of 64, each as if it were a syllable (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.hh#L174"><code>hb-ot-layout.hh:174</code></a>)</td>
+<td><a href="indic-model.html#a-limit-on-syllable-length">The Indic model</a>, <a href="khmer-and-myanmar.html#syllables">Khmer and Myanmar</a></td>
+</tr>
+<tr>
+<td id="ix-40"><code>HB_OT_SHAPE_MAX_COMBINING_MARKS</code></td>
+<td>32</td>
+<td id="ix-41">a run of marks that normalization sorts by combining class</td>
+<td id="ix-42">the run is left in the order typed (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh#L42"><code>hb-ot-shaper.hh:42</code></a>)</td>
+<td id="ix-43"><a href="normalization.html#round-two-reorder">Normalization</a></td>
+</tr>
+<tr>
+<td id="ix-44"><code>HB_OT_MAP_MAX_BITS</code></td>
+<td>8</td>
+<td id="ix-45">mask bits for one feature’s value</td>
+<td id="ix-46">values above 255 lose their high bits (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.hh#L35"><code>hb-ot-map.hh:35</code></a>)</td>
+<td id="ix-47"><a href="from-features-to-lookups.html#mask-bits">From features to lookups</a></td>
+</tr>
+<tr>
+<td id="ix-48"><code>HB_OT_MAX_TAGS_PER_SCRIPT</code>, <code>_PER_LANGUAGE</code></td>
+<td>3, 3</td>
+<td id="ix-49">OpenType tags tried for one script or language</td>
+<td id="ix-50">further tags are not tried (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.h#L99"><code>hb-ot-layout.h:99</code></a>)</td>
+<td id="ix-51"><a href="choosing-a-script-shaper.html#from-a-script-to-script-tags">Choosing a script shaper</a></td>
+</tr>
+<tr>
+<td><code>STCH_MAX_GLYPHS</code></td>
+<td>256</td>
+<td id="ix-52">glyphs that Syriac <code>stch</code> stretching may add</td>
+<td id="ix-53">tiles stop being repeated (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc#L572"><code>hb-ot-shaper-arabic.cc:572</code></a>)</td>
+<td id="ix-54"><a href="joining-scripts.html#stretching-stch">Joining scripts</a></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-55">The mark limit is cheap to show. Here an <em>a</em> is followed by 31 acutes and a dot below, a run of 32 marks, and then by 32 acutes and a dot below, a run of 33:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">normalization/norm.ttf</td><td class="in"><span class="txt">a◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌̣</span><span class="cps">U+0061 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0323</span></td><td class="opt">--no-positions --no-clusters</td><td class="out"><code>[aacute|dotbelowcomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb]</code></td></tr><tr><td class="font">normalization/norm.ttf</td><td class="in"><span class="txt">a◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌́◌̣</span><span class="cps">U+0061 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0301 U+0323</span></td><td class="opt">--no-positions --no-clusters</td><td class="out"><code>[aacute|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|acutecomb|dotbelowcomb]</code></td></tr></tbody></table></div>
+<p id="ix-56">In the first, the dot below, of class 220, is sorted ahead of the acutes, of class 230, and comes out second. In the second, the run is too long to sort, and the dot below stays last.</p>
+<h3 id="what-max_ops-is-charged-for">What <code>max_ops</code> is charged for</h3>
+<p id="ix-57">The budget is charged by the work a font controls: merging clusters, moving the output, setting masks over ranges (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc"><code>hb-buffer.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.hh#L657"><code>hb-buffer.hh:657</code></a>), each nested lookup a contextual rule calls (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L1151"><code>hb-ot-layout-gsubgpos.hh:1151</code></a>), the Indic shaper’s “would substitute” questions to the font (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L1595"><code>hb-ot-layout.cc:1595</code></a>), and in AAT, a pass over the buffer for every subtable, every DontAdvance transition and every insertion (next section). Once the buffer is unsuccessful, <code>apply_forward</code> stops at once (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L1983"><code>hb-ot-layout.cc:1983</code></a>), and <code>sync</code>, which ends a lookup that writes its output separately, discards that output and keeps the glyphs from before the lookup (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L432"><code>hb-buffer.cc:432</code></a>). So the result is the text as far as shaping got, not a mixture.</p>
+<p id="ix-58">Nesting is the surprise in the table. A contextual lookup that calls itself at the same position recurses until it is 64 deep, and then the whole buffer fails, not just that rule. The closure in the subsetter, which has its own copy of the limit, just stops following (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L77"><code>hb-ot-layout-gsubgpos.hh:77</code></a>).</p>
+<h3 id="a-budget-that-starts-negative">A budget that starts negative</h3>
+<p id="ix-59"><code>enter</code> computes the operation budget like this (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L343"><code>hb-buffer.cc:343</code></a>):</p>
+<pre><code class="language-c++">if (likely (!hb_unsigned_mul_overflows (len, HB_BUFFER_MAX_OPS_FACTOR, &amp;mul)))
+{
+  int limit = (int) hb_max (mul, (unsigned) HB_BUFFER_MAX_OPS_MIN);
+  max_ops = max_ops &lt; HB_BUFFER_MAX_OPS_DEFAULT ? hb_min (max_ops, limit) : limit;
+}
+</code></pre>
+<p id="ix-60"><code>mul</code> is unsigned. From a length of 524,288 characters, 4,096 times the length no longer fits in an <code>int</code>, and the cast makes it negative. Up to 1,048,575 characters, then, the budget is spent before shaping begins. From 1,048,576 the unsigned multiplication overflows too, the branch isn’t taken, and the budget stays at its default of about half a billion. Shaping <code>fi</code> repeated with <code>ligatures.ttf</code> (tried, not shown: the output is a million glyphs long) gives 262,143 ligatures for 524,286 characters, one ligature and then plain <code>f</code> and <code>i</code> for 524,290 and for 1,000,000 characters, and 524,286 ligatures again for 1,048,576. This looks like a bug: the line needs a clamp to <code>INT_MAX</code> before the cast. <code>hb-shape</code> doesn’t report the failure, since it doesn’t call <code>hb_buffer_allocation_successful</code>.</p>
+<blockquote>
+<p id="ix-61">Since 15.1.0: changed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/339aa688fa4dfb4c38591a609f01fd8ca759afdb"><code>339aa68</code></a> (11 November 2026), which charges each lookup pass to the budget: it still starts negative, and 1,000,000 characters get no ligature at all, while 524,290 shape fully, probably because the budget overflows and wraps around.</p>
+</blockquote>
+<h2 id="sanitizing">Sanitizing</h2>
+<p id="ix-62">The sanitizer checks a table once, when it is first loaded, and a table that fails is replaced by an empty one (<a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a>). All these limits have that consequence, the whole table and nothing less.</p>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Value</th>
+<th>What it bounds</th>
+<th>When reached</th>
+<th>Chapter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-63"><code>HB_SANITIZE_MAX_OPS_FACTOR</code>, <code>_MIN</code>, <code>_MAX</code></td>
+<td>64, 16,384, 0x3FFFFFFF</td>
+<td>bytes checked, as a multiple of the table’s length, with a floor and a ceiling</td>
+<td>every later check fails, and the table is rejected</td>
+<td id="ix-64"><a href="trust-nothing-the-sanitizer.html#max_ops">Sanitizer</a></td>
+</tr>
+<tr>
+<td id="ix-65"><code>HB_SANITIZE_MAX_SUBTABLES</code></td>
+<td>16,384</td>
+<td id="ix-66">lookup subtables in a GSUB or GPOS table</td>
+<td>the table is rejected</td>
+<td id="ix-67"><a href="trust-nothing-the-sanitizer.html#max_ops">Sanitizer</a></td>
+</tr>
+<tr>
+<td id="ix-68"><code>HB_MAX_NESTING_LEVEL</code></td>
+<td>64</td>
+<td id="ix-69">nesting of COLR <code>Paint</code>s and of FeatureVariations <code>Condition</code>s</td>
+<td>the table is rejected</td>
+<td id="ix-70"><a href="trust-nothing-the-sanitizer.html#recursion">Sanitizer</a></td>
+</tr>
+<tr>
+<td id="ix-71"><code>HB_AAT_MAX_SUBTABLES</code></td>
+<td>1,024</td>
+<td id="ix-72">subtables in one <code>morx</code>, <code>mort</code>, <code>kerx</code> or AAT <code>kern</code></td>
+<td id="ix-73">the table is rejected (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-morx-table.hh#L1501"><code>hb-aat-layout-morx-table.hh:1501</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-kerx-table.hh#L1154"><code>hb-aat-layout-kerx-table.hh:1154</code></a>)</td>
+<td><a href="aat-inside-harfbuzz.html#before-the-loop">AAT inside HarfBuzz</a>, <a href="legacy-kern.html#two-tables-called-kern">Legacy kern</a></td>
+</tr>
+<tr>
+<td id="ix-74"><code>HB_SANITIZE_MAX_EDITS</code></td>
+<td>32</td>
+<td>nothing</td>
+<td>never read</td>
+<td id="ix-75"><a href="trust-nothing-the-sanitizer.html#whats-left-of-repairing">Sanitizer</a></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p id="ix-76">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/91722141bb48a8414284cb3b4001b0c98cce9a19"><code>9172214</code></a> (17 November 2026), which removes <code>HB_SANITIZE_MAX_EDITS</code> (the table’s last row).</p>
+</blockquote>
+<p id="ix-77">The AAT limit is in the sanitizer for a reason its comment gives: the accelerator keeps one or two glyph sets per subtable, “which can take far more memory than the subtable has bytes” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L95"><code>hb-limits.hh:95</code></a>). A rejected <code>morx</code> means the font is shaped as if it had none, with GSUB if it has one. The state machines that pass the sanitizer are then checked as they run, against a sanitizer context with the maximum budget (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout.cc#L71"><code>hb-aat-layout.cc:71</code></a>; <a href="trust-nothing-the-sanitizer.html#the-aat-tables">The AAT tables</a>).</p>
+<h2 id="layout-queries-and-closure">Layout queries and closure</h2>
+<p id="ix-78">These bound the walks that collect features and lookups, and the glyph closure the subsetter computes. They don’t apply during shaping, which builds its map another way.</p>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Value</th>
+<th>What it bounds</th>
+<th>When reached</th>
+<th>Chapter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-79"><code>HB_CLOSURE_MAX_STAGES</code></td>
+<td>12</td>
+<td id="ix-80">passes of the GSUB glyph closure: at most this plus 2, that is 14</td>
+<td id="ix-81">the closure stops, and glyphs that later passes would add are missing (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L1700"><code>hb-ot-layout.cc:1700</code></a>)</td>
+<td><a href="subsetting.html#why-fixed-stages-and-not-a-fixpoint">Subsetting</a></td>
+</tr>
+<tr>
+<td id="ix-82"><code>HB_MAX_LOOKUP_VISIT_COUNT</code></td>
+<td>35,000</td>
+<td id="ix-83">lookups visited in one closure pass, or by the lookup closure; lookup indices written in a subset Feature</td>
+<td id="ix-84">further lookups are not visited, or not written</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-85"><code>HB_MAX_NESTING_LEVEL</code></td>
+<td>64</td>
+<td id="ix-86">nested lookups followed by the closures</td>
+<td id="ix-87">deeper lookups are not followed</td>
+<td id="ix-88"><a href="hb-depend.html#how-the-graph-is-built">hb-depend</a></td>
+</tr>
+<tr>
+<td id="ix-89"><code>HB_MAX_SCRIPTS</code></td>
+<td>500</td>
+<td id="ix-90">scripts visited by <code>hb_ot_layout_collect_features</code> and <code>_collect_lookups</code>, and by the subsetter</td>
+<td id="ix-91">the rest are not visited; in a subset, they are dropped (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L1135"><code>hb-ot-layout.cc:1135</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L129"><code>hb-ot-layout-common.hh:129</code></a>)</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-92"><code>HB_MAX_LANGSYS</code></td>
+<td>2,000</td>
+<td id="ix-93">language systems visited, in the same places</td>
+<td>the same</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-94"><code>HB_MAX_LANGSYS_FEATURE_COUNT</code></td>
+<td>50,000</td>
+<td id="ix-95">feature indices summed over language systems, when the subsetter prunes duplicate language systems</td>
+<td id="ix-96">the rest are not pruned (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L107"><code>hb-ot-layout-common.hh:107</code></a>)</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-97"><code>HB_MAX_FEATURE_INDICES</code></td>
+<td>8,000</td>
+<td id="ix-98">feature indices visited</td>
+<td id="ix-99">the rest are not collected; in a subset, the language system is dropped</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-100">Every one of these fails quietly. A subset that hits one is smaller than it should be, and nothing reports it. The language-system limits exist because a table can point many script records at one LangSys, so that a walk which looks linear is quadratic.</p>
+<h3 id="the-comment-on-hb_closure_max_stages">The comment on <code>HB_CLOSURE_MAX_STAGES</code></h3>
+<p id="ix-101">The comment on the definition says the value “must be larger than the number of times <code>add_gsub_pause()</code> is called in a collect_features call of any shaper” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L65"><code>hb-limits.hh:65</code></a>). The Indic shaper’s <code>collect_features_indic</code> calls it 14 times: once before <code>locl</code>, once before the basic features, once after each of the 11 basic features, and once before the presentation features (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc#L249-L265"><code>hb-ot-shaper-indic.cc:249–265</code></a>). The USE shaper calls it 8 times, Arabic up to 12. The value is 12, which is smaller than 14, so the comment and the code disagree. As written, the loop runs at most 14 passes, which equals the Indic count rather than exceeding it, so the code may be right by accident; but the reasoning in the comment doesn’t support the number. <a href="subsetting.html#where-the-fixed-order-misses">Subsetting</a> shows a chain that the 14 passes cut short.</p>
+<blockquote>
+<p id="ix-102">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/0209ec2865b55e892897966e95dfb8915a1309e9"><code>0209ec2</code></a> (17 November 2026), which raises <code>HB_CLOSURE_MAX_STAGES</code> to 16, so main runs at most 18 passes.</p>
+</blockquote>
+<h2 id="aat">AAT</h2>
+<p id="ix-103">The AAT state machines are charged to the buffer’s <code>max_ops</code>, like the OpenType lookups, but in more places, since a state machine can loop where a lookup can’t.</p>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Value</th>
+<th>What it bounds</th>
+<th>When reached</th>
+<th>Chapter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-104"><code>max_ops</code>, per DontAdvance transition</td>
+<td>the buffer’s budget</td>
+<td id="ix-105">a state machine reading the same glyph again</td>
+<td id="ix-106">DontAdvance is ignored and the machine moves on (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-common.hh#L1436"><code>hb-aat-layout-common.hh:1436</code></a>)</td>
+<td><a href="aat-inside-harfbuzz.html#the-loop">AAT inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td><code>max_ops</code>, per subtable</td>
+<td>the buffer’s length</td>
+<td>a pass over the buffer for each subtable</td>
+<td id="ix-107">the buffer is marked unsuccessful, and no later subtable runs (<code>charge_buffer_pass</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-common.hh#L171"><code>hb-aat-layout-common.hh:171</code></a>)</td>
+<td><a href="aat-inside-harfbuzz.html#the-loop">AAT inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td><code>max_ops</code>, per insertion</td>
+<td id="ix-108">glyphs inserted</td>
+<td id="ix-109"><code>morx</code> Insertion</td>
+<td id="ix-110">the insertion is not made (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-morx-table.hh#L805"><code>hb-aat-layout-morx-table.hh:805</code></a>)</td>
+<td><a href="aat-inside-harfbuzz.html#insertion">AAT inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td><code>max_ops</code>, per kerning value</td>
+<td>1</td>
+<td id="ix-111">values read from a <code>kerx</code> format 1 action list</td>
+<td id="ix-112">the buffer is marked unsuccessful (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-kerx-table.hh#L309"><code>hb-aat-layout-kerx-table.hh:309</code></a>)</td>
+<td></td>
+</tr>
+<tr>
+<td><code>max_ops</code>, per control-point attachment</td>
+<td>512</td>
+<td id="ix-113"><code>kerx</code> format 4 attachments to contour points, which may load whole outlines</td>
+<td id="ix-114">the attachment is not made (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-kerx-table.hh#L619"><code>hb-aat-layout-kerx-table.hh:619</code></a>)</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-115"><code>HB_MAX_CONTEXT_LENGTH</code></td>
+<td>64</td>
+<td id="ix-116">glyphs between a Rearrangement’s first and last</td>
+<td id="ix-117">nothing is rearranged (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-morx-table.hh#L132"><code>hb-aat-layout-morx-table.hh:132</code></a>)</td>
+<td><a href="aat-inside-harfbuzz.html#rearrangement">AAT inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td id="ix-118"><code>HB_MAX_CONTEXT_LENGTH</code></td>
+<td>64</td>
+<td id="ix-119">the stack of glyphs a Ligature subtable has marked</td>
+<td id="ix-120">the stack is circular: older positions are overwritten (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-morx-table.hh#L601"><code>hb-aat-layout-morx-table.hh:601</code></a>)</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-121"><code>HB_BUDGET_AAT_MAP</code></td>
+<td>2²⁴</td>
+<td id="ix-122">compiling feature flags for ranges of text with different features</td>
+<td id="ix-123">the last range compiled extends to the end of the text (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-map.cc#L161"><code>hb-aat-map.cc:161</code></a>)</td>
+<td><a href="aat-inside-harfbuzz.html#ranges">AAT inside HarfBuzz</a></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-124">The DontAdvance case is the one to understand. The machine in <code>loop.ttf</code> never advances, so it spends the whole budget on one glyph; the loop ends, but the next subtable’s pass fails, the buffer is marked unsuccessful, and that subtable never runs. The <a href="aat-inside-harfbuzz.html#the-loop">AAT chapter</a> shows it live.</p>
+<h2 id="drawing-and-painting">Drawing and painting</h2>
+<p id="ix-125">Drawing and painting have the most limits, because outlines, paint graphs and renderers drive each other. Each format has structural limits, and since 14.5.0 a session also has a work budget, <code>HB_BUDGET_GLYPH</code>, which a client can set with <code>hb_draw_set_budget</code> or <code>hb_paint_set_budget</code> to a number, to <code>HB_BUDGET_DEFAULT</code>, or to <code>HB_BUDGET_UNLIMITED</code>, which leaves only the structural limits (<a href="drawing-outlines.html#the-budget">Drawing outlines</a>).</p>
+<h3 id="outlines">Outlines</h3>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Value</th>
+<th>What it bounds</th>
+<th>When reached</th>
+<th>Chapter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-126"><code>HB_MAX_NESTING_LEVEL</code></td>
+<td>64</td>
+<td id="ix-127">composite glyphs nested, in <code>glyf</code> and VARC</td>
+<td id="ix-128">the glyph fails</td>
+<td><a href="drawing-outlines.html#limits-and-the-shared-budget">Drawing outlines</a></td>
+</tr>
+<tr>
+<td id="ix-129"><code>HB_MAX_GRAPH_EDGE_COUNT</code></td>
+<td>16,384</td>
+<td id="ix-130">glyphs one composite loads, counting repeats</td>
+<td id="ix-131">the glyph fails (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/Glyph.hh#L345"><code>Glyph.hh:345</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.hh#L162"><code>VARC.hh:162</code></a>)</td>
+<td><a href="drawing-outlines.html#limits-and-the-shared-budget">Drawing outlines</a></td>
+</tr>
+<tr>
+<td id="ix-132"><code>HB_GLYF_MAX_POINTS</code></td>
+<td>200,000</td>
+<td>points in one composite</td>
+<td id="ix-133">the glyph fails (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/Glyph.hh#L558"><code>Glyph.hh:558</code></a>)</td>
+<td><a href="drawing-outlines.html#limits-and-the-shared-budget">Drawing outlines</a></td>
+</tr>
+<tr>
+<td id="ix-134"><code>HB_CFF_MAX_OPS</code></td>
+<td>200,000</td>
+<td id="ix-135">operators in one charstring, subroutines included; capped further by the remaining budget</td>
+<td id="ix-136">the glyph fails (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-cs-common.hh#L898"><code>hb-cff-interp-cs-common.hh:898</code></a>)</td>
+<td><a href="drawing-outlines.html#limits-and-the-shared-budget">Drawing outlines</a></td>
+</tr>
+<tr>
+<td><code>kMaxCallLimit</code></td>
+<td>10</td>
+<td id="ix-137">CFF subroutine nesting</td>
+<td id="ix-138">the glyph fails (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-cs-common.hh#L59"><code>hb-cff-interp-cs-common.hh:59</code></a>)</td>
+<td><a href="drawing-outlines.html#limits-and-the-shared-budget">Drawing outlines</a></td>
+</tr>
+<tr>
+<td>argument stack</td>
+<td>513</td>
+<td id="ix-139">numbers on a charstring’s stack</td>
+<td id="ix-140">the glyph fails (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-common.hh#L443"><code>hb-cff-interp-common.hh:443</code></a>)</td>
+<td><a href="drawing-outlines.html#limits-and-the-shared-budget">Drawing outlines</a></td>
+</tr>
+<tr>
+<td id="ix-141"><code>HB_VAR_COMPOSITE_MAX_AXES</code></td>
+<td>4,096</td>
+<td id="ix-142">axis indices a VARC component may set, and coordinates it inherits</td>
+<td id="ix-143">a higher index is ignored; above 4,096 inherited coordinates, the component starts from the font’s (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/coord-setter.hh#L25"><code>coord-setter.hh:25</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc#L396"><code>VARC.cc:396</code></a>)</td>
+<td id="ix-144"><a href="variable-components.html#step-4-the-components-coordinates">Variable components</a></td>
+</tr>
+<tr>
+<td id="ix-145"><code>HB_BUDGET_GLYPH</code></td>
+<td>2²⁴</td>
+<td>the work of one drawing or painting session</td>
+<td>the work in hand fails, and everything after it in the session</td>
+<td><a href="drawing-outlines.html#the-budget">Drawing outlines</a></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-146">A composite that contains itself is not a limit but a cycle, and only the component that closes the cycle is skipped. Every other outline limit fails the whole glyph, which then draws as nothing while its extents still come from its header; <code>hb-shape</code> and layout see an ordinary glyph.</p>
+<h3 id="color">Color</h3>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Value</th>
+<th>What it bounds</th>
+<th>When reached</th>
+<th>Chapter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-147"><code>HB_MAX_NESTING_LEVEL</code></td>
+<td>64</td>
+<td id="ix-148">depth of a COLR v1 paint graph while painting</td>
+<td>deeper paints are not painted</td>
+<td><a href="color.html#guards">Color</a></td>
+</tr>
+<tr>
+<td id="ix-149"><code>HB_MAX_GRAPH_EDGE_COUNT</code></td>
+<td>16,384</td>
+<td id="ix-150">Paints visited for one glyph</td>
+<td>no more are painted</td>
+<td><a href="color.html#guards">Color</a></td>
+</tr>
+<tr>
+<td id="ix-151"><code>HB_PAINT_MAX_SWEEP_TILES</code></td>
+<td>4,096</td>
+<td>tiles one repeating or reflecting sweep gradient is cut into</td>
+<td id="ix-152">below an angle of 2π/4,096 per repeat, the circle is filled with the average color; beyond 4,096 tiles, tiling stops (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint.cc#L1220"><code>hb-paint.cc:1220</code></a>, <code>:1280</code>)</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-153"><code>dupe</code> chain</td>
+<td>8</td>
+<td id="ix-154"><code>sbix</code> records that point at another glyph’s image</td>
+<td id="ix-155">the image isn’t found (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/sbix/sbix.hh#L121"><code>sbix.hh:121</code></a>)</td>
+<td><a href="color.html#bitmaps-sbix-and-cbdt">Color</a></td>
+</tr>
+<tr>
+<td id="ix-156"><code>HB_SVG_MAX_DOCUMENT_SIZE</code></td>
+<td>16 MiB</td>
+<td>one SVG document, after decompression</td>
+<td id="ix-157">the document isn’t returned (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/svg/svg.hh#L63"><code>svg.hh:63</code></a>, <code>:78</code>)</td>
+<td></td>
+</tr>
+<tr>
+<td><code>MAX_DEPTH</code></td>
+<td>128</td>
+<td id="ix-158">elements nested in an SVG document, when HarfBuzz indexes it by glyph</td>
+<td id="ix-159">the document isn’t indexed (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/svg/svg.hh#L590"><code>svg.hh:590</code></a>), so (inferred) its glyphs aren’t found</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="renderers">Renderers</h3>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Value</th>
+<th>What it bounds</th>
+<th>When reached</th>
+<th>Chapter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-160"><code>HB_RASTER_MAX_DRAW_EDGES</code></td>
+<td>2²⁰</td>
+<td id="ix-161">edges in one hb-raster draw session</td>
+<td>drawing stops</td>
+<td id="ix-162"><a href="hb-raster.html#limits">hb-raster</a></td>
+</tr>
+<tr>
+<td id="ix-163"><code>HB_RASTER_MAX_AUTO_DIMENSION</code></td>
+<td>4,096</td>
+<td>pixels a side, when the size comes from the font, including a PNG’s header</td>
+<td>the surface is clamped; the PNG isn’t decoded</td>
+<td id="ix-164"><a href="hb-raster.html#limits">hb-raster</a></td>
+</tr>
+<tr>
+<td id="ix-165"><code>HB_RASTER_MAX_BUFFER_SIZE</code></td>
+<td>1 GiB</td>
+<td>one image’s or clip’s buffer</td>
+<td>it isn’t allocated</td>
+<td id="ix-166"><a href="hb-raster.html#limits">hb-raster</a></td>
+</tr>
+<tr>
+<td id="ix-167"><code>HB_BUDGET_RASTER_PIXELS</code>, <code>_PAINT_PASSES</code></td>
+<td>2²⁶, 4</td>
+<td>pixel work: the larger of the first and that many passes over the surface</td>
+<td>the image is left blank</td>
+<td id="ix-168"><a href="hb-raster.html#the-pixel-budget">hb-raster</a></td>
+</tr>
+<tr>
+<td id="ix-169"><code>HB_VECTOR_MAX_DOCUMENT_SIZE</code></td>
+<td>16 MiB</td>
+<td id="ix-170">one SVG or PDF document from hb-vector</td>
+<td>the buffer stops growing and drawing stops</td>
+<td id="ix-171"><a href="hb-vector.html#limits">hb-vector</a></td>
+</tr>
+<tr>
+<td id="ix-172">transform depth</td>
+<td>64</td>
+<td id="ix-173">transforms nested in hb-vector’s SVG output</td>
+<td id="ix-174">further ones are ignored (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-svg.cc#L372"><code>hb-vector-paint-svg.cc:372</code></a>)</td>
+<td id="ix-175"><a href="hb-vector.html#limits-for-color-glyphs">hb-vector</a></td>
+</tr>
+<tr>
+<td id="ix-176"><code>HB_GPU_DRAW_MAX_CURVES</code></td>
+<td>65,536</td>
+<td id="ix-177">curves in one hb-gpu glyph</td>
+<td id="ix-178">the encoding fails (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-draw.cc#L58"><code>hb-gpu-draw.cc:58</code></a>)</td>
+<td id="ix-179"><a href="hb-gpu.html#limits-on-outlines">hb-gpu</a></td>
+</tr>
+<tr>
+<td id="ix-180"><code>HB_GPU_CU2QU_MAX_DEPTH</code></td>
+<td>10</td>
+<td>subdivisions of a cubic into quadratics</td>
+<td id="ix-181">the last piece is used as it is (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-cu2qu.hh#L187"><code>hb-gpu-cu2qu.hh:187</code></a>)</td>
+<td id="ix-182"><a href="hb-gpu.html#limits-on-outlines">hb-gpu</a></td>
+</tr>
+<tr>
+<td id="ix-183"><code>HB_GPU_PAINT_MAX_OPS</code>, <code>_GROUP_DEPTH</code>, <code>_CLIP_DEPTH</code>, <code>_SUB_BLOBS</code></td>
+<td>32,767, 4, 3, 1,024</td>
+<td id="ix-184">an hb-gpu color glyph’s operations, nested groups, clips per layer, clip blobs</td>
+<td id="ix-185">the encoder returns <code>NULL</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.cc#L51"><code>hb-gpu-paint.cc:51</code></a>)</td>
+<td id="ix-186"><a href="hb-gpu.html#limits-on-color-glyphs">hb-gpu</a></td>
+</tr>
+<tr>
+<td id="ix-187"><code>HB_GPU_PAINT_MAX_SUB_BYTES</code></td>
+<td>64 MiB</td>
+<td id="ix-188">bytes of clip outlines and color stops in one hb-gpu paint</td>
+<td id="ix-189">the same (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.hh#L276"><code>hb-gpu-paint.hh:276</code></a>)</td>
+<td id="ix-190"><a href="hb-gpu.html#limits-on-color-glyphs">hb-gpu</a></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-191">The rule that runs through the renderers is in a comment on <code>HB_RASTER_MAX_AUTO_DIMENSION</code>: sizes that come from the font are capped, but sizes the client sets with <code>hb_raster_draw_set_extents</code> aren’t. The font is the attacker; the client is trusted with its own allocations.</p>
+<h2 id="subsetting-and-instancing">Subsetting and instancing</h2>
+<p id="ix-192">A subset either succeeds or fails as a whole: when any table fails, <code>hb_subset_or_fail</code> returns <code>NULL</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.cc#L495"><code>hb-subset.cc:495</code></a>). Closure limits are the exception, since a closure that stops early fails nothing.</p>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Value</th>
+<th>What it bounds</th>
+<th>When reached</th>
+<th>Chapter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-193"><code>HB_MAX_NESTING_LEVEL</code></td>
+<td>64</td>
+<td id="ix-194">composite components followed when collecting glyphs</td>
+<td id="ix-195">deeper components are not retained (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan.cc#L410"><code>hb-subset-plan.cc:410</code></a>)</td>
+<td><a href="subsetting.html#the-glyph-closure-stage-by-stage">Subsetting</a></td>
+</tr>
+<tr>
+<td id="ix-196"><code>HB_MAX_COMPOSITE_OPERATIONS_PER_GLYPH</code></td>
+<td>64</td>
+<td id="ix-197">components followed from each glyph, times the number of glyphs</td>
+<td>the same</td>
+<td><a href="subsetting.html#the-glyph-closure-stage-by-stage">Subsetting</a></td>
+</tr>
+<tr>
+<td id="ix-198"><code>HB_SUBSET_GLYF_MAX_BYTES_FACTOR</code></td>
+<td>16</td>
+<td id="ix-199">bytes of all retained glyphs, as a multiple of the <code>glyf</code> table</td>
+<td id="ix-200">the plan fails (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan.cc#L516"><code>hb-subset-plan.cc:516</code></a>)</td>
+<td><a href="subsetting.html#the-glyph-closure-stage-by-stage">Subsetting</a></td>
+</tr>
+<tr>
+<td id="ix-201"><code>HB_BUDGET_SUBSET_GLYF</code></td>
+<td>2²⁸</td>
+<td id="ix-202">work to instance every retained <code>glyf</code> glyph</td>
+<td id="ix-203">the <code>glyf</code> table fails (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh#L128"><code>glyf.hh:128</code></a>)</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-204"><code>HB_SUBSET_CBDT_MAX_COPY_FACTOR</code></td>
+<td>64</td>
+<td id="ix-205">bytes copied out of <code>CBDT</code>, as a multiple of its length</td>
+<td id="ix-206">the table fails (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/CBDT/CBDT.hh#L460"><code>CBDT.hh:460</code></a>)</td>
+<td></td>
+</tr>
+<tr>
+<td>table buffer</td>
+<td>256 × the source table</td>
+<td id="ix-207">the buffer a table is written into, doubled each time it runs out</td>
+<td id="ix-208">the table fails (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-table.hh#L61"><code>hb-subset-table.hh:61</code></a>)</td>
+<td><a href="writing-tables.html#when-writing-fails">Writing tables</a></td>
+</tr>
+<tr>
+<td id="ix-209"><code>HB_REPACKER_MAX_VERTICES</code></td>
+<td>800,000</td>
+<td id="ix-210">objects in the repacker’s graph, including duplicates</td>
+<td id="ix-211">repacking fails, and so does the table (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/graph.hh#L577"><code>graph/graph.hh:577</code></a>)</td>
+<td><a href="writing-tables.html#the-graph">Writing tables</a></td>
+</tr>
+<tr>
+<td id="ix-212"><code>HB_REPACKER_MAX_SPACES</code></td>
+<td>8,000</td>
+<td id="ix-213">spaces reached through 32-bit offsets</td>
+<td id="ix-214">the same (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/graph.hh#L978"><code>graph/graph.hh:978</code></a>)</td>
+<td><a href="writing-tables.html#32-bit-offsets-and-spaces">Writing tables</a></td>
+</tr>
+<tr>
+<td id="ix-215"><code>HB_REPACKER_MAX_ITERATIONS</code></td>
+<td>500</td>
+<td id="ix-216">rounds of the repacker</td>
+<td id="ix-217">it stops; if offsets still overflow, the table fails (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-repacker.hh#L422"><code>hb-repacker.hh:422</code></a>)</td>
+<td><a href="writing-tables.html#round-by-round">Writing tables</a></td>
+</tr>
+<tr>
+<td><code>MAX_GRID</code></td>
+<td>2¹⁴</td>
+<td id="ix-218">grid points used to find a variation’s exact extremes when limiting an axis</td>
+<td id="ix-219">a looser, still conservative, estimate is used (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan-var.cc#L183"><code>hb-subset-plan-var.cc:183</code></a>)</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-220">The nesting and operation limits share one weakness. A component that wasn’t retained keeps its old glyph ID when its composite is written (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/SubsetGlyph.hh#L55"><code>SubsetGlyph.hh:55</code></a>), so in the subset it points at whatever glyph now has that ID, or at none (inferred). This needs a composite more than 64 levels deep, which no renderer would draw anyway.</p>
+<h2 id="limits-that-cost-only-speed">Limits that cost only speed</h2>
+<p id="ix-221">Two limits change nothing visible. <code>HB_CBDT_MAX_INDEX_ENTRIES</code>, 65,536, caps the index HarfBuzz builds to find a glyph’s bitmap in <code>CBLC</code>; a strike that would pass it is searched linearly instead (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/CBDT/CBDT.hh#L940"><code>CBDT.hh:940</code></a>). <code>max_shared_tuple_count</code>, 4,096, caps the cache of <code>gvar</code>’s shared tuple scalars (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-gvar-table.hh#L645"><code>hb-ot-var-gvar-table.hh:645</code></a>).</p>
+<h2 id="limits-defined-but-unused">Limits defined but unused</h2>
+<p id="ix-222"><code>HB_SVG_MAX_PATH_SEGMENTS</code> (262,144, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L130"><code>hb-limits.hh:130</code></a>) appears nowhere else in the source, nor in <code>util/</code> or the tests. <code>HB_SANITIZE_MAX_EDITS</code> (32) is left over from the time the sanitizer repaired fonts. <code>HB_REPACKER_MAX_VERTICES</code> is used, but also by <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/test-repacker.cc"><code>test-repacker.cc</code></a>, which fills a graph to the limit to check it.</p>
+<blockquote>
+<p id="ix-223">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/91722141bb48a8414284cb3b4001b0c98cce9a19"><code>9172214</code></a> (17 November 2026), so main no longer defines <code>HB_SVG_MAX_PATH_SEGMENTS</code> or <code>HB_SANITIZE_MAX_EDITS</code>.</p>
+</blockquote>
+<h2 id="changing-a-limit">Changing a limit</h2>
+<p id="ix-224">Every limit in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>hb-limits.hh</code></a>, and the sanitizer’s in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L107"><code>hb-sanitize.hh:107</code></a>, is wrapped in <code>#ifndef</code>, so a build can set its own value by defining the macro first, with <code>-DHB_MAX_NESTING_LEVEL=128</code> or in a configuration header (<a href="compile-time-configuration.html">Compile-time configuration</a>). The exceptions are the fixed weights <code>HB_BUDGET_1</code> to <code>HB_BUDGET_8192</code>, which <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L211"><code>hb-limits.hh:211</code></a> asks to be left alone (“tune the common session cap, not these values”), and everything defined outside these two headers: <code>HB_OT_SHAPE_MAX_COMBINING_MARKS</code>, <code>HB_OT_MAP_MAX_BITS</code>, the hb-gpu limits, <code>kMaxCallLimit</code>, the CFF argument stack, <code>STCH_MAX_GLYPHS</code>, the 256 × table buffer and the SVG depth are plain definitions or literals, and changing them means changing the source. <code>HB_OT_MAX_TAGS_PER_SCRIPT</code> and <code>_PER_LANGUAGE</code> are public API, sizes for arrays that callers allocate.</p>
+<p id="ix-225">At run time, only the drawing and painting budget can be changed, through <code>hb_draw_set_budget</code> and <code>hb_paint_set_budget</code>. There is no API for the buffer’s limits.</p>
+<p id="ix-226">Most limits have grown over the years as real fonts reached them. <code>NEWS</code> records the buffer’s work limits raised in 2.7.3, “to handle fonts with many complex lookups”, and its length limits in 11.4.2, “for better handling of fonts that generate huge number of glyphs per codepoint (e.g. Noto Sans Duployan)”; the CFF operand limit raised twentyfold in 10.1.0; and, going the other way, nesting reduced “from 8 to 6” in 1.0.6.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>src/hb-limits.hh</code></a></td>
+<td>most limits and budgets, with comments, and <code>hb_budget_spend</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh"><code>src/hb-sanitize.hh</code></a></td>
+<td>the sanitizer’s budgets and <code>check_start_recursion</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc"><code>src/hb-buffer.cc</code></a></td>
+<td><code>enter</code> and <code>leave</code>, <code>enlarge</code>, and the operations charged to <code>max_ops</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh"><code>src/hb-ot-layout-gsubgpos.hh</code></a></td>
+<td>nesting and context length during shaping, and the closure contexts</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>src/hb-ot-layout.cc</code></a></td>
+<td>the GSUB closure loop, and the script and language-system counts</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-common.hh"><code>src/hb-aat-layout-common.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-morx-table.hh"><code>src/hb-aat-layout-morx-table.hh</code></a></td>
+<td>the AAT driver’s charges, and the subtable limit</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/Glyph.hh"><code>src/OT/glyf/Glyph.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-cs-common.hh"><code>src/hb-cff-interp-cs-common.hh</code></a></td>
+<td>the outline limits</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint.cc"><code>src/hb-paint.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh"><code>src/OT/Color/COLR/COLR.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/svg/svg.hh"><code>src/OT/Color/svg/svg.hh</code></a></td>
+<td>the color limits</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-raster-*.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-vector-*.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-gpu-*.cc</code></a></td>
+<td>the renderers’ limits</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan.cc"><code>src/hb-subset-plan.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-table.hh"><code>src/hb-subset-table.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/graph.hh"><code>src/graph/graph.hh</code></a></td>
+<td>the subsetter’s and repacker’s limits</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.h"><code>src/hb-common.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-draw.h"><code>src/hb-draw.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint.h"><code>src/hb-paint.h</code></a></td>
+<td><code>HB_BUDGET_DEFAULT</code>, <code>HB_BUDGET_UNLIMITED</code> and the budget API</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>No limit crashes, but the outcomes differ: a table rejected, a buffer marked unsuccessful, a rule skipped, a glyph left blank, a subset failed or quietly incomplete.</li>
+<li>An application can detect a failed buffer with <code>hb_buffer_allocation_successful</code>, a failed glyph with the <code>_or_fail</code> functions, and a failed subset by its <code>NULL</code>. Skipped rules and truncated closures can’t be detected.</li>
+<li>Lookup nesting past 64 fails the whole buffer, not just the rule. AAT state machines charge the same budget, and a loop can starve later subtables.</li>
+<li>From 524,288 to 1,048,575 characters, the buffer’s operation budget starts negative, and shaping stops almost at once: probably a bug.</li>
+<li><code>HB_CLOSURE_MAX_STAGES</code> is 12, though its comment requires it to exceed the Indic shaper’s 14 pauses. <code>HB_SVG_MAX_PATH_SEGMENTS</code> and <code>HB_SANITIZE_MAX_EDITS</code> are unused.</li>
+<li>The limits in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>hb-limits.hh</code></a> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh"><code>hb-sanitize.hh</code></a> can be changed at build time; the others are fixed in the source. Only the drawing and painting budget can be changed at run time.</li>
+</ul>
+<blockquote>
+<p>Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/0209ec2865b55e892897966e95dfb8915a1309e9"><code>0209ec2</code></a> and <a href="https://github.com/harfbuzz/harfbuzz/commit/91722141bb48a8414284cb3b4001b0c98cce9a19"><code>9172214</code></a> (17 November 2026), so main has <code>HB_CLOSURE_MAX_STAGES</code> at 16 and neither unused limit (the item on <code>HB_CLOSURE_MAX_STAGES</code>).</p>
+</blockquote>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="reading-harfbuzz-cpp.html">← Reading HarfBuzz’s C++</a><a rel="next" href="compile-time-configuration.html">Compile-time configuration →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

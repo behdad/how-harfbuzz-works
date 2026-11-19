@@ -1,0 +1,729 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>hb-gpu: rendering on the GPU · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part IX · Drawing</p>
+<h1 id="hb-gpu-rendering-on-the-gpu">39. hb-gpu: rendering on the GPU</h1>
+<p id="ix-1">The draw and paint APIs end at a callback. HarfBuzz walks the font’s data and calls the client: move here, curve to there, push this clip, fill with that gradient. Since 13.0.0 HarfBuzz has had renderers of its own, in three separate libraries: <a href="hb-raster.html">hb-raster</a>, which turns glyphs into pixel images on the CPU; <a href="hb-vector.html">hb-vector</a>, which writes them out as SVG or PDF; and hb-gpu, which arrived in 14.0.0. All three are clients of the APIs that <a href="drawing-outlines.html">Drawing outlines</a> and <a href="color.html">Color</a> describe, and nothing more. They see a glyph as an application would, with variations, synthetic bold and slant (<a href="fonts-and-font-functions.html#synthetic-bold-and-slant">Fonts and font functions</a>) and the font’s scale already applied, and without hinting.</p>
+<p id="ix-2"><strong>hb-gpu</strong> draws text on the GPU without first making bitmaps of its glyphs. It encodes each glyph’s curves on the CPU into a small block of integers, and a fragment shader, run for every pixel the glyph covers, works out from those curves how much of the pixel is inside the glyph. The method is <strong>Slug</strong>, Eric Lengyel’s algorithm, which hb-gpu implements with credit in its shader source (<code>hb-gpu-fragment.glsl:3–6</code>). Since coverage is computed from the curves wherever the glyph lands on screen, one encoding serves every size, rotation and perspective. HarfBuzz supplies the encoder and the shader functions; the application supplies the rest.</p>
+<p id="ix-3">Nothing here can run in the book’s build, which has no GPU. The shader code is quoted from the source. The dumps of encoded glyphs were made by hand, with a short program, <code>fonts/hb-gpu/dump-gpu-blob.c</code>, run on the test fonts of earlier chapters.</p>
+<h2 id="the-library">The library</h2>
+<p id="ix-4">The library is <code>libharfbuzz-gpu</code>, with the header <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.h"><code>hb-gpu.h</code></a>, built when the <a href="building-harfbuzz.html#optional-dependencies-and-backends">Meson option</a> <code>gpu</code> is enabled, as it is by default (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson_options.txt#L40"><code>meson_options.txt:40</code></a>). The option <code>gpu_demo</code>, <code>auto</code> by default (<code>:42</code>), adds <code>hb-gpu</code>, an interactive viewer for shaped text that needs GLEW, GLFW, OpenGL and GLib (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/meson.build#L231"><code>util/meson.build:231</code></a>). It isn’t built here, because GLEW isn’t installed. An uninstalled tool, <code>hb-gpu-encode-all</code>, encodes every glyph of a font and reports sizes and times. <code>hb-features.h</code> is meant to define <code>HB_HAS_GPU</code> when the library is built, but in 15.1.0 Meson never sets it: the book’s build has <code>#undef HB_HAS_GPU</code> there (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/build/src/hb-features.h#L100"><code>build/src/hb-features.h:100</code></a>).</p>
+<p>Its history, from <code>NEWS</code>, is short:</p>
+<table>
+<thead>
+<tr>
+<th>Version</th>
+<th>What happened</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>14.0.0</td>
+<td id="ix-5"><code>libharfbuzz-gpu</code> arrives, for outlines only, with shaders in four languages and the <code>hb-gpu</code> viewer</td>
+</tr>
+<tr>
+<td>14.1.0</td>
+<td id="ix-6">extra samples at small sizes; the font’s scale stored in the encoded glyph</td>
+</tr>
+<tr>
+<td>14.2.0</td>
+<td id="ix-7">the API review: color glyphs, “based on design by Lê Duy Quang”; encoding returns the extents and clears the encoder; shader sources chosen by stage</td>
+</tr>
+<tr>
+<td>14.5.0</td>
+<td id="ix-8">work budgets, shared with the font code</td>
+</tr>
+<tr>
+<td>14.5.1</td>
+<td id="ix-9">a heap buffer overflow with malicious <code>COLR</code> fonts fixed</td>
+</tr>
+<tr>
+<td>15.0.0</td>
+<td>“no longer considered experimental”: API and ABI stability now apply</td>
+</tr>
+<tr>
+<td>15.1.0</td>
+<td id="ix-10">“wrong clipping of <code>COLR</code> layers” fixed</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-11">There are two contexts. An <strong><code>hb_gpu_draw_t</code></strong> (14.0.0) encodes outlines; an <strong><code>hb_gpu_paint_t</code></strong> (14.2.0) encodes color glyphs. Each is an ordinary reference-counted HarfBuzz object, made with <code>_create_or_fail</code>, and each returns its result as an <code>hb_blob_t</code>. They are fed through their draw or paint funcs, from <code>hb_gpu_draw_get_funcs</code> or <code>hb_gpu_paint_get_funcs</code>, or through the convenience calls <code>hb_gpu_draw_glyph</code> and <code>hb_gpu_paint_glyph</code>. Those set the context’s scale from the font, then call <code>hb_font_draw_glyph_or_fail</code> or <code>hb_font_paint_glyph</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-draw.cc#L1073"><code>hb-gpu-draw.cc:1073</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.cc#L1460"><code>hb-gpu-paint.cc:1460</code></a>). Since 14.2.0 they return nothing; each has an <code>_or_fail</code> twin that says whether the font had anything to draw or paint.</p>
+<p id="ix-12"><code>_encode</code> packs what has been fed into a blob. It clears the context on the way out, whether it succeeded or not (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-draw.cc#L457"><code>hb-gpu-draw.cc:457</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.cc#L1509"><code>hb-gpu-paint.cc:1509</code></a>), so one context serves glyph after glyph. <code>_clear</code> throws away what has been fed and keeps the settings; <code>_reset</code> restores the defaults as well. <code>_recycle_blob</code> takes a finished blob back, once its contents have been uploaded, and the next encode reuses its memory (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.hh#L220"><code>hb-blob.hh:220</code></a>). The documentation of <code>hb_gpu_draw_recycle_blob</code> still says that it “simply destroys the blob”, which was once true.</p>
+<p id="ix-13">Both contexts implement the budget callbacks of <a href="drawing-outlines.html#the-budget">Drawing outlines</a>, and clearing recharges the budget. So one budget of 2²⁴ covers one glyph, as the contexts are normally used. The draw context charges one unit for every curve it stores and for every step of cubic conversion (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-draw.cc#L55"><code>hb-gpu-draw.cc:55</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-cu2qu.hh#L176"><code>hb-gpu-cu2qu.hh:176</code></a>).</p>
+<p id="ix-14">The two contexts make different blobs for different shader functions. An application usually picks one per font: the documentation says the draw path is “meaningfully faster than Paint on monochrome fonts” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L54"><code>hb-gpu.cc:54</code></a>). The <code>hb-gpu</code> viewer paints when the face has a <code>COLR</code> paint graph or layers, and draws otherwise (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/gpu-output.hh#L154"><code>util/gpu-output.hh:154</code></a>).</p>
+<h2 id="outlines">Outlines</h2>
+<h3 id="the-draw-context">The draw context</h3>
+<p id="ix-15"><code>hb_gpu_draw_t</code> keeps every piece of the outline as a quadratic Bézier curve, since quadratics are all the shader knows. A line becomes a quadratic whose control point is its start (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-draw.cc#L116"><code>hb-gpu-draw.cc:116</code></a>). A quadratic is kept as it is. A cubic is converted by <strong>cu2qu</strong>, the cubic-to-quadratic conversion familiar from fontTools, in its own implementation (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-cu2qu.hh"><code>hb-gpu-cu2qu.hh</code></a>). It tries one quadratic, and if that strays more than half a font unit from the cubic, splits the cubic in two and tries again, up to 10 levels deep; a piece that still doesn’t fit at the bottom becomes a straight line (<code>:187</code>). A cubic whose control points lie within that half unit of its chord is drawn as a line at once (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-draw.cc#L155"><code>hb-gpu-draw.cc:155</code></a>). So TrueType outlines are encoded exactly, and CFF and cubic <code>GLYF</code> outlines to within half a unit. Closing a path adds the closing line, and a curve of zero length is dropped (<code>:85</code>).</p>
+<p id="ix-16">The encoder works in whatever coordinates it is given, and the documentation asks for the font to be left at its default scale, the upem, with scaling done in the vertex shader (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L221"><code>hb-gpu.cc:221</code></a>). The reason is quantization. Every coordinate is stored as a 16-bit integer, in quarters of a unit (<code>HB_GPU_UNITS_PER_EM</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-draw.hh#L38"><code>hb-gpu-draw.hh:38</code></a>): a precision of 0.25 and a range of about ±8,000 units. Font units suit that; coordinates from 0 to 1 would vanish, as a comment in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.h"><code>hb-gpu.h</code></a> warns.</p>
+<p id="ix-17"><code>hb_gpu_draw_encode (draw, &amp;extents)</code> returns the blob, and the glyph’s extents, rounded outward to whole units (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-draw.cc#L400"><code>hb-gpu-draw.cc:400</code></a>). Those extents are what the application builds the glyph’s quad from. A glyph with no ink, like a space, encodes as the empty blob, of length zero; a failure returns <code>NULL</code> (<code>:440</code>).</p>
+<h3 id="bands">Bands</h3>
+<p id="ix-18">Walking every curve of a glyph at every pixel would be slow, so the encoder divides the glyph’s box into <strong>bands</strong>: horizontal strips and vertical strips of equal size, as many as there are curves, up to 16 each way (“capped at 16 per Slug paper”, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-draw.cc#L510"><code>hb-gpu-draw.cc:510</code></a>). Each band lists the curves that reach into it. A horizontal band doesn’t list horizontal lines, and a vertical band doesn’t list vertical ones, since a ray along a band can never cross them (<code>:541</code>).</p>
+<p>Each band has its list twice. One copy is sorted by the curves’ right (or top) ends, largest first, the other by their left (or bottom) ends, smallest first (<code>:626</code>). The band also stores a split point, chosen so that the longer of the two lists a pixel might need is as short as possible (<code>:793</code>). A pixel on the near side of the split looks one way along the band and reads one list; a pixel on the far side looks the other way and reads the other. Either way, the curves come nearest first, and the shader can stop as soon as they are out of reach.</p>
+<p id="ix-19">Bands are worked out from the quantized points, not the original ones, because the shader only ever sees the quantized ones. A comment records what happened when the two disagreed: a curve left out of a band it reached into, wrong winding numbers in that sliver, and “a thin black line through the glyph” (<code>:357</code>).</p>
+<h3 id="the-blob">The blob</h3>
+<p id="ix-20">The blob is an array of <strong>texels</strong>, the elements of a GPU texture or buffer: here each is four signed 16-bit integers, the format OpenGL calls RGBA16I, 8 bytes in all (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L70"><code>hb-gpu.cc:70</code></a>). In order, it holds:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-21">Texels</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td id="ix-22">the glyph’s box: minimum x and y, maximum x and y, in quarter units</td>
+</tr>
+<tr>
+<td>1</td>
+<td id="ix-23">the number of horizontal and vertical bands; the font’s x and y scale</td>
+</tr>
+<tr>
+<td>one per band</td>
+<td id="ix-24">the band’s curve count, the offsets of its two lists, and its split point</td>
+</tr>
+<tr>
+<td>the lists</td>
+<td id="ix-25">one curve offset per texel</td>
+</tr>
+<tr>
+<td>the curves</td>
+<td>the control points, shared between neighbors</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-26">A curve is three points, but neighbors on one contour share one. The first texel of a contour holds the first curve’s start and control point. Every texel after it holds one curve’s end and the next curve’s control point, which is also where the next curve starts (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-draw.cc#L752"><code>hb-gpu-draw.cc:752</code></a>). So a contour of <em>n</em> curves takes <em>n</em> + 1 texels, and a curve’s offset points at the texel with its start. Offsets are stored as 16-bit numbers less 32,768 (<code>:352</code>), so a glyph’s blob can be at most 65,536 texels long (<code>:706</code>).</p>
+<p id="ix-27">Here is the blob for the <code>square</code> glyph of <a href="drawing-outlines.html">Drawing outlines</a>’ <code>limits.ttf</code>, a square 100 units on a side drawn as four lines, trimmed in the middle. It was made by hand with <code>dump-gpu-blob limits.ttf square</code>, not when the page was built:</p>
+<pre><code class="language-text">square: 376 bytes, 47 texels
+  0:      0      0    400    400
+  1:      4      4   1000   1000
+  2:      2 -32758 -32756    200
+  3:      2 -32754 -32752    200
+   …
+  9:      2 -32730 -32728    200
+ 10: -32724      0      0      0
+ 11: -32726      0      0      0
+   …
+ 41: -32725      0      0      0
+ 42:      0      0      0      0
+ 43:      0    400      0    400
+ 44:    400    400    400    400
+ 45:    400      0    400      0
+ 46:      0      0      0      0
+</code></pre>
+<p id="ix-28">Texel 0 is the box, from 0 to 400 quarter units. Texel 1 has four bands each way, one per curve, and the font’s scale of 1,000. Texels 2 to 5 are the horizontal bands and 6 to 9 the vertical ones. Each band holds two curves, its two lists start at texels 10 and 12 (−32,758 + 32,768 and −32,756 + 32,768), and it splits at 200, the square’s middle. The horizontal bands all list the two vertical sides, at texels 44 and 42; the vertical bands list the top and bottom, at 43 and 45. The curves start at texel 42: (0, 0) with its control point (0, 0), on to (0, 400) with the next control point (0, 400), and so round the square to (0, 0) again.</p>
+<p id="ix-29">Four lines take 376 bytes. Most of them go on the lists, where each texel uses only its first component (<code>:815</code>): 32 of the 47 texels here. Other glyphs from the same chapter’s fonts, by the same program:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-30">Glyph</th>
+<th>Font</th>
+<th>Curves</th>
+<th>Bytes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>square</code></td>
+<td><code>limits.ttf</code></td>
+<td>4 lines</td>
+<td>376</td>
+</tr>
+<tr>
+<td><code>i</code></td>
+<td><code>outlines.ttf</code></td>
+<td>stem and dot</td>
+<td>992</td>
+</tr>
+<tr>
+<td><code>b</code></td>
+<td><code>outlines.ttf</code></td>
+<td>bowl and stem, quadratics</td>
+<td>1,592</td>
+</tr>
+<tr>
+<td><code>o</code></td>
+<td><code>cff.otf</code></td>
+<td id="ix-31">cubics, through cu2qu</td>
+<td>3,552</td>
+</tr>
+</tbody>
+</table>
+<h3 id="what-the-application-supplies">What the application supplies</h3>
+<p id="ix-32">The shaders come with the library, in four languages: GLSL (OpenGL 3.3, OpenGL ES 3.0, WebGL 2), WGSL (WebGPU), MSL (Metal) and HLSL (Direct3D) (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.h#L37"><code>hb-gpu.h:37</code></a>). They are compiled in as strings by <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-gpu-shader-artifacts.py"><code>gen-gpu-shader-artifacts.py</code></a> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L835"><code>src/meson.build:835</code></a>). <code>hb_gpu_shader_source (stage, lang)</code> returns the helpers both renderers share, and <code>hb_gpu_draw_shader_source</code> the draw renderer’s part, an empty string for the vertex stage. An application builds each of its shaders by joining a version line, those two, and a <code>main</code> of its own (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L119"><code>hb-gpu.cc:119</code></a>).</p>
+<p id="ix-33">Everything outside the shader functions is the application’s. Following the documentation (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L95"><code>hb-gpu.cc:95</code></a>), that is:</p>
+<ul>
+<li id="ix-34"><strong>The atlas.</strong> All the blobs go into one buffer, an <strong>atlas</strong> of encoded curves rather than of pixels, each at an offset the application chooses. In OpenGL it is a texture buffer of RGBA16I, bound to the uniform <code>hb_gpu_atlas</code>. WebGL 2 has no texture buffers, so defining <code>HB_GPU_ATLAS_2D</code> before the shader source makes the atlas a 2D integer texture instead, with its width in the uniform <code>hb_gpu_atlas_width</code> (<code>hb-gpu-fragment.glsl:60</code>). In WGSL the atlas is a storage buffer, passed to each function as a pointer; in MSL a <code>device</code> pointer; in HLSL a <code>StructuredBuffer</code>.</li>
+<li id="ix-35"><strong>The vertices.</strong> Each glyph is one quad, two triangles, built from its extents and the pen position from shaping, scaled by font size over upem. Each corner carries its position, its texture coordinate (the corner of the glyph’s box in font units), an outward normal, the inverse of the font-unit-to-screen scale, and the glyph’s offset in the atlas, which the vertex shader passes on as a flat varying (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L157"><code>hb-gpu.cc:157</code></a>).</li>
+<li><strong>The uniforms.</strong> The model-view-projection matrix and the viewport size in pixels, for the vertex helper.</li>
+<li><strong>Blending.</strong> Coverage comes back as alpha, to blend with <code>GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA</code> or multiply with any color.</li>
+</ul>
+<p id="ix-36">The vertex helper, <code>hb_gpu_dilate</code> (<code>hb-gpu-vertex.glsl:43</code>), moves each corner out by half a pixel on screen, correctly under perspective, and its texture coordinate with it. Without that, the soft edge of a glyph would be cut off at the edge of its quad. An application that only draws flat text can instead pad every quad by half a pixel at the smallest size it expects, at the cost of shading more empty pixels at larger sizes (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L264"><code>hb-gpu.cc:264</code></a>). The fragment helper is <code>hb_gpu_draw</code>, and the documentation’s minimal fragment shader (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L314"><code>hb-gpu.cc:314</code></a>) is:</p>
+<pre><code class="language-glsl">in vec2 v_texcoord;
+flat in uint v_glyphLoc;
+out vec4 fragColor;
+
+void main () {
+  float coverage = hb_gpu_draw (v_texcoord, v_glyphLoc);
+  fragColor = vec4 (0.0, 0.0, 0.0, coverage);
+}
+</code></pre>
+<h3 id="what-the-fragment-shader-computes">What the fragment shader computes</h3>
+<p id="ix-37"><code>hb_gpu_draw</code> measures the size of a pixel in font units with <code>fwidth</code>, then calls the shared Slug code (<code>hb-gpu-draw-fragment.glsl:34</code>). That reads the blob’s two header texels and picks the pixel’s horizontal and vertical band from its position (<code>hb-gpu-fragment.glsl:142</code>). Then, in <code>_hb_gpu_slug_single</code> (<code>:185</code>), it casts a ray along each band from the pixel’s center, in the direction the band’s split point chooses, and walks that band’s list, trimmed here:</p>
+<pre><code class="language-glsl">for (int ci = 0; ci &lt; hCurveCount; ci++)
+{
+  …
+  if (hLeftRay) {
+    if (min (min (p12.x, p12.z), p3.x) * pixelsPerEm.x &gt; 0.5) break;
+  } else {
+    if (max (max (p12.x, p12.z), p3.x) * pixelsPerEm.x &lt; -0.5) break;
+  }
+
+  uint code = _hb_gpu_calc_root_code (p12.y, p12.w, p3.y);
+  if (code != 0U)
+  {
+    …
+    vec2 r = _hb_gpu_solve_horiz_poly (a, b, p12.xy) * pixelsPerEm.x;
+    vec2 cov = hLeftRay ? clamp (vec2 (0.5) - r, 0.0, 1.0)
+                        : clamp (r + vec2 (0.5), 0.0, 1.0);
+    …
+  }
+}
+</code></pre>
+<p id="ix-38">The <code>break</code> is why the lists are sorted: once one curve is more than half a pixel behind the ray’s start, so are the rest. For each curve still in reach, the signs of its three points relative to the ray say which of its two possible crossings count, and in which direction, without solving anything (<code>_hb_gpu_calc_root_code</code>, <code>:78</code>). For those, the shader solves the quadratic for where the curve crosses the ray, in pixels from the center. A crossing more than half a pixel ahead counts fully, one more than half a pixel behind not at all, and one in between in proportion. Added up with their signs, the crossings give the winding number, blurred across one pixel: 0 outside the glyph, 1 inside, a fraction at an edge.</p>
+<p id="ix-39">The vertical ray does the same, and <code>_hb_gpu_calc_coverage</code> (<code>:122</code>) combines the two, weighting each by how close its nearest crossing was to the pixel’s center, since the ray across an edge measures it better than the ray along it. The result is the absolute value, clamped to 0 to 1, so overlapping contours wound the same way don’t add up to more than full coverage: in effect the nonzero fill rule.</p>
+<h3 id="small-sizes">Small sizes</h3>
+<p id="ix-40">At small sizes a pixel can hold several stems, and <code>_hb_gpu_slug</code> (<code>hb-gpu-fragment.glsl:314</code>) takes four more samples, a third of a pixel from the center diagonally, and blends their average in below 16 pixels per em, fully so by 8. Defining <code>HB_GPU_NO_MSAA</code> turns that off, in the GLSL and HLSL shaders; the WGSL and MSL ones have no switch.</p>
+<p id="ix-41">The pixels per em come from the font scale in the blob’s header and the pixel size in font units (<code>hb_gpu_ppem</code>, <code>:167</code>). <code>hb_gpu_draw_glyph</code> stores the font’s scale; an application that feeds its own shapes through the draw funcs should call <code>hb_gpu_draw_set_scale</code> first. Otherwise the scale is 0, the size always comes out as 0 pixels per em, and every pixel takes the extra samples.</p>
+<p id="ix-42"><code>hb_gpu_stem_darken (coverage, brightness, ppem)</code> (<code>:344</code>) is optional. It raises an edge pixel’s coverage under dark text and lowers it under light text, so that thin stems keep their weight, and fades out between 8 and 48 pixels per em. The documentation computes its <code>ppem</code> argument as <code>1.0 / max (fwidth (v_texcoord).x, fwidth (v_texcoord).y)</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L349"><code>hb-gpu.cc:349</code></a>), and so does the <code>hb-gpu</code> viewer (<code>util/gpu/demo-fragment.glsl:35</code>). With texture coordinates in font units, as the documentation sets them up, that is pixels per unit, not per em, a thousand times too small for a 1,000-unit font, so the darkening never fades out (inferred from the code; it can’t be run here). <code>hb_gpu_ppem</code> returns the true figure. Gamma correction is left to the application, as in the documentation’s example (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L512"><code>hb-gpu.cc:512</code></a>).</p>
+<p id="ix-43">Nothing in hb-gpu hints, and nothing renders for the subpixels of an LCD.</p>
+<h3 id="limits-on-outlines">Limits on outlines</h3>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Value</th>
+<th>When it’s reached</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-44"><code>HB_GPU_DRAW_MAX_CURVES</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L135"><code>hb-limits.hh:135</code></a>)</td>
+<td>65,536 curves</td>
+<td id="ix-45">the encoder returns <code>NULL</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-draw.cc#L58"><code>hb-gpu-draw.cc:58</code></a>)</td>
+</tr>
+<tr>
+<td id="ix-46">texels in one blob</td>
+<td>65,536</td>
+<td>the same (<code>:706</code>)</td>
+</tr>
+<tr>
+<td>coordinates</td>
+<td>−8,192 to 8,191.75 units, the int16 range in quarters</td>
+<td>the same (<code>:491</code>)</td>
+</tr>
+<tr>
+<td id="ix-47"><code>HB_GPU_CU2QU_MAX_DEPTH</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-cu2qu.hh#L48"><code>hb-gpu-cu2qu.hh:48</code></a>)</td>
+<td>10 splits</td>
+<td>the remaining piece becomes a line</td>
+</tr>
+<tr>
+<td>the budget</td>
+<td>2²⁴</td>
+<td>curves stop being stored</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-48">The texel limit comes first. Each curve takes a texel of its own and an entry in two lists for every band it reaches, in each direction, so a glyph runs out of texels somewhere below 22,000 curves (inferred from the layout).</p>
+<h2 id="color-glyphs">Color glyphs</h2>
+<h3 id="the-paint-context">The paint context</h3>
+<p id="ix-49"><code>hb_gpu_paint_t</code> turns a color glyph into a blob for the shader function <code>hb_gpu_paint</code>. Its design notes put the idea in one sentence: “The fragment shader is the interpreter: it walks a flat op stream per pixel, maintains a small group stack, and composites the result” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.hh#L41"><code>hb-gpu-paint.hh:41</code></a>). The context implements the paint callbacks of <a href="color.html#the-paint-api">Color</a> and keeps a transform stack and a stack of up to three pending clips. Each clip is a glyph, or since 14.2.0 a path drawn through <code>push_clip_path_start</code>. When a color or gradient callback arrives, it becomes one layer, painted through every clip on the stack.</p>
+<p id="ix-50">Each clip’s outline is encoded as a draw blob of its own, by a draw context the paint context keeps for the purpose, with the transform that was current when the clip was pushed applied to every point (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.cc#L529"><code>hb-gpu-paint.cc:529</code></a>). A glyph clip is encoded the first time a layer needs it and reused for the other layers under it (<code>:598</code>). The same outline at two different translations is encoded twice: the design notes leave sharing those for a “v2” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.hh#L117"><code>hb-gpu-paint.hh:117</code></a>).</p>
+<p id="ix-51">Colors are settled when the glyph is encoded. <code>hb_gpu_paint_set_palette</code> chooses the palette and <code>hb_gpu_paint_set_custom_palette_color</code> overrides entries; both are kept across clears, and changing either means encoding the glyphs again. The foreground color is the exception. A layer or color stop marked as foreground is colored by an argument to the shader, with the alpha from the paint graph, “so dark-mode and color-change toggles take effect without re-encoding” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L403"><code>hb-gpu.cc:403</code></a>). That is why <code>hb_gpu_paint_glyph</code> asks HarfBuzz to paint with opaque black as the foreground (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.cc#L1480"><code>hb-gpu-paint.cc:1480</code></a>): only the alpha of a foreground color goes into the blob.</p>
+<p id="ix-52"><code>hb_gpu_paint_glyph</code> calls <code>hb_font_paint_glyph</code>, so a glyph with no color version is painted as its outline, filled with the foreground: one layer. <code>hb_gpu_paint_glyph_or_fail</code> calls <code>hb_font_paint_glyph_or_fail</code> instead, and reports when a glyph has no color version. Neither reports the encoder’s own limits: those surface as <code>hb_gpu_paint_encode</code> returning <code>NULL</code> (<code>:1415</code>).</p>
+<h3 id="the-paint-blob">The paint blob</h3>
+<p id="ix-53">The paint blob has the same texel format as the draw blob, so both kinds can share one atlas. It starts with three header texels: the number of operations, the ink box in font units, and the offset of the first operation (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.cc#L1575"><code>hb-gpu-paint.cc:1575</code></a>). Then come the operations, four kinds (<code>:41</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th id="ix-54">Texels</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>solid layer</td>
+<td>3</td>
+<td id="ix-55">flags; the offsets of up to three clip outlines; the color, as four 15-bit fractions</td>
+</tr>
+<tr>
+<td>gradient layer</td>
+<td>3</td>
+<td id="ix-56">the gradient’s kind and flags; up to three clip offsets; the offset of its parameters, its extend mode and number of stops</td>
+</tr>
+<tr>
+<td>push group</td>
+<td>1</td>
+<td>nothing more</td>
+</tr>
+<tr>
+<td>pop group</td>
+<td>1</td>
+<td id="ix-57">the composite mode, numbered as in <code>hb_paint_composite_mode_t</code></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-58">After the operations come the clip outlines, each a complete draw blob, and the gradients’ parameters. Offsets inside a paint blob are 32-bit, made of two 16-bit halves, so a paint blob can be longer than a draw blob. A gradient’s parameters hold its origin, already transformed, and its axis, radii or angles in the gradient’s own coordinates, with the inverse of the transform’s linear part as four fixed-point numbers with 10 fractional bits. Each stop takes two texels: its offset, a foreground flag, and its color (<code>:715</code>). Geometry is stored in whole font units (<code>:797</code>).</p>
+<p id="ix-59">The design notes in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.hh"><code>hb-gpu-paint.hh</code></a> describe an earlier layout (one-texel operations, 16.16 transforms, palette indices in stops); the code is what 15.1.0 writes.</p>
+<p id="ix-60">A plain glyph through the paint context shows the layout at its smallest. Here is <code>square</code> again, from <code>dump-gpu-blob limits.ttf square paint</code>, made by hand and trimmed:</p>
+<pre><code class="language-text">square: 424 bytes, 53 texels
+  0:      1      0      0      0
+  1:      0      0    100    100
+  2:      3      0      0      0
+  3:      0      1      0      6
+  4:      0      0      0      0
+  5:      0      0      0  32767
+  6:      0      0    400    400
+  7:      4      4   1000   1000
+   …
+</code></pre>
+<p id="ix-61">One operation; the box from (0, 0) to (100, 100); operations from texel 3. The operation is a solid layer (type 0) with the foreground flag (1), clipped by the outline at texel 6 and by nothing else, in black at full alpha. From texel 6 on, the draw blob from before follows unchanged. So a plain glyph costs six texels more on the paint path. The test glyphs of <a href="color.html">Color</a> encode at 480 to 504 bytes for one gradient through one clip (<code>L</code>, <code>P</code>, <code>R</code>, <code>F</code>, <code>S</code>) and 1,944 bytes for two discs and a PaintComposite (<code>X</code>, <code>M</code>).</p>
+<h3 id="the-paint-shader">The paint shader</h3>
+<p id="ix-62"><code>hb_gpu_paint_shader_source</code> adds the paint interpreter to the shared helpers. Its documentation puts the draw source between them; the overview in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L440"><code>hb-gpu.cc:440</code></a> leaves it out. The interpreter calls only the shared Slug code, so both work. The entry point is</p>
+<pre><code class="language-glsl">vec4 hb_gpu_paint (vec2 renderCoord, uint glyphLoc, vec4 foreground,
+                   out float coverage);
+</code></pre>
+<p id="ix-63">and it walks the operations in order, for every pixel (<code>hb-gpu-paint-fragment.glsl:296</code>). A layer’s coverage is the product of its clips’ coverages, each computed as in the draw shader, and skipped for a clip whose box, plus two pixels, doesn’t contain the pixel (<code>:254</code>). Its color is the baked color, or the foreground argument, or a gradient evaluated at the pixel. The pixel’s position is taken back through the stored inverse into the gradient’s own coordinates, so a gradient under a shear or uneven scale is exact, not approximated (<code>:102–191</code>). The extend modes pad, repeat and reflect are all applied (<code>:49</code>), and stops are interpolated in premultiplied color, as the <code>COLR</code> specification requires (<code>:76</code>). The layer is then composited over what has accumulated, with ordinary source-over.</p>
+<p id="ix-64">A push saves the accumulated color on a stack of four and starts afresh. A pop composites the group onto what was saved with its mode, in <code>_hb_gpu_composite</code> (<code>:196</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Modes</th>
+<th>In the shader</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CLEAR, SRC, DEST, the OVER, IN, OUT and ATOP pairs, XOR, PLUS</td>
+<td>exact</td>
+</tr>
+<tr>
+<td>SCREEN, DARKEN, LIGHTEN, MULTIPLY</td>
+<td>exact</td>
+</tr>
+<tr>
+<td>OVERLAY, COLOR_BURN, HARD_LIGHT</td>
+<td>drawn as MULTIPLY</td>
+</tr>
+<tr>
+<td>COLOR_DODGE, SOFT_LIGHT</td>
+<td>drawn as SCREEN</td>
+</tr>
+<tr>
+<td>DIFFERENCE, EXCLUSION, the four HSL modes</td>
+<td>drawn as SRC_OVER</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-65"><code>hb_gpu_paint</code> returns premultiplied color, to blend with <code>GL_ONE, GL_ONE_MINUS_SRC_ALPHA</code>. Its <code>coverage</code> output is the largest coverage of any layer at the pixel. The documentation’s example applies stem darkening and gamma to that, and scales the color to match, only at edge pixels, so that the colors inside a glyph are left as the font gave them (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L493"><code>hb-gpu.cc:493</code></a>).</p>
+<h3 id="what-isnt-supported">What isn’t supported</h3>
+<p id="ix-66"><strong>Images.</strong> The paint context’s <code>image</code> callback marks the glyph as unsupported, so a glyph from <code>sbix</code>, <code>CBDT</code> or <code>SVG </code> encodes as <code>NULL</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.cc#L1077"><code>hb-gpu-paint.cc:1077</code></a>). The callback returns false, so HarfBuzz goes on to the next table and finally the outline, as <a href="color.html#which-picture-gets-painted">Color</a> explains, but the mark stays, and the glyph still fails: the caller learns that “the glyph won’t render rather than getting a partial blob”. In <code>images.ttf</code> from <a href="color.html">Color</a>, <code>S</code>, <code>T</code> and <code>P</code> encode as <code>NULL</code>. An application can fall back to the draw context, as <code>hb-gpu-encode-all</code> does, or draw images some other way.</p>
+<p id="ix-67"><strong>Rectangle clips.</strong> ClipBoxes and PaintClipBox reach the paint context as rectangle clips, and it ignores them: “output is bigger than it should be, but renders” (<code>:1074</code>). That holds when a glyph or path clip is also on the stack. A fill whose only clip is a rectangle is dropped, because a layer needs at least one outline to be painted through (<code>:673</code>). So <code>C</code> in <a href="color.html#clipboxes-and-unbounded-paint">Color</a>’s <code>colr1.ttf</code>, a PaintSolid inside its ClipBox, encodes as the empty blob, where the other renderers paint a square.</p>
+<p id="ix-68"><strong>Variations.</strong> A blob is made from the outlines and paint graph at the font’s current variation coordinates, so each instance of a variable font needs its own encoding.</p>
+<h3 id="limits-on-color-glyphs">Limits on color glyphs</h3>
+<p id="ix-69">Each of these makes <code>hb_gpu_paint_encode</code> return <code>NULL</code> rather than a blob that would render wrongly (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.cc#L48"><code>hb-gpu-paint.cc:48</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-70"><code>HB_GPU_PAINT_MAX_OPS</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.cc#L51"><code>hb-gpu-paint.cc:51</code></a>)</td>
+<td>32,767 operations</td>
+</tr>
+<tr>
+<td id="ix-71"><code>HB_GPU_PAINT_MAX_GROUP_DEPTH</code> (<code>:52</code>)</td>
+<td>4 nested groups, the shader’s stack</td>
+</tr>
+<tr>
+<td id="ix-72"><code>HB_GPU_PAINT_MAX_CLIP_DEPTH</code> (<code>:53</code>)</td>
+<td>3 clips intersected for one layer</td>
+</tr>
+<tr>
+<td id="ix-73"><code>HB_GPU_PAINT_MAX_SUB_BLOBS</code> (<code>:54</code>)</td>
+<td>1,024 clip outlines and gradients</td>
+</tr>
+<tr>
+<td id="ix-74"><code>HB_GPU_PAINT_MAX_SUB_BYTES</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L158"><code>hb-limits.hh:158</code></a>)</td>
+<td>64 MiB of clip outlines and gradients</td>
+</tr>
+<tr>
+<td>the budget</td>
+<td>2²⁴ for the whole walk</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-75">Only the last two are in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>hb-limits.hh</code></a>, where an application can change them; the others match fixed sizes in the shader or the blob. The budget is shared by everything the walk does: the paint graph, every clip outline drawn into the scratch draw context, and every layer’s use of a clip, charged by the clip’s size in texels, since the shader walks a clip’s bands again for every layer painted through it (<code>:627</code>).</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.h"><code>src/hb-gpu.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc"><code>src/hb-gpu.cc</code></a></td>
+<td>the API, and its long usage documentation: atlas, vertex attributes, dilation, fragment shaders, stem darkening</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-draw.hh"><code>src/hb-gpu-draw.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-draw.cc"><code>src/hb-gpu-draw.cc</code></a></td>
+<td>the draw context; quantizing, banding and packing, <code>hb_gpu_draw_encode</code>, 451</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-cu2qu.hh"><code>src/hb-gpu-cu2qu.hh</code></a></td>
+<td>cubics to quadratics</td>
+</tr>
+<tr>
+<td><code>src/hb-gpu-fragment.glsl</code></td>
+<td>the shared fragment helpers: atlas access, Slug, the extra samples, stem darkening</td>
+</tr>
+<tr>
+<td><code>src/hb-gpu-draw-fragment.glsl</code>, <code>src/hb-gpu-vertex.glsl</code></td>
+<td><code>hb_gpu_draw</code>; <code>hb_gpu_dilate</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.hh"><code>src/hb-gpu-paint.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu-paint.cc"><code>src/hb-gpu-paint.cc</code></a></td>
+<td>the paint context, its design notes, the encoder and its limits, 48</td>
+</tr>
+<tr>
+<td><code>src/hb-gpu-paint-fragment.glsl</code></td>
+<td>the interpreter: gradients, composite modes, <code>hb_gpu_paint</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-gpu-*.wgsl</code></a>, <code>.msl</code>, <code>.hlsl</code></td>
+<td>the same shaders in the other three languages</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-gpu-shader-artifacts.py"><code>src/gen-gpu-shader-artifacts.py</code></a></td>
+<td>turns each shader into a C string</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/gpu-output.hh"><code>util/gpu-output.hh</code></a>, <code>util/gpu/</code></td>
+<td>the <code>hb-gpu</code> viewer, and its renderers for OpenGL, Metal and Direct3D</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-gpu-encode-all.cc"><code>util/hb-gpu-encode-all.cc</code></a></td>
+<td>encodes every glyph of a font, for sizes and timing</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>hb-gpu encodes glyphs on the CPU for a fragment shader to draw on the GPU, with Eric Lengyel’s Slug algorithm. One encoding serves every size and transform. It arrived in 14.0.0, gained color glyphs in 14.2.0, and has been stable since 15.0.0.</li>
+<li><code>hb_gpu_draw_t</code> turns an outline into quadratics, converting cubics with cu2qu to within half a unit, quantizes them to quarter units, and packs them into a blob of RGBA16I texels: a header, up to 16 bands each way with two sorted lists each, and curves that share their endpoints.</li>
+<li>The application uploads the blobs into one atlas, draws one quad per glyph, and joins HarfBuzz’s shader source, in GLSL, WGSL, MSL or HLSL, with its own <code>main</code>. <code>hb_gpu_dilate</code> pads each quad by half a pixel; <code>hb_gpu_draw</code> returns coverage from a winding number blurred over one pixel, with four more samples below 16 pixels per em.</li>
+<li><code>hb_gpu_paint_t</code> turns a color glyph into a stream of layers and groups for an interpreter in the shader. Palettes are baked in; the foreground color stays a shader argument. Gradients are exact under any transform, and most composite modes are.</li>
+<li>Images make the encoder fail, rectangle clips are ignored, and five composite modes are approximated and six drawn as source-over. A color glyph may nest four groups and intersect three clips per layer.</li>
+<li>Nothing in hb-gpu hints. Gamma correction, and the stem darkening the library offers, are the application’s choice.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="hb-vector.html">← hb-vector: rendering to SVG and PDF</a><a rel="next" href="subsetting.html">Subsetting →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

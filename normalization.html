@@ -1,0 +1,679 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Normalization · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part V · The pipeline</p>
+<h1 id="normalization">17. Normalization</h1>
+<p id="ix-1">Text arrives as Unicode, and Unicode often has more than one way to write the same thing. <em>é</em> can be one character, U+00E9, or two, <em>e</em> followed by U+0301 COMBINING ACUTE ACCENT. A font may have a glyph for one spelling and not the other, or for neither. Before any lookup runs, HarfBuzz has to settle which characters it will ask the font for, and it does so by asking the font.</p>
+<p id="ix-2">That is HarfBuzz’s normalization. It decomposes characters, puts marks into a fixed order, and composes them again, much as Unicode’s own normalization forms do. The difference is that each step is taken only if the font has glyphs for the result. The <code>cmap</code> lookups this needs are the real ones: the glyph IDs that GSUB later starts from are the ones found here.</p>
+<p id="ix-3">This chapter follows the three rounds in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc"><code>hb-ot-shape-normalize.cc</code></a>, and the choices a script shaper can make about them. The examples use one test font, <code>norm.ttf</code>, built from <code>fonts/normalization/norm.fea</code>, with the coverage below. Its glyphs are boxes, and it has no GPOS, so most examples leave positions out. Every result on this page was made by HarfBuzz 15.1.0 when the page was built.</p>
+<table>
+<thead>
+<tr>
+<th>The font has</th>
+<th>It doesn’t have</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><em>a e o u A</em>, <em>á â é ü ǜ ȫ Å</em>, Ω, the angstrom sign Å (U+212B)</td>
+<td><em>à ê ö ǘ ạ ụ ñ x</em></td>
+</tr>
+<tr>
+<td>combining grave, acute, macron, dieresis, ring above, dot below</td>
+<td>combining circumflex (U+0302)</td>
+</tr>
+<tr>
+<td>U+2010 HYPHEN, the space</td>
+<td>U+2011 NON-BREAKING HYPHEN, every other space</td>
+</tr>
+<tr>
+<td>Devanagari NA, NNNA, NUKTA and the vowel sign AA</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2 id="why-normalize-and-why-against-the-font">Why normalize, and why against the font</h2>
+<p id="ix-4">Two strings are canonically equivalent when Unicode says they mean the same text, as with the two spellings of <em>é</em> (<a href="why-shaping-exists.html#one-character-several-glyphs-or-the-other-way-round-decomposition">Why shaping exists</a> has the first example). Unicode’s normalization forms turn every equivalent string into one chosen spelling: NFD decomposes everything, and NFC decomposes and then composes everything that can be composed. Neither is what a font wants. A font with <em>á</em> but no <em>é</em> is best served by composed <em>a</em>+acute and decomposed <em>é</em>, and no normal form gives both.</p>
+<p id="ix-5">So HarfBuzz uses the font’s <code>cmap</code> as its guide. The comment at the top of <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc"><code>hb-ot-shape-normalize.cc</code></a> sets out what it is for (<code>:36</code>, trimmed):</p>
+<pre><code class="language-c++"> * In general what happens is that: each grapheme is decomposed in a chain
+ * of 1:2 decompositions, marks reordered, and then recomposed if desired,
+ * so far it's like Unicode Normalization.  However, the decomposition and
+ * recomposition only happens if the font supports the resulting characters.
+ *
+ * The goals are:
+ *
+ *   - Try to render all canonically equivalent strings similarly.  To really
+ *     achieve this we have to always do the full decomposition and then
+ *     selectively recompose from there.  It's kinda too expensive though, so
+ *     we skip some cases.  [...]
+ *
+ *   - When a font has a precomposed character for a sequence but the 'ccmp'
+ *     feature in the font is not adequate, use the precomposed character
+ *     which typically has better mark positioning.
+ *
+ *   - When a font does not support a combining mark, but supports it precomposed
+ *     with previous base, use that.  [...]
+ *
+ *   - When a font does not support a character but supports its canonical
+ *     decomposition, well, use the decomposition.
+ *
+ *   - The shapers can customize the compose and decompose functions to
+ *     offload some of their requirements to the normalizer.  [...]
+</code></pre>
+<p>Here is the first goal at work. <em>ǘ</em> is U+01D8, and its canonical decomposition is <em>u</em>, U+0308 COMBINING DIAERESIS, U+0301 COMBINING ACUTE ACCENT. It can be typed in three ways, all equivalent. A fourth line adds a different letter, <em>ǖ</em>, with a macron in place of the acute:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">ǘ</span><span class="cps">U+01D8</span></td><td class="opt">--no-positions</td><td class="out"><code>[udieresis=0|acutecomb=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">ü◌́</span><span class="cps">U+00FC U+0301</span></td><td class="opt">--no-positions</td><td class="out"><code>[udieresis=0|acutecomb=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">u◌̈◌́</span><span class="cps">U+0075 U+0308 U+0301</span></td><td class="opt">--no-positions</td><td class="out"><code>[udieresis=0|acutecomb=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">ǖ</span><span class="cps">U+01D6</span></td><td class="opt">--no-positions</td><td class="out"><code>[udieresis=0|macroncomb=0]</code></td></tr></tbody></table></div>
+<p>The first three come out the same: <em>ü</em>, which the font has, and the acute, which it also has. The font has no <em>ǖ</em> either, so it gets <em>ü</em> and the macron.</p>
+<p id="ix-6">HarfBuzz’s normalization changes only the characters it asks the font for. The text the application passed in is untouched, and clusters still point into it.</p>
+<h2 id="where-it-runs">Where it runs</h2>
+<p id="ix-7">Normalization is the second thing <code>hb_ot_substitute_default</code> does (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L882"><code>hb-ot-shape.cc:882</code></a>), after mirroring and vertical forms (<code>hb_ot_rotate_chars</code>) and before the shaper sets its feature masks. By then the text is in the script’s native direction and the shaper’s <code>preprocess_text</code> has run. <a href="pipeline-step-by-step.html">The pipeline, step by step</a> shows where this sits in the whole of shaping. In outline (<code>:882</code>, trimmed):</p>
+<pre><code class="language-c++">  hb_ot_rotate_chars (c);
+  HB_BUFFER_ALLOCATE_VAR (buffer, normalizer_glyph_index);
+  _hb_ot_shape_normalize (c-&gt;plan, buffer, c-&gt;font);
+  hb_ot_shape_setup_masks (c);
+  [...]
+  hb_ot_map_glyphs_fast (buffer);
+  HB_BUFFER_DEALLOCATE_VAR (buffer, normalizer_glyph_index);
+</code></pre>
+<p id="ix-8">Throughout normalization the buffer holds Unicode: each <code>codepoint</code> is a character. Whenever the normalizer asks the font whether it has a character, it keeps the answer in the glyph’s scratch variable <strong><code>normalizer_glyph_index</code></strong>, the whole of <code>var1</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.hh#L35"><code>hb-ot-shape-normalize.hh:35</code></a>; <a href="buffers.html#who-has-which-byte-and-when">Buffers</a> has the table of who uses which byte when). After the masks are set, <code>hb_ot_map_glyphs_fast</code> copies it into <code>codepoint</code> for every glyph and changes the buffer’s content type to glyphs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L844"><code>hb-ot-shape.cc:844</code></a>). There is no second <code>cmap</code> lookup: the “mapping” step is a copy.</p>
+<p id="ix-9">The questions go to the font funcs <code>nominal_glyph</code>, <code>nominal_glyphs</code> and <code>variation_glyph</code> (<a href="fonts-and-font-functions.html">Fonts and font functions</a>), which for hb-ot read <code>cmap</code>.</p>
+<p>The trace shows the three rounds by name. Each “start” message is a chance for a message callback to skip the round (<a href="buffers.html#messages">Buffers</a>):</p>
+<div class="trace"><div class="trace-head"><code>hb-shape norm.ttf "ǘ◌̣"  --trace</code></div><table><tbody><tr><td class="what">start decompose</td><td class="buf"><code>&lt;U+01D8=0|U+0323=0&gt;</code></td></tr><tr><td class="what">end decompose</td><td class="buf"><code>&lt;U+0075=0|U+0308=0|U+0301=0|U+0323=0&gt;</code></td></tr><tr><td class="what">start reorder</td><td class="buf"><code>&lt;U+0075=0|U+0308=0|U+0301=0|U+0323=0&gt;</code></td></tr><tr><td class="what">end reorder</td><td class="buf"><code>&lt;U+0075=0|U+0323=0|U+0308=0|U+0301=0&gt;</code></td></tr><tr><td class="what">start compose</td><td class="buf"><code>&lt;U+0075=0|U+0323=0|U+0308=0|U+0301=0&gt;</code></td></tr><tr><td class="what">end compose</td><td class="buf"><code>&lt;U+00FC=0|U+0323=0|U+0301=0&gt;</code></td></tr></tbody></table></div>
+<p>The text is <em>ǘ</em> and a dot below. The first round splits <em>ǘ</em> all the way down. The second puts the dot below (class 220) before the marks above (230). The third composes <em>u</em> with the dieresis into <em>ü</em>, and stops there: the font has no <em>ǘ</em> and no <em>ụ</em>.</p>
+<h2 id="the-modes">The modes</h2>
+<p id="ix-10">How far HarfBuzz composes is chosen by the script shaper, in its <code>normalization_preference</code> (<a href="choosing-a-script-shaper.html#what-the-choice-decides">Choosing a script shaper</a>). The <strong>normalization modes</strong> are <code>hb_ot_shape_normalization_mode_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.hh#L39"><code>hb-ot-shape-normalize.hh:39</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Used by</th>
+<th id="ix-11">Round 1: single characters</th>
+<th>Round 1: base and marks</th>
+<th>Round 3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-12"><code>NONE</code></td>
+<td id="ix-13">Hangul, Zawgyi</td>
+<td>kept if the font has them</td>
+<td>kept if the font has them</td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>DECOMPOSED</code></td>
+<td>no shaper</td>
+<td>decomposed if the font allows</td>
+<td>decomposed if the font allows</td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>COMPOSED_DIACRITICS</code></td>
+<td id="ix-14">(through <code>AUTO</code>)</td>
+<td>kept if the font has them</td>
+<td>decomposed if the font allows</td>
+<td>yes</td>
+</tr>
+<tr>
+<td><code>COMPOSED_DIACRITICS_NO_SHORT_CIRCUIT</code></td>
+<td id="ix-15">Indic, Khmer, Myanmar, USE</td>
+<td>decomposed if the font allows</td>
+<td>decomposed if the font allows</td>
+<td>yes</td>
+</tr>
+<tr>
+<td id="ix-16"><code>AUTO</code> (= <code>DEFAULT</code>)</td>
+<td>default, Arabic, Hebrew, Thai, and <code>dumber</code></td>
+<td>as <code>COMPOSED_DIACRITICS</code></td>
+<td>as <code>COMPOSED_DIACRITICS</code></td>
+<td>yes</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-17"><code>AUTO</code> is resolved when normalization starts (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc#L288"><code>hb-ot-shape-normalize.cc:288</code></a>):</p>
+<pre><code class="language-c++">  hb_ot_shape_normalization_mode_t mode = plan-&gt;shaper-&gt;normalization_preference;
+  if (mode == HB_OT_SHAPE_NORMALIZATION_MODE_AUTO)
+  {
+    if (plan-&gt;has_gpos_mark)
+      // https://github.com/harfbuzz/harfbuzz/issues/653#issuecomment-423905920
+      //mode = HB_OT_SHAPE_NORMALIZATION_MODE_DECOMPOSED;
+      mode = HB_OT_SHAPE_NORMALIZATION_MODE_COMPOSED_DIACRITICS;
+    else
+      mode = HB_OT_SHAPE_NORMALIZATION_MODE_COMPOSED_DIACRITICS;
+  }
+</code></pre>
+<p id="ix-18">Both branches give <code>COMPOSED_DIACRITICS</code>. The code still has the shape of a choice: a font whose plan has a <code>mark</code> feature (<code>has_gpos_mark</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L196"><code>hb-ot-shape.cc:196</code></a>) once got full decomposition, on the theory that a font able to position marks would rather have them separate. The commented-out line and its link to issue #653 record that this was given up. So a description of HarfBuzz that says it decomposes text for fonts with GPOS mark positioning is out of date. <code>has_gpos_mark</code> still matters to the Hebrew shaper, below. Nothing in 15.1.0 asks for <code>DECOMPOSED</code>.</p>
+<p>The table’s columns come from two flags worked out from the mode (<code>:309</code>):</p>
+<pre><code class="language-c++">  bool always_short_circuit = mode == HB_OT_SHAPE_NORMALIZATION_MODE_NONE;
+  bool might_short_circuit = always_short_circuit ||
+                             (mode != HB_OT_SHAPE_NORMALIZATION_MODE_DECOMPOSED &amp;&amp;
+                              mode != HB_OT_SHAPE_NORMALIZATION_MODE_COMPOSED_DIACRITICS_NO_SHORT_CIRCUIT);
+</code></pre>
+<p id="ix-19">To <strong>short-circuit</strong> is to keep a character the font has, without looking at its decomposition. <code>might_short_circuit</code> applies to characters with no marks after them; <code>always_short_circuit</code> to characters that marks follow too. The names, as the table shows, are misleading in one way: <code>NONE</code> doesn’t mean no normalization. It still decomposes a character the font lacks, and still reorders marks. It only never composes.</p>
+<h2 id="round-one-decompose">Round one: decompose</h2>
+<p id="ix-20">The first round copies the buffer to its output side, one character or one cluster at a time, deciding for each what to write (<a href="buffers.html#the-buffers-three-arrays">Buffers</a> explains the input and output arrays).</p>
+<h3 id="runs-without-marks">Runs without marks</h3>
+<p id="ix-21">Most text has long stretches with no combining marks at all, and the round treats those first (<code>:330</code>). It looks ahead for the next mark, and stops one character short of it, “Leave one base for the marks to cluster with” (<code>:338</code>). Everything before that is a run of single characters. In the short-circuiting modes, the whole run goes to the font in one call, <code>get_nominal_glyphs</code>, which writes each glyph straight into <code>normalizer_glyph_index</code> and stops at the first character the font doesn’t have (<code>:343</code>). That character, and the rest of the run, go one at a time through <code>decompose_current_character</code>.</p>
+<p id="ix-22">If no mark turns up in the whole buffer, the round sets nothing more, and the variable <code>all_simple</code> stays true. The second and third rounds are then skipped altogether: there is nothing to reorder or to compose with. For most Latin text, normalization is one batch <code>cmap</code> lookup.</p>
+<h3 id="one-character">One character</h3>
+<p><code>decompose_current_character</code> (<code>:150</code>) tries these, in order, and takes the first that works:</p>
+<ol>
+<li id="ix-23">In shortest mode, the character itself, if the font has it.</li>
+<li>Its decomposition, if the font has every piece (<code>decompose</code>, below).</li>
+<li id="ix-24">Otherwise, the character itself, if the font has it.</li>
+<li id="ix-25">For a space character (general category Zs), the font’s U+0020 SPACE.</li>
+<li>For U+2011 NON-BREAKING HYPHEN, the font’s U+2010 HYPHEN.</li>
+<li id="ix-26">The not-found glyph.</li>
+</ol>
+<p id="ix-27"><strong>Shortest</strong> mode is the short circuit: the <code>shortest</code> argument is <code>might_short_circuit</code> for a lone character, and <code>always_short_circuit</code> for one followed by marks. In shortest mode, step 3 can’t be reached, since step 1 asked the same question.</p>
+<p id="ix-28"><code>decompose</code> (<code>:108</code>) is recursive. Unicode’s decomposition data is stored one step at a time, each step one character into one or two (<code>decompose</code> in <a href="unicode-inside-harfbuzz.html#decomposition-and-composition">Unicode inside HarfBuzz</a>). For a character <em>ab</em> that splits into <em>a</em> and <em>b</em>:</p>
+<pre><code class="language-c++">  if (!c-&gt;decompose (c, ab, &amp;a, &amp;b) ||
+      (b &amp;&amp; !font-&gt;get_nominal_glyph (b, &amp;b_glyph)))
+    return 0;
+
+  bool has_a = (bool) font-&gt;get_nominal_glyph (a, &amp;a_glyph);
+  if (shortest &amp;&amp; has_a) {
+    /* Output a and b */
+    [...]
+  }
+
+  if (unsigned ret = decompose (c, shortest, a)) {
+    if (b) { output_char (buffer, b, b_glyph); return ret + 1; }
+    return ret;
+  }
+
+  if (has_a) { /* output a, then b */ [...] }
+
+  return 0;
+</code></pre>
+<p id="ix-29">(trimmed). The second character, nearly always a mark, has to be in the font: if it isn’t, the decomposition is refused at this level and no deeper one is tried. The first may be decomposed further. In shortest mode, HarfBuzz stops at the first level where the font has <em>a</em>. Otherwise it goes as deep as the font allows, and only falls back on <em>a</em> if <em>a</em> can’t be split. So <em>ǘ</em> in a lone character gives <em>ü</em> + acute, the shortest spelling the font supports, while <em>ǘ</em> followed by a mark, which isn’t in shortest mode, gives <em>u</em> + dieresis + acute, as in the trace above.</p>
+<p id="ix-30">The same function handles <strong>singleton</strong> decompositions, where <em>b</em> is zero. U+2126 OHM SIGN decomposes to U+03A9 GREEK CAPITAL LETTER OMEGA, and U+212B ANGSTROM SIGN to <em>Å</em>. The test font has Omega but no ohm sign:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">Ω</span><span class="cps">U+2126</span></td><td class="opt">--no-positions</td><td class="out"><code>[Omega=0]</code></td></tr></tbody></table></div>
+<p>A decomposition can also need a mark the font lacks. The font has no combining circumflex, so <em>ê</em> has nowhere to go, and nor does <em>ñ</em>, whose base the font lacks too:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">ê</span><span class="cps">U+00EA</span></td><td class="opt">--no-positions</td><td class="out"><code>[.notdef=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">ñ</span><span class="cps">U+00F1</span></td><td class="opt">--no-positions</td><td class="out"><code>[.notdef=0]</code></td></tr></tbody></table></div>
+<p id="ix-31">Each stays one character, with no glyph.</p>
+<h3 id="spaces-and-one-hyphen">Spaces, and one hyphen</h3>
+<p id="ix-32">A font with no glyph for a space character still gets a space. For each Zs character that <code>space_fallback_type</code> knows (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh#L219"><code>hb-unicode.hh:219</code></a>), the normalizer uses the glyph for U+0020, or the buffer’s invisible glyph if the font has no space either. It writes the kind of space into the character’s properties, in the byte that holds a mark’s combining class, and sets the buffer flag <code>HAS_SPACE_FALLBACK</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc#L174"><code>hb-ot-shape-normalize.cc:174</code></a>). The <strong>space fallback</strong> is completed in positioning, where each such space is given a width that suits its kind (<code>_hb_ot_shape_fallback_spaces</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-fallback.cc#L559"><code>hb-ot-shape-fallback.cc:559</code></a>): an em for EM SPACE, a fifth of one for THIN SPACE, half the space for NARROW NO-BREAK SPACE, and so on. That part is in <a href="fallbacks.html">Fallbacks</a>.</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">a a</span><span class="cps">U+0061 U+2003 U+0061</span></td><td class="opt"></td><td class="out"><code>[a=0+500|space=1+1000|a=2+500]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">a a</span><span class="cps">U+0061 U+2009 U+0061</span></td><td class="opt"></td><td class="out"><code>[a=0+500|space=1+200|a=2+500]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">a a</span><span class="cps">U+0061 U+202F U+0061</span></td><td class="opt"></td><td class="out"><code>[a=0+500|space=1+125|a=2+500]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">a a</span><span class="cps">U+0061 U+1680 U+0061</span></td><td class="opt"></td><td class="out"><code>[a=0+500|.notdef=1+500|a=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-33">All four are Zs. The last, U+1680 OGHAM SPACE MARK, is the one Zs character that <code>space_fallback_type</code> leaves out, so it gets the not-found glyph. (It is usually drawn as a visible stroke, which may be why.)</p>
+<p id="ix-34">U+2011 is a special case of its own, the only character that is “a no-break version of another character and not a space”, as the comment says (<code>:190</code>). If the font lacks it, HarfBuzz uses U+2010 HYPHEN, as it has since 1.1.0, according to <code>NEWS</code>. The test font has only U+2010:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">a‑a</span><span class="cps">U+0061 U+2011 U+0061</span></td><td class="opt">--no-positions</td><td class="out"><code>[a=0|hyphen=1|a=2]</code></td></tr></tbody></table></div>
+<p id="ix-35">Only the glyph changes: the cluster still points at U+2011.</p>
+<h3 id="not-found">Not found</h3>
+<p id="ix-36">If nothing works, the glyph is the buffer’s <strong>not-found glyph</strong>: <code>.notdef</code>, glyph 0, unless the application has set another with <code>hb_buffer_set_not_found_glyph</code> (since 3.1.0). The default argument of <code>get_nominal_glyph</code> is what puts it there: the call stores its third argument as the answer before asking the font (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L322"><code>hb-font.hh:322</code></a>), so a failed lookup leaves it in place. <code>hb-shape</code> sets it with <code>--not-found-glyph</code>. The test font has an unencoded glyph, <code>missing</code>, as glyph 27:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">x◌́</span><span class="cps">U+0078 U+0301</span></td><td class="opt">--not-found-glyph=27 --no-positions</td><td class="out"><code>[missing=0|acutecomb=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">x︀</span><span class="cps">U+0078 U+FE00</span></td><td class="opt">--not-found-glyph=27 --no-positions</td><td class="out"><code>[.notdef=0|space=0]</code></td></tr></tbody></table></div>
+<p id="ix-37">The second line shows a gap, described next.</p>
+<h3 id="clusters-with-marks">Clusters with marks</h3>
+<p id="ix-38">After the run of single characters comes a character with marks after it: one base and every mark up to the next non-mark (<code>:359</code>). “Mark” here means a general category of Mn, Mc or Me. The cluster goes to <code>decompose_multi_char_cluster</code> (<code>:255</code>), which hands each character in turn to <code>decompose_current_character</code>, now with <code>shortest</code> false except in <code>NONE</code> mode. A precomposed character followed by marks is therefore decomposed as far as the font allows, and the third round builds it back up. That is what makes <em>é</em> followed by a dot below come out the same as <em>e</em>, dot below, acute.</p>
+<p id="ix-39">If the cluster contains a variation selector, none of this happens. “Currently if there’s a variation-selector we give-up on normalization, it’s just too hard” (<code>:208</code>). <code>handle_variation_selector_cluster</code> asks the font’s <code>variation_glyph</code> func for each base and selector pair, and replaces the two with one glyph if there is one. Otherwise each character gets its nominal glyph, with no decomposition. <a href="unicode-inside-harfbuzz.html#variation-selectors">Unicode inside HarfBuzz</a> covers what then happens to the selector. Here is the cost, with <em>ö</em>, which the font has only as <em>o</em> and a dieresis:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">ö</span><span class="cps">U+00F6</span></td><td class="opt">--no-positions</td><td class="out"><code>[o=0|dieresiscomb=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">ö︀</span><span class="cps">U+00F6 U+FE00</span></td><td class="opt">--no-positions</td><td class="out"><code>[.notdef=0|space=0]</code></td></tr></tbody></table></div>
+<p id="ix-40">With a selector after it, <em>ö</em> is not decomposed, and has no glyph. The selector, unmatched, becomes an invisible space glyph.</p>
+<p id="ix-41">The gap in the earlier example is here too. This path looks glyphs up with <code>set_glyph</code> (<code>:79</code>), which calls <code>get_nominal_glyph</code> without the not-found argument, so a missing character in a cluster with a variation selector gets glyph 0 whatever the buffer’s not-found glyph is. In the second line above it, <code>x</code> came out as <code>.notdef</code>, not <code>missing</code>. That looks like an oversight in HarfBuzz (inferred: nothing in the source says it is intended).</p>
+<blockquote>
+<p>Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/97d879446fe4de6f09ece771ef645127947f7795"><code>97d8794</code></a> (17 November 2026), so on main the <code>x</code> in the second line is <code>missing</code>.</p>
+</blockquote>
+<h2 id="round-two-reorder">Round two: reorder</h2>
+<p id="ix-42">Marks of different combining classes can be typed in any order, and all the orders are equivalent. <em>a</em> with an acute (class 230) and a dot below (220) is the same text whichever is typed first. To make equivalent strings look the same to the font, the second round sorts each run of marks by class, in place (<code>:372</code>):</p>
+<pre><code class="language-c++">    for (unsigned int i = 0; i &lt; count; i++)
+    {
+      if (_hb_glyph_info_get_modified_combining_class (&amp;info[i]) == 0)
+        continue;
+
+      unsigned int end;
+      for (end = i + 1; end &lt; count; end++)
+        if (_hb_glyph_info_get_modified_combining_class (&amp;info[end]) == 0)
+          break;
+
+      /* We are going to do a O(n^2).  Only do this if the sequence is short. */
+      if (end - i &gt; HB_OT_SHAPE_MAX_COMBINING_MARKS) {
+        i = end;
+        continue;
+      }
+
+      buffer-&gt;sort (i, end, compare_combining_class);
+
+      if (plan-&gt;shaper-&gt;reorder_marks)
+        plan-&gt;shaper-&gt;reorder_marks (plan, buffer, i, end);
+
+      i = end;
+    }
+</code></pre>
+<p id="ix-43">A run is a sequence of characters with a non-zero class. The class is HarfBuzz’s modified combining class, Unicode’s class renumbered for some scripts so that the order suits fonts, and zero for anything that isn’t a mark. <a href="unicode-inside-harfbuzz.html#modified-combining-classes">Unicode inside HarfBuzz</a> lists the changes and shows Hebrew and Thai marks being reordered.</p>
+<p id="ix-44">The sort is <code>hb_buffer_t::sort</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L2239"><code>hb-buffer.cc:2239</code></a>), an insertion sort, which is stable: marks of the same class keep their order, as Unicode requires, since swapping them would change the meaning. It is also why runs are limited. Insertion sort takes time proportional to the square of the run’s length, so a run longer than <code>HB_OT_SHAPE_MAX_COMBINING_MARKS</code>, 32 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh#L42"><code>hb-ot-shaper.hh:42</code></a>), is left as typed, so that no text can make the sort slow.</p>
+<p id="ix-45">Each move merges the clusters of the characters it passes over (<code>merge_clusters</code>, <a href="buffers.html#merging-clusters">Buffers</a>). At the default cluster level, marks are in their base’s cluster already and nothing visible happens. At level 1 they are merged; at level 2 they keep their own clusters, and the glyphs are marked unsafe to break instead:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">a◌́◌̣</span><span class="cps">U+0061 U+0301 U+0323</span></td><td class="opt">--no-positions</td><td class="out"><code>[aacute=0|dotbelowcomb=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">a◌̣◌́</span><span class="cps">U+0061 U+0323 U+0301</span></td><td class="opt">--no-positions</td><td class="out"><code>[aacute=0|dotbelowcomb=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">a◌́◌̣</span><span class="cps">U+0061 U+0301 U+0323</span></td><td class="opt">--cluster-level=1 --no-positions</td><td class="out"><code>[aacute=0|dotbelowcomb=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">a◌́◌̣</span><span class="cps">U+0061 U+0301 U+0323</span></td><td class="opt">--cluster-level=2 --no-positions --show-flags</td><td class="out"><code>[aacute=0|dotbelowcomb=2#1]</code></td></tr></tbody></table></div>
+<p id="ix-46">The two orders give the same glyphs. (The acute ends up inside <em>á</em> in the next round.)</p>
+<p id="ix-47">After sorting a run, the shaper’s <code>reorder_marks</code> hook may move marks again. Two shapers have one. The Arabic shaper moves the “modifier combining marks”, such as hamza above, to the front of their run, and renumbers them to keep the run sorted (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc#L721"><code>hb-ot-shaper-arabic.cc:721</code></a>; <a href="joining-scripts.html">Joining scripts</a>). The Hebrew shaper swaps a sheva or hiriq with a following meteg or below mark when they come after a patah or qamats (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-hebrew.cc#L166"><code>hb-ot-shaper-hebrew.cc:166</code></a>; <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a>).</p>
+<p id="ix-48">A mark of class zero ends a run. The combining grapheme joiner, U+034F, is such a mark, and is how a writer stops two marks being reordered. Straight after this round, HarfBuzz looks at each CGJ to see whether it kept anything apart, and lets later lookups pass over the ones that didn’t (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc#L403"><code>hb-ot-shape-normalize.cc:403</code></a>). That check, and an example, are in <a href="unicode-inside-harfbuzz.html#cgj-sometimes">Unicode inside HarfBuzz</a>.</p>
+<h2 id="round-three-recompose">Round three: recompose</h2>
+<p id="ix-49">The last round runs only in the two <code>COMPOSED_DIACRITICS</code> modes, and only if the first round found a mark somewhere (<code>!all_simple</code>). It walks the buffer again, writing to the output, and keeps track of the <strong>starter</strong>: the last character written whose modified class is zero, the one a mark can compose with. For each character it comes to (<code>:435</code>, trimmed):</p>
+<pre><code class="language-c++">      if (_hb_glyph_info_is_unicode_mark(&amp;buffer-&gt;cur()))
+      {
+        if (/* If there's anything between the starter and this char, they should have CCC
+             * smaller than this character's. */
+            (starter == buffer-&gt;out_len - 1 ||
+             info_cc (buffer-&gt;prev()) &lt; info_cc (buffer-&gt;cur())) &amp;&amp;
+            /* And compose. */
+            c.compose (&amp;c,
+                       buffer-&gt;out_info[starter].codepoint,
+                       buffer-&gt;cur().codepoint,
+                       &amp;composed) &amp;&amp;
+            /* And the font has glyph for the composite. */
+            font-&gt;get_nominal_glyph (composed, &amp;glyph))
+        {
+          /* Composes. */
+          [...]
+          buffer-&gt;merge_out_clusters (starter, buffer-&gt;out_len);
+          buffer-&gt;out_len--; /* Remove the second composable. */
+          /* Modify starter and carry on. */
+          buffer-&gt;out_info[starter].codepoint = composed;
+          buffer-&gt;out_info[starter].normalizer_glyph_index() = glyph;
+          [...]
+          continue;
+        }
+      }
+
+      /* Blocked, or doesn't compose. */
+      if (unlikely (!buffer-&gt;next_glyph ())) break;
+
+      if (info_cc (buffer-&gt;prev()) == 0)
+        starter = buffer-&gt;out_len - 1;
+</code></pre>
+<p id="ix-50">So a character is composed into the starter only if all of these hold:</p>
+<ul>
+<li id="ix-51"><strong>It is a mark.</strong> Two base characters are never composed, “both an optimization to avoid trying to compose every two neighboring glyphs in most scripts AND a desired feature for Hangul”, whose fonts “are not designed to mix-and-match pre-composed syllables and Jamo” (<code>:438</code>). The Hangul shaper does its own composing, before normalization (<a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a>).</li>
+<li id="ix-52"><strong>It isn’t blocked.</strong> Either it comes straight after the starter, or the mark before it has a lower class. A mark with the same class or a higher one in between is <strong>blocked</strong>: Unicode’s rule, applied with the modified classes.</li>
+<li><strong>The pair composes.</strong> By Unicode’s composition data, or by the shaper’s <code>compose</code> hook.</li>
+<li><strong>The font has the result.</strong></li>
+</ul>
+<p id="ix-53">When all hold, the composite replaces the starter, with its glyph, and the mark is dropped. The new starter can compose again with a later mark. <em>ǜ</em> is <em>ü</em> plus a grave, and the font has both <em>ü</em> and <em>ǜ</em>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">u◌̈◌̀</span><span class="cps">U+0075 U+0308 U+0300</span></td><td class="opt">--no-positions</td><td class="out"><code>[udieresisgrave=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">u◌̈◌́</span><span class="cps">U+0075 U+0308 U+0301</span></td><td class="opt">--no-positions</td><td class="out"><code>[udieresis=0|acutecomb=0]</code></td></tr></tbody></table></div>
+<p id="ix-54">The first composes twice. In the second, <em>u</em> and the dieresis compose, but <em>ü</em> and the acute would make <em>ǘ</em>, which the font lacks, so the acute stays a mark: a <strong>partial composition</strong>, the same result the first section reached by decomposing <em>ǘ</em>.</p>
+<p>Blocking, with a mark the font can’t compose:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">a◌̀◌́</span><span class="cps">U+0061 U+0300 U+0301</span></td><td class="opt">--no-positions</td><td class="out"><code>[a=0|gravecomb=0|acutecomb=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">a◌́◌̀</span><span class="cps">U+0061 U+0301 U+0300</span></td><td class="opt">--no-positions</td><td class="out"><code>[aacute=0|gravecomb=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">a◌̣◌́</span><span class="cps">U+0061 U+0323 U+0301</span></td><td class="opt">--no-positions</td><td class="out"><code>[aacute=0|dotbelowcomb=0]</code></td></tr></tbody></table></div>
+<p>In the first line, <em>a</em> and the grave can’t compose, since the font has no <em>à</em>, and the grave, of the same class 230, then blocks the acute from reaching the <em>a</em>. In the second, the acute comes first and composes. The two lines are different text, so a different result is right. In the third, the dot below has a lower class than the acute, so it doesn’t block it: <em>á</em> is formed past it, and the dot below follows. This was also the result of the reordering examples above.</p>
+<p id="ix-55">The third goal in the design comment, using a precomposed glyph for a mark the font lacks, comes for free:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">a◌̂</span><span class="cps">U+0061 U+0302</span></td><td class="opt">--no-positions</td><td class="out"><code>[acircumflex=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">e◌̂</span><span class="cps">U+0065 U+0302</span></td><td class="opt">--no-positions</td><td class="out"><code>[e=0|.notdef=0]</code></td></tr></tbody></table></div>
+<p id="ix-56">The font has no combining circumflex. It has <em>â</em>, so <em>a</em> + circumflex composes; it has no <em>ê</em>, so the circumflex after <em>e</em> has no glyph.</p>
+<p>The composition is greedy, and needs every step to exist in the font. <em>ȫ</em> is <em>ö</em> plus a macron. The font has <em>ȫ</em> but not <em>ö</em>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">ȫ</span><span class="cps">U+022B</span></td><td class="opt">--no-positions</td><td class="out"><code>[odieresismacron=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">o◌̈◌̄</span><span class="cps">U+006F U+0308 U+0304</span></td><td class="opt">--no-positions</td><td class="out"><code>[o=0|dieresiscomb=0|macroncomb=0]</code></td></tr></tbody></table></div>
+<p id="ix-57">Typed precomposed, <em>ȫ</em> has its glyph. Typed as <em>o</em>, dieresis, macron, it doesn’t: <em>o</em> and the dieresis would make <em>ö</em>, which the font lacks, so they stay apart, and the dieresis then blocks the macron. This is the case the design comment means when it says that rendering all equivalent strings alike would need a search HarfBuzz doesn’t do.</p>
+<blockquote>
+<p id="ix-58">For type designers: if a font has a precomposed glyph for a letter with two marks, it should also have the letter with the first of them. Otherwise, text typed with combining marks won’t reach the precomposed glyph. “A detour about diacritics” in Simon Cozens’ <a href="https://simoncozens.github.io/fonts-and-layout/localisation.html#a-detour-about-diacritics"><em>Fonts and Layout for Global Scripts</em></a> gives a font maker’s reasons for drawing precomposed glyphs at all.</p>
+</blockquote>
+<h3 id="clusters-when-composing">Clusters when composing</h3>
+<p id="ix-59">Composing merges the clusters of the starter and the mark, and of everything between them (<code>merge_out_clusters</code>). At level 2, <code>merge_out_clusters</code> does nothing (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.hh#L419"><code>hb-buffer.hh:419</code></a>), and the mark’s cluster number disappears along with the mark, as the level 2 line in the reordering example shows: the <em>á</em> has cluster 0, and the dot below cluster 2, but no glyph has cluster 1. Decomposition, the other way, gives every piece the cluster of the character it came from.</p>
+<h3 id="the-shapers-compose-and-decompose">The shapers’ compose and decompose</h3>
+<p id="ix-60">A shaper can replace both of the Unicode funcs’ functions used here, with its <code>compose</code> and <code>decompose</code> hooks (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc#L299"><code>hb-ot-shape-normalize.cc:299</code></a>). What they change:</p>
+<ul>
+<li id="ix-61"><strong>Indic.</strong> The shaper (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc#L1473"><code>hb-ot-shaper-indic.cc:1473</code></a>) doesn’t decompose four letters: DEVANAGARI LETTER RRA, the Bengali RRA and RHA (issue #779), and TAMIL LETTER AU. Its <code>compose</code> refuses any pair whose first character is a mark, so that the parts of a split vowel sign aren’t joined back together once the first round has split it. It also composes one pair that Unicode excludes, Bengali YA + NUKTA into YYA.</li>
+<li id="ix-62"><strong>Khmer.</strong> The shaper (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-khmer.cc#L326"><code>hb-ot-shaper-khmer.cc:326</code></a>) gives five two-part vowel signs, which Unicode doesn’t decompose, a decomposition of its own: U+17C1 KHMER VOWEL SIGN E, the part written before the consonant, followed by the sign itself. Its <code>compose</code> has Indic’s rule about marks.</li>
+<li id="ix-63"><strong>USE.</strong> Its <code>compose</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use.cc#L482"><code>hb-ot-shaper-use.cc:482</code></a>) has the same rule about marks.</li>
+<li id="ix-64"><strong>Hebrew.</strong> The shaper composes the presentation forms that Unicode’s composition excludes, such as YOD + HIRIQ into U+FB1D, for “old fonts”: only when Unicode composition fails, and only if the plan has no <code>mark</code> feature (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-hebrew.cc#L81"><code>hb-ot-shaper-hebrew.cc:81</code></a>). That is the one use of <code>has_gpos_mark</code> left in normalization. <code>HB_NO_OT_SHAPER_HEBREW_FALLBACK</code> leaves it out.</li>
+</ul>
+<p id="ix-65">The script chapters, <a href="indic-model.html">The Indic model</a>, <a href="khmer-and-myanmar.html">Khmer and Myanmar</a> and <a href="universal-shaping-engine.html">The Universal Shaping Engine</a>, say why each script needs them.</p>
+<h2 id="the-short-circuit-and-its-price">The short circuit, and its price</h2>
+<p id="ix-66">The design comment admits that the short circuit is a compromise: “we simply don’t touch 1-character clusters that are supported by the font, even though their NFC may be different”. The angstrom sign shows it. Its NFC is <em>Å</em>, and the test font has both:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">Å</span><span class="cps">U+212B</span></td><td class="opt">--no-positions</td><td class="out"><code>[angstrom=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">Å</span><span class="cps">U+212B</span></td><td class="opt">--script=deva --no-positions</td><td class="out"><code>[A=0|ringcomb=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">Åa◌́</span><span class="cps">U+212B U+0061 U+0301</span></td><td class="opt">--script=deva --no-positions</td><td class="out"><code>[Aring=0|aacute=1]</code></td></tr></tbody></table></div>
+<p id="ix-67">The default shaper keeps the font’s angstrom glyph. The second and third lines force the Indic shaper, which uses <code>COMPOSED_DIACRITICS_NO_SHORT_CIRCUIT</code>, on the same text. In the third line, the angstrom sign is decomposed to <em>A</em> and ring above, and composed back into <em>Å</em>, which is what that mode is for.</p>
+<p id="ix-68">The second line shows something else. The angstrom sign is decomposed into <em>A</em> and ring, and left that way. Recomposing is skipped when <code>all_simple</code> is true, that is, when the <em>input</em> had no marks, but in this mode the first round can make marks out of characters that had none. A buffer with a single <em>é</em>, shaped by any of the four shapers that use the mode, gets <em>e</em> and an acute; add a combining mark anywhere else in the buffer, and the same <em>é</em> comes out precomposed. With real Devanagari:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">ऩ</span><span class="cps">U+0929</span></td><td class="opt">--no-positions</td><td class="out"><code>[na=0|nukta=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">ऩा</span><span class="cps">U+0929 U+093E</span></td><td class="opt">--no-positions</td><td class="out"><code>[nnna=0|aaMatra=0]</code></td></tr></tbody></table></div>
+<p id="ix-69">NNNA, which the font has, comes out as NA and NUKTA when it is alone, and as NNNA when a vowel sign (a mark, category Mc) follows it. The difference is seldom visible, because Indic fonts usually compose the nukta forms themselves, with <code>nukt</code>, and because Indic text rarely goes long without a mark. It still looks unintended (inferred: the source gives no reason for it), since the mode’s own comment promises “Always fully decomposes and then recompose back” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.hh#L43"><code>hb-ot-shape-normalize.hh:43</code></a>).</p>
+<blockquote>
+<p>Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/bc7dff9a51e900d25d35ee1a903ab496caf0feae"><code>bc7dff9</code></a> (17 November 2026), so main recomposes what the first round decomposed: the second line gives <em>Å</em>, and NNNA alone stays NNNA.</p>
+</blockquote>
+<p id="ix-70">The <code>NONE</code> mode, in contrast, does short-circuit everywhere and never composes. Zawgyi, shaped as script <code>Qaag</code>, uses it (<a href="choosing-a-script-shaper.html#myanmar-and-zawgyi">Choosing a script shaper</a>):</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">a◌́</span><span class="cps">U+0061 U+0301</span></td><td class="opt">--script=Qaag --no-positions</td><td class="out"><code>[a=0|acutecomb=0]</code></td></tr><tr><td class="font">norm.ttf</td><td class="in"><span class="txt">ǘ</span><span class="cps">U+01D8</span></td><td class="opt">--script=Qaag --no-positions</td><td class="out"><code>[udieresis=0|acutecomb=0]</code></td></tr></tbody></table></div>
+<p><em>a</em> and the acute stay apart, though the font has <em>á</em>. <em>ǘ</em>, which the font lacks, is still decomposed.</p>
+<h2 id="what-normalization-doesnt-do">What normalization doesn’t do</h2>
+<ul>
+<li id="ix-71"><strong>Compatibility decompositions.</strong> Only canonical ones are used. A font with no glyph for <em>ﬁ</em> (U+FB01) gets <code>.notdef</code>, not <em>f i</em>. The Unicode funcs once had a <code>decompose_compatibility</code> callback; HarfBuzz stopped using it in 1.1.0 and deprecated it in 2.0.0 (<code>NEWS</code>).</li>
+<li id="ix-72"><strong>Composition for its own sake.</strong> Nothing is composed unless the font has the result, and lone characters the font has are left alone even when NFC would change them.</li>
+<li id="ix-73"><strong>Closure.</strong> <code>hb_ot_shape_glyphs_closure</code>, which works out the glyphs a piece of text can use, maps each character with <code>nominal_glyph</code> and its mirror and doesn’t decompose. A comment above it says so: “TODO Move this to hb-ot-shape-normalize, make it do decompose, and make it public” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L1268"><code>hb-ot-shape.cc:1268</code></a>). So for <em>ǘ</em> in the test font, it would find no glyph at all, where shaping uses <em>ü</em> and the acute (inferred from the code; not run here).</li>
+</ul>
+<p id="ix-74">Fonts shaped with <code>morx</code> are normalized like any other, by the <code>dumber</code> shaper, in <code>AUTO</code> mode, before <code>morx</code> runs.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc"><code>src/hb-ot-shape-normalize.cc</code></a></td>
+<td>the design comment, the three rounds, <code>decompose</code>, <code>decompose_current_character</code>, the variation-selector clusters, the CGJ check</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.hh"><code>src/hb-ot-shape-normalize.hh</code></a></td>
+<td>the modes, <code>normalizer_glyph_index</code>, the context with the <code>compose</code> and <code>decompose</code> hooks</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>src/hb-ot-shape.cc</code></a></td>
+<td><code>hb_ot_substitute_default</code>, which calls normalization; <code>hb_ot_map_glyphs_fast</code>; <code>has_gpos_mark</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh"><code>src/hb-ot-shaper.hh</code></a></td>
+<td>the shaper hooks and <code>normalization_preference</code>; <code>HB_OT_SHAPE_MAX_COMBINING_MARKS</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-ot-shaper-{indic,khmer,use,hebrew,arabic}.cc</code></a></td>
+<td>the shapers’ <code>compose</code>, <code>decompose</code> and <code>reorder_marks</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh"><code>src/hb-unicode.hh</code></a></td>
+<td><code>space_fallback_type</code>, <code>is_variation_selector</code>, the modified combining classes</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-fallback.cc"><code>src/hb-ot-shape-fallback.cc</code></a></td>
+<td><code>_hb_ot_shape_fallback_spaces</code>, which gives fallback spaces their widths</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc"><code>src/hb-buffer.cc</code></a></td>
+<td><code>sort</code>, the stable sort that reorders marks</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>HarfBuzz normalizes against the font: a character is decomposed only if the font has the pieces, and composed only if the font has the result. The result is neither NFC nor NFD.</li>
+<li>This is where the <code>cmap</code> lookup happens. Its answers are kept in <code>normalizer_glyph_index</code>, and <code>hb_ot_map_glyphs_fast</code> copies them into the buffer.</li>
+<li>There are three rounds. Decompose, recursively and as deep as needed, stopping early for lone characters the font has. Reorder runs of up to 32 marks by modified combining class. Recompose marks into the last starter, unless blocked by a mark of the same or higher class.</li>
+<li><code>AUTO</code> always means <code>COMPOSED_DIACRITICS</code> now. The Indic family and USE decompose everything first; Hangul and Zawgyi never compose.</li>
+<li>Missing spaces become the space glyph, with a width set later; a missing U+2011 becomes U+2010; anything else missing becomes the not-found glyph. A cluster with a variation selector isn’t normalized at all.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="pipeline-step-by-step.html">← The pipeline, step by step</a><a rel="next" href="gsub.html">GSUB: substituting glyphs →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

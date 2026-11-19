@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The family · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part XII · HarfBuzz and its relatives</p>
+<h1 id="the-family">49. The family</h1>
+<p id="ix-1">The rest of this book has looked inside one program. This chapter looks around it: at the Rust port that the HarfBuzz project now maintains next to the C++ library, at a few smaller relatives, and at how some of the best-known programs that use HarfBuzz actually call it.</p>
+<p id="ix-2">Everything here is about software other than HarfBuzz 15.1.0, so none of it can be checked against the code in <code>.cache/harfbuzz/</code> or shown live: the book’s build can’t run a browser. (HarfRust, which the book does build, has a chapter of its own: <a href="harfrust.html">HarfRust</a>.) Each claim is taken from the other project’s own repository, documentation or announcement, linked where it is made, and read in November 2026. Repositories move on, so a version number given here is the one that was there when it was read.</p>
+<h2 id="harfrust">HarfRust</h2>
+<p id="ix-3">HarfRust is, in its <a href="https://github.com/harfbuzz/harfrust">README</a>’s words, “a Rust port of HarfBuzz text shaping engine”: the HarfBuzz project’s own port of shaping, which began as a fork of rustybuzz and reads fonts with Fontations’ <code>read-fonts</code> crate. Each release names the HarfBuzz release it matches, and HarfBuzz can call it as its <code>harfrust</code> shaper. <a href="harfrust.html">HarfRust</a> covers its history, how it is kept in step, its APIs, the Fontations crates, and every example in this book run through it.</p>
+<h2 id="other-relatives">Other relatives</h2>
+<p id="ix-4"><code>fontations</code> is the font-funcs backend that reads fonts with Fontations’ Rust crates (<a href="fonts-and-font-functions.html#the-other-funcs">Fonts and font functions</a>). The crates are a project of their own at Google Fonts. Their <a href="https://github.com/googlefonts/fontations">README</a> describes <code>read-fonts</code> as “intended to be a high performance parser, suitable for shaping”, one that “performs no allocation and no copying”, which is HarfBuzz’s own approach (<a href="fonts-as-bytes.html">Fonts as bytes</a>), and says of Skrifa: “It’s primary purpose is to replace FreeType in Google applications.” The HarfBuzz README sends readers who need hinting to “FreeType or Skrifa”.</p>
+<p id="ix-5">Several bindings live in the HarfBuzz organization on GitHub (<a href="integrations.html#other-language-bindings">Integrations</a> covers bindings as a way to use HarfBuzz):</p>
+<ul>
+<li id="ix-6"><strong>harfbuzzjs</strong> offers “HarfBuzz shaping library for client/server side JavaScript projects” (<a href="https://github.com/harfbuzz/harfbuzzjs">README</a>). It is HarfBuzz compiled to WebAssembly with Emscripten, published on npm, and its API keeps HarfBuzz’s objects: blob, face, font, buffer, <code>shape</code>.</li>
+<li id="ix-7"><strong>uharfbuzz</strong> is “Streamlined Cython bindings for the HarfBuzz shaping engine” for Python (<a href="https://github.com/harfbuzz/uharfbuzz">README</a>). It normally builds its own copy of HarfBuzz, and with <code>USE_SYSTEM_LIBS=1</code> uses the system’s. The HarfBuzz README points Python users to it, and to GObject introspection (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.python.md"><code>README.python.md</code></a>). This book’s tools read fonts with fontTools and run <code>hb-shape</code> itself, not uharfbuzz.</li>
+<li id="ix-8"><strong>harfbuzz_rs</strong> is a Rust interface over HarfBuzz’s C library, as opposed to a port of it like <a href="harfrust.html">HarfRust</a>. HarfRust uses it to benchmark against HarfBuzz (HARFBUZZ.md).</li>
+</ul>
+<h2 id="how-applications-call-harfbuzz">How applications call HarfBuzz</h2>
+<p id="ix-9">HarfBuzz’s README lists users from Android and Chrome to car displays (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.md#L174"><code>README.md:174</code></a>). Among them are some of the most widely used programs for setting type: Adobe Photoshop, Illustrator and InDesign, QuarkXPress and Scribus, as well as Microsoft Edge, Figma, Canva, Amazon’s Kindle, the PlayStation, Flutter and the Unreal game engine. Most of those are closed source, so how they call HarfBuzz can’t be examined. What follows is the open-source ones whose code could be read, and only what their source shows: whether they keep their own copy of HarfBuzz (<strong>vendoring</strong>: copying its source into their tree and building it with their own code), which version that was, which font funcs they give it, which shapers they ask for, and which <a href="buffers.html#the-four-cluster-levels">cluster level</a> they set.</p>
+<table>
+<thead>
+<tr>
+<th>Project</th>
+<th>Copy of HarfBuzz</th>
+<th>Version read</th>
+<th>Font funcs</th>
+<th>Shapers asked for</th>
+<th id="ix-10">Cluster level</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Chromium (Blink)</td>
+<td>vendored</td>
+<td>15.1.0 and 148 commits</td>
+<td>callbacks into Skia</td>
+<td><code>ot</code>, or <code>harfrust</code> in tests</td>
+<td>default</td>
+</tr>
+<tr>
+<td>Skia (SkShaper)</td>
+<td>through its DEPS</td>
+<td>a commit, not a release</td>
+<td id="ix-11">hb-ot, with a sub-font calling Skia</td>
+<td>default</td>
+<td id="ix-12">monotone characters</td>
+</tr>
+<tr>
+<td>Firefox</td>
+<td>vendored</td>
+<td>15.1.0</td>
+<td>its own, reading tables</td>
+<td>default</td>
+<td id="ix-13">monotone characters</td>
+</tr>
+<tr>
+<td>Android (minikin)</td>
+<td>vendored</td>
+<td>10.2.0 in AOSP</td>
+<td id="ix-14">a sub-font calling Skia for advances</td>
+<td>default</td>
+<td>default</td>
+</tr>
+<tr>
+<td>Pango</td>
+<td>a dependency, or built from a wrap</td>
+<td>at least 11.0.0</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>LibreOffice</td>
+<td>bundled tarball, or system</td>
+<td>15.1.0</td>
+<td id="ix-15">hb-ot, with a sub-font for <code>cmap</code></td>
+<td><code>graphite2</code>, <code>ot</code>, <code>fallback</code></td>
+<td id="ix-16">characters</td>
+</tr>
+<tr>
+<td>Qt</td>
+<td>bundled, or system</td>
+<td>15.1.0</td>
+<td>its own, calling the font engine</td>
+<td><code>graphite2</code>, <code>ot</code>, <code>fallback</code></td>
+<td>default</td>
+</tr>
+<tr>
+<td>OpenJDK</td>
+<td>vendored</td>
+<td>15.0.0</td>
+<td>its own, calling Java’s font code</td>
+<td>default</td>
+<td id="ix-17">monotone characters</td>
+</tr>
+<tr>
+<td>Godot</td>
+<td>vendored</td>
+<td>15.0.0</td>
+<td id="ix-18">hb-ft (FreeType)</td>
+<td>default</td>
+<td>default</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-19">“Default” in the last column means the code read never sets a cluster level, so HarfBuzz’s level 0 applies. Blank cells are questions the source read for this chapter didn’t answer.</p>
+<h3 id="chrome-and-skia">Chrome and Skia</h3>
+<p id="ix-20">Chromium keeps HarfBuzz in <code>third_party/harfbuzz</code>. Its <a href="https://chromium.googlesource.com/chromium/src/+/refs/heads/main/third_party/harfbuzz/README.chromium">README.chromium</a> gives the version as <code>15.1.0-148</code>, rolled on 16 November 2026: Chromium follows HarfBuzz’s main branch, not its releases. It lists files it doesn’t build, among them the Core Text, DirectWrite and Uniscribe backends, “as we rely on HarfBuzz’ built-in AAT shaping”.</p>
+<p id="ix-21">The <a href="https://chromium.googlesource.com/chromium/src/+/refs/heads/main/third_party/harfbuzz/BUILD.gn">BUILD.gn</a> is a worked example of <a href="compile-time-configuration.html">compile-time configuration</a>. It uses ICU for Unicode data (<code>HB_NO_UCD</code>, with <code>HAVE_ICU</code>). It leaves out the <code>fallback</code> backend: “Fallback shaper not required, we only use the HarfBuzz internal OT shaper.” It drops drawing, painting, buffer messages and verification, and the experimental formats (<code>HB_NO_BEYOND_64K</code>, <code>HB_NO_CUBIC_GLYF</code>, and <code>HB_NO_VAR_COMPOSITES</code> with the comment “Don’t ship VARC yet”). It keeps the subsetter, because Skia’s PDF output needs it, but without layout or CFF subsetting unless Paint Previews are built. It defines <code>HAVE_FONTATIONS</code>, and in <a href="https://chromium.googlesource.com/chromium/src/+/refs/heads/main/third_party/harfbuzz/harfbuzz.gni">harfbuzz.gni</a> <code>enable_harfrust</code> is true, so Chromium builds HarfRust 0.15 into HarfBuzz as the <code>harfrust</code> backend.</p>
+<p id="ix-22">Blink’s <a href="https://chromium.googlesource.com/chromium/src/+/refs/heads/main/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_shaper.cc">harfbuzz_shaper.cc</a> decides between the two engines on each call to <code>hb_shape_full</code> (trimmed):</p>
+<pre><code class="language-c++">const char* const harfrust_shaper_list[] = {&quot;harfrust&quot;};
+const char* const ot_shaper_list[] = {&quot;ot&quot;};
+
+inline const char* const* ShapingBackend() {
+  return RuntimeEnabledFeatures::HarfRustShapingEnabled() ? harfrust_shaper_list
+                                                          : ot_shaper_list;
+}
+</code></pre>
+<p id="ix-23">The <code>HarfRustShaping</code> feature has the status <code>test</code> in <a href="https://chromium.googlesource.com/chromium/src/+/refs/heads/main/third_party/blink/renderer/platform/runtime_enabled_features.json5">runtime_enabled_features.json5</a>, which the file defines as “Enabled in ContentShell for testing, otherwise off.” So Chrome shapes with <code>ot</code>, and the Rust port runs in Blink’s test shell.</p>
+<p id="ix-24">Blink’s font funcs, in <a href="https://chromium.googlesource.com/chromium/src/+/refs/heads/main/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_face.cc">harfbuzz_face.cc</a>, answer the nominal and variation glyph, advance, vertical origin and extents callbacks from Skia, and it gets table data from the Skia typeface. On Apple platforms one exception is made: for a font with a <code>trak</code> table and no <code>sbix</code>, the horizontal advances are left to HarfBuzz. Since the <code>harfrust</code> backend asks the HarfBuzz font for these answers, the same callbacks serve either engine (inferred, from <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a>).</p>
+<p id="ix-25">Below Blink, Skia’s own text layout module has a HarfBuzz shaper, <a href="https://github.com/google/skia/blob/main/modules/skshaper/src/SkShaper_harfbuzz.cpp">SkShaper_harfbuzz.cpp</a>. It builds a face from the typeface’s bytes, or through a table callback when it can’t, makes a font with hb-ot funcs and the typeface’s variation coordinates, and then puts a sub-font on top whose funcs ask Skia for nominal glyphs, advances and extents. Its comment is the <a href="fonts-and-font-functions.html#parents-and-sub-fonts">parents and sub-fonts</a> model in one line: “Creating a sub font means that non-available functions are found from the parent.” It shapes at <code>HB_BUFFER_CLUSTER_LEVEL_MONOTONE_CHARACTERS</code>.</p>
+<p id="ix-26">What Skia reads fonts with is changing. Chrome’s blog post <a href="https://developer.chrome.com/blog/memory-safety-fonts">Memory safety for web fonts</a> (19 March 2025) describes a Skia font backend based on Skrifa, used for web fonts on Linux, Android and ChromeOS from Chrome 133. A note added in 2026 says it was enabled for system fonts on Linux and Android in Chrome 136, and that “In Chrome 145 we removed FreeType from Blink.”</p>
+<h3 id="firefox">Firefox</h3>
+<p id="ix-27">Firefox keeps HarfBuzz in <code>gfx/harfbuzz</code>. Its <a href="https://github.com/mozilla-firefox/firefox/blob/main/gfx/harfbuzz/moz.yaml">moz.yaml</a> gives the release, 15.1.0, tracks HarfBuzz by tag, and leaves out the Core Text, DirectWrite, <code>harfrust</code> and <code>kbts</code> backends and the paint, raster and vector code.</p>
+<p id="ix-28"><a href="https://github.com/mozilla-firefox/firefox/blob/main/gfx/thebes/gfxHarfBuzzShaper.cpp">gfxHarfBuzzShaper.cpp</a> gives HarfBuzz its own Unicode funcs (<code>mozilla_harfbuzz_glue_set_up_unicode_funcs</code>) and its own font funcs: nominal and variation glyphs, horizontal and vertical advances, vertical origin, extents, contour points, font extents, and <code>glyph_h_kerning</code>, for which it reads <code>kern</code> tables itself. That is the callback HarfBuzz’s <a href="fallbacks.html#kerning-through-the-font-funcs">fallback kerning</a> asks. For a font with a <code>CFF </code> table it does less: it makes a sub-font that supplies only the nominal glyph and font extents, and leaves the rest to the parent. It sets the scale in 16.16 fixed point from the font size, passes the variation settings, and shapes at the monotone-characters level.</p>
+<h3 id="android">Android</h3>
+<p>Android’s copy is <code>external/harfbuzz_ng</code>. In AOSP’s public main branch its <a href="https://android.googlesource.com/platform/external/harfbuzz_ng/+/refs/heads/main/METADATA">METADATA</a> gives version 10.2.0, last upgraded in January 2025, and its <a href="https://android.googlesource.com/platform/external/harfbuzz_ng/+/refs/heads/main/README.android">README.android</a> notes that “Chromium updates Harfbuzz more frequently”.</p>
+<p id="ix-29">The text layout library minikin calls it in <a href="https://android.googlesource.com/platform/frameworks/minikin/+/refs/heads/main/libs/minikin/LayoutCore.cpp">LayoutCore.cpp</a>. For each font it makes a sub-font, because “We override some functions which are not thread safe.” The funcs on it supply advances and origins from Skia, for a stated reason: “we can’t use HarfBuzz’s implemenation. It may return the wrong value if the font uses hinting aggressively.” Color bitmap fonts (those with <code>CBDT</code>) get funcs that keep HarfBuzz’s own advances, “for performance reasons”.</p>
+<h3 id="pango-and-gnome">Pango and GNOME</h3>
+<p id="ix-30">Pango’s <a href="https://github.com/GNOME/pango/blob/main/NEWS">NEWS</a> (read on the GitHub mirror) records the whole relationship. Version 1.13.0 “Moved the OpenType Layout code into a new project called HarfBuzz”. 1.31.0 ported Pango to HarfBuzz 0.9, used it as an external library, and removed Pango’s Arabic, Syriac, Hangul, Hebrew, Khmer, Tibetan, Thai and Indic shapers as “replaced by harfbuzz”. 1.44.0 said “Use harfbuzz for shaping on all platforms” and stopped using FreeType for font loading, which “drops support for type1 and bitmap fonts”. 1.44.4 switched to HarfBuzz for metrics too. Pango links HarfBuzz as an ordinary dependency: its <a href="https://github.com/GNOME/pango/blob/main/meson.build">meson.build</a> asks for <code>harfbuzz &gt;= 11.0.0</code>, and a Meson wrap file in <code>subprojects/</code> points at HarfBuzz 14.4.0 for building it from source.</p>
+<h3 id="libreoffice">LibreOffice</h3>
+<p id="ix-31">LibreOffice’s <a href="https://github.com/LibreOffice/core/blob/master/download.lst">download.lst</a> names <code>harfbuzz-15.1.0.tar.xz</code> among the third-party tarballs. In <a href="https://github.com/LibreOffice/core/blob/master/vcl/source/font/LogicalFontInstance.cxx">LogicalFontInstance.cxx</a> it creates a font with hb-ot funcs, its scale set to the font’s units per em, and passes variations. When it slants a font artificially it tells HarfBuzz to do the same, “so that mark positioning is also transformed” (<a href="fonts-and-font-functions.html#slant">synthetic slant</a>). On top it puts a sub-font that replaces only the nominal and variation glyph callbacks, so that a hyphen the font has no glyph for can use the minus sign’s glyph instead (bug tdf#171555).</p>
+<p id="ix-32"><a href="https://github.com/LibreOffice/core/blob/master/vcl/source/gdi/CommonSalLayout.cxx">CommonSalLayout.cxx</a> shapes each run with an explicit list, “in the order of preference”: <code>{ &quot;graphite2&quot;, &quot;ot&quot;, &quot;fallback&quot;, nullptr }</code>. It sets the BOT and EOT flags at the ends of the text, asks for <code>HB_BUFFER_FLAG_PRODUCE_SAFE_TO_INSERT_TATWEEL</code>, which marks where a tatweel may be inserted (<a href="buffers.html#glyph-flags">Buffers</a>), and uses the characters cluster level, not monotone characters.</p>
+<h3 id="qt">Qt</h3>
+<p>Qt bundles HarfBuzz in <code>src/3rdparty/harfbuzz-ng</code>. Its <a href="https://github.com/qt/qtbase/blob/dev/src/3rdparty/harfbuzz-ng/qt_attribution.json">qt_attribution.json</a> gives version 15.1.0, and says HarfBuzz is “Optionally used in Qt GUI”, with <code>-system-harfbuzz</code> or <code>-qt-harfbuzz</code> choosing between the system library and the bundled copy. Its copyright list still includes “Nokia Corporation and/or its subsidiary(-ies)”, from the history in <a href="why-shaping-exists.html#freetype-pango-and-qt-the-first-harfbuzz">chapter 1</a>.</p>
+<p id="ix-33"><a href="https://github.com/qt/qtbase/blob/dev/src/gui/text/qharfbuzzng.cpp">qharfbuzzng.cpp</a> builds the face from a table callback into Qt’s font engine, and gives HarfBuzz Qt’s own Unicode funcs and font funcs, including <code>glyph_h_kerning</code> and <code>glyph_contour_point</code>. <a href="https://github.com/qt/qtbase/blob/dev/src/gui/text/qtextengine.cpp">qtextengine.cpp</a> passes the same shaper list as LibreOffice, <code>graphite2</code>, <code>ot</code>, <code>fallback</code>, under the comment “whitelist cross-platforms shapers only”, and sets <code>HB_BUFFER_FLAG_PRESERVE_DEFAULT_IGNORABLES</code> for symbol fonts or when the application asks to show default ignorables.</p>
+<h3 id="openjdk">OpenJDK</h3>
+<p id="ix-34">Java took HarfBuzz in JDK 9. <a href="https://openjdk.org/jeps/258">JEP 258</a> proposed to “Replace the existing ICU OpenType font-layout engine with HarfBuzz”, because ICU’s layout engine “is no longer actively developed and IBM, the project owner, intends to replace it with HarfBuzz in the ICU project”. It found “no viable open-source alternatives to HarfBuzz”. The JDK keeps its copy in <code>src/java.desktop/share/native/libharfbuzz</code>, at 15.0.0 according to its <a href="https://github.com/openjdk/jdk/blob/master/src/java.desktop/share/legal/harfbuzz.md">legal notice</a>.</p>
+<p id="ix-35">Its glue, <a href="https://github.com/openjdk/jdk/blob/master/src/java.desktop/share/native/libfontmanager/hb-jdk-font.cc">hb-jdk-font.cc</a>, builds the face from a table callback and gives HarfBuzz a full set of font funcs that call back into Java’s font code, including kerning, contour points and glyph names. <a href="https://github.com/openjdk/jdk/blob/master/src/java.desktop/share/native/libfontmanager/HBShaper.c">HBShaper.c</a> shapes at the monotone-characters level, with no shaper list.</p>
+<h3 id="godot">Godot</h3>
+<p id="ix-36">The Godot game engine vendors HarfBuzz in <code>thirdparty/harfbuzz</code>. Its <a href="https://github.com/godotengine/godot/blob/master/thirdparty/README.md">thirdparty/README.md</a> gives version 15.0.0, and lists what it leaves out: among others <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-harfrust.cc"><code>hb-harfrust.cc</code></a>, <code>rust/*</code>, <code>hb-wasm*</code> and <code>hb-gpu*</code>. Its advanced text server, <a href="https://github.com/godotengine/godot/blob/master/modules/text_server_adv/text_server_adv.cpp">text_server_adv.cpp</a>, is the only project here that uses HarfBuzz’s FreeType funcs, <code>hb_ft_font_create</code>, and asks HarfBuzz for synthetic bold when a font is emboldened. For its bitmap fonts it supplies font funcs of its own.</p>
+<h3 id="what-they-have-in-common">What they have in common</h3>
+<p id="ix-37">Most of these programs let HarfBuzz read the layout tables but answer some of its questions about glyphs themselves, from the code that also renders them: Skia, Android and LibreOffice with a sub-font over hb-ot (<a href="fonts-and-font-functions.html#parents-and-sub-fonts">Fonts and font functions</a>), Firefox, Qt and OpenJDK with whole sets of funcs. Android’s comment gives one reason, hinted advances; keeping shaping and drawing in agreement is the general one (inferred). The platform backends hardly appear: Chromium stopped building Core Text in favor of HarfBuzz’s own AAT code, Firefox leaves the Core Text and DirectWrite files out, and Qt and LibreOffice name only cross-platform shapers. And while Chromium builds HarfRust in and tests with it, Firefox and Godot leave <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-harfrust.cc"><code>hb-harfrust.cc</code></a> out of their copies.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>Where</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-harfrust.cc"><code>src/hb-harfrust.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/rust/shape.rs"><code>src/rust/shape.rs</code></a>, <code>src/rust/Cargo.toml</code></td>
+<td>HarfBuzz’s side of the <code>harfrust</code> backend, and the HarfRust version it builds</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/rust/font.rs"><code>src/rust/font.rs</code></a></td>
+<td>the <code>fontations</code> font funcs</td>
+</tr>
+<tr>
+<td><code>NEWS</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.md"><code>README.md</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.python.md"><code>README.python.md</code></a></td>
+<td>HarfBuzz’s record of the HarfRust backend, its list of users, and its Python bindings</td>
+</tr>
+<tr>
+<td>harfrust: <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.md"><code>README.md</code></a>, <code>CHANGELOG.md</code>, <code>HARFBUZZ.md</code>, <code>harfrust_capi/README.md</code></td>
+<td>what HarfRust ports, which HarfBuzz each release matches, how it is tested against HarfBuzz, and its C API</td>
+</tr>
+<tr>
+<td>Chromium: <code>third_party/harfbuzz/</code>, <code>third_party/blink/renderer/platform/fonts/shaping/</code></td>
+<td>Chromium’s copy and build of HarfBuzz, and Blink’s font funcs and shaper</td>
+</tr>
+<tr>
+<td>Skia: <code>modules/skshaper/src/SkShaper_harfbuzz.cpp</code></td>
+<td>Skia’s HarfBuzz shaper</td>
+</tr>
+<tr>
+<td>Firefox: <code>gfx/harfbuzz/moz.yaml</code>, <code>gfx/thebes/gfxHarfBuzzShaper.cpp</code></td>
+<td>Firefox’s copy and its shaper</td>
+</tr>
+<tr>
+<td>Android: <code>external/harfbuzz_ng/</code>, <code>frameworks/minikin/libs/minikin/LayoutCore.cpp</code></td>
+<td>Android’s copy, and minikin’s calls</td>
+</tr>
+<tr>
+<td>LibreOffice: <code>vcl/source/font/LogicalFontInstance.cxx</code>, <code>vcl/source/gdi/CommonSalLayout.cxx</code></td>
+<td>LibreOffice’s fonts and shaping</td>
+</tr>
+<tr>
+<td>Qt: <code>src/gui/text/qharfbuzzng.cpp</code>, <code>src/gui/text/qtextengine.cpp</code></td>
+<td>Qt’s glue and shaping</td>
+</tr>
+<tr>
+<td>OpenJDK: <code>src/java.desktop/share/native/libfontmanager/</code></td>
+<td>the JDK’s glue and shaping</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>HarfRust is the HarfBuzz project’s Rust port of shaping. It began as a fork of rustybuzz that reads fonts with Fontations instead of ttf-parser, and is now developed with Google Fonts.</li>
+<li>HarfBuzz leads and HarfRust follows: each HarfRust release names the HarfBuzz release it matches, and 0.16.0 matches 15.1.0. HarfBuzz 15.1.0 itself builds HarfRust 0.15.</li>
+<li>HarfRust ports shaping and Unicode, and leaves font parsing, subsetting and drawing to the Fontations crates. It has no ppem (it scales with <code>ShaperFont::set_scale</code>), no platform integrations and no Graphite, and it now has a C API with HarfBuzz’s names.</li>
+<li>Most large users vendor HarfBuzz: Chromium follows its main branch, and Firefox, Qt and LibreOffice were on 15.1.0 when read. Pango takes it as an ordinary dependency.</li>
+<li>Most of them give HarfBuzz font funcs that answer from their own rendering code, often on a sub-font over hb-ot, and shape with <code>ot</code>. Chromium builds the <code>harfrust</code> backend but uses it only in tests.</li>
+</ul>
+<p>HarfBuzz 15.1.0 is one release of a program that changes every few weeks, and some of what this book describes will have changed by the time it is read. The book’s examples run when it is built, so building it again against a newer HarfBuzz will show what has changed.</p>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="harfrust.html">← HarfRust</a><a rel="next" href="feature-order.html">Feature order →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

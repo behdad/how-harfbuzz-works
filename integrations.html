@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Integrations: FreeType, cairo, ICU and the platforms · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part XI · Using HarfBuzz</p>
+<h1 id="integrations-freetype-cairo-icu-and-the-platforms">45. Integrations: FreeType, cairo, ICU and the platforms</h1>
+<p id="ix-1">HarfBuzz’s core needs nothing but a C++ compiler. It reads fonts itself, carries its own Unicode tables, and returns glyph IDs and positions as plain numbers. But the programs that call it already have a font library, a graphics library, a Unicode library or an operating system’s text stack, and they want HarfBuzz to work with the objects those already hold: an <code>FT_Face</code>, a <code>cairo_t</code>, a <code>CTFont</code>, a <code>UScriptCode</code>. The <strong>integration layers</strong> are the small files that make the connection, each with its own header: <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.h"><code>hb-ft.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cairo.h"><code>hb-cairo.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-icu.h"><code>hb-icu.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-glib.h"><code>hb-glib.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext.h"><code>hb-coretext.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-directwrite.h"><code>hb-directwrite.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-uniscribe.h"><code>hb-uniscribe.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gdi.h"><code>hb-gdi.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-graphite2.h"><code>hb-graphite2.h</code></a> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gobject.h"><code>hb-gobject.h</code></a>.</p>
+<p id="ix-2">None of them changes how text is shaped. What they offer falls into four kinds: a face made from another library’s font object, so HarfBuzz reads tables through it; font funcs that ask that library for metrics and outlines, in place of <a href="fonts-and-font-functions.html#hb-ot-the-default-funcs">hb-ot</a>; Unicode funcs from another library’s character database; and conversions between HarfBuzz’s types and the other library’s. A few also carry a shaping backend, which <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a> covers. This chapter takes the layers one at a time: what each adds, and when an application would want it.</p>
+<p id="ix-3">Most of the layers aren’t in the HarfBuzz this book is built with. Their output on this page was produced by hand, from a build of HarfBuzz 15.1.0 on macOS with FreeType, cairo, ICU, GLib, GObject, Core Text and Graphite turned on, and each example says so.</p>
+<h2 id="which-layer-is-where">Which layer is where</h2>
+<p id="ix-4">Each layer is turned on by a Meson option (<a href="building-harfbuzz.html#optional-dependencies-and-backends">Building HarfBuzz</a>). Some are compiled into <code>libharfbuzz</code> itself; others are libraries of their own, so that a program that doesn’t use them doesn’t link their dependencies (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.md#L30"><code>README.md:30</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th>Header</th>
+<th>Option (default)</th>
+<th>Library</th>
+<th>What it adds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-5"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.h"><code>hb-ft.h</code></a></td>
+<td><code>freetype</code> (auto)</td>
+<td><code>libharfbuzz</code></td>
+<td id="ix-6">faces and fonts from an <code>FT_Face</code>; FreeType font funcs; a face loader</td>
+</tr>
+<tr>
+<td id="ix-7"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-glib.h"><code>hb-glib.h</code></a></td>
+<td id="ix-8"><code>glib</code> (auto)</td>
+<td><code>libharfbuzz</code></td>
+<td id="ix-9">GLib’s Unicode funcs; script conversions; blobs from <code>GBytes</code></td>
+</tr>
+<tr>
+<td id="ix-10"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-icu.h"><code>hb-icu.h</code></a></td>
+<td><code>icu</code> (auto)</td>
+<td><code>libharfbuzz-icu</code>, or <code>libharfbuzz</code> with <code>icu_builtin</code></td>
+<td id="ix-11">ICU’s Unicode funcs; script conversions</td>
+</tr>
+<tr>
+<td id="ix-12"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cairo.h"><code>hb-cairo.h</code></a></td>
+<td><code>cairo</code> (auto)</td>
+<td><code>libharfbuzz-cairo</code></td>
+<td id="ix-13">cairo font faces that draw through HarfBuzz; cairo glyphs from a buffer</td>
+</tr>
+<tr>
+<td id="ix-14"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext.h"><code>hb-coretext.h</code></a></td>
+<td><code>coretext</code> (off)</td>
+<td><code>libharfbuzz</code></td>
+<td>faces from a <code>CGFont</code>, fonts from a <code>CTFont</code>; Core Text font funcs and shaper</td>
+</tr>
+<tr>
+<td id="ix-15"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-directwrite.h"><code>hb-directwrite.h</code></a></td>
+<td><code>directwrite</code> (off)</td>
+<td><code>libharfbuzz</code></td>
+<td>faces and fonts from an <code>IDWriteFontFace</code>; DirectWrite font funcs and shaper</td>
+</tr>
+<tr>
+<td id="ix-16"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gdi.h"><code>hb-gdi.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-uniscribe.h"><code>hb-uniscribe.h</code></a></td>
+<td><code>gdi</code> (off)</td>
+<td><code>libharfbuzz</code></td>
+<td>a face from an <code>HFONT</code>; the Uniscribe shaper</td>
+</tr>
+<tr>
+<td id="ix-17"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-graphite2.h"><code>hb-graphite2.h</code></a></td>
+<td><code>graphite2</code> (off)</td>
+<td><code>libharfbuzz</code></td>
+<td>the Graphite shaper; the <code>gr_face</code> behind a face</td>
+</tr>
+<tr>
+<td id="ix-18"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gobject.h"><code>hb-gobject.h</code></a></td>
+<td><code>gobject</code> (auto)</td>
+<td><code>libharfbuzz-gobject</code></td>
+<td>GObject types, for introspection</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-19">“Auto” means the layer is built if Meson finds the library (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson_options.txt#L2"><code>meson_options.txt:2</code></a> and on). The platform options are off by default, and they are also limited to their platforms: <code>gdi</code> and <code>directwrite</code> are checked only when the host is Windows, <code>coretext</code> only on Darwin (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build#L300"><code>meson.build:300</code></a> to <code>:350</code>).</p>
+<p id="ix-20">A program can test what its HarfBuzz was built with. <code>hb-features.h</code>, installed with the headers, defines <code>HB_HAS_FREETYPE</code>, <code>HB_HAS_CAIRO</code>, <code>HB_HAS_ICU</code> and the rest for the layers that were built (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L586"><code>src/meson.build:586</code></a>). One of them never appears: the list asks for <code>HAVE_GRAPHITE</code>, but the build sets <code>HAVE_GRAPHITE2</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build#L253"><code>meson.build:253</code></a>), so <code>HB_HAS_GRAPHITE</code> stays undefined even when the Graphite shaper is there. In the hand-built HarfBuzz described above, <code>hb-shape --list-shapers</code> lists <code>graphite2</code>, and <code>hb-features.h</code> says <code>#undef HB_HAS_GRAPHITE</code>.</p>
+<blockquote>
+<p id="ix-21">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/2b873b805800dcad37827f90a5c28ccb6ccc4ba8"><code>2b873b8</code></a> and <a href="https://github.com/harfbuzz/harfbuzz/commit/506cc943b3c2ad82c5398361afdaf6e9eaad6b0f"><code>506cc94</code></a> (17 November 2026), so main’s <code>hb-features.h</code> defines <code>HB_HAS_GRAPHITE</code> when the Graphite shaper is built.</p>
+</blockquote>
+<h2 id="freetype-hb-ft">FreeType: hb-ft</h2>
+<p id="ix-22">FreeType is the oldest partner. For years an application on Linux or Android opened a font with FreeType, made a HarfBuzz font from the same <code>FT_Face</code>, shaped with HarfBuzz and rasterized with FreeType, and <code>hb-ft</code> exists to make that one step. <a href="fonts-and-font-functions.html#the-other-funcs">Fonts and font functions</a> describes the FreeType font funcs themselves: how they set FreeType’s size, the lock they take, and the kerning and contour-point callbacks only they provide. This section is about the API around them.</p>
+<h3 id="faces">Faces</h3>
+<p id="ix-23"><code>hb_ft_face_create (ft_face, destroy)</code> makes a face that reads the font’s data through FreeType. If FreeType holds the whole font in memory, as it does for a face opened with <code>FT_New_Memory_Face</code>, the face is made over that memory directly; otherwise each table is fetched with <code>FT_Load_Sfnt_Table</code> as it is asked for (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L1333"><code>hb-ft.cc:1333</code></a>, <code>:1355</code>). Either way, the face is an ordinary one, and a font made from it gets hb-ot’s funcs unless told otherwise (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L1310"><code>hb-ft.cc:1310</code></a>).</p>
+<p id="ix-24">There are three versions, which differ only in who keeps the <code>FT_Face</code> alive. The header is unusually direct about which to choose (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.h#L81"><code>hb-ft.h:81</code></a>):</p>
+<ul>
+<li id="ix-25"><code>hb_ft_face_create_referenced</code> calls <code>FT_Reference_Face</code>, and <code>FT_Done_Face</code> when the face is destroyed. “This is the most convenient version to use. Use it unless you have very good reasons not to.”</li>
+<li id="ix-26"><code>hb_ft_face_create</code> does no reference counting. The caller must keep the <code>FT_Face</code> until the face is gone, and <code>destroy</code> is called with the <code>FT_Face</code> when it is.</li>
+<li id="ix-27"><code>hb_ft_face_create_cached</code> stores the face in the <code>FT_Face</code>’s <code>generic</code> field, so that asking again for the same <code>FT_Face</code> returns the same face. If something else was already using that field, its finalizer is run and the field is taken over (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L1432"><code>hb-ft.cc:1432</code></a>).</li>
+</ul>
+<p id="ix-28">Since 10.1.0 and 11.0.0, <code>hb_ft_face_create_from_file_or_fail</code> and <code>hb_ft_face_create_from_blob_or_fail</code> let FreeType open the file itself, with a FreeType library HarfBuzz keeps for the purpose. Their documentation gives the reason to: “This can be useful, for example, to load WOFF and WOFF2 font data” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L1767"><code>hb-ft.cc:1767</code></a>), which HarfBuzz’s own loader can’t unpack. They are also the <code>ft</code> <a href="blobs-faces-and-lazy-tables.html#face-loaders">face loader</a>, so <code>hb-shape --face-loader=ft</code> uses them.</p>
+<h3 id="fonts">Fonts</h3>
+<p id="ix-29"><code>hb_ft_font_create (ft_face, destroy)</code> and <code>hb_ft_font_create_referenced (ft_face)</code> make the face and the font together, and install FreeType’s funcs on the font (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L1483"><code>hb-ft.cc:1483</code></a>). The same advice applies: use the referenced one. <code>hb_ft_font_set_funcs</code> does the opposite job. It takes a font made from any face, such as one from <code>hb_face_create</code>, opens a private <code>FT_Face</code> on the face’s blob, and installs FreeType’s funcs on that (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L1918"><code>hb-ft.cc:1918</code></a>). That private face is HarfBuzz’s own, and nothing outside can reach it except through <code>hb_ft_font_get_ft_face</code>.</p>
+<p id="ix-30">When the font is made from an <code>FT_Face</code>, the <code>FT_Face</code> must already have a size, because hb-ft reads it unconditionally (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.h#L102"><code>hb-ft.h:102</code></a>). The font’s scale is copied from it, and its units are FreeType’s: 26.6 fixed point, 64 units to the pixel. <code>hb_ft_font_changed</code> computes the scale from the face’s size metrics (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L1510"><code>hb-ft.cc:1510</code></a>), and since FreeType’s <code>x_scale</code> converts font units to 64ths of a pixel, the result is the pixel size times 64. Every advance and offset HarfBuzz returns for that font is then in 64ths of a pixel, as FreeType’s own numbers are. Variation coordinates are copied too, as normalized coordinates (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L1537"><code>hb-ft.cc:1537</code></a>).</p>
+<p id="ix-31">Here is that in use. This is hand-written to show the calls, with no error checking:</p>
+<pre><code class="language-c">FT_Face ft_face;
+FT_New_Face (ft_library, &quot;Roboto-Regular.ttf&quot;, 0, &amp;ft_face);
+FT_Set_Pixel_Sizes (ft_face, 0, 11);          /* 11 pixels per em */
+
+hb_font_t *font = hb_ft_font_create_referenced (ft_face);
+/* hb_font_get_scale now gives 704: 11 × 64 */
+hb_ft_font_set_load_flags (font, FT_LOAD_DEFAULT);   /* hinted */
+
+hb_shape (font, buffer, NULL, 0);
+/* x_advance values are in 64ths of a pixel */
+
+hb_font_destroy (font);        /* drops HarfBuzz's reference */
+FT_Done_Face (ft_face);        /* drops ours */
+</code></pre>
+<p id="ix-32">The <strong>load flags</strong> are what hb-ft passes to every <code>FT_Load_Glyph</code> and <code>FT_Get_Advance</code> call. They start as <code>FT_LOAD_DEFAULT | FT_LOAD_NO_HINTING</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L130"><code>hb-ft.cc:130</code></a>), so a FreeType font is unhinted until <code>hb_ft_font_set_load_flags</code> says otherwise. Hinting is the main reason to use hb-ft at all, and <a href="hb-raster.html#hinting-with-freetype">hb-raster</a> shows what it changes, in pixels and in advances.</p>
+<h3 id="keeping-the-two-in-step">Keeping the two in step</h3>
+<p id="ix-33">A font made with hb-ft has its size in two places: the <code>hb_font_t</code>’s scale and coordinates, and the <code>FT_Face</code>’s size and design coordinates. There are two functions for keeping them together, one for each direction.</p>
+<p id="ix-34"><strong>From FreeType to HarfBuzz.</strong> After the application changes the <code>FT_Face</code>, with <code>FT_Set_Char_Size</code> or <code>FT_Set_Var_Design_Coordinates</code>, it must call <code>hb_ft_font_changed</code>, which reads the scale and coordinates back. Nothing calls it automatically. Until it’s called, the <code>hb_font_t</code> still has its old scale, and hb-ft’s advance cache still has the old advances, while FreeType measures any glyph it hasn’t cached at the new size. Here is a hand-run program built against the FreeType-enabled HarfBuzz described above, with Roboto, load flags <code>FT_LOAD_DEFAULT</code>, and advances in 64ths of a pixel. It shapes <code>HH</code> at 11 pixels, then sets the <code>FT_Face</code> to 22 pixels and shapes <code>HO</code>, then calls <code>hb_ft_font_changed</code> and shapes <code>HO</code> again:</p>
+<pre><code>11 px                        H=512 H=512
+FT at 22 px, not told        H=512 O=960
+after hb_ft_font_changed     H=1024 O=960
+</code></pre>
+<p id="ix-35">In the middle line, the <code>H</code> comes from the cache, at 11 pixels, and the <code>O</code> from FreeType, at 22: one run, two sizes.</p>
+<p id="ix-36"><strong>From HarfBuzz to FreeType.</strong> The other direction is now automatic. Every hb-ft callback compares the font’s serial number with the one it last saw, and if the font has changed, it sets FreeType’s size and coordinates from it before answering (<code>_hb_ft_hb_font_check_changed</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L252"><code>hb-ft.cc:252</code></a>, called at <code>:526</code> and in every callback after it). <code>hb_ft_hb_font_changed</code>, added in 4.4.0 to do this by hand, says that “as of version 11.0.0, calling this function is not necessary” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L1566"><code>hb-ft.cc:1566</code></a>), though the documentation of <code>hb_ft_font_set_funcs</code> still tells the reader to call it (<code>:1909</code>). The change is made to the <code>FT_Face</code> itself, so when it is the application’s own face, the application sees it: in the program above, setting the font’s scale back to 704 with <code>hb_font_set_scale</code> put the <code>FT_Face</code> back to 11 pixels per em.</p>
+<p id="ix-37">hb-ft turns the scale into a FreeType size in a simple way: it passes the scale to <code>FT_Set_Char_Size</code> as a character size in 26.6 points at FreeType’s default 72 dpi (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L190"><code>hb-ft.cc:190</code></a>). A font scaled in 64ths of a pixel gets the right FreeType size; one scaled in font units or whole pixels is set to a meaningless one, which matters only when hinting is on. A negative scale becomes a FreeType transform. If FreeType can’t set the size and the font has bitmap strikes, as color emoji fonts often do, hb-ft picks the largest strike and scales it with a transform instead (<code>:202</code>).</p>
+<h3 id="locking">Locking</h3>
+<p id="ix-38">The header warns that FreeType “is not thread-safe. Hence, these functions are not either” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.h#L40"><code>hb-ft.h:40</code></a>). What hb-ft does about it is to give each font a mutex and hold it during every FreeType call. An application that uses the same <code>FT_Face</code> itself, from another thread, can take the same lock: <code>hb_ft_font_lock_face</code> returns the <code>FT_Face</code> with the lock held, and blocks HarfBuzz’s calls until <code>hb_ft_font_unlock_face</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L383"><code>hb-ft.cc:383</code></a>).</p>
+<h3 id="when-to-use-it-and-when-not">When to use it, and when not</h3>
+<p id="ix-39">Use hb-ft when shaping must agree with FreeType’s numbers: when text is rasterized hinted by FreeType, and its advances must be the hinted ones, or when the font is one HarfBuzz can’t read but FreeType can, such as WOFF, or a Type 1 font whose kerning only FreeType knows (<a href="fonts-and-font-functions.html#the-other-funcs">Fonts and font functions</a>). The <code>FT_Face</code> an application already has is also a convenient source of a face, through <code>hb_ft_face_create_referenced</code>, even when its funcs aren’t wanted.</p>
+<p id="ix-40">Otherwise, hb-ot is usually right. It is the default for every new font (<a href="fonts-and-font-functions.html#choosing-funcs">Choosing funcs</a>), it reads every table HarfBuzz’s shaper reads, its outlines and metrics vary with the font, and it takes no lock. hb-ft with hinting off gives the same advances, at the cost of a lock and a second copy of the font’s state. In the hand-built HarfBuzz, <code>hb-shape --font-funcs=ft</code> and <code>--font-funcs=ot</code> give identical output for Roboto at its default scale.</p>
+<h2 id="cairo-hb-cairo">cairo: hb-cairo</h2>
+<p id="ix-41">cairo is a 2D graphics library, used by GTK among others. <code>hb-cairo</code>, added in 7.0.0 as “a separate harfbuzz-cairo library” (<code>NEWS</code>), connects it to HarfBuzz in both directions: it lets cairo draw glyphs with HarfBuzz’s outlines and paint, and it converts a shaped buffer into the glyph array cairo draws.</p>
+<h3 id="font-faces">Font faces</h3>
+<p id="ix-42"><code>hb_cairo_font_face_create_for_font (font)</code> makes a cairo font face from a HarfBuzz font. It is a cairo <em>user font</em>: cairo calls back into HarfBuzz to draw each glyph, which hb-cairo does with <code>hb_font_draw_glyph_or_fail</code> and the draw funcs of <a href="drawing-outlines.html">Drawing outlines</a>, or, for color glyphs, <code>hb_font_paint_glyph</code> with paint funcs that turn the <a href="color.html">paint graph</a> into cairo operations (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cairo.cc#L750"><code>hb-cairo.cc:750</code></a>, <code>:780</code>). The HarfBuzz font is made immutable. Its variations and synthetic slant and bold show in the result, but its scale doesn’t: cairo’s font matrix sets the size (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cairo.cc#L852"><code>hb-cairo.cc:852</code></a>).</p>
+<p id="ix-43"><code>hb_cairo_font_face_create_for_face (face)</code> makes a font face from a face instead, and a new HarfBuzz font is made for each cairo scaled font. Its variations come from the cairo font options, and its scale is the cairo font matrix times the <strong>scale factor</strong> set with <code>hb_cairo_font_face_set_scale_factor</code>, or the units per em if none was set (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cairo.cc#L643"><code>hb-cairo.cc:643</code></a>). <code>hb_cairo_font_face_set_font_init_func</code> installs a callback to adjust each new font before it is used.</p>
+<p id="ix-44">Because it is drawn by HarfBuzz, such a font face works on any cairo surface, in color, but unhinted, as the user manual notes (<code>docs/usermanual-integration.xml:349</code>). It also supports cairo’s simple text API. Given <code>cairo_show_text</code>, it shapes the string with <code>hb_shape</code> after <code>hb_buffer_guess_segment_properties</code>, with no features and no control over language or direction (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cairo.cc#L715"><code>hb-cairo.cc:715</code></a>). That is fine for a label; for real text, shape with HarfBuzz and pass cairo the glyphs.</p>
+<h3 id="glyphs-from-a-buffer">Glyphs from a buffer</h3>
+<p id="ix-45"><code>hb_cairo_glyphs_from_buffer</code> does that conversion. It takes the shaped buffer, a scale factor for each axis, an origin, and optionally the UTF-8 text, and fills an array of <code>cairo_glyph_t</code> with absolute positions: each glyph’s offset added to the sum of the advances before it, divided by the scale factor, with y flipped, since cairo’s y grows downward (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cairo.cc#L1163"><code>hb-cairo.cc:1163</code></a>). The array has one more entry than there are glyphs, holding the total advance. With the text, it also fills cairo’s cluster array, for <code>cairo_show_text_glyphs</code>, which lets PDF output keep the text searchable. cairo’s clusters must be monotonic, so if the buffer’s aren’t, everything becomes one cluster (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cairo.cc#L1146"><code>hb-cairo.cc:1146</code></a>).</p>
+<p id="ix-46">The scale factor is whatever relates the HarfBuzz font’s scale to cairo’s font size. Shaping <code>Ham</code> with the 11-pixel FreeType font above, whose units are 64ths of a pixel, and passing 64 for both, gives glyphs at x = 0, 8 and 14, and an extra entry at 24: whole pixels, since the advances were hinted (hand-run). The doc comment has the descriptions of the two scale-factor parameters swapped: “@x_scale_factor: scale factor to divide #hb_position_t Y values by” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cairo.cc#L1056"><code>hb-cairo.cc:1056</code></a>).</p>
+<h3 id="how-hb-view-uses-it">How hb-view uses it</h3>
+<p id="ix-47"><code>hb-view</code>, the drawing tool of <a href="command-line-tools.html#drawing-hb-vector-hb-raster-and-hb-view">The command-line tools</a>, is hb-cairo’s main user in HarfBuzz’s own tree. It makes its cairo font face with <code>hb_cairo_font_face_create_for_font</code>, with the scale factor set to <code>1 &lt;&lt; subpixel_bits</code>, the same factor by which it multiplied the font size when it set the HarfBuzz font’s scale (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/helper-cairo.hh#L102"><code>util/helper-cairo.hh:102</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/font-options.hh#L99"><code>util/font-options.hh:99</code></a>). It turns each shaped line into cairo glyphs with <code>hb_cairo_glyphs_from_buffer</code> and the same factor (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/helper-cairo.hh#L587"><code>helper-cairo.hh:587</code></a>), and draws them with <code>cairo_show_glyphs</code> or <code>cairo_show_text_glyphs</code>. Only when cairo is older than 1.17.5, or the <code>HB_DRAW</code> environment variable is 0, does it draw through cairo’s FreeType font face instead, because older cairo had bugs in color fonts and user fonts (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/helper-cairo.hh#L73"><code>helper-cairo.hh:73</code></a>).</p>
+<h2 id="unicode-from-icu-or-glib-hb-icu-and-hb-glib">Unicode from ICU or GLib: hb-icu and hb-glib</h2>
+<p id="ix-48">HarfBuzz asks Unicode six questions, through an <code>hb_unicode_funcs_t</code>, and answers them by default from its own tables (<a href="unicode-inside-harfbuzz.html#three-implementations">Unicode inside HarfBuzz</a>). <code>hb_icu_get_unicode_funcs</code> and <code>hb_glib_get_unicode_funcs</code> return funcs that ask ICU or GLib instead. Each is a single static object, and an application uses it by setting it on each buffer with <code>hb_buffer_set_unicode_funcs</code>.</p>
+<p id="ix-49">On the same machine, the three agree on ordinary questions. Asked for the general category and combining class of U+0301 COMBINING ACUTE ACCENT and the script of U+0627 ARABIC LETTER ALEF, HarfBuzz’s tables, Homebrew’s ICU and Homebrew’s GLib all answered 12 (nonspacing mark), 230 and <code>Arab</code> (hand-run). Where they can differ is newly encoded characters: HarfBuzz’s tables follow its own release, the others follow whatever version of ICU or GLib is installed.</p>
+<p id="ix-50">So the reasons to switch are about agreement and size, not quality. An application whose text stack is built on ICU, for segmentation, line breaking and bidi, may want HarfBuzz to see characters exactly as ICU does. And one that ships ICU or GLib anyway can save the 40 to 60 KB of HarfBuzz’s tables. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/CONFIG.md#L65"><code>CONFIG.md:65</code></a> describes that: build with ICU built in (<code>icu_builtin</code>), or with GLib, and define <code>HB_NO_UCD</code>. Then <code>hb_unicode_funcs_get_default</code> returns GLib’s funcs if GLib is there, and ICU’s otherwise (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.cc#L154"><code>hb-unicode.cc:154</code></a>). Without <code>HB_NO_UCD</code>, HarfBuzz’s own tables stay the default, whatever else is built.</p>
+<p id="ix-51">Both headers also convert script codes, because a text stack that uses ICU or GLib hands HarfBuzz its runs labeled with that library’s script enum. <code>hb_icu_script_to_script</code> and <code>hb_icu_script_from_script</code> convert between <code>UScriptCode</code> and <code>hb_script_t</code> through the four-letter ISO 15924 names (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-icu.cc#L84"><code>hb-icu.cc:84</code></a>). <code>hb_glib_script_to_script</code> and <code>hb_glib_script_from_script</code> do the same for <code>GUnicodeScript</code>, using GLib’s own ISO 15924 conversion (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-glib.cc#L66"><code>hb-glib.cc:66</code></a>). hb-glib has one more function, <code>hb_glib_blob_create</code>, which wraps a <code>GBytes</code> in a blob and keeps a reference to it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-glib.cc#L211"><code>hb-glib.cc:211</code></a>); it is mostly useful to bindings, as the next section but one shows.</p>
+<h2 id="the-platforms-core-text-directwrite-gdi-and-uniscribe">The platforms: Core Text, DirectWrite, GDI and Uniscribe</h2>
+<p id="ix-52">The platform layers do two jobs. One is to run the operating system’s own shaper in place of HarfBuzz’s, which is for comparison and testing, and is in <a href="hb_shape-and-its-backends.html#the-platform-backends-coretext-directwrite-uniscribe">hb_shape and its backends</a>. The other is to let an application that already has the platform’s font objects shape with HarfBuzz’s own <code>ot</code> shaper. That is the part covered here.</p>
+<h3 id="core-text">Core Text</h3>
+<p id="ix-53">On Apple platforms, <code>hb_coretext_face_create (cg_font)</code> makes a face from a <code>CGFont</code>, which fetches each table with <code>CGFontCopyTableForTag</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext.cc#L55"><code>hb-coretext.cc:55</code></a>, <code>:407</code>). <code>hb_coretext_font_create (ct_font)</code> makes a font from a <code>CTFont</code>: it takes the <code>CGFont</code> behind it for the face, sets the font’s <code>ptem</code> to the <code>CTFont</code>’s size, copies its variation settings, and keeps the <code>CTFont</code> for the Core Text shaper and funcs to use (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext.cc#L543"><code>hb-coretext.cc:543</code></a>). The font funcs it gets are hb-ot’s. The documentation calls Core Text’s funcs “rarely needed” (<code>:535</code>); <code>hb_coretext_font_set_funcs</code>, since 10.1.0, installs them.</p>
+<p id="ix-54">This is how an application with a <code>CTFont</code> from the system’s font matching shapes it with HarfBuzz, for example to get OpenType features applied as HarfBuzz applies them, or the same results on every platform. Two details follow from the code. Since <code>ptem</code> is in points but the scale is still the units per em, the application sets the scale it wants itself. And the kept <code>CTFont</code> lasts only until the font changes: <code>hb_font_t::changed</code> throws away all shaper data (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L1159"><code>hb-font.hh:1159</code></a>), so after <code>hb_font_set_scale</code>, <code>hb_coretext_font_get_ct_font</code> returns a new <code>CTFont</code> that HarfBuzz made from the <code>CGFont</code> at <code>ptem</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext-shape.cc#L68"><code>hb-coretext-shape.cc:68</code></a>) (inferred from the code). <code>hb_coretext_face_create_from_file_or_fail</code> and <code>_from_blob_or_fail</code> are the <code>coretext</code> face loader; they can open a named instance, but no face of a collection except the first (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext.cc#L440"><code>hb-coretext.cc:440</code></a>).</p>
+<h3 id="directwrite">DirectWrite</h3>
+<p id="ix-55">On Windows, <code>hb_directwrite_face_create</code> makes a face from an <code>IDWriteFontFace</code>, fetching tables through it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-directwrite.cc#L267"><code>hb-directwrite.cc:267</code></a>), and <code>hb_directwrite_font_create</code>, since 11.0.0, makes a font from one, copying its variation axis values when it has any (<code>:395</code>). <code>hb_directwrite_font_set_funcs</code> installs DirectWrite’s funcs, and <code>hb_directwrite_face_get_dw_font_face</code> and <code>hb_directwrite_font_get_dw_font_face</code> give the <code>IDWriteFontFace</code> back. <code>hb_directwrite_font_get_dw_font</code>, from 10.3.0, was deprecated in 11.0.0 and now returns <code>NULL</code> (<code>:465</code>).</p>
+<h3 id="gdi-and-uniscribe">GDI and Uniscribe</h3>
+<p id="ix-56"><code>hb_gdi_face_create (hfont)</code>, since 2.6.0, makes a face from a GDI <code>HFONT</code>, for the many Windows programs that still select fonts through GDI. Each table is read with <code>GetFontData</code> on a device context the font is selected into, and copied into a new blob (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gdi.cc#L42"><code>hb-gdi.cc:42</code></a>). The face doesn’t own the <code>HFONT</code> (<code>:82</code>), so the application must keep it until the face is gone.</p>
+<p id="ix-57"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-uniscribe.h"><code>hb-uniscribe.h</code></a> has only two functions, <code>hb_uniscribe_font_get_logfontw</code> and <code>hb_uniscribe_font_get_hfont</code>, which return the <code>LOGFONTW</code> and <code>HFONT</code> that the Uniscribe shaper made for a font, or <code>NULL</code> if it hasn’t made one (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-uniscribe.cc#L560"><code>hb-uniscribe.cc:560</code></a>, <code>:577</code>). They are for code that runs the Uniscribe shaper and then wants to call other Uniscribe or GDI functions on the same font. The user manual says that <code>hb_shape</code> itself is the replacement for Uniscribe’s <code>ScriptShape</code> and <code>ScriptPlace</code> (<code>docs/usermanual-integration.xml:388</code>).</p>
+<h2 id="graphite-hb-graphite2">Graphite: hb-graphite2</h2>
+<p id="ix-58"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-graphite2.h"><code>hb-graphite2.h</code></a> belongs to the Graphite shaping backend, which <a href="hb_shape-and-its-backends.html#graphite2">hb_shape and its backends</a> describes. Its public API is the tag <code>HB_GRAPHITE2_TAG_SILF</code> and <code>hb_graphite2_face_get_gr_face</code>, which returns the <code>gr_face</code> that the backend made for a face, for an application that wants to ask Graphite about the font’s features itself (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-graphite2.cc#L170"><code>hb-graphite2.cc:170</code></a>). <code>hb_graphite2_font_get_gr_font</code> has returned <code>NULL</code> since 1.4.2. There is nothing to call to turn Graphite on: a HarfBuzz built with it uses it for any font with a <code>Silf</code> table.</p>
+<h2 id="gobject-and-introspection-hb-gobject">GObject and introspection: hb-gobject</h2>
+<p id="ix-59"><code>libharfbuzz-gobject</code> registers HarfBuzz’s types with GObject’s type system. Each object type (buffer, blob, face, font, font funcs, set, map, shape plan, Unicode funcs, draw funcs, paint funcs) becomes a boxed type whose copy is <code>hb_*_reference</code> and whose free is <code>hb_*_destroy</code>. Each plain struct, such as <code>hb_feature_t</code> or <code>hb_glyph_position_t</code>, becomes a boxed type that is copied by value. Every enum gets a GType generated from the headers (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gobject-structs.cc#L57"><code>hb-gobject-structs.cc:57</code></a>, <code>hb-gobject-enums.h.tmpl</code>). Its documentation says that this is “solely a linkage” and that “client programs should never need to access the GObject-integration mechanics” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gobject-structs.cc#L41"><code>hb-gobject-structs.cc:41</code></a>).</p>
+<p id="ix-60">What it is for is GObject introspection. With <code>introspection</code> on, the build runs <code>g-ir-scanner</code> over the headers and sources of <code>libharfbuzz</code> and <code>libharfbuzz-gobject</code>, and makes <code>HarfBuzz-0.0.gir</code> and <code>HarfBuzz-0.0.typelib</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L1314"><code>src/meson.build:1314</code></a>). The annotations in HarfBuzz’s doc comments, such as <code>(transfer full)</code> and <code>(nullable)</code>, tell the scanner who owns what, and <code>(skip)</code> leaves a function out of bindings. Because hb-ft and hb-glib are compiled into <code>libharfbuzz</code>, they are in the typelib; the separate libraries <code>libharfbuzz-subset</code>, <code>-cairo</code>, <code>-icu</code>, <code>-raster</code> and <code>-vector</code> aren’t. In the hand-built HarfBuzz the <code>.gir</code> file has 565 functions, 16 of them <code>hb_ft_*</code>, 4 <code>hb_glib_*</code> and none <code>hb_subset_*</code>.</p>
+<p id="ix-61">Any language with a GObject introspection binding can then load the typelib at run time. The GObject introspection project lists them, among them PyGObject for Python and GJS for JavaScript (<a href="https://gi.readthedocs.io/en/latest/users.html">users</a>). HarfBuzz’s <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.python.md"><code>README.python.md</code></a> explains the Python route, and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/sample.py"><code>src/sample.py</code></a> uses it: <code>from gi.repository import HarfBuzz</code>, then <code>hb.glib_blob_create (GLib.Bytes.new (fontdata))</code>, <code>hb.face_create</code>, <code>hb.font_create</code> and so on, the C API with the <code>hb_</code> prefix moved into the namespace. This is where hb-glib’s <code>GBytes</code> function earns its place, since a <code>GBytes</code> is how introspection passes bytes. The README also warns: “The Python API will change.”</p>
+<h2 id="other-language-bindings">Other language bindings</h2>
+<p id="ix-62">Most programs that call HarfBuzz from another language use a binding written for that language instead. Those the HarfBuzz project hosts itself, harfbuzzjs (WebAssembly, for JavaScript) and uharfbuzz (Cython, for Python), are described in <a href="family.html#other-relatives">The family</a>, along with harfbuzz_rs for Rust. Two more are widely used:</p>
+<ul>
+<li id="ix-63"><strong>harfbuzz-sys</strong> and <strong>harfbuzz</strong>, from the Servo project, are “Rust bindings to the HarfBuzz text shaping engine” (<a href="https://github.com/servo/rust-harfbuzz">rust-harfbuzz</a>). The repository has HarfBuzz as a Git submodule, built with the <code>bundled</code> feature. Its <code>harfbuzz-sys/Cargo.toml</code> has features named <code>coretext</code>, <code>directwrite</code> and <code>freetype</code>, all on by default, which expose this chapter’s integration layers to Rust.</li>
+<li id="ix-64"><strong>HarfBuzzSharp</strong>, in the SkiaSharp repository, “provides .NET bindings for the HarfBuzz OpenType text shaping engine”, and pairs with SkiaSharp for rendering through <code>SkiaSharp.HarfBuzz</code> (<a href="https://github.com/mono/SkiaSharp/blob/main/binding/HarfBuzzSharp/PACKAGE-README.md">its README</a>). The repository has a native-assets package for each platform it supports, from Android to WebAssembly (<code>binding/HarfBuzzSharp.NativeAssets.*</code>).</li>
+</ul>
+<p id="ix-65">Bindings like these wrap the core C API directly, so what they offer of the integration layers is whatever their authors chose to wrap.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.h"><code>src/hb-ft.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc"><code>src/hb-ft.cc</code></a></td>
+<td>FreeType faces, fonts, funcs, load flags, <code>hb_ft_font_changed</code>, the lock, the face loader</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cairo.h"><code>src/hb-cairo.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cairo.cc"><code>src/hb-cairo.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cairo-utils.cc"><code>src/hb-cairo-utils.cc</code></a></td>
+<td>cairo user font faces, <code>hb_cairo_glyphs_from_buffer</code>, the cairo draw and paint funcs</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-icu.cc"><code>src/hb-icu.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-glib.cc"><code>src/hb-glib.cc</code></a></td>
+<td>ICU and GLib Unicode funcs and script conversions; <code>hb_glib_blob_create</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext.cc"><code>src/hb-coretext.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext-font.cc"><code>src/hb-coretext-font.cc</code></a></td>
+<td>faces from <code>CGFont</code>, fonts from <code>CTFont</code>, Core Text funcs</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-directwrite.cc"><code>src/hb-directwrite.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-directwrite-font.cc"><code>src/hb-directwrite-font.cc</code></a></td>
+<td>faces and fonts from <code>IDWriteFontFace</code>, DirectWrite funcs</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gdi.cc"><code>src/hb-gdi.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-uniscribe.cc"><code>src/hb-uniscribe.cc</code></a></td>
+<td>faces from <code>HFONT</code>; the Uniscribe accessors (the rest is the shaper)</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-graphite2.cc"><code>src/hb-graphite2.cc</code></a></td>
+<td>the Graphite backend and <code>hb_graphite2_face_get_gr_face</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gobject-structs.cc"><code>src/hb-gobject-structs.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-gobject-enums.*.tmpl</code></a></td>
+<td>the GObject types</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build"><code>src/meson.build</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build"><code>meson.build</code></a></td>
+<td>which layer goes into which library; the introspection data; <code>hb-features.h</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/helper-cairo.hh"><code>util/helper-cairo.hh</code></a></td>
+<td>how <code>hb-view</code> uses hb-cairo</td>
+</tr>
+<tr>
+<td><code>docs/usermanual-integration.xml</code></td>
+<td>the user manual’s chapter on integration</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>The integration layers connect HarfBuzz to other libraries’ objects: faces from their fonts, font funcs from their metrics, Unicode funcs from their databases, and conversions. None changes how text is shaped.</li>
+<li>hb-ft makes faces and fonts from an <code>FT_Face</code>; use the <code>_referenced</code> versions. Its scale is FreeType’s 26.6, its load flags start unhinted, and after changing the <code>FT_Face</code> call <code>hb_ft_font_changed</code>. Changes to the <code>hb_font_t</code> reach FreeType by themselves.</li>
+<li>Use hb-ft for FreeType’s hinted metrics or for fonts only FreeType can read; otherwise hb-ot, the default, is usually right.</li>
+<li>hb-cairo makes cairo font faces that draw and paint through HarfBuzz, and turns a shaped buffer into cairo glyphs and clusters; <code>hb-view</code> is built on it.</li>
+<li>hb-icu and hb-glib supply Unicode funcs and script conversions, for agreement with an ICU or GLib text stack, or with <code>HB_NO_UCD</code>, a smaller library.</li>
+<li>The platform layers wrap a <code>CGFont</code>, <code>CTFont</code>, <code>IDWriteFontFace</code> or <code>HFONT</code> so that HarfBuzz’s own shaper can use it; their shapers are for comparison.</li>
+<li>hb-gobject and introspection make HarfBuzz callable from PyGObject, GJS and other introspection bindings; most programs use a language’s own binding instead.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="for-applications.html">← For applications</a><a rel="next" href="other-tables.html">Other tables →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

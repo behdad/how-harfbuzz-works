@@ -1,0 +1,922 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Other tables · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part XI · Using HarfBuzz</p>
+<h1 id="other-tables">46. Other tables</h1>
+<p id="ix-1">Shaping reads <code>cmap</code>, GSUB, GPOS, GDEF and the metrics tables. A font has others that matter to the software around the shaper: how to build a fraction or stretch a parenthesis, where the hanging baseline is, what weight the font is, what it is called in German, which languages it was made for. HarfBuzz reads five of these for applications: <code>MATH</code>, <code>BASE</code>, <code>STAT</code>, <code>name</code> and <code>meta</code>. None of them changes what <code>hb_shape</code> returns. Each has a small API that answers questions about the font, and leaves the layout to the caller.</p>
+<p>This chapter is about those APIs: what each offers, how it reads its table, and what it does when the table is missing or says less than asked.</p>
+<p id="ix-2">The examples use eight small fonts built with fontTools by <code>fonts/other-tables/build-fonts.py</code>, and one variable font from <code>fonts/variations/</code>. Their glyphs are boxes. Most of the output on this page comes from <code>hb-info</code>, run on those fonts with HarfBuzz 15.1.0 when the page was built. <code>hb-info</code> has no options for <code>MATH</code> or for <code>BASE</code>’s min and max extents, so the values quoted for those come from <code>fonts/other-tables/query.c</code>, a short C program run against the same build when the chapter was written, not when the page is built.</p>
+<h2 id="math">MATH</h2>
+<p id="ix-3">The <code>MATH</code> table holds what a formula typesetter needs from a font: 56 constants (how far to raise a superscript, how thick to draw a fraction bar), per-glyph corrections, and larger versions of glyphs that grow, such as parentheses, radicals and integrals. HarfBuzz doesn’t typeset formulas. The section comment in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-math.cc"><code>hb-ot-math.cc</code></a> says so: “HarfBuzz itself does not implement a math layout solution. The functions and types provided can be used by client programs to access the font data necessary for typesetting OpenType Math layout.” The API came from Frédéric Wang of Igalia, whose name is on the file, and appeared in 1.3.3.</p>
+<p id="ix-4">Two browsers use it for MathML: Chromium’s <code>third_party/blink/renderer/platform/fonts/opentype/open_type_math_support.cc</code> and Firefox’s <code>gfx/thebes/gfxMathTable.cpp</code> both call <code>hb_ot_math_get_constant</code>, <code>hb_ot_math_get_glyph_italics_correction</code>, <code>hb_ot_math_get_glyph_variants</code> and <code>hb_ot_math_get_glyph_assembly</code>. The layout itself is theirs.</p>
+<p>The functions follow the table’s three parts:</p>
+<table>
+<thead>
+<tr>
+<th>Part of the table</th>
+<th>Function</th>
+<th>Returns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-5"><code>MathConstants</code></td>
+<td id="ix-6"><code>hb_ot_math_get_constant</code></td>
+<td>one constant, scaled, or a percentage</td>
+</tr>
+<tr>
+<td id="ix-7"><code>MathGlyphInfo</code></td>
+<td id="ix-8"><code>hb_ot_math_get_glyph_italics_correction</code></td>
+<td id="ix-9">a glyph’s italics correction, or 0</td>
+</tr>
+<tr>
+<td></td>
+<td id="ix-10"><code>hb_ot_math_get_glyph_top_accent_attachment</code></td>
+<td id="ix-11">where an accent centers over a glyph, or half its advance</td>
+</tr>
+<tr>
+<td></td>
+<td id="ix-12"><code>hb_ot_math_is_glyph_extended_shape</code></td>
+<td id="ix-13">whether the glyph is in the extended-shape coverage</td>
+</tr>
+<tr>
+<td></td>
+<td id="ix-14"><code>hb_ot_math_get_glyph_kerning</code>, <code>hb_ot_math_get_glyph_kernings</code></td>
+<td id="ix-15">the cut-in at one corner of a glyph, at a height or as the whole list</td>
+</tr>
+<tr>
+<td id="ix-16"><code>MathVariants</code></td>
+<td id="ix-17"><code>hb_ot_math_get_glyph_variants</code></td>
+<td id="ix-18">larger versions of a glyph in one direction</td>
+</tr>
+<tr>
+<td></td>
+<td id="ix-19"><code>hb_ot_math_get_glyph_assembly</code></td>
+<td id="ix-20">parts to build a glyph of any size from</td>
+</tr>
+<tr>
+<td></td>
+<td id="ix-21"><code>hb_ot_math_get_min_connector_overlap</code></td>
+<td>how much those parts must overlap</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-22"><code>hb_ot_math_has_data</code> tests for the table: its version is non-zero. The sanitizer accepts major version 1 only (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-math-table.hh#L1258"><code>hb-ot-math-table.hh:1258</code></a>).</p>
+<h3 id="constants">Constants</h3>
+<p id="ix-23">Every constant is read through one switch, <code>MathConstants::get_value</code>. Most are <code>MathValueRecord</code>s, a value with an optional Device table (a delta for the variation coordinates or the ppem), scaled by the font’s y scale; four horizontal ones, the radical kerns, the skewed fraction gap and <code>spaceAfterScript</code>, take the x scale. The two script scale-downs and <code>radicalDegreeBottomRaisePercent</code> are percentages, returned as they are. The two minimum heights are plain integers, scaled with no Device table.</p>
+<p id="ix-24">In <code>math.ttf</code> the axis height is 250 and the script scale-down 70. At the default scale, 1,000 units per em, HarfBuzz returns 250 and 70; at a scale of 2,000, it returns 500 for the axis height and still 70 for the percentage (from <code>query.c</code>).</p>
+<p id="ix-25">One font gets special treatment. HarfBuzz issue #4653 found that Cambria Math has the values of <code>displayOperatorMinHeight</code> and <code>delimitedSubFormulaMinHeight</code> the wrong way round, and that Microsoft’s implementation swaps them. <code>hb_ot_math_get_constant</code> does the same when <code>is_bad_cambria</code> recognizes the font: a <code>MATH</code> table 25,722 bytes long with those two fields at 2,500 and 3,000 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-math-table.hh#L1266"><code>hb-ot-math-table.hh:1266</code></a>, comparing three known <code>cambria.ttc</code> files). 11.4.3 fixed the detection for fonts at other scales.</p>
+<h3 id="glyph-info">Glyph info</h3>
+<p id="ix-26">An <strong>italics correction</strong> is the extra space a slanted glyph needs after it before an upright one, or where a superscript goes. <code>f</code> in <code>math.ttf</code> has one of 120 units. A glyph outside the coverage table gets 0.</p>
+<p id="ix-27">The <strong>top accent attachment</strong> is the horizontal position over which an accent is centered. It is the one value in the table that HarfBuzz makes up when the font doesn’t give it: a glyph not in the coverage gets half its advance (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-math-table.hh#L331"><code>hb-ot-math-table.hh:331</code></a>). In <code>math.ttf</code>, <code>a</code> has 300 and <code>x</code>, not covered, gets 250, half of its 500.</p>
+<p id="ix-28">A <strong>math kern</strong> is a cut-in at one corner of a glyph: how far a superscript or subscript may tuck under or over it, as a step function of height. Each corner has <em>n</em> heights and <em>n</em> + 1 kern values. <code>MathKern::get_value</code> (<code>:391</code>) chooses the value whose range contains the height asked for, by binary search, as <code>std::upper_bound</code> would: “the index chosen for kern value should be i such that correctionHeight[i-1] &lt;= correction_height &lt; correctionHeight[i]”. A height exactly on a boundary takes the value above it. The top-right corner of <code>f</code> has heights 300 and 600 and values −50, 0 and 40; at heights 0, 150, 300, 600 and 900 HarfBuzz returns −50, −50, 0, 40 and 40. The heights are compared after scaling. HarfBuzz 8.3.1’s <code>NEWS</code> says it changed this function “to match updated ‘MATH’ table spec”.</p>
+<p id="ix-29"><code>hb_ot_math_get_glyph_kernings</code> (3.4.0) returns the whole step function as <code>hb_ot_math_kern_entry_t</code> pairs. There is one more value than height, so the last entry’s <code>max_correction_height</code> is <code>INT32_MAX</code>: for <code>f</code>, (300, −50), (600, 0), (2147483647, 40).</p>
+<p id="ix-30"><code>hb_ot_math_is_glyph_extended_shape</code> is a coverage test. The specification uses it for glyphs whose extents are not a good guide to where scripts go, typically the larger variants; in <code>math.ttf</code>, <code>parenleft.size1</code> and <code>parenleft.size2</code>.</p>
+<h3 id="glyph-variants-and-assemblies">Glyph variants and assemblies</h3>
+<p id="ix-31">A glyph that can grow has a <code>MathGlyphConstruction</code> in each direction it grows in: a list of larger variants, each with its size, and optionally a <strong>glyph assembly</strong>, a list of parts from which any larger size is built. <code>math.ttf</code> has a vertical construction for <code>parenleft</code>: variants of 900, 1,300 and 1,700 units (the first is the glyph itself), and an assembly of a bottom, an extender and a top, each 600 units with 200-unit connectors at the ends that join.</p>
+<p id="ix-32"><code>get_glyph_construction</code> (<code>:1156</code>) chooses the vertical or horizontal coverage by <code>HB_DIRECTION_IS_VERTICAL</code>, and the sizes are scaled by that direction’s scale. Asked for the vertical variants of <code>parenleft</code>, HarfBuzz returns the three glyphs with 900, 1,300 and 1,700; asked for horizontal ones, none. The parts come back in the table’s order, “from left to right and bottom to top”, with their connector lengths, full advances and one flag, <code>HB_OT_MATH_GLYPH_PART_FLAG_EXTENDER</code>, which marks a part that may be repeated or left out. The assembly’s own italics correction comes back beside them. Choosing a variant, or working out how many extenders to use and how far to overlap them, at least <code>hb_ot_math_get_min_connector_overlap</code> (20 in <code>math.ttf</code>), is the client’s job.</p>
+<p>All of these take a <code>start_offset</code> and an in/out count, as HarfBuzz’s list functions do, and return the total, so a client can ask for the count first and then fill an array.</p>
+<p id="ix-33"><code>MATH</code> matters to subsetting too: the glyph closure adds the variants and assembly parts of the glyphs kept, and what it misses is in <a href="subsetting.html#where-the-fixed-order-misses">Where the fixed order misses</a>.</p>
+<h2 id="base">BASE</h2>
+<p id="ix-34">A line of text can mix scripts that sit on different baselines: Latin on the alphabetic baseline, Devanagari hanging from its headline, Chinese on the bottom of the ideographic em box. The <code>BASE</code> table says where each baseline is, for each script, so that an application can line them up. It can also give each script, and each language system, its own <strong>min/max extents</strong>: how far the glyphs reach above and below the baseline, in place of the font’s ascender and descender.</p>
+<p id="ix-35"><code>hb_ot_layout_get_baseline</code> (2.6.0) reads one baseline, and <code>hb_ot_layout_get_baseline_with_fallback</code> (4.0.0) makes one up when the font doesn’t have it. Both take a baseline tag, a direction, and OpenType script and language tags; the versions ending in <code>2</code> (8.0.0) take an <code>hb_script_t</code> and an <code>hb_language_t</code> instead. <code>hb-info --list-baselines</code> prints every baseline both ways, with an asterisk on the ones that were made up. <code>base.ttf</code> has a horizontal axis, with the baselines <code>hang</code>, <code>ideo</code> and <code>romn</code> for the scripts <code>DFLT</code>, <code>dev2</code> and <code>hani</code>, and <code>latn</code> with extents but no baselines:</p>
+<figure class="views ttx"><pre><code>&lt;BASE&gt;
+  &lt;Version value=&quot;0x00010000&quot;/&gt;
+  &lt;HorizAxis&gt;
+    &lt;BaseTagList&gt;
+      &lt;!-- BaseTagCount=3 --&gt;
+      &lt;BaselineTag index=&quot;0&quot; value=&quot;hang&quot;/&gt;
+      &lt;BaselineTag index=&quot;1&quot; value=&quot;ideo&quot;/&gt;
+      &lt;BaselineTag index=&quot;2&quot; value=&quot;romn&quot;/&gt;
+    &lt;/BaseTagList&gt;
+    &lt;BaseScriptList&gt;
+      &lt;!-- BaseScriptCount=4 --&gt;
+      &lt;BaseScriptRecord index=&quot;0&quot;&gt;
+        &lt;BaseScriptTag value=&quot;DFLT&quot;/&gt;
+        &lt;BaseScript&gt;
+          &lt;BaseValues&gt;
+            &lt;DefaultIndex value=&quot;2&quot;/&gt;
+            &lt;!-- BaseCoordCount=3 --&gt;
+            &lt;BaseCoord index=&quot;0&quot; Format=&quot;1&quot;&gt;
+              &lt;Coordinate value=&quot;600&quot;/&gt;
+            &lt;/BaseCoord&gt;
+            &lt;BaseCoord index=&quot;1&quot; Format=&quot;1&quot;&gt;
+              &lt;Coordinate value=&quot;-120&quot;/&gt;
+            &lt;/BaseCoord&gt;
+            &lt;BaseCoord index=&quot;2&quot; Format=&quot;1&quot;&gt;
+              &lt;Coordinate value=&quot;0&quot;/&gt;
+            &lt;/BaseCoord&gt;
+          &lt;/BaseValues&gt;
+          &lt;!-- BaseLangSysCount=0 --&gt;
+        &lt;/BaseScript&gt;
+      &lt;/BaseScriptRecord&gt;
+      &lt;BaseScriptRecord index=&quot;1&quot;&gt;
+        &lt;BaseScriptTag value=&quot;dev2&quot;/&gt;
+        &lt;BaseScript&gt;
+          &lt;BaseValues&gt;
+            &lt;DefaultIndex value=&quot;0&quot;/&gt;
+            &lt;!-- BaseCoordCount=3 --&gt;
+            &lt;BaseCoord index=&quot;0&quot; Format=&quot;1&quot;&gt;
+              &lt;Coordinate value=&quot;640&quot;/&gt;
+            &lt;/BaseCoord&gt;
+            &lt;BaseCoord index=&quot;1&quot; Format=&quot;1&quot;&gt;
+              &lt;Coordinate value=&quot;-120&quot;/&gt;
+            &lt;/BaseCoord&gt;
+            &lt;BaseCoord index=&quot;2&quot; Format=&quot;1&quot;&gt;
+              &lt;Coordinate value=&quot;0&quot;/&gt;
+            &lt;/BaseCoord&gt;
+          &lt;/BaseValues&gt;
+          &lt;!-- BaseLangSysCount=0 --&gt;
+        &lt;/BaseScript&gt;
+      &lt;/BaseScriptRecord&gt;
+      &lt;BaseScriptRecord index=&quot;2&quot;&gt;
+        &lt;BaseScriptTag value=&quot;hani&quot;/&gt;
+        &lt;BaseScript&gt;
+          &lt;BaseValues&gt;
+            &lt;DefaultIndex value=&quot;1&quot;/&gt;
+            &lt;!-- BaseCoordCount=3 --&gt;
+            &lt;BaseCoord index=&quot;0&quot; Format=&quot;1&quot;&gt;
+              &lt;Coordinate value=&quot;760&quot;/&gt;
+            &lt;/BaseCoord&gt;
+            &lt;BaseCoord index=&quot;1&quot; Format=&quot;1&quot;&gt;
+              &lt;Coordinate value=&quot;-120&quot;/&gt;
+            &lt;/BaseCoord&gt;
+            &lt;BaseCoord index=&quot;2&quot; Format=&quot;1&quot;&gt;
+              &lt;Coordinate value=&quot;0&quot;/&gt;
+            &lt;/BaseCoord&gt;
+          &lt;/BaseValues&gt;
+          &lt;!-- BaseLangSysCount=0 --&gt;
+        &lt;/BaseScript&gt;
+      &lt;/BaseScriptRecord&gt;
+      &lt;BaseScriptRecord index=&quot;3&quot;&gt;
+        &lt;BaseScriptTag value=&quot;latn&quot;/&gt;
+        &lt;BaseScript&gt;
+          &lt;DefaultMinMax&gt;
+            &lt;MinCoord Format=&quot;1&quot;&gt;
+              &lt;Coordinate value=&quot;-250&quot;/&gt;
+            &lt;/MinCoord&gt;
+            &lt;MaxCoord Format=&quot;1&quot;&gt;
+              &lt;Coordinate value=&quot;900&quot;/&gt;
+            &lt;/MaxCoord&gt;
+            &lt;!-- FeatMinMaxCount=0 --&gt;
+          &lt;/DefaultMinMax&gt;
+          &lt;!-- BaseLangSysCount=1 --&gt;
+          &lt;BaseLangSysRecord index=&quot;0&quot;&gt;
+            &lt;BaseLangSysTag value=&quot;VIT &quot;/&gt;
+            &lt;MinMax&gt;
+              &lt;MinCoord Format=&quot;1&quot;&gt;
+                &lt;Coordinate value=&quot;-300&quot;/&gt;
+              &lt;/MinCoord&gt;
+              &lt;MaxCoord Format=&quot;1&quot;&gt;
+                &lt;Coordinate value=&quot;1100&quot;/&gt;
+              &lt;/MaxCoord&gt;
+              &lt;!-- FeatMinMaxCount=0 --&gt;
+            &lt;/MinMax&gt;
+          &lt;/BaseLangSysRecord&gt;
+        &lt;/BaseScript&gt;
+      &lt;/BaseScriptRecord&gt;
+    &lt;/BaseScriptList&gt;
+  &lt;/HorizAxis&gt;
+&lt;/BASE&gt;</code></pre><figcaption>base.ttf: BASE (TTX)</figcaption></figure>
+<h3 id="looking-a-baseline-up">Looking a baseline up</h3>
+<p id="ix-36">The lookup is short (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-base-table.hh#L605-L683"><code>hb-ot-layout-base-table.hh:605–683</code></a>). The direction chooses the axis, horizontal or vertical. The script tag is found in that axis’s script list by binary search; if it isn’t there, <code>DFLT</code> is used instead. The baseline tag is found in the axis’s tag list, and its index picks the coordinate from the script’s values. The language tag isn’t used at all: in the <code>BASE</code> table, language systems have min/max extents but no baselines of their own.</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">base.ttf</td><td class="opt">--list-baselines</td><td class="out"><pre><code>Baselines information:
+
+Tag:  Name				Value
+---------------------------------------------
+romn: roman                            	0	
+hang: hanging                          	600	
+icfb: ideo-face-bottom-or-left         	-20	*
+icft: ideo-face-top-or-right           	780	*
+Icfc: ideo-face-central                	380	*
+ideo: ideo-embox-bottom-or-left        	-120	
+idtp: ideo-embox-top-or-right          	880	*
+Idce: ideo-embox-central               	380	*
+math: math                             	260	*
+
+[*] Fallback value</code></pre></td></tr><tr><td class="font">base.ttf</td><td class="opt">--list-baselines --ot-script=dev2</td><td class="out"><pre><code>Baselines information:
+
+Tag:  Name				Value
+---------------------------------------------
+romn: roman                            	0	
+hang: hanging                          	640	
+icfb: ideo-face-bottom-or-left         	-20	*
+icft: ideo-face-top-or-right           	780	*
+Icfc: ideo-face-central                	380	*
+ideo: ideo-embox-bottom-or-left        	-120	
+idtp: ideo-embox-top-or-right          	880	*
+Idce: ideo-embox-central               	380	*
+math: math                             	260	*
+
+[*] Fallback value</code></pre></td></tr><tr><td class="font">base.ttf</td><td class="opt">--list-baselines --script=Latn</td><td class="out"><pre><code>Baselines information:
+
+Tag:  Name				Value
+---------------------------------------------
+romn: roman                            	0	*
+hang: hanging                          	600	*
+icfb: ideo-face-bottom-or-left         	-100	*
+icft: ideo-face-top-or-right           	700	*
+Icfc: ideo-face-central                	300	*
+ideo: ideo-embox-bottom-or-left        	-200	*
+idtp: ideo-embox-top-or-right          	800	*
+Idce: ideo-embox-central               	300	*
+math: math                             	260	*
+
+[*] Fallback value</code></pre></td></tr></tbody></table></div>
+<p id="ix-37">With no script, the values are <code>DFLT</code>’s: <code>hang</code> 600, <code>ideo</code> −120, <code>romn</code> 0. With the tag <code>dev2</code>, the hanging baseline is 640. With <code>--script=Latn</code>, every value has an asterisk, though <code>DFLT</code> has three of them: <code>latn</code> is in the font, so the search finds it and doesn’t go on to <code>DFLT</code>, and <code>latn</code> has no baseline values. A script record with only extents hides <code>DFLT</code>’s baselines from that script.</p>
+<p id="ix-38">There are three coordinate formats. Format 1 is a number. Format 3 adds a Device table, which in a variable font is a variation index into the table’s item variation store (<code>BASE</code> version 1.1). Format 2 names a glyph and a contour point whose position should be used instead, so that the baseline follows hinting; HarfBuzz reads only its number, and the code says <code>/* TODO */</code> (<code>:73</code>). Format 4 is format 2 with a 24-bit glyph ID, for fonts beyond 64K glyphs.</p>
+<h3 id="which-script-tag">Which script tag</h3>
+<p id="ix-39">The functions that take an <code>hb_script_t</code> turn it into tags with <code>choose_base_tags</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L2168"><code>hb-ot-layout.cc:2168</code></a>), and keep the <em>last</em> of them. For Devanagari, HarfBuzz’s tags are <code>dev3</code>, <code>dev2</code> and <code>deva</code>, in that order of preference, and the last is the oldest, <code>deva</code>. So a <code>BASE</code> table that lists its Devanagari values under <code>dev2</code> isn’t found from <code>HB_SCRIPT_DEVANAGARI</code>, and the <code>DFLT</code> values are used. <code>hb-info</code> chooses the same way:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">base.ttf</td><td class="opt">--get-baseline=hang --script=Deva</td><td class="out"><pre><code>Baseline hang: 600</code></pre></td></tr><tr><td class="font">base.ttf</td><td class="opt">--get-baseline=hang --ot-script=dev2</td><td class="out"><pre><code>Baseline hang: 640</code></pre></td></tr></tbody></table></div>
+<p id="ix-40">The OpenType specification doesn’t say which of a script’s tags <code>BASE</code> should use; GSUB and GPOS have both, and a font may use either. A client that knows the font uses <code>dev2</code> can pass tags directly.</p>
+<h3 id="baselines-a-font-doesnt-have">Baselines a font doesn’t have</h3>
+<p id="ix-41"><code>hb_ot_layout_get_baseline_with_fallback</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L2423"><code>hb-ot-layout.cc:2423</code></a>) synthesizes a missing baseline, following the CSS Inline Layout specification’s “baseline synthesis” (the comment links to it). In horizontal text:</p>
+<table>
+<thead>
+<tr>
+<th>Tag</th>
+<th>What HarfBuzz does without it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-42"><code>romn</code></td>
+<td>0, with a comment “FIXME origin ?”</td>
+</tr>
+<tr>
+<td id="ix-43"><code>math</code></td>
+<td>the middle of the minus sign’s ink (U+2212, or else the hyphen-minus); without either, half the x-height</td>
+</tr>
+<tr>
+<td id="ix-44"><code>hang</code></td>
+<td id="ix-45">the top of a typical letter for one of 21 Indic and other hanging scripts (क for Devanagari, ক for Bengali, ཀ for Tibetan…); for any other script, or without that glyph, 60% of the em</td>
+</tr>
+<tr>
+<td id="ix-46"><code>ideo</code></td>
+<td id="ix-47">the embox top (<code>idtp</code>) minus the em, if the font has <code>idtp</code>; otherwise the font’s descender</td>
+</tr>
+<tr>
+<td id="ix-48"><code>idtp</code></td>
+<td id="ix-49"><code>ideo</code> plus the em, if the font has <code>ideo</code>; otherwise the font’s ascender</td>
+</tr>
+<tr>
+<td id="ix-50"><code>icfb</code>, <code>icft</code></td>
+<td>the embox edges, each moved inwards by a tenth of the em box’s height</td>
+</tr>
+<tr>
+<td id="ix-51"><code>Icfc</code>, <code>Idce</code></td>
+<td>halfway between the two face edges, or the two embox edges</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-52"><code>Icfc</code> and <code>Idce</code> aren’t in OpenType’s registry of baseline tags: HarfBuzz gave them capital first letters, as its private tags have, so in practice they are always synthesized. <code>nobase.ttf</code> has the same glyphs as <code>base.ttf</code> and no <code>BASE</code> table:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">nobase.ttf</td><td class="opt">--list-baselines</td><td class="out"><pre><code>Baselines information:
+
+Tag:  Name				Value
+---------------------------------------------
+romn: roman                            	0	*
+hang: hanging                          	600	*
+icfb: ideo-face-bottom-or-left         	-100	*
+icft: ideo-face-top-or-right           	700	*
+Icfc: ideo-face-central                	300	*
+ideo: ideo-embox-bottom-or-left        	-200	*
+idtp: ideo-embox-top-or-right          	800	*
+Idce: ideo-embox-central               	300	*
+math: math                             	260	*
+
+[*] Fallback value</code></pre></td></tr><tr><td class="font">nobase.ttf</td><td class="opt">--get-baseline=hang --script=Deva</td><td class="out"><pre><code>Baseline hang: 640	*
+
+[*] Fallback value</code></pre></td></tr><tr><td class="font">nobase.ttf</td><td class="opt">--list-baselines --direction=ttb</td><td class="out"><pre><code>Baselines information:
+
+Tag:  Name				Value
+---------------------------------------------
+romn: roman                            	0	*
+hang: hanging                          	600	*
+icfb: ideo-face-bottom-or-left         	-400	*
+icft: ideo-face-top-or-right           	400	*
+Icfc: ideo-face-central                	0	*
+ideo: ideo-embox-bottom-or-left        	-500	*
+idtp: ideo-embox-top-or-right          	500	*
+Idce: ideo-embox-central               	0	*
+math: math                             	250	*
+
+[*] Fallback value</code></pre></td></tr></tbody></table></div>
+<p id="ix-53">Every value is made up. The <code>math</code> baseline is 260, the middle of the minus sign’s box, from 230 to 290. The hanging baseline is 600 for no script and 640, the top of क’s headline, for Devanagari. The ideographic em box is the font’s descender and ascender, −200 and 800, and the face is a tenth inside it. In <code>base.ttf</code> above, <code>ideo</code> came from the font, so <code>idtp</code> was <code>ideo</code> plus the em: 880. Vertical text, as in the third row, takes its em box from the vertical font extents, −500 and 500 for this font, which has no <code>vhea</code> (<a href="where-metrics-come-from.html#font-extents">Where metrics come from</a>), its <code>math</code> baseline from half the x-height, and its hanging baseline from 60% of the em across the column. 15.1.0’s <code>NEWS</code> lists a fix to the fallback for “the hanging baseline for some scripts”.</p>
+<p id="ix-54"><code>hb_ot_layout_get_horizontal_baseline_tag_for_script</code> (4.0.0) gives the baseline a script usually sits on: <code>hang</code> for the 21 hanging scripts, <code>icfb</code> for Han, Hangul, kana, Bopomofo, Tangut, Nushu, Khitan, Jurchen and Seal, and <code>romn</code> for the rest. Its list is the same as the fallback’s, and a comment in each says to keep them in step.</p>
+<h3 id="extents-for-a-script">Extents for a script</h3>
+<p id="ix-55"><code>hb_ot_layout_get_font_extents</code> and <code>hb_ot_layout_get_font_extents2</code> (8.0.0) read a script’s min/max extents: the language system’s if there is a record for it, else the script’s default (per-feature values are never asked for). Found, they become the ascender and descender, with a line gap of zero, and the function returns true. If not, it returns the font’s ordinary extents and false.</p>
+<p id="ix-56">In <code>base.ttf</code>, Latin text gets 900 and −250, Vietnamese (<code>VIT </code>) 1,100 and −300, and Devanagari, with no extents in the table, the font’s 800 and −200 and false (from <code>query.c</code>). One case goes wrong. A script with language-system extents but no default extents, <code>DefaultMinMax</code> being optional, returns true with an ascender and descender of 0 for every other language: the missing table is read as the <code>Null</code> object, whose coordinates are 0 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-base-table.hh#L482"><code>hb-ot-layout-base-table.hh:482</code></a>, checked with a copy of <code>base.ttf</code> without <code>latn</code>’s defaults). That looks like a HarfBuzz bug. A missing <code>MinCoord</code> or <code>MaxCoord</code> in a record that exists is read as 0 in the same way.</p>
+<p id="ix-57">Nothing in shaping reads <code>BASE</code>; <a href="vertical-text.html">Vertical text</a> covers what HarfBuzz leaves to applications in vertical layout.</p>
+<h2 id="stat-and-hb_style_get_value">STAT and hb_style_get_value</h2>
+<p id="ix-58"><code>hb_style_get_value</code> (3.0.0) answers one question about a font: where does it sit on a style axis? It knows six tags:</p>
+<table>
+<thead>
+<tr>
+<th>Tag</th>
+<th>Constant</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-59"><code>wght</code></td>
+<td id="ix-60"><code>HB_STYLE_TAG_WEIGHT</code></td>
+<td>weight, 1 to 1,000</td>
+</tr>
+<tr>
+<td id="ix-61"><code>wdth</code></td>
+<td id="ix-62"><code>HB_STYLE_TAG_WIDTH</code></td>
+<td>width, as a percentage of normal</td>
+</tr>
+<tr>
+<td id="ix-63"><code>ital</code></td>
+<td id="ix-64"><code>HB_STYLE_TAG_ITALIC</code></td>
+<td>0 for roman, 1 for italic</td>
+</tr>
+<tr>
+<td id="ix-65"><code>slnt</code></td>
+<td id="ix-66"><code>HB_STYLE_TAG_SLANT_ANGLE</code></td>
+<td>slant, in degrees counter-clockwise, so negative for a right-leaning italic</td>
+</tr>
+<tr>
+<td id="ix-67"><code>Slnt</code></td>
+<td id="ix-68"><code>HB_STYLE_TAG_SLANT_RATIO</code></td>
+<td>the same slant as a ratio, positive for a right-leaning italic</td>
+</tr>
+<tr>
+<td id="ix-69"><code>opsz</code></td>
+<td id="ix-70"><code>HB_STYLE_TAG_OPTICAL_SIZE</code></td>
+<td>optical size, in points</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-71"><code>Slnt</code>, with a capital, is HarfBuzz’s own: it is the slant angle turned into a ratio, <code>tan (−angle)</code>. The others are the registered axis tags. The answer comes from the first of these that has one (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-style.cc#L72"><code>hb-style.cc:72</code></a>):</p>
+<ol>
+<li id="ix-72">A variation axis with that tag in <code>fvar</code>: the font’s design coordinate on it, or the axis default if no coordinates are set. For a variable font, as the code says, “fvar’s default_value is better than STAT records”.</li>
+<li id="ix-73">For <code>opsz</code> only, the font’s point size, <code>ptem</code>, if it is set (<a href="fonts-and-font-functions.html#three-kinds-of-size">Three kinds of size</a>).</li>
+<li id="ix-74">The <code>STAT</code> table: the value of the first axis value record for that axis.</li>
+<li id="ix-75">Older tables: OS/2’s <code>usWeightClass</code>, its <code>usWidthClass</code> turned into a percentage, its italic bit or <code>head</code>’s, and <code>post</code>’s italic angle. Without OS/2, <code>head</code>’s bold, condensed and expanded bits give 700 or 400, 75, 125 or 100. For <code>opsz</code>, the middle of OS/2’s optical size range (version 5), or the design size of GPOS’s <code>size</code> feature, or else 12.</li>
+</ol>
+<p id="ix-76"><code>variations/var.ttf</code> has <code>wght</code> and <code>wdth</code> axes, so those come from the coordinates; the rest from its other tables:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="opt">--list-style --variations=wght=650,wdth=80 --font-ptem=9 --font-slant=0.2</td><td class="out"><pre><code>Style information:
+
+Tag:  Name				Value
+---------------------------------------------
+ital: italic                           	0
+opsz: optical-size                     	9
+slnt: slant-angle                      	-11.3099
+Slnt: slant-ratio                      	0.2
+wdth: width                            	80
+wght: weight                           	650</code></pre></td></tr></tbody></table></div>
+<h3 id="reading-stat">Reading STAT</h3>
+<p id="ix-77"><code>STAT</code> names the positions in a family (<a href="design-space.html">Design space</a>); <code>hb_style_get_value</code> uses it as a record of where a <em>static</em> font sits. <code>STAT::get_value</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-stat-table.hh#L480"><code>hb-ot-stat-table.hh:480</code></a>) finds the axis tag among the design axes, then returns the value of the first axis value table that refers to that axis. Formats 1 and 3 give their value, format 2 its nominal value. Format 4, which gives a combination of values on several axes, is never matched: “Makes more sense for variable fonts which are handled by fvar in hb-style” (<code>:371</code>).</p>
+<p id="ix-78">Choosing the first is right for a font whose <code>STAT</code> lists only its own values. A <code>STAT</code> table can list more: a static font made as one of a family may describe the family’s whole weight range, with flags that mark which values are elidable, and nothing in the table marks the font’s own. <code>style-stat.ttf</code> has OS/2 weight 700 and a <code>STAT</code> with weight values 300, 400 and 700, in that order:</p>
+<figure class="views ttx"><pre><code>&lt;STAT&gt;
+  &lt;Version value=&quot;0x00010001&quot;/&gt;
+  &lt;DesignAxisRecordSize value=&quot;8&quot;/&gt;
+  &lt;!-- DesignAxisCount=2 --&gt;
+  &lt;DesignAxisRecord&gt;
+    &lt;Axis index=&quot;0&quot;&gt;
+      &lt;AxisTag value=&quot;wght&quot;/&gt;
+      &lt;AxisNameID value=&quot;256&quot;/&gt;  &lt;!-- Weight --&gt;
+      &lt;AxisOrdering value=&quot;0&quot;/&gt;
+    &lt;/Axis&gt;
+    &lt;Axis index=&quot;1&quot;&gt;
+      &lt;AxisTag value=&quot;slnt&quot;/&gt;
+      &lt;AxisNameID value=&quot;260&quot;/&gt;  &lt;!-- Slant --&gt;
+      &lt;AxisOrdering value=&quot;1&quot;/&gt;
+    &lt;/Axis&gt;
+  &lt;/DesignAxisRecord&gt;
+  &lt;!-- AxisValueCount=4 --&gt;
+  &lt;AxisValueArray&gt;
+    &lt;AxisValue index=&quot;0&quot; Format=&quot;1&quot;&gt;
+      &lt;AxisIndex value=&quot;0&quot;/&gt;
+      &lt;Flags value=&quot;0&quot;/&gt;
+      &lt;ValueNameID value=&quot;257&quot;/&gt;  &lt;!-- Light --&gt;
+      &lt;Value value=&quot;300.0&quot;/&gt;
+    &lt;/AxisValue&gt;
+    &lt;AxisValue index=&quot;1&quot; Format=&quot;1&quot;&gt;
+      &lt;AxisIndex value=&quot;0&quot;/&gt;
+      &lt;Flags value=&quot;2&quot;/&gt;  &lt;!-- ElidableAxisValueName --&gt;
+      &lt;ValueNameID value=&quot;258&quot;/&gt;  &lt;!-- Regular --&gt;
+      &lt;Value value=&quot;400.0&quot;/&gt;
+    &lt;/AxisValue&gt;
+    &lt;AxisValue index=&quot;2&quot; Format=&quot;1&quot;&gt;
+      &lt;AxisIndex value=&quot;0&quot;/&gt;
+      &lt;Flags value=&quot;0&quot;/&gt;
+      &lt;ValueNameID value=&quot;259&quot;/&gt;  &lt;!-- Bold --&gt;
+      &lt;Value value=&quot;700.0&quot;/&gt;
+    &lt;/AxisValue&gt;
+    &lt;AxisValue index=&quot;3&quot; Format=&quot;1&quot;&gt;
+      &lt;AxisIndex value=&quot;1&quot;/&gt;
+      &lt;Flags value=&quot;2&quot;/&gt;  &lt;!-- ElidableAxisValueName --&gt;
+      &lt;ValueNameID value=&quot;261&quot;/&gt;  &lt;!-- Upright --&gt;
+      &lt;Value value=&quot;0.0&quot;/&gt;
+    &lt;/AxisValue&gt;
+  &lt;/AxisValueArray&gt;
+  &lt;ElidedFallbackNameID value=&quot;2&quot;/&gt;  &lt;!-- Regular --&gt;
+&lt;/STAT&gt;</code></pre><figcaption>style-stat.ttf: STAT (TTX)</figcaption></figure>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">style.ttf</td><td class="opt">--list-style</td><td class="out"><pre><code>Style information:
+
+Tag:  Name				Value
+---------------------------------------------
+ital: italic                           	1
+opsz: optical-size                     	320
+slnt: slant-angle                      	-12
+Slnt: slant-ratio                      	0.212557
+wdth: width                            	75
+wght: weight                           	700</code></pre></td></tr><tr><td class="font">style-stat.ttf</td><td class="opt">--list-style</td><td class="out"><pre><code>Style information:
+
+Tag:  Name				Value
+---------------------------------------------
+ital: italic                           	1
+opsz: optical-size                     	320
+slnt: slant-angle                      	0
+Slnt: slant-ratio                      	-0
+wdth: width                            	75
+wght: weight                           	300</code></pre></td></tr><tr><td class="font">style-stat.ttf</td><td class="opt">--get-style=slnt --font-slant=0.2</td><td class="out"><pre><code>Style slnt: 0</code></pre></td></tr><tr><td class="font">style.ttf</td><td class="opt">--get-style=slnt --font-slant=0.2</td><td class="out"><pre><code>Style slnt: -22.4189</code></pre></td></tr></tbody></table></div>
+<p id="ix-79"><code>style.ttf</code> has no <code>STAT</code>, and reports what OS/2 and <code>post</code> say: weight 700, width 75 (width class 3), italic 1, slant −12. <code>style-stat.ttf</code> reports weight 300, the first value, though the font is bold. Its slant of 0, upright, comes from <code>STAT</code> too, and wins over <code>post</code>’s −12. It also wins over synthetic slant: only the <code>post</code> fallback adds the font’s synthetic slant to the angle (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-style.cc#L114"><code>hb-style.cc:114</code></a>), so <code>--font-slant=0.2</code> changes the answer for <code>style.ttf</code> and not for <code>style-stat.ttf</code>, nor (read from the code) for a variable font with a <code>slnt</code> axis. (Synthetic slant itself is in <a href="fonts-and-font-functions.html#slant">Fonts and font functions</a>.)</p>
+<h3 id="optical-size-from-os2">Optical size from OS/2</h3>
+<p id="ix-80">The optical size fallback has a unit wrong. OS/2 version 5’s <code>usLowerOpticalPointSize</code> and <code>usUpperOpticalPointSize</code> are in TWIPs, twentieths of a point, as the OpenType specification says, but <code>OS2V5Tail::get_optical_size</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-os2-table.hh#L86"><code>hb-ot-os2-table.hh:86</code></a>) returns them as they are, and <code>hb_style_get_value</code> averages them as points. <code>style.ttf</code>’s range is 8 to 24 points, stored as 160 and 480:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">style.ttf</td><td class="opt">--get-style=opsz</td><td class="out"><pre><code>Style opsz: 320</code></pre></td></tr><tr><td class="font">style-size.ttf</td><td class="opt">--get-style=opsz</td><td class="out"><pre><code>Style opsz: 10</code></pre></td></tr></tbody></table></div>
+<p id="ix-81">The answer is 320 points, not 16. That looks like a HarfBuzz bug. The <code>size</code> feature’s design size is in decipoints, and is divided by 10: <code>style-size.ttf</code>, which has OS/2 version 4 and a <code>size</code> feature of 100, reports 10.</p>
+<blockquote>
+<p>Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/b14a94e52fed2ebb39744a4596ec2c840beffef3"><code>b14a94e</code></a> (17 November 2026), so main converts the TWIPs to points, and <code>style.ttf</code> reports 16.</p>
+</blockquote>
+<p id="ix-82"><code>STAT</code> is read in shaping in one place: an AAT <code>trak</code> table is applied only to a font that also has <code>STAT</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L218"><code>hb-ot-shape.cc:218</code></a>), Apple’s test for a modern font (<a href="aat-positioning.html">AAT positioning</a>).</p>
+<h2 id="name">name</h2>
+<p id="ix-83">The <code>name</code> table holds the font’s strings: family and style names, copyright, version, designer, and any string another table refers to by name ID, such as a <code>STAT</code> axis name, a named instance, a stylistic set’s label or a palette name. Each <strong>name record</strong> has a platform, an encoding, a language and a name ID, and points to its bytes in a pool. The API (2.1.0, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-name.h"><code>hb-ot-name.h</code></a>) has two parts. <code>hb_ot_name_list_names</code> returns the name IDs and languages the face has, as <code>hb_ot_name_entry_t</code>s. <code>hb_ot_name_get_utf8</code>, <code>hb_ot_name_get_utf16</code> and <code>hb_ot_name_get_utf32</code> return one name, in one language, converted to that encoding.</p>
+<p id="ix-84"><code>names.ttf</code> has the family name, ID 1, for Windows in US English, UK English, German and Japanese, and for the Macintosh in English; a name 256 for the Macintosh only, with an é; and a name 257 on the Unicode platform, in two languages given by an <code>ltag</code> table:</p>
+<figure class="views ttx"><pre><code>&lt;name&gt;
+  &lt;namerecord nameID=&quot;257&quot; platformID=&quot;0&quot; platEncID=&quot;4&quot; langID=&quot;0x0&quot;&gt;
+    Name
+  &lt;/namerecord&gt;
+  &lt;namerecord nameID=&quot;257&quot; platformID=&quot;0&quot; platEncID=&quot;4&quot; langID=&quot;0x1&quot;&gt;
+    Ainm
+  &lt;/namerecord&gt;
+  &lt;namerecord nameID=&quot;1&quot; platformID=&quot;1&quot; platEncID=&quot;0&quot; langID=&quot;0x0&quot; unicode=&quot;True&quot;&gt;
+    HBBook Names (Mac)
+  &lt;/namerecord&gt;
+  &lt;namerecord nameID=&quot;256&quot; platformID=&quot;1&quot; platEncID=&quot;0&quot; langID=&quot;0x0&quot; unicode=&quot;True&quot;&gt;
+    Café
+  &lt;/namerecord&gt;
+  &lt;namerecord nameID=&quot;1&quot; platformID=&quot;3&quot; platEncID=&quot;1&quot; langID=&quot;0x407&quot;&gt;
+    HBBook Namen
+  &lt;/namerecord&gt;
+  &lt;namerecord nameID=&quot;1&quot; platformID=&quot;3&quot; platEncID=&quot;1&quot; langID=&quot;0x409&quot;&gt;
+    HBBook Names
+  &lt;/namerecord&gt;
+  &lt;namerecord nameID=&quot;2&quot; platformID=&quot;3&quot; platEncID=&quot;1&quot; langID=&quot;0x409&quot;&gt;
+    Regular
+  &lt;/namerecord&gt;
+  &lt;namerecord nameID=&quot;1&quot; platformID=&quot;3&quot; platEncID=&quot;1&quot; langID=&quot;0x411&quot;&gt;
+    HBBook 名前
+  &lt;/namerecord&gt;
+  &lt;namerecord nameID=&quot;1&quot; platformID=&quot;3&quot; platEncID=&quot;1&quot; langID=&quot;0x809&quot;&gt;
+    HBBook Names (UK)
+  &lt;/namerecord&gt;
+&lt;/name&gt;</code></pre><figcaption>names.ttf: name (TTX)</figcaption></figure>
+<h3 id="choosing-one-record">Choosing one record</h3>
+<p id="ix-85">The accelerator (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/name/name.hh#L477"><code>OT/name/name.hh:477</code></a>) turns the records into a sorted list when the table is first used. For each record it works out a language, an <code>hb_language_t</code>, and a score for its platform and encoding (<code>:118</code>), in the same order of preference as <code>cmap</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Score</th>
+<th>Platform, encoding</th>
+<th>Read as</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0–2</td>
+<td>Windows UCS-4 (3, 10); Unicode full repertoire (0, 6) and UCS-4 (0, 4)</td>
+<td>UTF-16BE</td>
+</tr>
+<tr>
+<td>3–7</td>
+<td>Windows BMP (3, 1); Unicode BMP and older (0, 3) to (0, 0)</td>
+<td>UTF-16BE</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Windows Symbol (3, 0)</td>
+<td>UTF-16BE</td>
+</tr>
+<tr>
+<td>10</td>
+<td>Macintosh Roman (1, 0)</td>
+<td>ASCII</td>
+</tr>
+<tr>
+<td>—</td>
+<td>anything else</td>
+<td>dropped</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-86">It sorts by name ID, language, score and position, and keeps the first record of each name ID and language, dropping unsupported encodings and records whose language it doesn’t know. So for each name and language there is one string, and the platform with the best encoding provides it. A Windows name hides a Macintosh one in the same language.</p>
+<p id="ix-87">The language comes from the platform. A Windows record’s language ID is looked up in a table of 240 Windows language codes (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-name-language-static.hh"><code>hb-ot-name-language-static.hh</code></a>), and a Macintosh record’s in a table of 117 of Apple’s. A Unicode-platform record’s language ID is an index into the font’s <code>ltag</code> table, Apple’s list of language tags, which is otherwise read for <code>morx</code> (<a href="aat-inside-harfbuzz.html#feat-and-ltag">feat and ltag</a>). Without an <code>ltag</code> table, a Unicode-platform record has no language and is dropped. The name table’s own language tags, format 1’s <code>langTagRecord</code>s, aren’t read at all: the sanitizer accepts format 1, but “We only implement format 0 for now” (<code>:568</code>), and a language ID of 0x8000 or more isn’t in the Windows table.</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">names.ttf</td><td class="opt">--get-name=257 --language=ga</td><td class="out"><pre><code>257: Ainm</code></pre></td></tr><tr><td class="font">names-noltag.ttf</td><td class="opt">--get-name=257 --language=ga</td><td class="out"><pre><code>257:</code></pre></td></tr></tbody></table></div>
+<p id="ix-88">The Windows table maps codes to tags without regions, mostly: 0x0409, US English, and 0x0809, UK English, are both <code>en</code> (<code>:61</code>, <code>:186</code>), as are the other English variants, and so with French, German, Spanish and Portuguese. Chinese keeps its regions (<code>zh-cn</code>, <code>zh-tw</code>, <code>zh-hk</code>, <code>zh-sg</code>). Since one record is kept for each name and language, the UK English family name in <code>names.ttf</code> can’t be reached at all: it and the US one are both <code>en</code>, and the US one comes first. <code>hb_ot_name_list_names</code> lists ID 1 three times, for <code>de</code>, <code>en</code> and <code>ja</code> (from <code>query.c</code>).</p>
+<h3 id="matching-a-language">Matching a language</h3>
+<p id="ix-89"><code>get_index</code> (<code>:522</code>) looks for the name ID and the language asked for, first exactly, then by <code>hb_language_matches</code>: a request for a more specific tag finds a record in a less specific one, so <code>en-GB</code> finds <code>en</code> and <code>de-AT</code> finds <code>de</code>. A request for a less specific tag doesn’t find a more specific record: <code>zh</code> doesn’t find <code>zh-tw</code>. With no language, <code>HB_LANGUAGE_INVALID</code>, the functions ask for <code>en</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-name.cc#L78"><code>hb-ot-name.cc:78</code></a>). With a language the font doesn’t have, they return nothing: there is no fallback to English, or to any name. <code>hb-info</code> adds one of its own, asking for <code>en</code> when the first request fails:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">names.ttf</td><td class="opt">--get-name=1 --language=de-AT</td><td class="out"><pre><code>1: HBBook Namen</code></pre></td></tr><tr><td class="font">names.ttf</td><td class="opt">--get-name=1 --language=en-GB</td><td class="out"><pre><code>1: HBBook Names</code></pre></td></tr><tr><td class="font">names.ttf</td><td class="opt">--get-name=1 --language=fr</td><td class="out"><pre><code>1: HBBook Names</code></pre></td></tr></tbody></table></div>
+<p id="ix-90"><code>hb-info --list-names</code> (<a href="command-line-tools.html#hb-info">The command-line tools</a>) has a slip of its own. It lists every entry from <code>hb_ot_name_list_names</code>, but fetches each one’s string in the language given on the command line, not in the entry’s language, so a name in three languages is printed three times in one of them:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">names.ttf</td><td class="opt">--list-names --language=de</td><td class="out"><pre><code>Name information:
+
+Id: Name			Text
+------------------------------------
+1: font-family                	HBBook Namen
+1: font-family                	HBBook Namen
+1: font-family                	HBBook Namen
+2: font-subfamily             	Regular
+256:                            	Caf�
+257:                            	Name
+257:                            	Name</code></pre></td></tr></tbody></table></div>
+<h3 id="encodings">Encodings</h3>
+<p id="ix-91">The bytes are UTF-16BE for every supported platform but the Macintosh, and HarfBuzz converts them to the encoding asked for with its own UTF readers and writers (<code>hb_ot_name_convert_utf</code>, <code>:40</code>). A malformed sequence, such as an unpaired surrogate, becomes U+FFFD. Macintosh Roman is read as ASCII: “We treat all Mac Latin names as ASCII only.” A byte of 0x80 or more becomes U+FFFD (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-utf.hh#L415"><code>hb-utf.hh:415</code></a>), so the é of name 256 is lost:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">names.ttf</td><td class="opt">--get-name=256</td><td class="out"><pre><code>256: Caf�</code></pre></td></tr></tbody></table></div>
+<p>The other Macintosh encodings, such as Japanese, aren’t read at all.</p>
+<p id="ix-92">The functions take the buffer size in, give the length written out, and return the name’s full length. The output is always NUL-terminated, and the NUL counts against the buffer: with room for 4 bytes, family name 1 comes back as “HBB” and a NUL, and the return value is 12, the length of “HBBook Names”. A truncated string never ends in the middle of a character.</p>
+<h2 id="meta">meta</h2>
+<p id="ix-93">The <code>meta</code> table, which came from Apple, is a list of tagged blobs of data. Two tags are defined by OpenType: <code>dlng</code>, the languages and scripts the font was designed for, and <code>slng</code>, those it supports, each a comma-separated list of tags in ASCII. HarfBuzz’s API (2.6.0) has two functions: <code>hb_ot_meta_get_entry_tags</code>, which lists the tags, and <code>hb_ot_meta_reference_entry</code>, which returns one entry’s data as a sub-blob of the table. The <code>hb_ot_meta_tag_t</code> enum names <code>dlng</code> and <code>slng</code>; Apple’s <code>appl</code> and <code>bild</code> are there commented out. Entries are found by linear search (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-meta-table.hh#L80"><code>hb-ot-meta-table.hh:80</code></a>), and a missing one is an empty blob.</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">names.ttf</td><td class="opt">--list-meta</td><td class="out"><pre><code>Meta information:
+
+Tag	Data
+------------
+dlng	Latn
+slng	Latn, Grek, Cyrl</code></pre></td></tr><tr><td class="font">names.ttf</td><td class="opt">--get-meta=slng</td><td class="out"><pre><code>Meta slng: Latn, Grek, Cyrl</code></pre></td></tr><tr><td class="font">nobase.ttf</td><td class="opt">--get-meta=slng</td><td class="out"><pre><code>Meta slng:</code></pre></td></tr></tbody></table></div>
+<p id="ix-94">HarfBuzz doesn’t parse the lists. <code>dlng</code> and <code>slng</code> are text for the client to split, and nothing in HarfBuzz uses them, not even to choose a language for shaping or for <code>name</code>.</p>
+<h2 id="other-readers-for-applications">Other readers for applications</h2>
+<p id="ix-95">Two more functions read GPOS and GSUB for applications. <code>hb_ot_layout_get_size_params</code> reads the <code>size</code> feature: a design size in decipoints, a subfamily ID and name ID, and a range of sizes. <code>hb_ot_layout_feature_get_name_ids</code> reads a stylistic set’s UI label, or a character variant’s label, tooltip, sample text and parameter names; <code>hb-info --list-features</code> shows the labels. Like <code>STAT</code>, <code>fvar</code> and <code>CPAL</code>, these give name IDs, whose strings come from <code>hb_ot_name_get_utf8</code>. The other readers are in their own chapters: <code>hb_ot_color_*</code> in <a href="color.html">Color</a>, <code>hb_ot_var_*</code> in <a href="design-space.html">Design space</a>, and <code>hb_ot_metrics_get_position</code> in <a href="where-metrics-come-from.html">Where metrics come from</a>.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-math.h"><code>src/hb-ot-math.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-math.cc"><code>src/hb-ot-math.cc</code></a></td>
+<td>the MATH API, its constants and part flags, and the Cambria swap</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-math-table.hh"><code>src/hb-ot-math-table.hh</code></a></td>
+<td><code>MathConstants</code>, <code>MathGlyphInfo</code> with italics corrections, accent attachments and <code>MathKern</code>, <code>MathVariants</code> with constructions and assemblies, <code>is_bad_cambria</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-base-table.hh"><code>src/hb-ot-layout-base-table.hh</code></a></td>
+<td><code>BASE</code>: the axes, script and language records, <code>MinMax</code>, and the coordinate formats</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>src/hb-ot-layout.cc</code></a></td>
+<td><code>hb_ot_layout_get_baseline</code> and its fallbacks (<code>:2362</code>–<code>2640</code>), <code>hb_ot_layout_get_font_extents</code>, <code>hb_ot_layout_get_horizontal_baseline_tag_for_script</code>, <code>hb_ot_layout_get_size_params</code>, <code>hb_ot_layout_feature_get_name_ids</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-style.h"><code>src/hb-style.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-style.cc"><code>src/hb-style.cc</code></a></td>
+<td><code>hb_style_get_value</code> and its order of sources</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-stat-table.hh"><code>src/hb-ot-stat-table.hh</code></a></td>
+<td><code>STAT</code>: axis records, the four axis value formats, <code>STAT::get_value</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-os2-table.hh"><code>src/hb-ot-os2-table.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-head-table.hh"><code>src/hb-ot-head-table.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-post-table.hh"><code>src/hb-ot-post-table.hh</code></a></td>
+<td>the older fields the style fallbacks read</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-name.h"><code>src/hb-ot-name.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-name.cc"><code>src/hb-ot-name.cc</code></a></td>
+<td>the name API</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/name/name.hh"><code>src/OT/name/name.hh</code></a></td>
+<td><code>name</code>: records, scores, the accelerator, language matching, UTF conversion</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-name-language-static.hh"><code>src/hb-ot-name-language-static.hh</code></a></td>
+<td>the Windows and Macintosh language code tables</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-ltag-table.hh"><code>src/hb-aat-ltag-table.hh</code></a></td>
+<td><code>ltag</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-meta.h"><code>src/hb-ot-meta.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-meta.cc"><code>src/hb-ot-meta.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-meta-table.hh"><code>src/hb-ot-meta-table.hh</code></a></td>
+<td><code>meta</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-info.cc"><code>util/hb-info.cc</code></a></td>
+<td>the <code>--list-baselines</code>, <code>--list-style</code>, <code>--list-names</code> and <code>--list-meta</code> options</td>
+</tr>
+</tbody>
+</table>
+<p>Each API can be compiled out: <code>HB_NO_MATH</code>, <code>HB_NO_BASE</code>, <code>HB_NO_STYLE</code>, <code>HB_NO_NAME</code> and <code>HB_NO_META</code>. <code>HB_NO_NAME</code> sets <code>HB_NO_OT_NAME_LANGUAGE</code>, which leaves out the language tables, and <code>HB_NO_AAT</code> sets <code>HB_NO_OT_NAME_LANGUAGE_AAT</code>, which leaves out <code>ltag</code>’s use in <code>name</code>. <code>HB_LEAN</code> sets all of them except <code>HB_NO_BASE</code>, along with <code>HB_NO_LAYOUT_FEATURE_PARAMS</code>, which removes the feature name IDs and the <code>size</code> parameters (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh#L55-L80"><code>hb-config.hh:55–80</code></a>). <code>HB_NO_STYLE</code> also turns off <code>trak</code>, whose test for <code>STAT</code> it removes.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li><code>MATH</code>, <code>BASE</code>, <code>STAT</code>, <code>name</code> and <code>meta</code> don’t affect shaping (apart from <code>STAT</code> as the test for <code>trak</code>). HarfBuzz reads them for applications.</li>
+<li>The MATH API returns constants, italics corrections, accent positions (half the advance when missing), math kerns as step functions of height, and size variants and assemblies by direction. It swaps two constants for Cambria Math.</li>
+<li><code>BASE</code> baselines are per script, found by tag with <code>DFLT</code> as fallback; a script with a record but no values gets no baselines from <code>DFLT</code>. With an <code>hb_script_t</code>, HarfBuzz looks up the oldest tag, <code>deva</code> not <code>dev2</code>. Missing baselines are synthesized from the minus sign, a hanging letter, the font extents and the em. Min/max extents can be per language.</li>
+<li><code>hb_style_get_value</code> takes the value from <code>fvar</code> coordinates, then <code>ptem</code> for <code>opsz</code>, then the first <code>STAT</code> value for the axis, then OS/2, <code>head</code> and <code>post</code>. The first <code>STAT</code> value may not be the font’s own, <code>STAT</code> hides synthetic slant, and OS/2’s optical sizes are read as points when they are TWIPs.</li>
+<li><code>name</code> keeps one record per name ID and language, from the platform with the best encoding. Windows English variants are all <code>en</code>; Unicode-platform names need <code>ltag</code>; format 1 language tags aren’t read; Macintosh Roman is read as ASCII. Names come out as UTF-8, UTF-16 or UTF-32, in the language asked for or a less specific one, else not at all.</li>
+<li><code>meta</code> entries come back as raw blobs; HarfBuzz doesn’t parse <code>dlng</code> or <code>slng</code>.</li>
+</ul>
+<blockquote>
+<p>Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/b14a94e52fed2ebb39744a4596ec2c840beffef3"><code>b14a94e</code></a> (17 November 2026), so main reads OS/2’s optical sizes as TWIPs (the item on <code>hb_style_get_value</code>; the other two issues there remain).</p>
+</blockquote>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="integrations.html">← Integrations: FreeType, cairo, ICU and the platforms</a><a rel="next" href="testing-harfbuzz.html">Testing HarfBuzz →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Building HarfBuzz · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part I · Getting started</p>
+<h1 id="building-harfbuzz">2. Building HarfBuzz</h1>
+<p id="ix-1">Most people get HarfBuzz already built: inside their operating system or their browser, or from a package manager. Building it yourself is for when you want to work on it, or at least to watch it work: to run the command-line tools on your own fonts, to see the traces this book shows, to run the test suites, and to change something and see what happens.</p>
+<blockquote>
+<p id="ix-2">This chapter is for readers who will build HarfBuzz themselves: to run the tools or this book’s examples against HarfBuzz 15.1.0, to see the detailed traces, or to work on HarfBuzz itself. Readers who use one of the ready-made routes below, or a packaged HarfBuzz 15, can skip it, and so can readers happy to read the book’s examples rather than rerun them.</p>
+</blockquote>
+<p>To program with HarfBuzz, you don’t necessarily have to build it either. Three ready-made routes skip the build:</p>
+<ul>
+<li id="ix-3"><strong>JavaScript.</strong> <a href="https://github.com/harfbuzz/harfbuzzjs">harfbuzzjs</a>, from the HarfBuzz project, is HarfBuzz compiled to WebAssembly, for Node and browsers, installed with <code>npm install harfbuzzjs</code>. Version 1.6.4 contains HarfBuzz 15.0.0. It has the shaper and the glyph outlines, but not hb-vector, hb-raster or the tools.</li>
+<li id="ix-4"><strong>Python.</strong> <a href="https://github.com/harfbuzz/uharfbuzz">uharfbuzz</a>, also from the HarfBuzz project, comes ready-built for the common platforms with <code>pip install uharfbuzz</code>. Version 0.57.0 contains HarfBuzz 15.0.0.</li>
+<li id="ix-5"><strong>Rust.</strong> The <a href="https://crates.io/crates/harfrust">HarfRust</a> crate needs no C at all, but it isn’t HarfBuzz: it is a port of HarfBuzz’s shaping to Rust, which matches HarfBuzz 15.1.0 closely but not exactly (<a href="harfrust.html">HarfRust</a>).</li>
+</ul>
+<p id="ix-6">The <a href="quick-start.html">Quick start</a> chapter uses all three. A package manager’s HarfBuzz is another way in, but check its version first, with <code>pkg-config --modversion harfbuzz</code>. This book describes HarfBuzz 15, and a packaged HarfBuzz can be much older: Linux distributions such as Debian and Ubuntu keep the version they shipped with for the life of a release, and Homebrew keeps the version you installed until you upgrade. An older HarfBuzz may not do what this book describes, and before 13.0.0 it has no hb-vector or hb-raster.</p>
+<p>This chapter follows a developer setting up a build, in order: the source, a first build, a development build, a second build for detailed traces, and the daily work in the tree. It ends with a short tour of builds for shipping. Options are named where they are needed; the appendix <a href="compile-time-configuration.html">Compile-time configuration</a> lists them all.</p>
+<p id="ix-7">Builds can’t run when the book is built, so the commands here are plain listings, and the little output shown was produced by hand, with HarfBuzz 15.1.0 on a Mac.</p>
+<h2 id="getting-the-source">Getting the source</h2>
+<p>HarfBuzz lives on GitHub. Cloning one release, as this book does, takes a few seconds:</p>
+<pre><code>git clone --depth 1 --branch 15.1.0 https://github.com/harfbuzz/harfbuzz.git
+cd harfbuzz
+</code></pre>
+<p>Without <code>--depth 1 --branch</code>, the clone has the whole history, which is what you want if you will be making commits. The tree’s top level is small:</p>
+<table>
+<thead>
+<tr>
+<th>Directory</th>
+<th>What’s in it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-8"><code>src/</code></td>
+<td id="ix-9">the library: about 470 files, mostly <code>hb-*.cc</code>, <code>hb-*.hh</code> and the public <code>hb-*.h</code> headers, with the OpenType table code in <code>src/OT/</code>, the subsetter’s graph code in <code>src/graph/</code> and the Rust integrations in <code>src/rust/</code></td>
+</tr>
+<tr>
+<td><code>util/</code></td>
+<td>the command-line tools: <code>hb-shape</code>, <code>hb-view</code>, <code>hb-info</code>, <code>hb-subset</code>, <code>hb-raster</code>, <code>hb-vector</code>, <code>hb-gpu</code></td>
+</tr>
+<tr>
+<td><code>test/</code></td>
+<td id="ix-10">the test suites: <code>api</code>, <code>shape</code>, <code>subset</code>, <code>vector</code>, <code>threads</code> and <code>fuzzing</code></td>
+</tr>
+<tr>
+<td><code>perf/</code></td>
+<td id="ix-11">benchmarks, and the fonts they use</td>
+</tr>
+<tr>
+<td><code>docs/</code></td>
+<td>the hand-written user manual and the files that build the API reference</td>
+</tr>
+<tr>
+<td><code>subprojects/</code></td>
+<td id="ix-12">Meson “wrap” files, which describe how to fetch a dependency that isn’t installed</td>
+</tr>
+<tr>
+<td><code>.ci/</code>, <code>.github/</code></td>
+<td id="ix-13">the scripts and workflows of HarfBuzz’s continuous integration</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-14">Beside them are <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/BUILD.md"><code>BUILD.md</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/CONFIG.md"><code>CONFIG.md</code></a> (small builds), <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/TESTING.md"><code>TESTING.md</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.mingw.md"><code>README.mingw.md</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.python.md"><code>README.python.md</code></a>, and <code>NEWS</code>, the release notes.</p>
+<p id="ix-15">A good part of <code>src/</code> was written by programs. The Unicode property tables, the character categories that the script shapers use, the table that maps language tags to OpenType’s, and the state machines that find syllables in Indic and other scripts are all generated, and the generated files are committed. A build never downloads Unicode data or runs those generators; a maintainer runs them by hand when Unicode or a registry changes, as <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a> describes. A few generated files are different: the single-file sources <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz.cc"><code>harfbuzz.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz-subset.cc"><code>harfbuzz-subset.cc</code></a> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz-world.cc"><code>harfbuzz-world.cc</code></a>, and, if Ragel is installed, the state machines’ C are remade by every build and copied back into <code>src/</code> when they change (<a href="#rebuilding-after-changing-generated-code">below</a>).</p>
+<h2 id="meson-and-ninja">Meson and Ninja</h2>
+<p id="ix-16">HarfBuzz is built with Meson. <strong>Meson</strong> is a build system: it reads a description of the project, written in its own small language in files called <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build"><code>meson.build</code></a>, looks at the machine (the compilers, which libraries are installed and where), and writes out the exact commands that will build everything. It doesn’t run those commands itself. It hands them to <strong>Ninja</strong>, a small, fast build tool whose only job is to run build steps in the right order, as many at once as the machine allows, and on the next run to repeat only the steps whose inputs have changed.</p>
+<p id="ix-17">Neither comes with macOS or with most Linux systems, but both are easy to get. HarfBuzz needs Meson 0.60.0 or later (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build#L2"><code>meson.build:2</code></a>), a C++ compiler, and <code>pkg-config</code>, which Meson uses to find libraries:</p>
+<ul>
+<li id="ix-18"><strong>macOS</strong>, with <a href="https://brew.sh">Homebrew</a>: <code>brew install meson pkg-config</code>. Homebrew installs Ninja with Meson. The compiler comes with Apple’s command-line tools, <code>xcode-select --install</code>.</li>
+<li id="ix-19"><strong>Debian and Ubuntu</strong>: <code>sudo apt install meson ninja-build pkg-config g++</code>. Debian calls its Ninja package <code>ninja-build</code>.</li>
+<li id="ix-20"><strong>Fedora</strong>: <code>sudo dnf install meson ninja-build pkgconfig gcc-c++</code>.</li>
+<li id="ix-21"><strong>Anywhere with Python</strong>: <code>pip install meson ninja</code>. Meson is written in Python, and the <code>ninja</code> package is Ninja ready-built. Where the system’s Python refuses to install packages, as recent Debian and Homebrew do, make a virtual environment for them (<code>python3 -m venv ~/hb-tools</code>, then <code>~/hb-tools/bin/pip install meson ninja</code>) and put its <code>bin</code> folder on your <code>PATH</code>. This book’s own build gets them that way.</li>
+</ul>
+<p id="ix-22"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/BUILD.md"><code>BUILD.md</code></a> adds the libraries the optional parts need, such as FreeType, GLib and cairo, for each platform.</p>
+<p id="ix-23">The two meet in a <strong>build directory</strong>. Meson never writes into the source tree’s own directories (apart from the generated files above, which HarfBuzz copies back on purpose): everything it makes goes in a directory you name, by convention <code>build/</code>. You can have as many build directories as you like, each configured differently, side by side in one tree. This chapter will end up with three.</p>
+<p>There are two steps:</p>
+<pre><code>meson setup build
+ninja -C build
+</code></pre>
+<p id="ix-24"><code>meson setup</code> configures the build directory once: it runs the checks, records the choices, and writes <code>build/build.ninja</code>. <code>ninja -C build</code> (“change to <code>build</code>, then run”) builds, and is what you run after every edit; <code>meson compile -C build</code> does the same through Meson. If a <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build"><code>meson.build</code></a> file changes, Ninja reruns Meson before building.</p>
+<p id="ix-25">Choices are made with <strong>build options</strong>, given to <code>meson setup</code> as <code>-Dname=value</code>. Some belong to Meson and work in any project, such as <code>buildtype</code> or <code>b_sanitize</code>. The rest belong to HarfBuzz and are declared in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson_options.txt"><code>meson_options.txt</code></a>. Most of HarfBuzz’s are <strong>feature options</strong>, with three values: <code>enabled</code> (build it, and fail if a dependency is missing), <code>disabled</code>, or <code>auto</code> (build it if the dependencies are found). An existing build directory is changed with <code>meson configure build -Dname=value</code>, or with <code>meson setup --reconfigure build</code> and the options; <code>meson configure build</code> alone lists every option with its current value.</p>
+<h2 id="a-first-build">A first build</h2>
+<p id="ix-26">The first <code>meson setup</code> is the one that looks around. HarfBuzz needs nothing but a C++ compiler; everything else is optional, and with <code>auto</code>, used if found. Meson asks <code>pkg-config</code> for each library (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build#L115"><code>meson.build:115</code></a>–<code>:167</code>): FreeType, GLib and GObject, ICU, cairo, Chafa, libpng and zlib. What it finds decides what gets built: GLib is the one that matters most to a developer, since without it there are no command-line tools (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/meson.build#L44"><code>util/meson.build:44</code></a>) and no API tests (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/api/meson.build#L2"><code>test/api/meson.build:2</code></a>). <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/BUILD.md"><code>BUILD.md</code></a> lists the packages to install on Linux distributions and with Homebrew.</p>
+<p id="ix-27">What Meson doesn’t do by default is fetch what it doesn’t find. A wrap file in <code>subprojects/</code> can build a missing dependency from source, but HarfBuzz sets <code>wrap_mode=nofallback</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build#L8"><code>meson.build:8</code></a>), so that only happens when asked for with <code>--wrap-mode=default</code>, as <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/BUILD.md"><code>BUILD.md</code></a> suggests for Windows. Ragel, the tool that compiles the syllable machines, is looked for too (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L455"><code>src/meson.build:455</code></a>). Without it the build uses the committed C, and Meson warns, correctly, that “You have to install ragel if you are going to develop HarfBuzz itself” (<code>:463</code>). You need it only if you change a <code>.rl</code> grammar.</p>
+<p id="ix-28">At the end, <code>meson setup</code> prints a summary (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build#L466"><code>meson.build:466</code></a>). It is worth reading every time, because a missing dependency doesn’t stop an <code>auto</code> build; it just leaves something out. Here is part of it, from <code>meson setup build</code> in a fresh tree on a Mac with Homebrew’s FreeType, GLib, cairo and libpng installed (hand-run):</p>
+<pre><code>  Unicode callbacks (you want at least one)
+    Builtin                   : YES
+    Glib                      : YES
+    ICU                       : NO
+
+  Font callbacks (the more the merrier)
+    Builtin                   : YES
+    FreeType                  : YES
+    Fontations                : NO
+
+  Additional libraries
+    Subset                    : YES
+    Raster                    : YES
+    Vector                    : YES
+    GPU                       : YES
+</code></pre>
+<p id="ix-29">ICU is missing even though Homebrew has it, because Homebrew keeps ICU out of <code>pkg-config</code>’s default path; HarfBuzz’s own macOS workflow runs <code>brew link --force icu4c</code> first (<code>.github/workflows/macos.yml</code>). Most of the other headings name the backends that <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a> describes; all are off by default.</p>
+<p id="ix-30"><code>ninja -C build</code> then runs 467 build steps. On the ten-core laptop this chapter was written on, that took a minute.</p>
+<h3 id="what-a-build-makes">What a build makes</h3>
+<p>Everything lands in <code>build/</code>, laid out like the source tree. The libraries are in <code>build/src/</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Library</th>
+<th>Built when</th>
+<th>What it is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>libharfbuzz</code></td>
+<td>always</td>
+<td>shaping, and the font, draw and paint APIs</td>
+</tr>
+<tr>
+<td><code>libharfbuzz-subset</code></td>
+<td><code>subset</code> is not disabled (default enabled)</td>
+<td>subsetting and instancing fonts</td>
+</tr>
+<tr>
+<td><code>libharfbuzz-raster</code></td>
+<td><code>raster</code> (default enabled)</td>
+<td id="ix-31">glyphs to pixels: <a href="hb-raster.html">hb-raster</a></td>
+</tr>
+<tr>
+<td><code>libharfbuzz-vector</code></td>
+<td><code>vector</code> (default enabled)</td>
+<td id="ix-32">glyphs to SVG and PDF: <a href="hb-vector.html">hb-vector</a></td>
+</tr>
+<tr>
+<td><code>libharfbuzz-gpu</code></td>
+<td><code>gpu</code> (default enabled)</td>
+<td id="ix-33">glyphs encoded for a shader: <a href="hb-gpu.html">hb-gpu</a></td>
+</tr>
+<tr>
+<td><code>libharfbuzz-icu</code></td>
+<td id="ix-34">ICU is found, and <code>icu_builtin</code> is off</td>
+<td id="ix-35">ICU’s Unicode functions</td>
+</tr>
+<tr>
+<td><code>libharfbuzz-cairo</code></td>
+<td>cairo is found</td>
+<td id="ix-36">drawing with cairo; <code>hb-view</code> uses it</td>
+</tr>
+<tr>
+<td><code>libharfbuzz-gobject</code></td>
+<td>GObject is found</td>
+<td id="ix-37">GObject types, for bindings to other languages</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-38">FreeType and GLib don’t get libraries of their own: their glue, hb-ft and hb-glib, goes into <code>libharfbuzz</code> itself (<a href="integrations.html">Integrations</a> covers what each layer offers). Each library comes with a <strong><code>.pc</code> file</strong>, the small text file that <code>pkg-config</code> reads to tell another project’s build which compiler and linker flags it needs (<code>pkg-config --cflags --libs harfbuzz</code>). The ones to be installed are in <code>build/meson-private/</code>. Meson also writes <code>build/meson-uninstalled/harfbuzz-uninstalled.pc</code> and its siblings, which point into the build directory, so another project can build against a HarfBuzz that was never installed: put that directory on <code>PKG_CONFIG_PATH</code>.</p>
+<p id="ix-39">The build also writes <strong><code>hb-features.h</code></strong> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L614"><code>src/meson.build:614</code></a>), an installed header that defines <code>HB_HAS_FREETYPE</code>, <code>HB_HAS_RASTER</code> and so on for each optional part this build has, so that an application can test for them with <code>#ifdef</code>. Two entries are never set by Meson: <code>HB_HAS_GRAPHITE</code>, because the option sets <code>HAVE_GRAPHITE2</code>, and <code>HB_HAS_GPU</code>, though hb-gpu is built (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L587"><code>src/meson.build:587</code></a>; <a href="compile-time-configuration.html#the-meson-options">Compile-time configuration</a>).</p>
+<blockquote>
+<p id="ix-40">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/2b873b805800dcad37827f90a5c28ccb6ccc4ba8"><code>2b873b8</code></a> and <a href="https://github.com/harfbuzz/harfbuzz/commit/506cc943b3c2ad82c5398361afdaf6e9eaad6b0f"><code>506cc94</code></a> (17 November 2026), so main’s <code>hb-features.h</code> defines <code>HB_HAS_GPU</code> when hb-gpu is built, and <code>HB_HAS_GRAPHITE</code> when graphite2 is.</p>
+</blockquote>
+<p id="ix-41">The tools are in <code>build/util/</code>: <code>hb-shape</code>, <code>hb-view</code> (with cairo), <code>hb-info</code>, <code>hb-subset</code>, <code>hb-raster</code>, <code>hb-vector</code>, and <code>hb-ft-raster</code> when FreeType is found, plus <code>hb-gpu</code> when GLFW and GLEW are (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/meson.build#L225"><code>util/meson.build:225</code></a>). <code>hb-ft-raster</code>, which renders with FreeType for comparison, is built but not installed. The test programs are under <code>build/test/</code> and <code>build/src/</code>.</p>
+<p id="ix-42"><code>ninja -C build install</code> copies the libraries, headers, <code>.pc</code> files and tools under the prefix, <code>/usr/local</code> unless <code>meson setup</code> was given <code>--prefix</code>. A developer usually doesn’t install at all, and runs everything from the build directory, <a href="#working-in-the-tree">below</a>.</p>
+<h2 id="a-build-for-development">A build for development</h2>
+<p id="ix-43">The first build is already close to a development build. Meson’s own default build type is <code>debug</code>; HarfBuzz changes it to <code>debugoptimized</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build#L9"><code>meson.build:9</code></a>), which compiles with optimization and debugging information (for GCC and Clang, <code>-O2 -g</code>), and keeps assertions on: <code>b_ndebug=if-release</code> (<code>:10</code>) removes them only in a <code>release</code> build. So it runs the tests quickly, has symbols for a debugger, and checks HarfBuzz’s assumptions. What a developer changes is mostly this:</p>
+<p id="ix-44"><strong>Debugging.</strong> In an optimized build, a debugger shows variables as “optimized out” and steps through code in a surprising order. To step through HarfBuzz line by line, set up a second directory with <code>--buildtype=debug</code> (no optimization). It is slower: keep <code>debugoptimized</code> for everyday work and the tests. <code>meson test -C build --gdb testname</code> runs one test under GDB (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/TESTING.md"><code>TESTING.md</code></a>).</p>
+<p id="ix-45"><strong>Sanitizers.</strong> <code>-Db_sanitize=address,undefined</code> compiles in AddressSanitizer, which stops the program at the first read or write outside an allocation, and UndefinedBehaviorSanitizer, which reports overflowing arithmetic, misaligned reads and the like. HarfBuzz reads untrusted bytes all day (<a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a> is about how), and these are how a mistake in that reading is caught before a fuzzer or a user finds it. HarfBuzz’s CI runs the whole test suite this way, and separately with <code>thread</code> and <code>memory</code> (<code>.github/workflows/sanitizers.yml:28</code>). A sanitized build is slower and larger, so it is another build directory, not a replacement for the first. Some tests then run past their time limits: the CI gives <code>meson test</code> the option <code>-t 10</code> (<code>:81</code>), which multiplies every limit by ten. On a Mac, add <code>-Dintrospection=disabled</code> too. When this chapter was written, with Meson 1.12.1 and Homebrew’s gobject-introspection 1.84.0, the introspection scanner tried to link with <code>-lasan</code>, a library Apple’s toolchain doesn’t have, and the build stopped there.</p>
+<p id="ix-46"><strong>Experimental API.</strong> <code>-Dexperimental_api=true</code> defines <code>HB_EXPERIMENTAL_API</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build#L264"><code>meson.build:264</code></a>), which adds the functions not yet promised to stay the same, such as <code>hb_shape_justify</code> and the <code>hb_subset_depend_*</code> functions of <a href="hb-depend.html">hb-depend</a>, and builds the tool and tests that use them (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/meson.build#L192"><code>util/meson.build:192</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/subset/meson.build#L105"><code>test/subset/meson.build:105</code></a>). HarfBuzz’s CI turns it on in its sanitizer builds. <a href="compile-time-configuration.html#the-other-switches">The other switches</a> lists what it adds.</p>
+<p id="ix-47"><strong>Making missing dependencies fatal.</strong> <code>-Dauto_features=enabled</code>, a Meson option, turns every <code>auto</code> into <code>enabled</code>, so that a missing library stops <code>meson setup</code> instead of quietly removing a feature. HarfBuzz’s Linux and macOS CI builds start this way.</p>
+<p id="ix-48"><strong>An editor that understands the code.</strong> Every Ninja build directory has a <code>compile_commands.json</code>, the exact compiler command for each source file. Editors and language servers such as clangd read it to resolve includes and macros: point the editor at <code>build/compile_commands.json</code>, or link it into the top of the tree. Choose the build whose options you want the editor to see, since it decides, for instance, whether code under <code>#ifdef HAVE_FREETYPE</code> is live.</p>
+<p id="ix-49"><strong>ccache.</strong> Switching branches recompiles most of the library. ccache keeps the object file for each exact command and input, and hands it back instead of compiling again. Meson uses it with no configuration: when the compiler isn’t named in <code>CC</code> or <code>CXX</code> (or a cross or native file), Meson looks for <code>sccache</code> and then <code>ccache</code> on the <code>PATH</code> and puts it in front of the compiler (Meson 1.12.1, <code>mesonbuild/envconfig.py:467</code>, <code>compilers/detect.py:141</code>). Installing it is the whole job.</p>
+<p>A development setup might then be:</p>
+<pre><code>meson setup build -Dexperimental_api=true -Dauto_features=enabled
+meson setup build-asan -Db_sanitize=address,undefined -Dexperimental_api=true -Dintrospection=disabled
+</code></pre>
+<p>with <code>build/</code> for everyday work and the editor, and <code>build-asan/</code> for running the tests before a change is committed.</p>
+<h2 id="a-second-build-for-traces">A second build for traces</h2>
+<p id="ix-50"><code>hb-shape --trace</code> prints a line for each step of shaping, and the buffer after it: each feature’s lookups starting and ending, normalization, the script shaper’s passes. Those messages come from the library itself, through a callback any application can install (<a href="testing-harfbuzz.html#buffer-messages">Testing HarfBuzz</a>). A released build sends the coarse ones. The <strong>detailed messages</strong>, from inside lookups (“replacing glyph at 1 (single substitution)”, “ligating glyphs at 0,1,2”, “start recursing to lookup 2 at 1”), cost time even when nobody listens, so since 12.0.0 they are compiled only when <code>HB_BUFFER_MESSAGE_MORE</code> is defined to 1 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-debug.hh#L452"><code>hb-debug.hh:452</code></a>). That needs a build of its own.</p>
+<p id="ix-51">Defines like this aren’t build options. They are given as compiler flags, either through the environment when the directory is first set up, or with Meson’s <code>cpp_args</code>:</p>
+<pre><code>CXXFLAGS=-DHB_BUFFER_MESSAGE_MORE=1 meson setup build-msg
+meson setup build-msg -Dcpp_args=-DHB_BUFFER_MESSAGE_MORE=1
+</code></pre>
+<p id="ix-52">Meson reads <code>CXXFLAGS</code> only at that first setup, and stores it with the directory: after the first command, <code>meson introspect build-msg --buildoptions</code> reports <code>cpp_args</code> as <code>['-DHB_BUFFER_MESSAGE_MORE=1']</code>. Here is the <code>liga</code> lookup of the <a href="gsub.html">GSUB</a> chapter’s test font on “ffi”, from <code>hb-shape --trace --language=en ligatures.ttf ffi</code>, first from <code>build/</code> and then from <code>build-msg/</code> (hand-run, trimmed to the one lookup):</p>
+<pre><code>trace: start lookup 0 feature 'liga'	buffer: [f=0|f=1|i=2]
+trace: end lookup 0 feature 'liga'	buffer: [f_f_i=0]
+</code></pre>
+<pre><code>trace: start lookup 0 feature 'liga'	buffer: [f=0|f=1|i=2]
+trace: ligating glyphs at 0,1,2	buffer: [f=0|f=1|i=2]
+trace: ligated glyph at 0	buffer: [f_f_i=0]
+trace: end lookup 0 feature 'liga'	buffer: [f_f_i=0]
+</code></pre>
+<p id="ix-53">The <code>HB_DEBUG_*</code> macros work the same way: <code>-DHB_DEBUG_SANITIZE=100</code>, say, makes the library print every sanitize call to standard error, a hundred levels deep, and <code>-DHB_DEBUG_SUBSET=100</code>, as in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/TESTING.md"><code>TESTING.md</code></a>, does the same for subsetting. <a href="testing-harfbuzz.html#debug-output">Testing HarfBuzz</a> shows what they print, and <a href="compile-time-configuration.html#the-other-switches">Compile-time configuration</a> lists them all. Such a build is for watching, not for timing, and its output would drown a test log, which is why it is kept apart from the first.</p>
+<p>This book’s own <code>tools/build-harfbuzz.sh</code>, which builds the HarfBuzz behind every live example, is a worked example. It clones 15.1.0 into <code>.cache/harfbuzz/</code> and sets up three build directories side by side, each built only as far as the book needs (trimmed):</p>
+<pre><code class="language-sh">OPTS=&quot;-Dtests=disabled -Ddocs=disabled -Dcairo=disabled -Dfreetype=disabled -Dicu=disabled&quot;
+[ -d build ] || meson setup build $OPTS
+ninja -C build util/hb-shape util/hb-vector util/hb-info util/hb-subset util/hb-raster
+[ -d build-msg ] || CXXFLAGS=-DHB_BUFFER_MESSAGE_MORE=1 meson setup build-msg $OPTS
+ninja -C build-msg util/hb-shape
+FT_OPTS=&quot;-Dtests=disabled -Ddocs=disabled -Dcairo=disabled -Dfreetype=enabled -Dicu=disabled&quot;
+[ -d build-ft ] || meson setup build-ft $FT_OPTS
+ninja -C build-ft util/hb-raster util/hb-shape util/hb-ft-raster
+</code></pre>
+<ul>
+<li id="ix-54"><strong><code>build/</code></strong> has the tests, the documentation, cairo, FreeType and ICU off: the book runs no tests and needs no <code>hb-view</code>, and without FreeType and ICU its results can’t depend on the versions a machine has. Every shaping result, drawing and <code>info</code> block in the book comes from here.</li>
+<li id="ix-55"><strong><code>build-msg/</code></strong> is the same with <code>HB_BUFFER_MESSAGE_MORE</code>, and builds only <code>hb-shape</code>, since only the traces use it.</li>
+<li id="ix-56"><strong><code>build-ft/</code></strong> has FreeType on, so <code>hb-shape</code> and <code>hb-raster</code> can be asked for FreeType’s font functions with <code>--font-funcs=ft</code>, and builds <code>hb-ft-raster</code>. It is there for the few examples that compare HarfBuzz’s outlines and metrics with FreeType’s hinted ones, as <a href="hb-raster.html#hinting-with-freetype">hb-raster</a> does.</li>
+</ul>
+<p id="ix-57">Two things about the script are worth copying. The <code>[ -d build ] ||</code> guards set a directory up only once, so running the script again just brings each build up to date. And naming targets (<code>ninja -C build util/hb-shape</code>) builds only those programs and what they need, which on a trace build is a fraction of the whole.</p>
+<h2 id="working-in-the-tree">Working in the tree</h2>
+<h3 id="running-the-tools">Running the tools</h3>
+<p id="ix-58">The tools run straight from the build directory: Meson links them so that they find the libraries next to them, with nothing installed and no library path to set.</p>
+<pre><code>build/util/hb-shape font.ttf 'office'
+build-msg/util/hb-shape --trace font.ttf 'office'
+</code></pre>
+<p id="ix-59">Type the path every time: an <code>hb-shape</code> from a package manager is probably on the <code>PATH</code> too, and it is a different HarfBuzz. <a href="command-line-tools.html">The command-line tools</a> is about what the tools do.</p>
+<h3 id="running-the-tests">Running the tests</h3>
+<p id="ix-60"><code>meson test -C build</code> runs the test suites, after first rebuilding whatever is out of date. Each test belongs to one or more <strong>suites</strong>, and <code>--suite</code> picks them. These are the ones that matter for everyday work, as <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/AGENTS.md"><code>AGENTS.md</code></a> in HarfBuzz’s tree advises: <code>shape</code> after a change to shaping, <code>subset</code> after a change to the subsetter, <code>api</code> after a change to the public API, and the whole set before committing. The <code>shape</code> suite runs thousands of recorded shaping results through <code>hb-shape</code>, which is why the tools must be built for it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/meson.build#L4"><code>test/meson.build:4</code></a>). <a href="testing-harfbuzz.html">Testing HarfBuzz</a> describes the suites and their formats.</p>
+<p>Here is the <code>shape</code> suite on the first build (hand-run, <code>meson test -C build --suite shape</code>):</p>
+<pre><code>1/3 shape+aots - harfbuzz:aots                                 OK              0.12s   541 subtests passed
+2/3 shape+text-rendering-tests - harfbuzz:text-rendering-tests OK              0.15s   874 subtests passed
+3/3 shape+in-house - harfbuzz:in-house                         OK              1.10s   6374 subtests passed
+
+Ok:                3
+Fail:              0
+</code></pre>
+<p id="ix-61">The full suite, 277 tests in this build, took under a minute. <code>--list</code> shows the tests without running them, <code>--print-errorlogs</code> prints a failing test’s output, and Meson keeps the whole log in <code>build/meson-logs/testlog.txt</code>.</p>
+<h3 id="rebuilding-after-changing-generated-code">Rebuilding after changing generated code</h3>
+<p id="ix-62">Ninja tracks which headers each file includes. So when a generated table such as <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd-table.hh"><code>hb-ucd-table.hh</code></a> or <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use-table.hh"><code>hb-ot-shaper-use-table.hh</code></a> is regenerated, by the makefile of <a href="regenerating-the-unicode-and-shaping-tables.html#running-the-data-generators">Regenerating the Unicode and shaping tables</a>, the next <code>ninja -C build</code> recompiles exactly the files that include it. Nothing needs to be cleaned or reconfigured.</p>
+<p id="ix-63">The Ragel grammars are different, because they are part of the build. With Ragel 6.10 installed, Meson compiles each <code>.rl</code> file to its header in every build, and copies the header into <code>src/</code> when it differs from the committed one (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L466"><code>src/meson.build:466</code></a>). Without Ragel, editing a <code>.rl</code> file changes nothing, silently: install it, or set <code>-Dragel_subproject=true</code> to have Meson build it from its wrap file. Either way, commit the regenerated header together with the grammar. The single-file sources are regenerated the same way, so adding a source file to <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build"><code>src/meson.build</code></a> updates <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz.cc"><code>harfbuzz.cc</code></a> in the tree too; the files that turn up changed after a build belong in the commit.</p>
+<h2 id="builds-to-ship">Builds to ship</h2>
+<p id="ix-64">A build to ship makes the opposite choices: release optimization, the platform’s dependencies, and nothing unused. What follows is a map; <a href="compile-time-configuration.html">Compile-time configuration</a> has the details.</p>
+<h3 id="optional-dependencies-and-backends">Optional dependencies and backends</h3>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>What it turns on</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>freetype</code></td>
+<td id="ix-65">hb-ft: FreeType’s font functions, and making a HarfBuzz font from an <code>FT_Face</code>. Needed for hinted text, since HarfBuzz doesn’t hint: <a href="hb-raster.html#hinting-with-freetype">hb-raster</a></td>
+</tr>
+<tr>
+<td id="ix-66"><code>glib</code></td>
+<td>GLib’s Unicode functions; needed for the tools and the API tests</td>
+</tr>
+<tr>
+<td><code>icu</code>, <code>icu_builtin</code></td>
+<td id="ix-67">ICU’s Unicode functions, in <code>libharfbuzz-icu</code> or in <code>libharfbuzz</code> itself</td>
+</tr>
+<tr>
+<td><code>cairo</code></td>
+<td><code>libharfbuzz-cairo</code>, and <code>hb-view</code></td>
+</tr>
+<tr>
+<td id="ix-68"><code>png</code>, <code>zlib</code></td>
+<td id="ix-69">PNG output in hb-raster; compressed SVG glyphs and PDF output</td>
+</tr>
+<tr>
+<td><code>gobject</code>, <code>introspection</code></td>
+<td id="ix-70"><code>libharfbuzz-gobject</code>, and the introspection data that lets Python and other languages call HarfBuzz</td>
+</tr>
+<tr>
+<td><code>fontations</code></td>
+<td id="ix-71">font functions from Google’s Rust fontations crates; needs a Rust compiler</td>
+</tr>
+<tr>
+<td id="ix-72"><code>graphite2</code>, <code>harfrust</code>, <code>kbts</code>, <code>wasm</code></td>
+<td id="ix-73">other shaping backends (<a href="hb_shape-and-its-backends.html#the-backends">hb_shape and its backends</a>)</td>
+</tr>
+<tr>
+<td><code>coretext</code>, <code>directwrite</code>, <code>gdi</code></td>
+<td id="ix-74">the platform shapers and font functions, for comparison</td>
+</tr>
+<tr>
+<td><code>subset</code>, <code>raster</code>, <code>vector</code>, <code>gpu</code></td>
+<td>the libraries of the same names; disable what you don’t ship</td>
+</tr>
+<tr>
+<td id="ix-75"><code>utilities</code>, <code>tests</code>, <code>docs</code></td>
+<td>the tools, the tests and the gtk-doc reference</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-76">A build to ship also sets <code>--buildtype=release</code> and the <code>--prefix</code>, and, for a HarfBuzz linked into one application, perhaps <code>--default-library=static</code>. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/CONFIG.md"><code>CONFIG.md</code></a> recommends link-time optimization (<code>-Db_lto=true</code>) and, where size matters, optimizing for size (<code>--buildtype=minsize</code>), which it says Chrome does too. <a href="compile-time-configuration.html#the-meson-options">The Meson options</a> has the defaults and the macros each option sets.</p>
+<h3 id="single-file-builds">Single-file builds</h3>
+<p id="ix-77">HarfBuzz can also be built with no build system at all. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz.cc"><code>src/harfbuzz.cc</code></a>, available since 2.6.0, is one line per source file of the main library, <code>#include &quot;hb-buffer.cc&quot;</code> and so on, so <code>c++ -c src/harfbuzz.cc</code> compiles all of <code>libharfbuzz</code> in one go (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/BUILD.md#L50"><code>BUILD.md:50</code></a>). <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz-subset.cc"><code>harfbuzz-subset.cc</code></a> does the same for the subsetter. Since 11.4.2 even <code>hb-shape</code> can be built against it, as <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/BUILD.md#L57"><code>BUILD.md:57</code></a> shows:</p>
+<pre><code>c++ -O2 src/harfbuzz.cc util/hb-shape.cc -o hb-shape -I src -DHB_NO_FEATURES_H `pkg-config --cflags --libs glib-2.0`
+</code></pre>
+<p id="ix-78">Run by hand in a fresh tree on the same Mac, that command made a working <code>hb-shape</code> in under twenty seconds, on one core. <code>-DHB_NO_FEATURES_H</code> stops the tool from including <code>hb-features.h</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/options.hh#L50"><code>util/options.hh:50</code></a>), which only a Meson build generates. Optional parts are switched on with the same <code>HAVE_*</code> macros Meson would write into <code>config.h</code>: <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz.cc"><code>harfbuzz.cc</code></a> includes <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc"><code>hb-ft.cc</code></a> and the platform backends, and each of those compiles to nothing unless, for example, <code>HAVE_FREETYPE</code> is defined.</p>
+<p id="ix-79"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz-world.cc"><code>harfbuzz-world.cc</code></a>, new in 14.0.0, goes further: every library in one file, each part chosen by an <code>HB_HAS_*</code> macro. It is generated from <code>src/harfbuzz-world.cc.in</code> by <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-harfbuzz-world.py"><code>src/gen-harfbuzz-world.py</code></a>, which replaces each placeholder in the template with the <code>#include</code> lines for one group of sources. The result begins like this (<code>harfbuzz-world.cc.in:1</code>, trimmed):</p>
+<pre><code class="language-c++">#ifdef HB_FEATURES_H
+#include HB_FEATURES_H
+#endif
+
+#ifdef HB_HAS_FREETYPE
+#define HAVE_FREETYPE 1
+#endif
+...
+/* Core library. */
+#include &quot;OT/Var/VARC/VARC.cc&quot;
+#include &quot;hb-aat-layout.cc&quot;
+...
+#ifdef HB_HAS_RASTER
+#include &quot;hb-raster-draw.cc&quot;
+...
+#endif
+</code></pre>
+<p id="ix-80">So a project writes its own small header defining the <code>HB_HAS_*</code> macros it wants, and compiles with <code>-DHB_FEATURES_H='&quot;my-features.h&quot;'</code>; <code>NEWS</code> for 14.0.0 calls this a “custom <code>hb-features.h</code>”. By hand, <code>c++ -O2 -c src/harfbuzz-world.cc -I src -DHB_FEATURES_H='&quot;my-features.h&quot;'</code>, with a header defining <code>HB_HAS_SUBSET</code>, <code>HB_HAS_RASTER</code> and <code>HB_HAS_VECTOR</code>, made one object file with all four libraries in forty seconds. The header can’t be the <code>hb-features.h</code> that Meson writes, nor a copy of it, because <code>HB_FEATURES_H</code> is also that header’s include guard (<code>hb-features.h.in:25</code>): with the macro already defined, its whole body is skipped. Checked with the preprocessor: naming Meson’s header leaves <code>HB_HAS_RASTER</code> undefined. The library macros can also come from a <code>config.h</code>, compiled with <code>-DHAVE_CONFIG_H</code>, because the core sources, which come first, include it before the template tests for the other libraries. That is what HarfBuzz’s own web build of the hb-gpu demo does (<code>util/gpu/web/build.sh:13</code>, <code>config.h:5</code>).</p>
+<h3 id="smaller-builds">Smaller builds</h3>
+<p id="ix-81">For an embedded system, or a download where every kilobyte counts, almost every part of the library can be compiled out with an <code>HB_NO_*</code> macro, and three ready-made sets cover the common cases. <code>HB_MINI</code> keeps a capable OpenType shaper and drops AAT and the legacy-font paths; <code>HB_LEAN</code> drops most of what isn’t shaping; <code>HB_TINY</code> is both, and makes the library single-threaded. They are passed as compiler flags, as <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/CONFIG.md"><code>CONFIG.md</code></a> shows:</p>
+<pre><code>meson setup build -Dcpp_args=-DHB_MINI -Dc_args=-DHB_MINI
+</code></pre>
+<p id="ix-82">A tier can be partly undone with an override header. <a href="compile-time-configuration.html#the-tiers">The tiers</a> says exactly what each removes, and <a href="compile-time-configuration.html#how-the-macros-are-processed">How the macros are processed</a> how the override headers work.</p>
+<h3 id="cmake">CMake</h3>
+<p id="ix-83"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/CMakeLists.txt"><code>CMakeLists.txt</code></a> is still there, but its first act is a warning: “The main build system for HarfBuzz is Meson. CMake build support is community-maintained and is not actively supported by HarfBuzz developers” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/CMakeLists.txt#L4"><code>CMakeLists.txt:4</code></a>). It reads its version from <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build"><code>meson.build</code></a> (<code>:170</code>) and its library sources from <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz.cc"><code>harfbuzz.cc</code></a> (<code>:181</code>), so it keeps up without being edited. It builds the libraries (<code>:59</code>–<code>:62</code>) and, with <code>HB_BUILD_UTILS</code>, some of the tools, but not <code>hb-raster</code> or <code>hb-vector</code> (<code>:1008</code>–<code>:1074</code>), and no tests. Its options are named differently (<code>HB_HAVE_FREETYPE</code>, <code>:35</code>) and off by default, except CoreText on Apple platforms (<code>:45</code>), which Meson leaves off. Meson also installs a <code>harfbuzz-config.cmake</code> in <code>cmakepackagedir</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L1240"><code>src/meson.build:1240</code></a>), so a CMake project can find a HarfBuzz built with Meson.</p>
+<h3 id="webassembly-windows-and-python">WebAssembly, Windows and Python</h3>
+<p id="ix-84"><strong>WebAssembly.</strong> There is no Meson setup for building HarfBuzz to WebAssembly; the single-file sources are the way. <code>util/gpu/web/build.sh</code> compiles <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz-world.cc"><code>harfbuzz-world.cc</code></a> and the hb-gpu demo with Emscripten’s <code>em++ -Oz -flto</code> in one command, configured by a <code>config.h</code> that defines <code>HB_TINY</code> and <code>HB_HAS_GPU</code> and an override header that brings back drawing, painting, color, metrics and variations. The <a href="https://harfbuzz-world.cc/">harfbuzz-world.cc</a> playground, which <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.md"><code>README.md</code></a> calls “a worked example of the world.cc single-file build”, is built the same way. (The <code>wasm</code> option is something else: a shaping backend that runs WebAssembly code stored in a font.)</p>
+<p id="ix-85"><strong>Windows, from Linux or macOS.</strong> <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.mingw.md"><code>README.mingw.md</code></a> is a step-by-step guide to cross-compiling with MinGW and running the tools and tests under Wine, which is how HarfBuzz’s developers test the Uniscribe and DirectWrite backends without Windows. Its easiest path is <code>.ci/build-win.sh 64</code>, which also makes HarfBuzz’s Windows binaries; with real Windows DLLs copied into Wine, <code>hb-shape --shaper=uniscribe</code> compares HarfBuzz with Microsoft’s engine. On Windows itself, Meson works with MSVC or with GCC or Clang on the <code>PATH</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/BUILD.md#L40"><code>BUILD.md:40</code></a>).</p>
+<p id="ix-86"><strong>Python.</strong> <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.python.md"><code>README.python.md</code></a> describes calling HarfBuzz from Python through GObject introspection: with GObject and gobject-introspection found, the build makes <code>HarfBuzz-0.0.typelib</code>, and PyGObject’s <code>from gi.repository import HarfBuzz</code> loads it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/sample.py"><code>src/sample.py</code></a> is an example). It warns that “The Python API will change”. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.md"><code>README.md</code></a> also points to <a href="https://github.com/harfbuzz/uharfbuzz">uharfbuzz</a>, separate Python bindings that don’t need any of this.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/BUILD.md"><code>BUILD.md</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/TESTING.md"><code>TESTING.md</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/CONFIG.md"><code>CONFIG.md</code></a></td>
+<td>upstream’s own notes on building, testing and small builds</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build"><code>meson.build</code></a></td>
+<td>the project defaults, the dependency checks, the <code>HAVE_*</code> macros, the summary</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson_options.txt"><code>meson_options.txt</code></a></td>
+<td>HarfBuzz’s build options</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build"><code>src/meson.build</code></a></td>
+<td>the libraries, Ragel, <code>hb-features.h</code>, the single-file sources, the source checks</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/meson.build"><code>util/meson.build</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/meson.build"><code>test/meson.build</code></a></td>
+<td>which tools and tests are built, and on what they depend</td>
+</tr>
+<tr>
+<td><code>src/harfbuzz-world.cc.in</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-harfbuzz-world.py"><code>src/gen-harfbuzz-world.py</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-harfbuzzcc.py"><code>src/gen-harfbuzzcc.py</code></a></td>
+<td>the single-file builds</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/CMakeLists.txt"><code>CMakeLists.txt</code></a></td>
+<td>the community CMake build</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.mingw.md"><code>README.mingw.md</code></a>, <code>.ci/build-win.sh</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/.ci/win64-cross-file.txt"><code>.ci/win64-cross-file.txt</code></a></td>
+<td>building for Windows</td>
+</tr>
+<tr>
+<td><code>util/gpu/web/build.sh</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/gpu/web/config.h"><code>util/gpu/web/config.h</code></a></td>
+<td>a single-file WebAssembly build</td>
+</tr>
+<tr>
+<td><code>.github/workflows/</code></td>
+<td>how HarfBuzz’s own CI configures its builds, sanitizers included</td>
+</tr>
+<tr>
+<td><code>tools/build-harfbuzz.sh</code> (this book)</td>
+<td>three build directories for the book’s examples</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>HarfBuzz builds with Meson, which configures a build directory (<code>meson setup build</code>), and Ninja, which builds in it (<code>ninja -C build</code>). Each build directory is configured once, and a tree can have several.</li>
+<li>Only a C++ compiler is required. Optional parts are built when their libraries are found; read the summary at the end of <code>meson setup</code>. Without GLib there are no tools and no API tests.</li>
+<li>The default build type is <code>debugoptimized</code>, with assertions on. A development setup adds <code>experimental_api</code>, a sanitized build directory (<code>-Db_sanitize=address,undefined</code>), <code>compile_commands.json</code> for the editor, and ccache, which Meson finds by itself.</li>
+<li>The detailed buffer messages and the <code>HB_DEBUG_*</code> output are compiled in with macros, so they need a build directory of their own, as <code>tools/build-harfbuzz.sh</code> sets up with <code>build-msg/</code>.</li>
+<li>Run the tools from <code>build/util/</code>, and the tests with <code>meson test -C build</code>, by suite. Generated tables are committed; Ragel is needed only to change a grammar.</li>
+<li>To ship: choose the backends and dependencies, release or size optimization, and if needed the single-file sources (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz.cc"><code>harfbuzz.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz-world.cc"><code>harfbuzz-world.cc</code></a> with a custom features header) and the <code>HB_MINI</code>, <code>HB_LEAN</code> and <code>HB_TINY</code> tiers. CMake is community-maintained.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="why-shaping-exists.html">← Why shaping exists</a><a rel="next" href="command-line-tools.html">The command-line tools →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

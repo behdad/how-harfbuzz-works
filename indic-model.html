@@ -1,0 +1,1005 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Indic model · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part VI · Scripts</p>
+<h1 id="the-indic-model">25. The Indic model</h1>
+<p id="ix-1">The Indic shaper serves nine scripts: Bengali, Devanagari, Gujarati, Gurmukhi, Kannada, Malayalam, Oriya, Tamil and Telugu. It puts characters, typed in the order they are spoken, into the order their glyphs are drawn, and tells the font’s lookups which glyph is which: which consonant is the base of the syllable, which go before it as half forms, which below or after it, and where the reph goes. <a href="why-shaping-exists.html#order-on-the-page-order-in-the-text-reordering">Why shaping exists</a> showed the simplest case, a vowel sign moving in front of its consonant.</p>
+<p id="ix-2">There are four parts. Each character is given a <strong>category</strong> and a <strong>position</strong> from a table generated from Unicode’s data. A state machine, compiled by Ragel, divides the run into syllables. An <strong>initial reordering</strong> before the basic features finds each syllable’s base consonant, sorts the syllable by position and sets each glyph’s feature masks. A <strong>final reordering</strong> after them moves the reph, the pre-base vowel signs and the pre-base-reordering consonants to where the basic features’ results say they belong. In between, HarfBuzz decides what each consonant does by asking the font’s own lookups.</p>
+<p id="ix-3">The examples use seven Devanagari test fonts with plain boxes for glyphs, built by <code>fonts/indic-model/build-fonts.py</code> from one feature file. <code>full.ttf</code> has one lookup each for <code>rphf</code>, <code>blwf</code>, <code>half</code>, <code>pstf</code> and <code>init</code>; the others leave out or change one or two. An eighth, <code>scripts.ttf</code>, has a few glyphs each of Bengali, Telugu, Kannada and Malayalam. All have their lookups under the new tags, <code>dev2</code> and the like, so the shaper runs in its new mode (<a href="choosing-a-script-shaper.html">Choosing a script shaper</a>). Every result and trace on this page was produced by running HarfBuzz 15.1.0 on them when the page was built.</p>
+<h2 id="categories-and-positions">Categories and positions</h2>
+<p id="ix-4">The shaper’s <code>setup_masks</code> hook sets no masks: those come later, “in a pause-callback”. It looks each character up with <code>hb_indic_get_categories</code>, which returns the category in a low byte and the position in a high one, and keeps them in the scratch bytes <code>indic_category</code> and <code>indic_position</code> (<a href="buffers.html#eight-bytes-of-scratch-space">Buffers</a>; <code>setup_masks_indic</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc#L397"><code>hb-ot-shaper-indic.cc:397</code></a>).</p>
+<h3 id="where-the-table-comes-from">Where the table comes from</h3>
+<p id="ix-5"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic-table.cc"><code>hb-ot-shaper-indic-table.cc</code></a> is generated by <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py"><code>gen-indic-table.py</code></a> from three Unicode data files: <code>IndicSyllabicCategory.txt</code>, <code>IndicPositionalCategory.txt</code> and <code>Blocks.txt</code>. Its header records version 18.0.0 of each. Only some blocks are kept (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py#L25"><code>gen-indic-table.py:25</code></a>): the nine scripts and their extensions, Myanmar, Khmer, Vedic Extensions, General Punctuation (for the joiners) and a few more, plus NO-BREAK SPACE and DOTTED CIRCLE. Everything else is category <code>X</code>, position <code>END</code>. The table also serves the Khmer and Myanmar shapers, whose machines use the same numbers for shared categories (<a href="khmer-and-myanmar.html">Khmer and Myanmar</a>). Those numbers are kept equal by hand; only the four vowel-sign categories, <code>VAbv</code>, <code>VBlw</code>, <code>VPre</code> and <code>VPst</code>, are checked against Myanmar’s by a <code>static_assert</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic-table.cc#L61"><code>hb-ot-shaper-indic-table.cc:61</code></a>). With <code>--rust</code>, the script writes HarfRust’s copy.</p>
+<p>The generator works in four steps.</p>
+<ol>
+<li id="ix-6"><strong>Unicode’s syllabic category becomes HarfBuzz’s category</strong> (<code>category_map</code>, <code>:147</code>). Many map to one: <code>Consonant</code> and <code>Consonant_Dead</code> are <code>C</code>; <code>Virama</code> and <code>Invisible_Stacker</code> are <code>H</code>; <code>Vowel_Dependent</code> is <code>M</code>; <code>Bindu</code>, <code>Visarga</code> and <code>Syllable_Modifier</code> are <code>SM</code>, or <code>SMPst</code> if they have no position; <code>Nukta</code> is <code>N</code>; <code>Joiner</code> and <code>Non_Joiner</code> are <code>ZWJ</code> and <code>ZWNJ</code>.</li>
+<li id="ix-7"><strong>Overrides replace some categories</strong> (<code>category_overrides</code>, <code>:207</code>). The ten RAs, one per script and Assamese’s in the Bengali block, become <code>Ra</code>, so that the grammar can recognize a reph; the rest, most with an issue number, are characters that behave unlike their Unicode category, such as Vedic signs and the dotted circle.</li>
+<li id="ix-8"><strong>Unicode’s positional category becomes a position</strong>, but only for the categories that have one (<code>CM</code>, <code>SM</code>, <code>RS</code>, <code>H</code>, <code>M</code>, <code>MPst</code>; <code>:457</code>). A split vowel sign gets the position of its last part (<code>:193</code>). Then every consonant-like category gets <code>BASE_C</code>, syllable modifiers and Vedic signs <code>SMVD</code>, and each vowel sign’s position is translated, per script, into where it should sort (<code>indic_matra_position</code>, <code>:427</code>): a left one is always <code>PRE_M</code>; a right one is <code>AFTER_SUB</code> in Devanagari, <code>AFTER_POST</code> in Bengali.</li>
+<li id="ix-9"><strong>Two positions are overridden</strong> (<code>position_overrides</code>, <code>:386</code>): U+0A51 GURMUKHI SIGN UDAAT, and the Oriya candrabindu, “BeforeSub in the spec”.</li>
+</ol>
+<p id="ix-10">The positions are an ordered list, from left to right in the finished syllable (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.hh#L36"><code>hb-ot-shaper-indic.hh:36</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th id="ix-11">Position</th>
+<th>What has it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td><code>POS_START</code></td>
+<td></td>
+</tr>
+<tr>
+<td>1</td>
+<td><code>POS_RA_TO_BECOME_REPH</code></td>
+<td>an initial RA that will be the reph</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>POS_PRE_M</code></td>
+<td>left (pre-base) vowel signs</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>POS_PRE_C</code></td>
+<td>consonants before the base</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>POS_BASE_C</code></td>
+<td>the base; at first, every consonant</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>POS_AFTER_MAIN</code></td>
+<td>some vowel signs (Oriya’s top ones, for example)</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>POS_ABOVE_C</code></td>
+<td></td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>POS_BEFORE_SUB</code></td>
+<td>vowel signs that go before below-base forms</td>
+</tr>
+<tr>
+<td>8</td>
+<td><code>POS_BELOW_C</code></td>
+<td>consonants with a below-base form</td>
+</tr>
+<tr>
+<td>9</td>
+<td><code>POS_AFTER_SUB</code></td>
+<td>vowel signs after below-base forms (all of Devanagari’s right, top and bottom ones)</td>
+</tr>
+<tr>
+<td>10</td>
+<td><code>POS_BEFORE_POST</code></td>
+<td></td>
+</tr>
+<tr>
+<td>11</td>
+<td><code>POS_POST_C</code></td>
+<td>consonants with a post-base or pre-base-reordering form</td>
+</tr>
+<tr>
+<td>12</td>
+<td><code>POS_AFTER_POST</code></td>
+<td>vowel signs after post-base forms</td>
+</tr>
+<tr>
+<td>13</td>
+<td><code>POS_SMVD</code></td>
+<td>syllable modifiers and Vedic signs</td>
+</tr>
+<tr>
+<td>14</td>
+<td><code>POS_END</code></td>
+<td>everything else</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-12">Sorting a syllable by these numbers is most of the initial reordering. A consonant’s position isn’t in the table: every consonant starts as <code>BASE_C</code>, and the font decides the rest. A vowel sign’s position depends on its script (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py#L393"><code>gen-indic-table.py:393</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th id="ix-13">Script</th>
+<th>Right</th>
+<th>Top</th>
+<th>Bottom</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Devanagari</td>
+<td><code>AFTER_SUB</code></td>
+<td><code>AFTER_SUB</code></td>
+<td><code>AFTER_SUB</code></td>
+</tr>
+<tr>
+<td>Bengali</td>
+<td><code>AFTER_POST</code></td>
+<td>(none)</td>
+<td><code>AFTER_SUB</code></td>
+</tr>
+<tr>
+<td>Gurmukhi</td>
+<td><code>AFTER_POST</code></td>
+<td><code>AFTER_POST</code>, “Deviate from spec”</td>
+<td><code>AFTER_POST</code></td>
+</tr>
+<tr>
+<td>Gujarati</td>
+<td><code>AFTER_POST</code></td>
+<td><code>AFTER_SUB</code></td>
+<td><code>AFTER_POST</code></td>
+</tr>
+<tr>
+<td>Oriya</td>
+<td><code>AFTER_POST</code></td>
+<td><code>AFTER_MAIN</code></td>
+<td><code>AFTER_SUB</code></td>
+</tr>
+<tr>
+<td>Tamil</td>
+<td><code>AFTER_POST</code></td>
+<td><code>AFTER_SUB</code></td>
+<td><code>AFTER_POST</code></td>
+</tr>
+<tr>
+<td>Telugu</td>
+<td><code>BEFORE_SUB</code> to U+0C42, then <code>AFTER_SUB</code></td>
+<td><code>BEFORE_SUB</code></td>
+<td><code>BEFORE_SUB</code></td>
+</tr>
+<tr>
+<td>Kannada</td>
+<td><code>BEFORE_SUB</code>, but <code>AFTER_SUB</code> for U+0CC3 to U+0CD6</td>
+<td><code>BEFORE_SUB</code></td>
+<td><code>BEFORE_SUB</code></td>
+</tr>
+<tr>
+<td>Malayalam</td>
+<td><code>AFTER_POST</code></td>
+<td>(none)</td>
+<td><code>AFTER_POST</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="the-per-script-configuration">The per-script configuration</h2>
+<p id="ix-14">What differs between the scripts is kept, where it is “cheaper keeping here, than in the code”, in one table (<code>indic_configs</code>, <code>:153</code>); anything only one script needs is an <code>if</code> in the code.</p>
+<table>
+<thead>
+<tr>
+<th id="ix-15">Script</th>
+<th>Old spec</th>
+<th>Virama</th>
+<th id="ix-16">Reph position</th>
+<th id="ix-17">Reph mode</th>
+<th id="ix-18"><code>blwf</code> mode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>(default)</td>
+<td>no</td>
+<td>none</td>
+<td>before post</td>
+<td>implicit</td>
+<td>pre and post</td>
+</tr>
+<tr>
+<td>Devanagari</td>
+<td>yes</td>
+<td>U+094D</td>
+<td>before post</td>
+<td>implicit</td>
+<td>pre and post</td>
+</tr>
+<tr>
+<td>Bengali</td>
+<td>yes</td>
+<td>U+09CD</td>
+<td>after sub</td>
+<td>implicit</td>
+<td>pre and post</td>
+</tr>
+<tr>
+<td>Gurmukhi</td>
+<td>yes</td>
+<td>U+0A4D</td>
+<td>before sub</td>
+<td>implicit</td>
+<td>pre and post</td>
+</tr>
+<tr>
+<td>Gujarati</td>
+<td>yes</td>
+<td>U+0ACD</td>
+<td>before post</td>
+<td>implicit</td>
+<td>pre and post</td>
+</tr>
+<tr>
+<td>Oriya</td>
+<td>yes</td>
+<td>U+0B4D</td>
+<td>after main</td>
+<td>implicit</td>
+<td>pre and post</td>
+</tr>
+<tr>
+<td>Tamil</td>
+<td>yes</td>
+<td>U+0BCD</td>
+<td>after post</td>
+<td>implicit</td>
+<td>pre and post</td>
+</tr>
+<tr>
+<td>Telugu</td>
+<td>yes</td>
+<td>U+0C4D</td>
+<td>after post</td>
+<td>explicit</td>
+<td>post only</td>
+</tr>
+<tr>
+<td>Kannada</td>
+<td>yes</td>
+<td>U+0CCD</td>
+<td>after post</td>
+<td>implicit</td>
+<td>post only</td>
+</tr>
+<tr>
+<td>Malayalam</td>
+<td>yes</td>
+<td>U+0D4D</td>
+<td>after main</td>
+<td>log repha</td>
+<td>pre and post</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-19">The <strong>reph mode</strong> says how a reph is written: as RA + virama (implicit), as RA + virama + ZWJ (explicit, Telugu), or as an encoded repha character, U+0D4E MALAYALAM LETTER DOT REPH (log repha). The <strong>reph position</strong> is where the final reordering moves it. The <strong><code>blwf</code> mode</strong> says whether consonants before the base may take below-base forms too. Old spec is <code>has_old_spec</code> (<a href="choosing-a-script-shaper.html#old-and-new-indic-tags">Choosing a script shaper</a>).</p>
+<p id="ix-20">The shaper needs the virama’s glyph to question the font, and a plan has no font. So <code>load_virama_glyph</code> (<code>:281</code>) looks it up in the <code>cmap</code> the first time the plan shapes a buffer, and keeps it in the plan, in an atomic. A comment admits that “the spec says we should apply ‘locl’ to virama too. Maybe one day...”.</p>
+<h2 id="finding-syllables">Finding syllables</h2>
+<p id="ix-21">The shaper works one syllable at a time, so the first thing it does, in a GSUB pause before any lookup, is find them (<code>setup_syllables_indic</code>, <code>:414</code>). It runs a state machine over the categories, and marks each syllable unsafe to break inside.</p>
+<h3 id="ragel">Ragel</h3>
+<p id="ix-22"><strong>Ragel</strong> compiles regular expressions over an alphabet, with actions for their matches, into C code with the machine as tables. The grammar is <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic-machine.rl"><code>hb-ot-shaper-indic-machine.rl</code></a> (154 lines); the generated <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic-machine.hh"><code>hb-ot-shaper-indic-machine.hh</code></a> (1,302 lines, nearly all tables) is committed, so building HarfBuzz doesn’t need Ragel. If meson finds Ragel 6.10, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ragel-artifacts.py"><code>gen-ragel-artifacts.py</code></a> regenerates the header with <code>ragel -e -F1</code> and copies it into <code>src/</code>. The Khmer, Myanmar and USE machines, and the buffer deserializers, are made the same way (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L281"><code>src/meson.build:281</code></a>).</p>
+<p id="ix-23">The alphabet is the category byte (<code>getkey info[p].indic_category()</code>). The categories are numbered Ragel exports, which the generated header turns into the <code>#define</code>s the shaper uses through <code>I_Cat(…)</code>:</p>
+<pre><code>export X    = 0;
+export C    = 1;
+export V    = 2;
+export N    = 3;
+export H    = 4;
+export ZWNJ = 5;
+export ZWJ  = 6;
+export M    = 7;
+export SM   = 8;
+...
+export Repha = 14;
+export Ra    = 15;
+export CM    = 16;
+export Symbol= 17;
+export CS    = 18;
+export SMPst = 57;
+</code></pre>
+<p id="ix-24">(trimmed; <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic-machine.rl#L63"><code>hb-ot-shaper-indic-machine.rl:63</code></a>). The grammar follows in full (<code>:86</code>):</p>
+<pre><code>c = (C | Ra);			# is_consonant
+n = ((ZWNJ?.RS)? (N.N?)?);	# is_consonant_modifier
+z = ZWJ|ZWNJ;			# is_joiner
+reph = (Ra H | Repha);		# possible reph
+sm = SM | SMPst;
+
+cn = c.ZWJ?.n?;
+symbol = Symbol.N?;
+matra_group = z*.(M | sm? MPst).N?.H?;
+syllable_tail = (z?.sm.sm?.ZWNJ?)? (A | VD)*;
+halant_group = (z?.H.(ZWJ.N?)?);
+final_halant_group = halant_group | H.ZWNJ;
+medial_group = CM?;
+halant_or_matra_group = (final_halant_group | matra_group*);
+
+complex_syllable_tail = (halant_group.cn)* medial_group halant_or_matra_group syllable_tail;
+
+consonant_syllable =	(Repha|CS)? cn complex_syllable_tail;
+vowel_syllable =	reph? V.n? (ZWJ | complex_syllable_tail);
+standalone_cluster =	((Repha|CS)? PLACEHOLDER | reph? DOTTEDCIRCLE).n? complex_syllable_tail;
+symbol_cluster =	symbol syllable_tail;
+broken_cluster =	reph? n? complex_syllable_tail;
+other =			any;
+
+main := |*
+	consonant_syllable	=&gt; { found_syllable (indic_consonant_syllable); };
+	vowel_syllable		=&gt; { found_syllable (indic_vowel_syllable); };
+	standalone_cluster	=&gt; { found_syllable (indic_standalone_cluster); };
+	symbol_cluster		=&gt; { found_syllable (indic_symbol_cluster); };
+	SMPst			=&gt; { found_syllable (indic_non_indic_cluster); };
+	broken_cluster		=&gt; { found_syllable (indic_broken_cluster); buffer-&gt;scratch_flags |= HB_BUFFER_SCRATCH_FLAG_HAS_BROKEN_SYLLABLE; };
+	other			=&gt; { found_syllable (indic_non_indic_cluster); };
+*|;
+</code></pre>
+<p id="ix-25">A <strong>consonant syllable</strong> is a consonant, then optionally more consonants each joined by a virama, a medial, either a final virama or any number of vowel signs, and syllable modifiers (such as anusvara) and Vedic signs. An initial RA + virama is just its first consonant and virama. A <strong>vowel syllable</strong> is built the same way on an independent vowel, a <strong>standalone cluster</strong> on NO-BREAK SPACE or a dotted circle. A <strong>symbol cluster</strong> is a symbol such as avagraha with its marks; a <strong>broken cluster</strong> is marks with nothing to attach to; anything else is a <strong>non-Indic cluster</strong> of one character. Virama + ZWNJ ends a syllable: it is how a visible virama is written inside a word.</p>
+<p id="ix-26"><code>|* … *|</code> makes the machine a <strong>scanner</strong>: at each point it takes the longest match, and of equally long ones the first listed. So the catch-alls come last. A vowel sign alone matches both <code>broken_cluster</code> and <code>other</code>, with the same length, and <code>broken_cluster</code> wins.</p>
+<p id="ix-27"><code>found_syllable</code> (<code>:123</code>) writes into each glyph’s <code>syllable</code> byte the type in the low four bits and a serial number in the high four:</p>
+<pre><code class="language-c++">for (unsigned int i = ts; i &lt; te; i++)
+  info[i].syllable() = (syllable_serial &lt;&lt; 4) | syllable_type;
+syllable_serial++;
+if (syllable_serial == 16) syllable_serial = 1;
+</code></pre>
+<p id="ix-28">The serial need only differ from the previous syllable’s, so that <code>foreach_syllable</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.hh#L163"><code>hb-ot-layout.hh:163</code></a>), which walks forward while the byte stays the same, can see where a syllable ends. The same byte keeps per-syllable lookups inside a syllable (<a href="gsub.html#skipping-step-by-step">GSUB</a>). A broken cluster also sets a buffer scratch flag, so the dotted-circle step can skip buffers with none.</p>
+<p>Some syllables of different types:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">full.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|ka=0+600]</code></td></tr><tr><td class="font">full.ttf</td><td class="in"><span class="txt">अि</span><span class="cps">U+0905 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|a=0+600]</code></td></tr><tr><td class="font">full.ttf</td><td class="in"><span class="txt"> ि</span><span class="cps">U+00A0 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|nbsp=0+250]</code></td></tr><tr><td class="font">full.ttf</td><td class="in"><span class="txt">ि</span><span class="cps">U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|dottedcircle=0+500]</code></td></tr><tr><td class="font">full.ttf</td><td class="in"><span class="txt">क्⟨ZWNJ⟩ि</span><span class="cps">U+0915 U+094D U+200C U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|virama=0+0|space=2+0|iMatra=2+250|dottedcircle=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-29">A consonant syllable, a vowel syllable and a standalone cluster are reordered alike: the code treats vowels and placeholders “as if they were consonants. This is safe because Vowels cannot happen in a consonant syllable” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc#L61"><code>hb-ot-shaper-indic.cc:61</code></a>). A lone vowel sign is a broken cluster and gets a dotted circle, as does the one after KA, virama and ZWNJ, whose syllable the ZWNJ ended (<a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a>). Symbol and non-Indic clusters are left alone.</p>
+<h3 id="a-limit-on-syllable-length">A limit on syllable length</h3>
+<p id="ix-30"><code>foreach_syllable</code> never returns a syllable longer than <code>HB_MAX_SYLLABLE_LENGTH</code>, 64 glyphs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L62"><code>hb-limits.hh:62</code></a>, used at <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.hh#L174"><code>hb-ot-layout.hh:174</code></a>); a longer one is reordered in pieces, each treated as a syllable. With 32 TAs joined by viramas, then KA and vowel sign I (66 characters), <code>full.ttf</code> put the vowel sign just before KA, and left the 32nd TA, the first piece’s base, full with a visible virama (tried, not shown). So a branch for syllables over 127 glyphs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc#L810"><code>hb-ot-shaper-indic.cc:810</code></a>) is never taken (inferred).</p>
+<h2 id="features-and-stages">Features and stages</h2>
+<p id="ix-31"><code>collect_features_indic</code> (<code>:244</code>) lays out the GSUB stages:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-32">Stage</th>
+<th id="ix-33">Features</th>
+<th id="ix-34">Pause after it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-35">after <code>rvrn</code>’s</td>
+<td id="ix-36">the direction features, <code>frac</code>, <code>numr</code>, <code>dnom</code>, <code>rand</code>, <code>Harf</code>, <code>HARF</code></td>
+<td><code>setup_syllables_indic</code></td>
+</tr>
+<tr>
+<td>next</td>
+<td id="ix-37"><code>locl</code>, <code>ccmp</code></td>
+<td><code>initial_reordering_indic</code></td>
+</tr>
+<tr>
+<td>one each</td>
+<td id="ix-38"><code>nukt</code>, <code>akhn</code>, <code>rphf</code>, <code>rkrf</code>, <code>pref</code>, <code>blwf</code>, <code>abvf</code>, <code>half</code>, <code>pstf</code>, <code>vatu</code>, <code>cjct</code></td>
+<td id="ix-39">none, and after <code>cjct</code>’s, <code>final_reordering_indic</code></td>
+</tr>
+<tr>
+<td>last</td>
+<td id="ix-40"><code>init</code>, <code>pres</code>, <code>abvs</code>, <code>blws</code>, <code>psts</code>, <code>haln</code>; then <code>Buzz</code>, <code>BUZZ</code>, the common and horizontal features, and the application’s</td>
+<td id="ix-41"><code>hb_syllabic_clear_var</code></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-42">(<a href="from-features-to-lookups.html#stages-and-pauses">From features to lookups</a> explains <code>rvrn</code> and the private <code>Harf</code> and <code>Buzz</code>.) <a href="feature-order.html#indic">Feature order</a> lists these stages beside the other shapers’. A <code>Harf</code> lookup runs before syllables are found. The shaper’s features, from <code>locl</code> on, are all per syllable. <code>nukt</code>, <code>akhn</code>, <code>rkrf</code>, <code>vatu</code>, <code>cjct</code> and the presentation features other than <code>init</code> are global; <code>rphf</code>, <code>pref</code>, <code>blwf</code>, <code>abvf</code>, <code>half</code>, <code>pstf</code> and <code>init</code> have mask bits, which the reordering sets on the glyphs that should take them. The basic and presentation features have both manual-joiner flags, so their input never passes over ZWJ or ZWNJ (<a href="gsub.html#joiners">Joiners</a>). <code>override_features_indic</code> turns <code>liga</code> off and adds the last pause, which gives back the <code>syllable</code> byte (<code>:272</code>).</p>
+<p id="ix-43">The basic features are “applied in order, one at a time” (<code>:174</code>), each seeing what the one before made. The presentation features are “applied all at once”, in LookupList order, because the “Default Bengali font in Windows for example has intermixed lookups for init,pres,abvs,blws features” (<code>:192</code>). A stage per basic feature has a second use, which comes next.</p>
+<h2 id="how-the-font-decides-the-base">How the font decides the base</h2>
+<p>In consonant + virama + consonant, the second consonant may take a below-base form (RA as rakar), a post-base form or a pre-base-reordering form; or the first may become a half form on the second as base. Which, for each consonant, is the font designer’s choice. HarfBuzz asks the font.</p>
+<p id="ix-44">The plan keeps, for each of <code>rphf</code>, <code>pref</code>, <code>blwf</code>, <code>pstf</code> and <code>vatu</code>, the lookups of that feature’s stage, which are exactly that feature’s lookups (<code>hb_indic_would_substitute_feature_t</code>, <code>:90</code>; <code>data_create_indic</code>, <code>:341</code>). Its <code>would_substitute</code> asks whether any would substitute a given glyph sequence, through <code>hb_ot_layout_lookup_would_substitute_with_buffer</code>, which leaves the glyphs alone and charges the buffer’s operation budget. At the start of the initial reordering, <code>update_consonant_positions_indic</code> (<code>:437</code>) asks it about every glyph still at <code>BASE_C</code> (<code>consonant_position_from_face</code>, <code>:361</code>):</p>
+<pre><code class="language-c++">hb_codepoint_t glyphs[3] = {virama, consonant, virama};
+if (indic_plan-&gt;blwf.would_substitute (glyphs  , 2, face, buffer) ||
+    indic_plan-&gt;blwf.would_substitute (glyphs+1, 2, face, buffer) ||
+    indic_plan-&gt;vatu.would_substitute (glyphs  , 2, face, buffer) ||
+    indic_plan-&gt;vatu.would_substitute (glyphs+1, 2, face, buffer))
+  return POS_BELOW_C;
+if (indic_plan-&gt;pstf.would_substitute (glyphs  , 2, face, buffer) ||
+    indic_plan-&gt;pstf.would_substitute (glyphs+1, 2, face, buffer))
+  return POS_POST_C;
+if (indic_plan-&gt;pref.would_substitute (glyphs  , 2, face, buffer) ||
+    indic_plan-&gt;pref.would_substitute (glyphs+1, 2, face, buffer))
+  return POS_POST_C;
+return POS_BASE_C;
+</code></pre>
+<p id="ix-45">A consonant is below-base if <code>blwf</code> or <code>vatu</code> would substitute virama + consonant, post-base if <code>pstf</code> or <code>pref</code> would, and a possible base otherwise. Each question is asked in the new model’s order and the old one’s, because “some broken fonts (like Free Sans) simply copied lookups from old-spec to new-spec without modification. And oddly enough, Uniscribe seems to respect those lookups.”</p>
+<p id="ix-46">The consonant is the buffer’s glyph after <code>locl</code> and <code>ccmp</code>, but the virama is the <code>cmap</code>’s, so a font whose <code>locl</code> replaces the virama is asked about the wrong one. With <code>zero_context</code> (<code>:340</code>), a chaining rule with any backtrack or lookahead doesn’t count (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L4559"><code>hb-ot-layout-gsubgpos.hh:4559</code></a>). It is set for the new model, except in Malayalam:</p>
+<blockquote>
+<p id="ix-47">testing with Malayalam shows that old and new spec both allow context. Testing with Bengali new-spec however shows that it doesn’t. So, the heuristic here is the way it is. It should <em>only</em> be changed, as we discover more cases of what Windows does. DON’T TOUCH OTHERWISE.</p>
+</blockquote>
+<p>Here is KA, virama, RA and vowel sign I in four of the test fonts:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">full.ttf</td><td class="in"><span class="txt">क्रि</span><span class="cps">U+0915 U+094D U+0930 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|ka=0+600|rakar=0+0]</code></td></tr><tr><td class="font">no-blwf.ttf</td><td class="in"><span class="txt">क्रि</span><span class="cps">U+0915 U+094D U+0930 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|ka.half=0+400|ra=0+500]</code></td></tr><tr><td class="font">old-order.ttf</td><td class="in"><span class="txt">क्रि</span><span class="cps">U+0915 U+094D U+0930 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|ka=0+600|virama=0+0|ra=0+500]</code></td></tr><tr><td class="font">no-blwf-half.ttf</td><td class="in"><span class="txt">क्रि</span><span class="cps">U+0915 U+094D U+0930 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|virama=0+0|iMatra=2+250|ra=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-48">In <code>full.ttf</code>, <code>blwf</code> makes RA below-base, so KA is the base: the vowel sign goes before KA and RA below it. Without <code>blwf</code>, RA is the base and KA takes its half form. <code>old-order.ttf</code>’s <code>blwf</code> is written RA + virama; the probe accepts that, so KA is the base, but the lookup never matches the new order, and nothing forms: KA, a visible virama, a full RA. In <code>no-blwf-half.ttf</code> RA is the base, KA has no half form, and the vowel sign ends up between them, as the final reordering explains.</p>
+<blockquote>
+<p id="ix-49">For type designers: the Indic shaper reads a consonant’s role from your <code>blwf</code>, <code>vatu</code>, <code>pstf</code> and <code>pref</code> lookups, by asking whether each would substitute the virama + consonant pair on its own. A consonant whose below-base form is made only by a contextual rule, or only by a lookup under some other feature, is a base consonant to HarfBuzz. For the new Indic tags (except Malayalam), a rule with backtrack or lookahead doesn’t count. “Other complex scripts” in Simon Cozens’ <a href="https://simoncozens.github.io/fonts-and-layout/localisation.html#other-complex-scripts"><em>Fonts and Layout for Global Scripts</em></a> walks through the same exchange from the font’s side, with Devanagari.</p>
+</blockquote>
+<h2 id="initial-reordering">Initial reordering</h2>
+<p id="ix-50"><code>initial_reordering_indic</code> (<code>:974</code>) updates the consonant positions, inserts dotted circles into broken clusters, and reorders every syllable but symbol and non-Indic ones with <code>initial_reordering_consonant_syllable</code> (<code>:463</code>), whose comments quote Microsoft’s Devanagari specification step by step.</p>
+<h3 id="the-reph">The reph</h3>
+<p id="ix-51">In the implicit mode, a reph needs RA + virama at the start, not followed by a joiner, and an <code>rphf</code> mask bit, which exists only if the font has the feature. Then the <code>rphf</code> probe is asked about the two glyphs (<code>:507</code>):</p>
+<pre><code class="language-c++">if (indic_plan-&gt;rphf.would_substitute (glyphs, 2, face, buffer) || …)
+{
+  limit += 2;
+  while (limit &lt; end &amp;&amp; is_joiner (info[limit]))
+    limit++;
+  base = start;
+  has_reph = true;
+}
+</code></pre>
+<p>(trimmed). If it would, <code>limit</code> keeps the RA and virama out of the base search. A Malayalam dot reph is set aside without asking. If the RA is the only consonant, it is the base after all (<code>:590</code>).</p>
+<p id="ix-52">In Telugu’s explicit mode the reph is RA + virama + ZWJ, and the probe is asked about two glyphs or three. Kannada’s mode is implicit, but “for compatibility with legacy usage in Kannada, Ra+h+ZWJ must behave like Ra+ZWJ+h”: the shaper swaps the ZWJ and virama (<code>:475</code>, issue #435), and the probe is then asked about RA + ZWJ. <code>scripts.ttf</code> has a reph and a below-base KA in both scripts:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">scripts.ttf</td><td class="in"><span class="txt">ర్క</span><span class="cps">U+0C30 U+0C4D U+0C15</span></td><td class="opt">--language=te</td><td class="out"><code>[te.ra=0+500|te.ka.below=0+0]</code></td></tr><tr><td class="font">scripts.ttf</td><td class="in"><span class="txt">ర్⟨ZWJ⟩క</span><span class="cps">U+0C30 U+0C4D U+200D U+0C15</span></td><td class="opt">--language=te</td><td class="out"><code>[space=0+0|te.ka=0+600|te.reph=0+0]</code></td></tr><tr><td class="font">scripts.ttf</td><td class="in"><span class="txt">ರ್ಕ</span><span class="cps">U+0CB0 U+0CCD U+0C95</span></td><td class="opt">--language=kn</td><td class="out"><code>[kn.ka=0+600|kn.reph=0+0]</code></td></tr><tr><td class="font">scripts.ttf</td><td class="in"><span class="txt">ರ್⟨ZWJ⟩ಕ</span><span class="cps">U+0CB0 U+0CCD U+200D U+0C95</span></td><td class="opt">--language=kn</td><td class="out"><code>[kn.ra=0+500|space=0+0|kn.ka.below=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-53">Telugu needs the ZWJ for a reph. Kannada makes one without it, and with it RA is the base, its ZWJ (drawn with the space glyph) now before the virama.</p>
+<p>The grammar allows a reph before a dotted circle, not before NO-BREAK SPACE, so RA + virama + NBSP is two syllables:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">full.ttf</td><td class="in"><span class="txt">र् </span><span class="cps">U+0930 U+094D U+00A0</span></td><td class="opt">--language=hi</td><td class="out"><code>[ra=0+500|virama=0+0|nbsp=2+250]</code></td></tr><tr><td class="font">full.ttf</td><td class="in"><span class="txt">र्◌</span><span class="cps">U+0930 U+094D U+25CC</span></td><td class="opt">--language=hi</td><td class="out"><code>[dottedcircle=0+500|reph=0+0]</code></td></tr></tbody></table></div>
+<h3 id="finding-the-base">Finding the base</h3>
+<p>Then the base search, from the end of the syllable backwards (<code>:540</code>):</p>
+<pre><code class="language-c++">unsigned int i = end;
+bool seen_below = false;
+do {
+  i--;
+  if (is_consonant (info[i]))
+  {
+    if (info[i].indic_position() != POS_BELOW_C &amp;&amp;
+        (info[i].indic_position() != POS_POST_C || seen_below))
+    {
+      base = i;
+      break;
+    }
+    if (info[i].indic_position() == POS_BELOW_C)
+      seen_below = true;
+    base = i;
+  }
+  else
+  {
+    if (start &lt; i &amp;&amp;
+        info[i].indic_category() == I_Cat(ZWJ) &amp;&amp;
+        info[i - 1].indic_category() == I_Cat(H))
+      break;
+  }
+} while (i &gt; limit);
+</code></pre>
+<p>(trimmed of its comments). It passes over consonants with below-base or post-base forms (including pre-base-reordering ones, which are <code>POS_POST_C</code>) and stops at the first with neither, or at the first consonant. Post-base forms must follow below-base ones, so after a below-base consonant a post-base one stops the search. In the <code>else</code>, a ZWJ after a virama “stops the base search, and requests an explicit half form”:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">full.ttf</td><td class="in"><span class="txt">क्र</span><span class="cps">U+0915 U+094D U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|rakar=0+0]</code></td></tr><tr><td class="font">full.ttf</td><td class="in"><span class="txt">क्⟨ZWJ⟩र</span><span class="cps">U+0915 U+094D U+200D U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka.half=0+400|space=0+0|ra=3+500]</code></td></tr></tbody></table></div>
+<p id="ix-54">With the ZWJ, RA is the base and KA takes its half form. <code>is_consonant</code> and the other tests (<code>is_one_of</code>, <code>:54</code>) are false for a ligated glyph, “If it ligated, all bets are off”, which matters most in the final reordering.</p>
+<p>A ZWJ <em>before</em> a virama “requests a subjoined form instead, and hence search continues. This is particularly important for Bengali sequence Ra,H,Ya that should form Ya-Phalaa”. The ZWJ also stops the reph, as the probe is asked about RA + ZWJ:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">scripts.ttf</td><td class="in"><span class="txt">র্য</span><span class="cps">U+09B0 U+09CD U+09AF</span></td><td class="opt">--language=bn</td><td class="out"><code>[bn.ya=0+550|bn.reph=0+0]</code></td></tr><tr><td class="font">scripts.ttf</td><td class="in"><span class="txt">র⟨ZWJ⟩্য</span><span class="cps">U+09B0 U+200D U+09CD U+09AF</span></td><td class="opt">--language=bn</td><td class="out"><code>[bn.ra=0+500|space=0+0|bn.ya.phalaa=0+250]</code></td></tr></tbody></table></div>
+<p>Without the ZWJ, YA is the base under a reph; with it, RA is the base, with ya-phalaa.</p>
+<h3 id="positions-and-the-sort">Positions, and the sort</h3>
+<p id="ix-55">Glyphs before the base get at most <code>POS_PRE_C</code>, the base <code>POS_BASE_C</code>, the reph’s RA <code>POS_RA_TO_BECOME_REPH</code> (<code>:631</code>). The old model then moves its virama (<a href="choosing-a-script-shaper.html#old-and-new-indic-tags">Old and new Indic tags</a>).</p>
+<p id="ix-56">Marks with no place of their own, joiners, nuktas, register shifters, medials and viramas, take the position of the glyph before them (<code>:691</code>), so a nukta sorts with its consonant and a virama with the consonant it kills. But a virama after a left vowel sign takes the position of what preceded the vowel sign: “Uniscribe doesn’t move the Halant with Left Matra”. Each post-base consonant takes everything since the last consonant or vowel sign before it (<code>:722</code>).</p>
+<p id="ix-57">Then <code>hb_stable_sort</code> sorts the syllable by position (<code>:743</code>): “Sit tight, rock ’n roll!” A stable sort would leave several left vowel signs in typed order, the first typed furthest left; the code reverses the run, keeping each with its own nukta and virama, so the last typed is furthest from the base (<code>:764</code>, issue #3863).</p>
+<p id="ix-58">Clusters are merged only from the base on. The <code>syllable</code> byte is borrowed to hold each glyph’s original index, and each cycle of the permutation has its span merged (<code>:815</code>). Before the base, merging waits for the final reordering, which moves pre-base vowel signs again: “these two merge-clusters from the two sides of base will interlock to merge things correctly” (issue #2272). The old model merges everything from the base to the end.</p>
+<h3 id="masks">Masks</h3>
+<p id="ix-59">Last, the masks (<code>:840</code>), which tell the basic features which glyph is which:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-60">Glyphs</th>
+<th id="ix-61">Masks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>the reph’s RA and virama</td>
+<td id="ix-62"><code>rphf</code></td>
+</tr>
+<tr>
+<td>before the base</td>
+<td id="ix-63"><code>half</code>; and <code>blwf</code> too, in the new model where the <code>blwf</code> mode is “pre and post”</td>
+</tr>
+<tr>
+<td>the base</td>
+<td>none</td>
+</tr>
+<tr>
+<td>after the base</td>
+<td id="ix-64"><code>blwf</code>, <code>abvf</code> and <code>pstf</code></td>
+</tr>
+<tr>
+<td id="ix-65">the first virama + consonant pair after the base that <code>pref</code> would substitute</td>
+<td id="ix-66"><code>pref</code></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-67">In Telugu and Kannada (“post only”), a consonant before the base never takes a below-base form. In old-model Devanagari, RA + virama before the base gets <code>blwf</code> too, unless a ZWJ follows: that is “the correct way to request eyelash form of Ra” (<code>:866</code>). A ZWNJ clears <code>half</code> from the glyphs back to the previous consonant (<code>:916</code>); ZWJ and ZWNJ stop <code>cjct</code> “by being there”, since <code>cjct</code> doesn’t pass over them. Here virama + ZWNJ also ends KA’s syllable, and ZWJ asks for the half form explicitly:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">full.ttf</td><td class="in"><span class="txt">क्त</span><span class="cps">U+0915 U+094D U+0924</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka.half=0+400|ta=2+550]</code></td></tr><tr><td class="font">full.ttf</td><td class="in"><span class="txt">क्⟨ZWNJ⟩त</span><span class="cps">U+0915 U+094D U+200C U+0924</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|virama=0+0|space=2+0|ta=3+550]</code></td></tr><tr><td class="font">full.ttf</td><td class="in"><span class="txt">क्⟨ZWJ⟩त</span><span class="cps">U+0915 U+094D U+200D U+0924</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka.half=0+400|space=0+0|ta=3+550]</code></td></tr></tbody></table></div>
+<p id="ix-68"><code>vatu-cjct.ttf</code> makes RA’s below-base form in the global <code>vatu</code> rather than <code>blwf</code>, which the probe accepts (issue #1587), and has a <code>cjct</code> ligature of KA’s half form and TA:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">vatu-cjct.ttf</td><td class="in"><span class="txt">क्रि</span><span class="cps">U+0915 U+094D U+0930 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|ka=0+600|rakar=0+0]</code></td></tr><tr><td class="font">vatu-cjct.ttf</td><td class="in"><span class="txt">क्त</span><span class="cps">U+0915 U+094D U+0924</span></td><td class="opt">--language=hi</td><td class="out"><code>[kta=0+700]</code></td></tr><tr><td class="font">vatu-cjct.ttf</td><td class="in"><span class="txt">क्⟨ZWJ⟩त</span><span class="cps">U+0915 U+094D U+200D U+0924</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka.half=0+400|space=0+0|ta=3+550]</code></td></tr></tbody></table></div>
+<p>KA is the base, as with <code>full.ttf</code>, not RA as with <code>no-blwf.ttf</code>. The ZWJ keeps the half form but stops the conjunct.</p>
+<p id="ix-69">The trace for <code>no-blwf-half.ttf</code>, from this pause to the end of GSUB:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape no-blwf-half.ttf "क्रि" --language=hi --trace</code></div><table><tbody><tr><td class="what">start reordering indic initial</td><td class="buf"><code>[ka=0|virama=0|ra=2|iMatra=2]</code></td></tr><tr><td class="what">skipped inserting dotted-circles because there is no broken syllables</td><td class="buf"><code>[ka=0|virama=0|ra=2|iMatra=2]</code></td></tr><tr><td class="what">end reordering indic initial</td><td class="buf"><code>[iMatra=2|ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">start lookup 0 feature &#x27;rphf&#x27;</td><td class="buf"><code>[iMatra=2|ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;rphf&#x27;</td><td class="buf"><code>[iMatra=2|ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">start reordering indic final</td><td class="buf"><code>[iMatra=2|ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">end reordering indic final</td><td class="buf"><code>[ka=0|virama=0|iMatra=2|ra=2]</code></td></tr><tr><td class="what">start lookup 2 feature &#x27;init&#x27;</td><td class="buf"><code>[ka=0|virama=0|iMatra=2|ra=2]</code></td></tr><tr><td class="what">end lookup 2 feature &#x27;init&#x27;</td><td class="buf"><code>[ka=0|virama=0|iMatra=2|ra=2]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;dev2&#x27;</td><td class="buf"><code>[ka=0|virama=0|iMatra=2|ra=2]</code></td></tr></tbody></table></div>
+<p id="ix-70">The vowel sign is sorted to the front, its cluster not yet merged; the final reordering moves it again and merges it.</p>
+<h2 id="final-reordering">Final reordering</h2>
+<p id="ix-71"><code>final_reordering_indic</code> (<code>:1444</code>) runs after <code>cjct</code>, on glyphs the basic features have changed. Positions still match the glyph order, but categories may no longer fit, so <code>final_reordering_syllable_indic</code> (<code>:999</code>) first repairs one sure case: the virama glyph, ligated and then multiplied, gets category <code>H</code> back. Afterward <code>indic_category</code> and <code>indic_position</code> are released.</p>
+<h3 id="the-base-again">The base again</h3>
+<p id="ix-72">The base is the first glyph at <code>BASE_C</code> or later (<code>:1041</code>). If a glyph after it has the <code>pref</code> mask but wasn’t ligated, “this was a ‘pref’ candidate but didn’t form any. Base is around here...”, and that consonant becomes the base. In Malayalam, so does a below-base consonant whose virama is still there: “skip over unformed below- (but NOT post-) forms” (<code>:1067</code>). A base that lands on a nukta or virama steps back.</p>
+<p id="ix-73">Malayalam’s probes count contextual rules, so a promised form may not form. In <code>scripts.ttf</code>, <code>ignore</code> rules block LA’s below-base form after KA and RA’s <code>pref</code> form after TA:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">scripts.ttf</td><td class="in"><span class="txt">ത്ലെ</span><span class="cps">U+0D24 U+0D4D U+0D32 U+0D46</span></td><td class="opt">--language=ml</td><td class="out"><code>[ml.eMatra=0+300|ml.ta=0+550|ml.la.below=0+0]</code></td></tr><tr><td class="font">scripts.ttf</td><td class="in"><span class="txt">ക്ലെ</span><span class="cps">U+0D15 U+0D4D U+0D32 U+0D46</span></td><td class="opt">--language=ml</td><td class="out"><code>[ml.ka=0+600|ml.virama=0+0|ml.eMatra=0+300|ml.la=0+550]</code></td></tr><tr><td class="font">scripts.ttf</td><td class="in"><span class="txt">ക്രെ</span><span class="cps">U+0D15 U+0D4D U+0D30 U+0D46</span></td><td class="opt">--language=ml</td><td class="out"><code>[ml.eMatra=0+300|ml.ra.pref=0+300|ml.ka=0+600]</code></td></tr><tr><td class="font">scripts.ttf</td><td class="in"><span class="txt">ത്രെ</span><span class="cps">U+0D24 U+0D4D U+0D30 U+0D46</span></td><td class="opt">--language=ml</td><td class="out"><code>[ml.ta=0+550|ml.virama=0+0|ml.eMatra=0+300|ml.ra=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-74">Where a form is blocked, its consonant becomes the base, and vowel sign E goes before it, not at the front.</p>
+<h3 id="pre-base-vowel-signs">Pre-base vowel signs</h3>
+<p id="ix-75">A pre-base vowel sign moves from the front to “after last standalone halant glyph, after initial matra position and before the main consonant” (<code>:1100</code>): after the last virama that wasn’t ligated into a half form. Half forms stay after the vowel sign:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">no-blwf.ttf</td><td class="in"><span class="txt">क्रि</span><span class="cps">U+0915 U+094D U+0930 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|ka.half=0+400|ra=0+500]</code></td></tr><tr><td class="font">no-blwf-half.ttf</td><td class="in"><span class="txt">क्रि</span><span class="cps">U+0915 U+094D U+0930 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|virama=0+0|iMatra=2+250|ra=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-76">The specification adds “If ZWJ or ZWNJ follow this halant, position is moved after it.” That code is in an <code>#if 0</code>: testing with Windows 7 showed that the vowel sign doesn’t pass a virama + ZWJ, and the search goes on before it, while a ZWNJ has already ended the syllable (issue #1070). The move then merges clusters up to the base. Malayalam and Tamil skip the search and put the vowel sign, and a <code>pref</code> form (<code>:1394</code>), straight before the base, as their <code>half</code> glyphs are “Chillus or ligated explicit viramas. We want to position matra after them” (<code>:1133</code>). Here NA’s half form is a <strong>chillu</strong>, a consonant without its vowel, written as a letter of its own:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">scripts.ttf</td><td class="in"><span class="txt">ന്കെ</span><span class="cps">U+0D28 U+0D4D U+0D15 U+0D46</span></td><td class="opt">--language=ml</td><td class="out"><code>[ml.na.chillu=0+450|ml.eMatra=2+300|ml.ka=2+600]</code></td></tr></tbody></table></div>
+<h3 id="the-reph_1">The reph</h3>
+<p>The reph moves only if it formed (<code>:1229</code>). The test is an exclusive or:</p>
+<pre><code class="language-c++">if (start + 1 &lt; end &amp;&amp;
+    info[start].indic_position() == POS_RA_TO_BECOME_REPH &amp;&amp;
+    ((info[start].indic_category() == I_Cat(Repha)) ^
+     _hb_glyph_info_ligated_and_didnt_multiply (&amp;info[start])))
+</code></pre>
+<p id="ix-77">RA + virama moves if <code>rphf</code> ligated it; an encoded repha moves if it did <em>not</em>: “If it ligated, it’s probably the font trying to make it work without the reordering.” The reph glyph’s GDEF class plays no part: a reph that <code>rphf</code> formed moves whether or not the font puts it in a mark class. Where to depends on the reph position, through the specification’s six steps:</p>
+<ol>
+<li>After post-base forms: go to step 5.</li>
+<li>Otherwise, after the first unligated virama between the reph and the base, or a joiner after it.</li>
+<li id="ix-78">After the main consonant (Oriya, Malayalam): after the base and anything with position up to <code>POS_AFTER_MAIN</code>.</li>
+<li id="ix-79">After below-base forms (Bengali): before the first glyph at <code>POST_C</code>, <code>AFTER_POST</code> or <code>SMVD</code>: “our take on what step 4 is trying to say (and failing, BADLY).”</li>
+<li id="ix-80">Step 2, “Copied from step 2”, which is new only to scripts coming from step 1.</li>
+<li>Otherwise, the end of the syllable, before trailing syllable modifiers and Vedic signs, and before a virama that follows a vowel sign, “so it can interact with the Matra”.</li>
+</ol>
+<p>“Before sub” and “before post” are never tested for. Devanagari, Gujarati and Gurmukhi fall through to step 6, and the reph goes to the end, before any anusvara:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">full.ttf</td><td class="in"><span class="txt">र्कि</span><span class="cps">U+0930 U+094D U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|ka=0+600|reph=0+0]</code></td></tr><tr><td class="font">full.ttf</td><td class="in"><span class="txt">र्कुं</span><span class="cps">U+0930 U+094D U+0915 U+0941 U+0902</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|uMatra=0+0|reph=0+0|anusvara=0+0]</code></td></tr><tr><td class="font">no-rphf.ttf</td><td class="in"><span class="txt">र्कि</span><span class="cps">U+0930 U+094D U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[ra=0+500|virama=0+0|iMatra=2+250|ka=2+600]</code></td></tr></tbody></table></div>
+<p id="ix-81">Without <code>rphf</code>, RA is an ordinary pre-base consonant with no half form, so the vowel sign moves after its virama. The trace shows both moves in one pause:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape full.ttf "र्कि" --language=hi --trace</code></div><table><tbody><tr><td class="what">start reordering indic final</td><td class="buf"><code>[reph=0|iMatra=2|ka=2]</code></td></tr><tr><td class="what">end reordering indic final</td><td class="buf"><code>[iMatra=0|ka=0|reph=0]</code></td></tr></tbody></table></div>
+<p id="ix-82">Moving the reph merges the clusters of everything it passes. A Malayalam dot reph needs no <code>rphf</code>. Unless the font ligated it, it moves after the base and anything at <code>POS_AFTER_MAIN</code>, so before a right vowel sign:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">scripts.ttf</td><td class="in"><span class="txt">ൎക</span><span class="cps">U+0D4E U+0D15</span></td><td class="opt">--language=ml</td><td class="out"><code>[ml.ka=0+600|ml.dotReph=0+0]</code></td></tr><tr><td class="font">scripts.ttf</td><td class="in"><span class="txt">ൎകാ</span><span class="cps">U+0D4E U+0D15 U+0D3E</span></td><td class="opt">--language=ml</td><td class="out"><code>[ml.ka=0+600|ml.dotReph=0+0|ml.aaMatra=0+300]</code></td></tr></tbody></table></div>
+<h3 id="pre-base-reordering-consonants">Pre-base-reordering consonants</h3>
+<p id="ix-83">A <strong>pre-base-reordering consonant</strong> follows the base in the text but is drawn before it, as Malayalam’s RA after a virama is. <code>pref</code> makes its form, and the final reordering moves it if it ligated (“We don’t check that the <pref> feature actually did it...”, <code>:1370</code>), to where a pre-base vowel sign would go. <code>pref.ttf</code> gives Devanagari YA such a form, which no Devanagari font needs but the shaper allows:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">full.ttf</td><td class="in"><span class="txt">क्य</span><span class="cps">U+0915 U+094D U+092F</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|ya.post=0+300]</code></td></tr><tr><td class="font">pref.ttf</td><td class="in"><span class="txt">क्य</span><span class="cps">U+0915 U+094D U+092F</span></td><td class="opt">--language=hi</td><td class="out"><code>[ya.pref=0+300|ka=0+600]</code></td></tr><tr><td class="font">pref.ttf</td><td class="in"><span class="txt">क्यि</span><span class="cps">U+0915 U+094D U+092F U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|ya.pref=0+300|ka=0+600]</code></td></tr></tbody></table></div>
+<p id="ix-84">In <code>full.ttf</code>, YA’s <code>pstf</code> form stays after KA. In <code>pref.ttf</code>, YA is post-base too, but its virama and YA get the <code>pref</code> mask, ligate, and move before KA:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape pref.ttf "क्यि" --language=hi --trace</code></div><table><tbody><tr><td class="what">end reordering indic initial</td><td class="buf"><code>[iMatra=2|ka=0|virama=0|ya=0]</code></td></tr><tr><td class="what">start lookup 4 feature &#x27;pref&#x27;</td><td class="buf"><code>[iMatra=2|ka=0|virama=0|ya=0]</code></td></tr><tr><td class="what">ligating glyphs at 2,3</td><td class="buf"><code>[iMatra=2|ka=0|virama=0|ya=0]</code></td></tr><tr><td class="what">ligated glyph at 2</td><td class="buf"><code>[iMatra=2|ka=0|ya.pref=0]</code></td></tr><tr><td class="what">end lookup 4 feature &#x27;pref&#x27;</td><td class="buf"><code>[iMatra=2|ka=0|ya.pref=0]</code></td></tr><tr><td class="what">start lookup 2 feature &#x27;half&#x27;</td><td class="buf"><code>[iMatra=2|ka=0|ya.pref=0]</code></td></tr><tr><td class="what">end lookup 2 feature &#x27;half&#x27;</td><td class="buf"><code>[iMatra=2|ka=0|ya.pref=0]</code></td></tr><tr><td class="what">start reordering indic final</td><td class="buf"><code>[iMatra=2|ka=0|ya.pref=0]</code></td></tr><tr><td class="what">end reordering indic final</td><td class="buf"><code>[iMatra=0|ya.pref=0|ka=0]</code></td></tr></tbody></table></div>
+<p id="ix-85"><code>pref</code>’s lookup, number 4, runs before <code>half</code>’s, number 2 (and <code>blwf</code>’s, number 1, left out of the trace as it had nothing to match): each basic feature has its own stage.</p>
+<h3 id="init"><code>init</code></h3>
+<p id="ix-86">Last, a pre-base vowel sign starting a word gets the <code>init</code> mask (<code>:1431</code>): at the start of the buffer, or after a glyph whose general category is none of the letters, the marks, <code>Cf</code>, <code>Cn</code>, <code>Co</code> and <code>Cs</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">full.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|ka=0+600]</code></td></tr><tr><td class="font">full.ttf</td><td class="in"><span class="txt">ककि</span><span class="cps">U+0915 U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|iMatra=1+250|ka=1+600]</code></td></tr><tr><td class="font">full.ttf</td><td class="in"><span class="txt">␣कि</span><span class="cps">U+0020 U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[space=0+250|iMatra.init=1+250|ka=1+600]</code></td></tr><tr><td class="font">full.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--language=hi --text-before=क</td><td class="out"><code>[iMatra.init=0+250|ka=0+600]</code></td></tr></tbody></table></div>
+<p id="ix-87">After KA it isn’t initial, and the two syllables become unsafe to break between. In the last line the earlier KA is given as pre-context, and the vowel sign is initial again: the test looks only inside the buffer. An application that splits a word into two runs, for a change of color say, gets the initial form mid-word even if it passes the first as context. That may be unintended (inferred: the source gives no reason, and the Arabic shaper’s joining does read context).</p>
+<blockquote>
+<p id="ix-88">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/5795f8699503de6c64206cb939eaae9086b279f1"><code>5795f86</code></a> (17 November 2026), so main reads the pre-context, and in the last line the vowel sign isn’t initial.</p>
+</blockquote>
+<h2 id="the-old-model">The old model</h2>
+<p id="ix-89">The old model’s virama move (<a href="choosing-a-script-shaper.html#old-and-new-indic-tags">Choosing a script shaper</a>) takes the first virama after the base to after the last consonant (<code>:669</code>): KA, virama, RA, virama, with RA below-base, becomes KA, RA, virama, virama, except in Kannada. The old model also differs in three ways, all met above: its probes count contextual rules; glyphs before the base get no <code>blwf</code> mask, except Devanagari RA + virama; and after the sort everything from the base on is one cluster, because “we move halants around”.</p>
+<h2 id="script-by-script">Script by script</h2>
+<p id="ix-90">The rules that apply to one script or two, with where each is:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-91">Script</th>
+<th>Rule</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Devanagari</td>
+<td id="ix-92">old model: RA + virama before the base gets <code>blwf</code>, unless ZWJ follows</td>
+<td><code>:866</code></td>
+</tr>
+<tr>
+<td>Devanagari, Bengali</td>
+<td>RRA (U+0931), and Bengali RRA and RHA, aren’t decomposed (issue #779); Bengali YA + nukta is recomposed to U+09DF, though Unicode excludes it</td>
+<td><code>:1481</code>, <code>:1516</code></td>
+</tr>
+<tr>
+<td>Bengali</td>
+<td>RA + ZWJ + virama + YA: RA is the base, YA ya-phalaa</td>
+<td><code>:572</code></td>
+</tr>
+<tr>
+<td>Gurmukhi</td>
+<td id="ix-93">U+0A40 VOWEL SIGN II is <code>MPst</code>, so a bindi may come before it, and sorts with it (<code>sm? MPst</code> in the grammar)</td>
+<td id="ix-94"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py#L255"><code>gen-indic-table.py:255</code></a>; <code>:713</code></td>
+</tr>
+<tr>
+<td>Gurmukhi</td>
+<td>U+0A51 UDAAT is a vowel sign at <code>BELOW_C</code> (issue #524)</td>
+<td id="ix-95"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py#L292"><code>gen-indic-table.py:292</code></a>, <code>:388</code></td>
+</tr>
+<tr>
+<td>Tamil</td>
+<td id="ix-96">pre-base vowel signs and <code>pref</code> forms go straight before the base; Tamil AU isn’t decomposed</td>
+<td><code>:1133</code>, <code>:1394</code>, <code>:1485</code></td>
+</tr>
+<tr>
+<td>Telugu</td>
+<td>reph only with ZWJ; no below-base forms before the base</td>
+<td><code>:511</code>, <code>:850</code></td>
+</tr>
+<tr>
+<td>Kannada</td>
+<td id="ix-97">RA + virama + ZWJ becomes RA + ZWJ + virama; no below-base forms before the base; the old model’s virama stays before a final virama</td>
+<td><code>:475</code>, <code>:850</code>, <code>:671</code></td>
+</tr>
+<tr>
+<td>Malayalam</td>
+<td id="ix-98">the dot reph; contextual rules count in the probes; unformed below-base forms make a new base; pre-base glyphs straight before the base</td>
+<td><code>:529</code>, <code>:340</code>, <code>:1067</code>, <code>:1133</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="uniscribe">Uniscribe</h2>
+<p>Microsoft’s specifications say what Uniscribe was meant to do; fonts were tested against what it did. The comments record where HarfBuzz follows the latter:</p>
+<table>
+<thead>
+<tr>
+<th>Where</th>
+<th>What HarfBuzz does, and why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>consonant_position_from_face</code>, <code>:367</code></td>
+<td id="ix-99">asks the probes in both orders, because Uniscribe honors old-order lookups in new-model fonts</td>
+</tr>
+<tr>
+<td><code>data_create_indic</code>, <code>:331</code></td>
+<td id="ix-100">uses zero-context probes except for Malayalam and the old model, from testing what Windows does</td>
+</tr>
+<tr>
+<td id="ix-101">initial reordering, <code>:641</code></td>
+<td>moves the old model’s virama unconditionally, except in Kannada, where “Uniscribe does this only if there is <em>not</em> a Halant after last consonant already”</td>
+</tr>
+<tr>
+<td id="ix-102">initial reordering, <code>:701</code></td>
+<td>doesn’t move a virama with a left vowel sign: “Uniscribe doesn’t move the Halant with Left Matra”</td>
+</tr>
+<tr>
+<td id="ix-103">final reordering, <code>:1111</code></td>
+<td>doesn’t move a pre-base vowel sign past ZWJ, from testing with Windows 7</td>
+</tr>
+<tr>
+<td id="ix-104">final reordering, <code>:1330</code></td>
+<td id="ix-105">puts a reph before a final virama only after a vowel sign + virama, “Uniscribe doesn’t do this” otherwise</td>
+</tr>
+<tr>
+<td><code>indic_features</code>, <code>:192</code></td>
+<td id="ix-106">applies the presentation features together, for the Windows Bengali font</td>
+</tr>
+</tbody>
+</table>
+<p><code>NEWS</code> for 12.3.0 records the removal of “the disabled by default uniscribe-bug-compatible mode” from the Indic and Khmer shapers. Asking the font goes back to 0.9.6: “Make reph and ‘pref’ logic introspect the font.”</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc"><code>src/hb-ot-shaper-indic.cc</code></a></td>
+<td>the per-script configuration, the features and stages, the probes, both reorderings, and the <code>decompose</code> and <code>compose</code> hooks</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.hh"><code>src/hb-ot-shaper-indic.hh</code></a></td>
+<td>the positions, <code>ot_position_t</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic-machine.rl"><code>src/hb-ot-shaper-indic-machine.rl</code></a></td>
+<td>the categories and the syllable grammar, in Ragel</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic-machine.hh"><code>src/hb-ot-shaper-indic-machine.hh</code></a></td>
+<td>the machine Ragel generated from it, committed</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ragel-artifacts.py"><code>src/gen-ragel-artifacts.py</code></a></td>
+<td>runs Ragel for meson and copies the result into <code>src/</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic-table.cc"><code>src/hb-ot-shaper-indic-table.cc</code></a></td>
+<td>the generated categories and positions, shared with Khmer and Myanmar</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py"><code>src/gen-indic-table.py</code></a></td>
+<td>the generator, which reads <code>IndicSyllabicCategory.txt</code>, <code>IndicPositionalCategory.txt</code> and <code>Blocks.txt</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-syllabic.cc"><code>src/hb-ot-shaper-syllabic.cc</code></a></td>
+<td>inserting dotted circles into broken clusters, and releasing the <code>syllable</code> byte</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.hh"><code>src/hb-ot-layout.hh</code></a></td>
+<td><code>foreach_syllable</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>src/hb-limits.hh</code></a></td>
+<td><code>HB_MAX_SYLLABLE_LENGTH</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Each character gets a category and a position from a table generated from Unicode’s Indic syllabic and positional categories, with HarfBuzz’s overrides. Every consonant starts as a possible base.</li>
+<li>A Ragel scanner divides the run into consonant syllables, vowel syllables, standalone clusters, symbol clusters, broken clusters and non-Indic clusters, and writes each syllable’s type and a serial number into the <code>syllable</code> byte. Syllables are handled at most 64 glyphs at a time.</li>
+<li>The basic features run one stage each, after the initial reordering; the presentation features run together, after the final reordering. All are confined to the syllable.</li>
+<li>The font decides each consonant’s role: if its <code>blwf</code> or <code>vatu</code> would substitute virama + consonant (in either order) the consonant is below-base, if <code>pstf</code> or <code>pref</code> would, post-base. The base is the last consonant that is neither. <code>rphf</code> decides the reph the same way.</li>
+<li>The initial reordering sorts the syllable by position and sets the masks; the final reordering moves pre-base vowel signs after any virama left standing, moves the reph to its script’s place, and moves a <code>pref</code> form before the base, each only if the basic features made what it needs.</li>
+<li>The scripts differ in a table and a few <code>if</code>s: Telugu’s reph needs a ZWJ, Malayalam’s is a character, and Malayalam and Tamil put pre-base glyphs just before the base.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="hebrew-thai-lao-and-hangul.html">← Hebrew, Thai, Lao and Hangul</a><a rel="next" href="khmer-and-myanmar.html">Khmer and Myanmar →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

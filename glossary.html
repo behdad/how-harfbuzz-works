@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Glossary · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<h1 id="glossary">Glossary</h1>
+<p><strong>Accelerator.</strong> An object HarfBuzz builds once per face from a table, holding whatever makes the table quick to read: a chosen <code>cmap</code> subtable, per-lookup digests, a glyph count.</p>
+<p><strong>Advance.</strong> How far the pen moves after a glyph: along <em>x</em> in horizontal text, along <em>y</em> in vertical text.</p>
+<p><strong>Analytic coverage.</strong> Working out how much of each pixel an outline covers exactly, from its edges, rather than by sampling points.</p>
+<p><strong>Anchor.</strong> A point on a glyph where another glyph attaches: a mark onto a base, or one cursive glyph onto the next.</p>
+<p><strong>ankr.</strong> Apple’s anchor point table, which <code>kerx</code> format 4 uses to attach one glyph to another by named points.</p>
+<p><strong>Attachment chain.</strong> HarfBuzz’s record, on each attached glyph, of the glyph it hangs from (<code>attach_chain</code>, <code>attach_type</code>), resolved into offsets after all GPOS lookups have run.</p>
+<p><strong>Backend.</strong> A complete shaping engine that <code>hb_shape</code> can hand a run to: <code>ot</code>, HarfBuzz’s own, or <code>graphite2</code>, <code>wasm</code>, <code>harfrust</code>, a platform engine or <code>fallback</code>. Not the same as a script shaper.</p>
+<p><strong>Base consonant.</strong> The consonant an Indic syllable is built around, which HarfBuzz finds by asking the font’s own <code>blwf</code>, <code>pstf</code>, <code>pref</code> and <code>vatu</code> lookups which consonants they would change.</p>
+<p><strong>Bidi closure.</strong> Adding the mirrored partners of requested characters, such as ( for ), so right-to-left text still works in a subset.</p>
+<p><strong>Blob.</strong> A run of bytes with a reference count and a function that frees them. Every table HarfBuzz reads is a blob, usually a sub-blob of the font file’s.</p>
+<p><strong>Blocked.</strong> Of a mark during composition: separated from the starter by a mark of the same or a higher combining class, so it can’t compose with it.</p>
+<p><strong>Broken cluster.</strong> A syllable that doesn’t follow its script’s grammar, such as a vowel sign with no consonant. HarfBuzz gives it a dotted circle.</p>
+<p><strong>cfar.</strong> “Conjunct form after Ro”: the Khmer feature applied to the glyphs after a COENG + RO that has been moved before the base.</p>
+<p><strong>Chain.</strong> In <code>morx</code>, a sequence of subtables run in order, each enabled or disabled by flags that the requested features set.</p>
+<p><strong>Charstring.</strong> A small program in a CFF or CFF2 font that draws one glyph’s outline. HarfBuzz runs it, ignoring the hints.</p>
+<p><strong>Chillu.</strong> In Malayalam, a consonant written in its final, vowelless form, which HarfBuzz treats like a half form.</p>
+<p><strong>Chosen script.</strong> The script tag HarfBuzz settles on in GSUB or GPOS: the first of the run’s tags the font has, or a fallback. GSUB’s choice helps pick the script shaper.</p>
+<p><strong>ClipBox.</strong> In COLR version 1, a box that bounds a glyph’s paint, giving its extents and limiting gradients that would otherwise fill everything.</p>
+<p><strong>Cluster.</strong> A number on each glyph naming the text it came from, normally the index of its first character. Glyphs from the same text share a cluster.</p>
+<p><strong>Cluster level.</strong> A buffer setting that decides how eagerly HarfBuzz merges clusters, and whether it keeps them in order.</p>
+<p><strong>Code point.</strong> The number Unicode gives a character, written in hexadecimal after “U+”, from U+0000 to U+10FFFF.</p>
+<p><strong>COENG.</strong> The Khmer sign, U+17D2, that makes the next consonant a subscript: Khmer’s counterpart of the virama.</p>
+<p><strong>Color line.</strong> The list of color stops along a COLR gradient, with an extend mode saying what happens beyond its ends.</p>
+<p><strong>Content type.</strong> Whether a buffer holds characters (Unicode), glyph IDs (glyphs), or nothing yet.</p>
+<p><strong>Context (of a run).</strong> Text just before and after a run, given to HarfBuzz so that rules looking across the run’s edges still work. It is not shaped.</p>
+<p><strong>Context set.</strong> In hb-depend, the glyphs a contextual lookup’s rule needs around it before an edge applies.</p>
+<p><strong>Continuation.</strong> A character that belongs with the one before it in a grapheme, such as a mark. HarfBuzz keeps a bit for it in each glyph’s Unicode properties.</p>
+<p><strong>Coverage table.</strong> A list of glyphs that a subtable applies to. A glyph’s place in the list (its coverage index) picks its data in the subtable.</p>
+<p><strong>Cross-stream kerning.</strong> Kerning that moves glyphs across the line rather than along it: up and down in horizontal text.</p>
+<p><strong>Cursive attachment.</strong> GPOS joining one glyph’s exit anchor to the next glyph’s entry anchor, so that connected letters line up across the line.</p>
+<p><strong>Data generators.</strong> The Python scripts in HarfBuzz’s <code>src/</code> that turn Unicode and registry data into the C tables committed to the repository, run by hand when the data changes.</p>
+<p><strong>Default ignorable.</strong> A character meant to be invisible unless a font does something with it: a joiner, a soft hyphen, a variation selector. HarfBuzz keeps its own list, and hides them at the end of shaping.</p>
+<p><strong>Detailed messages.</strong> The extra buffer messages, one per lookup and stage, that HarfBuzz emits only when built with <code>HB_BUFFER_MESSAGE_MORE</code>.</p>
+<p><strong>Device table.</strong> A table of small corrections attached to a GPOS value or anchor: per pixel size, for hinting, or, as a VariationIndex table, per position in a variable font’s design space.</p>
+<p><strong>dfont.</strong> A classic Mac OS resource fork stored as a plain file, holding one or more OpenType fonts as <code>sfnt</code> resources.</p>
+<p><strong>Dispatch context.</strong> The job HarfBuzz passes down a table’s structure: sanitizing, applying, closure, subsetting. Each struct with formats dispatches to the right one, and the context says what to do there.</p>
+<p><strong>DontAdvance.</strong> An AAT state-machine flag that makes the machine look at the same glyph again, bounded in HarfBuzz by the operation budget.</p>
+<p><strong>Dot reph.</strong> The Malayalam reph, written as a dot (log repha), which HarfBuzz places after the base without an <code>rphf</code> lookup.</p>
+<p><strong>Dotted circle.</strong> U+25CC, which HarfBuzz inserts as a base for a mark that has none, so that the mark has something to sit on. It does so in four places: at the start of text, for broken syllables, for stray Hangul tone marks, and for the vowel constraints.</p>
+<p><strong>Draw functions.</strong> The callbacks a client gives HarfBuzz to receive an outline: move to, line to, quadratic and cubic curves to, and close path (<code>hb_draw_funcs_t</code>).</p>
+<p><strong>Empty blob, empty face.</strong> Static, immutable objects of length zero. A missing or broken table is the empty blob, which reads as the table’s Null object.</p>
+<p><strong>Empty plan.</strong> The shape plan returned when none can be made. Running it does nothing and returns false.</p>
+<p><strong>Extension promotion.</strong> The repacker’s rescue for a lookup out of reach of a 16-bit offset: wrapping its subtables in Extension subtables, whose 32-bit offsets reach anywhere.</p>
+<p><strong>Eyelash RA.</strong> In Devanagari, the form of RA before a virama that a ZWJ asks for, written as a small hook rather than a reph.</p>
+<p><strong>Face.</strong> One font in a font file, without a size. It hands out tables by tag and keeps lazily loaded accelerators for them, and can be shared between threads.</p>
+<p><strong>Face index.</strong> The number that picks a face in a collection (its low 16 bits) and, optionally, a named instance (its high 16 bits, minus one).</p>
+<p><strong>Fallbacks.</strong> What HarfBuzz does itself when a font lacks a table: positioning marks from glyph extents, giving missing spaces a width, and kerning through the font functions.</p>
+<p><strong>feat.</strong> Apple’s table of feature names, for user interfaces. HarfBuzz uses it to decide which requested features a <code>morx</code> font supports.</p>
+<p><strong>Feature table substitution.</strong> The part of a FeatureVariations record that swaps a feature’s whole table for another in some region of the design space.</p>
+<p><strong>Feature type and selector.</strong> AAT’s way of naming a feature setting, by two numbers rather than a tag. HarfBuzz maps OpenType tags onto them.</p>
+<p><strong>Final reordering.</strong> The Indic shaper’s second pass, after the basic features: it moves the reph and pre-base vowel signs to their final places, now that conjuncts and half forms are known.</p>
+<p><strong>Fixpoint.</strong> The point where repeating a step changes nothing further. HarfBuzz’s subset closure runs a fixed number of stages instead of iterating to one.</p>
+<p><strong>Font.</strong> A face at a particular scale, with variation coordinates and synthetic settings, and the font functions that answer questions about its glyphs.</p>
+<p><strong>Font extents.</strong> The ascender, descender and line gap of a font as a whole.</p>
+<p><strong>Font functions.</strong> The table of callbacks a font uses to answer questions about glyphs: which glyph a character maps to, advances, origins, extents, outlines. HarfBuzz’s own are hb-ot.</p>
+<p><strong>Font segmentation.</strong> Splitting a font into pieces that can be loaded separately, as incremental font transfer does; it needs to know which glyphs depend on which.</p>
+<p><strong>Foreground color.</strong> The color of the surrounding text, which a color glyph asks for with palette entry 0xFFFF.</p>
+<p><strong>Fuzzer.</strong> A program that feeds a library endless mutated inputs, looking for crashes, hangs and runaway memory. HarfBuzz’s run continuously on OSS-Fuzz.</p>
+<p><strong>Global bit.</strong> Bit 31 of each glyph’s mask, shared by every feature that is on for the whole run with value 1.</p>
+<p><strong>Global feature.</strong> A feature applied to the whole run. Global features with value 1 share one mask bit; a feature over a range needs bits of its own.</p>
+<p><strong>Glyph assembly.</strong> In MATH, a recipe for building a very large glyph, such as a tall bracket, from pieces and extenders.</p>
+<p><strong>Glyph closure.</strong> The set of glyphs a font can reach from given characters, through cmap, layout, composites, COLR, MATH and VARC. The subsetter computes it in a fixed order of stages.</p>
+<p><strong>Glyph dependency graph.</strong> A graph of which glyphs a font can turn into or pull in, each edge labeled with the table that causes it: GSUB lookups, composites, COLR, MATH, VARC. HarfBuzz builds it with hb-depend.</p>
+<p><strong>Glyph extents.</strong> The box around a glyph’s ink, relative to its origin.</p>
+<p><strong>Glyph ID.</strong> A glyph’s number in its font. Glyph 0 is <code>.notdef</code>.</p>
+<p><strong>Glyph properties.</strong> HarfBuzz’s record, on each glyph in the buffer, of its GDEF class and of how it got there (substituted, ligated, multiplied).</p>
+<p><strong>Golden-file test.</strong> A test that compares output with a stored expected file, as <code>test/subset</code> and <code>test/vector</code> do.</p>
+<p><strong>Grade.</strong> Synthetic bold that leaves advances alone, so text doesn’t reflow.</p>
+<p><strong>HarfRust.</strong> The HarfBuzz project’s Rust port of HarfBuzz shaping, reading fonts with Fontations’ <code>read-fonts</code>; HarfBuzz can call it as its <code>harfrust</code> shaper.</p>
+<p><strong>hb-depend.</strong> HarfBuzz’s experimental API for computing a font’s glyph dependency graph, part of the subset library.</p>
+<p><strong>hb-gpu.</strong> HarfBuzz’s library that encodes glyphs for drawing on the GPU, with the Slug method, and the shaders that draw them.</p>
+<p><strong>HB_LEAN, HB_MINI, HB_TINY.</strong> HarfBuzz’s configuration tiers: one macro each that turns off a group of features. <code>HB_TINY</code> sets both of the others, and more.</p>
+<p><strong>hb-raster.</strong> HarfBuzz’s library that turns drawn and painted glyphs into pixels: anti-aliased coverage masks for outlines, and color images for painted glyphs.</p>
+<p><strong>hb-vector.</strong> HarfBuzz’s library that writes drawn and painted glyphs as SVG or PDF. The book’s drawings are made with it.</p>
+<p><strong>Hidden axes.</strong> Design axes that no user sets: avar 2’s, which other axes drive, and VARC components’ own part parameters, set by the glyph that uses the part.</p>
+<p><strong>Hidden (character).</strong> A default ignorable that GSUB must not pass over, because it changes the shaping around it: the Mongolian free variation selectors, TAG characters, and a CGJ that kept marks apart.</p>
+<p><strong>Implied on-curve point.</strong> In a <code>glyf</code> outline, the point halfway between two consecutive off-curve points, which TrueType doesn’t store.</p>
+<p><strong>Initial reordering.</strong> The Indic shaper’s first pass over each syllable, before the basic features: it finds the base consonant, moves pre-base vowel signs and the reph, and sets each glyph’s feature masks by its position.</p>
+<p><strong>Instance.</strong> A font made from a variable font at a chosen position (a full instance, with no axes left) or over a narrower range (a partial instance).</p>
+<p><strong>Invertible set.</strong> An <code>hb_set_t</code> that can stand for everything except its members, so “all features but these” costs no more than “these”.</p>
+<p><strong>Invisible glyph.</strong> The glyph a hidden default ignorable becomes at the end of shaping: one the application sets, or else the font’s space, with no advance.</p>
+<p><strong>Italics correction.</strong> In MATH, the extra space to add after a slanted glyph before an upright one, so a superscript or the next symbol doesn’t collide with it.</p>
+<p><strong>Jamo.</strong> The letters a Korean syllable is built from: a leading consonant, a vowel and an optional trailing consonant. Unicode encodes them separately and also as 11,172 precomposed syllables.</p>
+<p><strong>Joining type.</strong> A character’s Unicode property saying which sides it joins on: dual-joining, right-joining, left-joining, join-causing, non-joining or transparent.</p>
+<p><strong>Kern machine.</strong> HarfBuzz’s loop that applies pair kerning from the <code>kern</code> and <code>kerx</code> tables and from fallback kerning (<code>hb_kern_machine_t</code>).</p>
+<p><strong>kerx.</strong> Apple’s extended kerning table, with 32-bit headers and formats for anchor attachment and class matrices, applied by HarfBuzz in place of GPOS when a font is shaped the AAT way.</p>
+<p><strong>Kinzi.</strong> In Myanmar, a NGA with ASAT and virama written above the next consonant; HarfBuzz moves it after the base, like a reph.</p>
+<p><strong>Language.</strong> What a run of text is written in, given to HarfBuzz as a BCP 47 tag such as <code>tr</code>, <code>ur</code> or <code>zh-Hant</code>, built from the subtags in <a href="https://www.iana.org/assignments/language-subtag-registry">IANA’s registry</a>. HarfBuzz ignores case and reads <code>_</code> as <code>-</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.cc#L167"><code>hb-common.cc:167</code></a>), and maps the tag to OpenType language system tags: <code>tr</code> becomes <code>'TRK '</code>.</p>
+<p><strong>Language system tag.</strong> OpenType’s name for a language under a script, such as <code>MAR</code> or <code>TRK</code>, with its own features. Like every OpenType tag it is four bytes: most language system tags are three letters padded with a space (<code>'TRK '</code>), and a few use all four (<code>'ZHTM'</code>, <code>'HYE0'</code>). The tags are <a href="https://learn.microsoft.com/en-us/typography/opentype/spec/languagetags">listed in the OpenType specification</a>.</p>
+<p><strong>Lazy loader.</strong> A one-pointer slot on a face that is filled the first time a table or accelerator is asked for, without a lock.</p>
+<p><strong>Leaf.</strong> In VARC, a component drawn from an ordinary outline, in <code>glyf</code>, CFF2 or CFF, rather than from more components.</p>
+<p><strong>Legacy kern table.</strong> <code>kern</code>, the kerning table that came before GPOS, in Microsoft’s and Apple’s incompatible versions. HarfBuzz applies it only where GPOS has no <code>kern</code> feature, and only under some shapers.</p>
+<p><strong>Ligature caret.</strong> A position inside a ligature where a text cursor can stand, from GDEF, so “ffi” can be edited letter by letter.</p>
+<p><strong>Ligature ID and component.</strong> Numbers HarfBuzz gives a ligature and the marks inside it, so each mark knows which part of the ligature it belongs to.</p>
+<p><strong>Ligature set.</strong> In hb-depend, the set of glyphs that must all be present for a ligature edge to apply.</p>
+<p><strong>Limiting.</strong> Narrowing an axis’s range when instancing, so the font keeps the axis but varies over less of it, renormalized to the new range.</p>
+<p><strong>Long metric.</strong> An advance and side bearing pair in <code>hmtx</code> or <code>vmtx</code>. Glyphs after the last one store only a side bearing and share its advance.</p>
+<p><strong>Lookup.</strong> One set of rules of one type, with flags saying which glyphs it ignores. Features are lists of lookups.</p>
+<p><strong>Map.</strong> The part of a shape plan that turns feature tags into the lookups that run: each with its mask and flags, in stages.</p>
+<p><strong>Mask.</strong> 32 bits on each glyph saying which features are on for it.</p>
+<p><strong>Math kern.</strong> In MATH, kerning for a glyph’s corners that varies with height, for placing superscripts and subscripts.</p>
+<p><strong>Meson.</strong> The build system HarfBuzz uses. A build is set up with <code>meson setup</code>, which reads <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build"><code>meson.build</code></a> and the options in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson_options.txt"><code>meson_options.txt</code></a>, and then run with Ninja (<a href="building-harfbuzz.html#meson-and-ninja">Building HarfBuzz</a>).</p>
+<p><strong>Min/max extents.</strong> In BASE, the highest and lowest a script’s glyphs reach, for a given language, used to set line spacing.</p>
+<p><strong>Modified combining class.</strong> HarfBuzz’s version of Unicode’s combining class, used to sort marks into the order fonts expect for Hebrew, Arabic, Telugu, Thai and Tibetan.</p>
+<p><strong>Modifier combining mark.</strong> One of the Arabic marks, such as hamza above, that Unicode’s Arabic mark rendering (UTR #53) moves to the front of a run of marks.</p>
+<p><strong>morx.</strong> Apple’s extended glyph metamorphosis table: chains of state-machine subtables that substitute, ligate, insert and rearrange glyphs. HarfBuzz runs it in place of GSUB.</p>
+<p><strong>Multiple item variation store.</strong> The variation store VARC uses, whose items are lists of numbers that vary together (all of one component’s values), and whose regions name only the axes they use.</p>
+<p><strong>Name record.</strong> One entry in the <code>name</code> table: a string for a name ID in one platform, encoding and language.</p>
+<p><strong>Native order.</strong> The order a script is read in. HarfBuzz reverses a run into it at the start of shaping if it was given in the other direction, so that lookups see text the way fonts are written for.</p>
+<p><strong>Neutering.</strong> What the sanitizer did before HarfBuzz 12.3: writing zero over a bad offset in the font’s bytes, so that the rest of the table could be kept.</p>
+<p><strong>Ninja.</strong> A small, fast build tool that runs the build steps Meson writes out (<code>ninja -C build</code>).</p>
+<p><strong>Nominal glyph.</strong> The glyph a font’s <code>cmap</code> gives for a character: where shaping starts.</p>
+<p><strong>Normalization.</strong> HarfBuzz’s decomposing, reordering and recomposing of characters before shaping, done against the font: a character is decomposed only if the font has the pieces, and composed only if it has the result.</p>
+<p><strong>Normalization mode.</strong> How far a script shaper wants HarfBuzz to compose: never, or diacritics onto their bases, with or without first decomposing characters the font already has.</p>
+<p><strong>Not-found glyph.</strong> The glyph used for a character the font doesn’t have: <code>.notdef</code>, glyph 0, unless the application sets another.</p>
+<p><strong>Null object.</strong> A read-only, empty instance of a table type, usually all zeros. A zero offset, an out-of-range index or a missing table reads as one.</p>
+<p><strong>Object graph.</strong> A table being written, seen as objects (subtables) joined by links (offsets). The serializer builds it; the repacker rearranges it.</p>
+<p><strong>Offset.</strong> A number of bytes, counted from some base structure, to another structure in the same table. In HarfBuzz an offset knows the type of its target.</p>
+<p><strong>Old and new Indic tags.</strong> The two generations of OpenType tag for the nine Indic scripts (<code>deva</code>, <code>dev2</code>), which expect some glyphs in different orders. <code>dev3</code> and the other <code>3</code> tags, which HarfBuzz and Core Text support but the OpenType registry doesn’t list, send text to the Universal Shaping Engine.</p>
+<p><strong>Old Hangul.</strong> Korean as written before the twentieth century, whose syllables have no precomposed characters and are drawn from jamo glyphs with <code>ljmo</code>, <code>vjmo</code> and <code>tjmo</code>.</p>
+<p><strong>Output buffer.</strong> The second sequence a buffer writes to while a step reads the first. It shares memory with the input until it would overtake it, then moves into the positions array.</p>
+<p><strong>Override header.</strong> A header named by <code>HB_CONFIG_OVERRIDE_H</code> (or <code>HB_CONFIG_OVERRIDE_LAST_H</code>, read after the rest) that a build uses to define or undefine HarfBuzz’s configuration macros.</p>
+<p><strong>packTab.</strong> HarfBuzz’s packer for multi-level lookup tables, used by the generators to make the Unicode tables small.</p>
+<p><strong>Paint graph.</strong> How a COLR version 1 glyph is described: a tree of paints (fills, gradients, transforms, clips, composites, other glyphs) that HarfBuzz walks and hands to the client’s paint functions.</p>
+<p><strong>Palette.</strong> A list of colors in the CPAL table. A color glyph refers to entries by index, so one font can be shown in several palettes, chosen by the client.</p>
+<p><strong>Pause.</strong> The end of a stage, where a script shaper may run a function of its own before the next stage’s lookups.</p>
+<p><strong>Phantom points.</strong> Four points HarfBuzz adds to each TrueType glyph, at the ends of its horizontal and vertical advances, so that <code>gvar</code> deltas can vary the advances.</p>
+<p><strong>Pinning.</strong> Fixing an axis at one value when instancing, so the axis disappears and its deltas are applied.</p>
+<p><strong>Pipe.</strong> HarfBuzz’s way of chaining iterator steps with <code>|</code>, as in <code>+ glyphs | hb_filter (set) | hb_map (map) | hb_sink (out)</code>; each step is a function object applied to the iterator before it.</p>
+<p><strong>Point matching.</strong> Placing a <code>glyf</code> component by making one of its points coincide with one of the glyph’s earlier points, instead of by an offset.</p>
+<p><strong>ppem.</strong> Pixels per em: the size a font is drawn at on a pixel grid, as the length of its em measured in pixels.</p>
+<p><strong>Presentation form.</strong> A character that encodes a letter already shaped: an Arabic letter in one joining form, or a Hebrew letter with its points. HarfBuzz uses them only for old fonts without layout tables.</p>
+<p><strong>ptem.</strong> The font’s size in points. Read only by <code>trak</code>, CoreText, and the reported optical size.</p>
+<p><strong>PUA fallback.</strong> HarfBuzz’s shaping of Thai for old fonts without a <code>thai</code> script, by swapping marks and consonants for the private-use glyphs Windows and Mac fonts once drew them with.</p>
+<p><strong>Ragel.</strong> The state-machine compiler HarfBuzz uses for the grammars that find syllables in Indic, Khmer, Myanmar and USE text.</p>
+<p><strong>Recategorizing.</strong> Replacing marks’ combining classes with the few positional classes fallback mark positioning understands, just before glyphs are mapped.</p>
+<p><strong>Repacker.</strong> The code that reorders, splits and duplicates a table’s objects when its 16-bit offsets overflow, so the table can still be written.</p>
+<p><strong>Reph.</strong> The form of RA written above the syllable when RA and a virama begin it, moved by the Indic shaper to where the script puts it.</p>
+<p><strong>Required feature.</strong> A feature a language system names by index, whose lookups always run, whatever the application asks for.</p>
+<p><strong>Run.</strong> Text in one font, script, direction and language: what HarfBuzz shapes in one call.</p>
+<p><strong>rustybuzz.</strong> An earlier Rust port of HarfBuzz shaping, built on ttf-parser, now archived; HarfRust started from it.</p>
+<p><strong>Sanitizer.</strong> The code that checks, once per table, that HarfBuzz can read the table without going outside it. It checks for safety, not validity.</p>
+<p><strong>SARA AM.</strong> The Thai vowel ำ, drawn as a small circle over the consonant and a SARA AA after it. HarfBuzz always splits it into NIKHAHIT and SARA AA.</p>
+<p><strong>Scale.</strong> The number of output units in one em. Everything HarfBuzz returns is in those units.</p>
+<p><strong>Scratch fields (<code>var1</code>, <code>var2</code>).</strong> Eight private bytes on each glyph, lent to one stage of shaping after another and checked by <code>HB_BUFFER_ALLOCATE_VAR</code>.</p>
+<p><strong>Script shaper.</strong> The part of HarfBuzz that knows one family of scripts’ rules: joining, reordering, which features apply to which glyphs.</p>
+<p><strong>Script tag.</strong> OpenType’s four-letter name for a script in a font’s ScriptList, such as <code>latn</code> or <code>dev2</code>; a few shorter ones are padded with spaces (<code>'nko '</code>, <code>'yi  '</code>). One Unicode script can have several. The tags are <a href="https://learn.microsoft.com/en-us/typography/opentype/spec/scripttags">listed in the OpenType specification</a>.</p>
+<p><strong>Segment properties.</strong> A buffer’s direction, script and language.</p>
+<p><strong>Serializer.</strong> HarfBuzz’s writer of font tables, <code>hb_serialize_context_t</code>: it builds each table as a graph of objects joined by links, shares identical objects, and resolves the offsets at the end.</p>
+<p><strong>Set digest.</strong> A small, fast summary of a set of glyphs, which can say for certain that a glyph is <em>not</em> in the set.</p>
+<p><strong>sfnt.</strong> The container format of TrueType and OpenType fonts: a header, a directory of tables, and the tables.</p>
+<p><strong>Shape plan.</strong> Everything HarfBuzz decides about a run before seeing its text: the script shaper, the feature masks and the lookups in stages. Made per face, and cached on it.</p>
+<p><strong>Shaper list.</strong> The ordered list of backends a build has. The first that accepts a face shapes it. <code>HB_SHAPER_LIST</code> reorders it.</p>
+<p><strong>Sharing.</strong> The serializer writing one copy of an object that several others link to, found by hashing the objects as they are packed.</p>
+<p><strong>Short-circuit.</strong> In normalization, keeping a character the font has without looking at its decomposition.</p>
+<p><strong>Sink.</strong> The last step of a pipe, which stores each item somewhere: a set, a vector or a serializer.</p>
+<p><strong>Slug.</strong> Eric Lengyel’s method of drawing glyphs directly from their quadratic curves on the GPU, which hb-gpu implements.</p>
+<p><strong>Stage.</strong> A group of lookups run together, between pauses where a script shaper can work on the buffer.</p>
+<p><strong>Standard cluster.</strong> USE’s name for an ordinary syllable: a base with its marks, medials and finals, matched by its grammar.</p>
+<p><strong>Starter.</strong> In normalization, the last character with combining class zero: the one a following mark may compose with.</p>
+<p><strong>stch.</strong> A feature for Syriac’s abbreviation mark and similar lines, which HarfBuzz stretches to the width of the word by repeating tiles.</p>
+<p><strong>Strike.</strong> One size of bitmap in an sbix or CBDT table. HarfBuzz chooses the strike nearest the font’s ppem.</p>
+<p><strong>Structural limit.</strong> A fixed bound on the shape of the data, such as nesting depth or pattern length, as against a work budget, which bounds how much is done.</p>
+<p><strong>Sub-blob.</strong> A blob that points into another blob’s bytes and keeps it alive. Tables are sub-blobs of the file.</p>
+<p><strong>Sub-font.</strong> A font whose parent is another font. Questions its own font functions don’t answer go to the parent, rescaled.</p>
+<p><strong>Subset plan.</strong> What the subsetter computes before writing anything: which glyphs, characters, lookups and features survive, and the map from old glyph IDs to new.</p>
+<p><strong>Subsetter.</strong> HarfBuzz’s library for cutting a font down to the characters, glyphs and features a document needs, <code>hb_subset_or_fail</code>.</p>
+<p><strong>Synthetic bold and slant.</strong> Emboldening and shearing applied by the font object to whatever its font functions report, for families without a real bold or italic.</p>
+<p><strong>Tagged Null.</strong> A Null object’s address with its lowest bit set, stored in a lazy slot when building an accelerator failed, so that the failure isn’t retried.</p>
+<p><strong>Tent.</strong> A region of the design space along one axis: zero at its start and end, full at its peak. Deltas apply in proportion to how far into the tent a location is.</p>
+<p><strong>Top accent attachment.</strong> In MATH, the horizontal position over a glyph where an accent is centered; HarfBuzz returns half the advance when the font gives none.</p>
+<p><strong>Top to bottom (TTB).</strong> HarfBuzz’s direction for vertical text. A bottom-to-top run is turned into it at the start of shaping, and stays in it.</p>
+<p><strong>trak.</strong> Apple’s tracking table: letter-spacing that varies with point size, which HarfBuzz reads at the font’s ptem.</p>
+<p><strong>TrueType Collection (TTC).</strong> A file holding several fonts, each with its own table directory, which can share tables.</p>
+<p><strong>Unicode funcs.</strong> The table of callbacks a buffer uses to ask about characters: general category, combining class, mirroring, script, composition and decomposition.</p>
+<p><strong>Unicode properties.</strong> Sixteen bits HarfBuzz keeps on each glyph for the whole of shaping: its general category, ignorable, hidden and continuation bits, and a byte whose meaning depends on the category.</p>
+<p><strong>Universal Shaping Engine (USE).</strong> Microsoft’s shaping model for scripts that have no shaper of their own, driven by Unicode character properties: in effect the Indic model with most of its script-specific rules taken out.</p>
+<p><strong>Unsafe to break.</strong> A glyph flag saying the run can’t be cut at the start of this glyph’s cluster and shaped in two parts without changing the result.</p>
+<p><strong>Unsafe to concat.</strong> A glyph flag saying that changing the text on one side of this cluster’s start could change the result on the other. Recorded only when the buffer asks for it.</p>
+<p><strong>Upright and sideways.</strong> The two ways a run sits in a vertical line. HarfBuzz shapes vertical runs upright; text set sideways is shaped as horizontal text and rotated by the application.</p>
+<p><strong>Value record.</strong> In GPOS, up to eight numbers or Device-table offsets that move a glyph or change its advance. A ValueFormat says which are stored.</p>
+<p><strong>VARC.</strong> The variable composites table: glyphs built from components, each placed with a full transform and drawn at its own position in the design space.</p>
+<p><strong>Variation selector.</strong> A character that follows another to ask for a particular form of it, through the font’s <code>cmap</code> format 14.</p>
+<p><strong>Vendoring.</strong> Keeping a copy of a library’s source in a project’s own tree and building it with the project, as most of HarfBuzz’s users do.</p>
+<p><strong>Vertical origin.</strong> The point a glyph hangs from in vertical text, usually centered above it.</p>
+<p><strong>Vertical presentation form.</strong> A character such as U+FE35, a parenthesis drawn for vertical text. HarfBuzz substitutes these itself in vertical runs, but only when the font has no <code>vert</code> feature.</p>
+<p><strong>Visual order.</strong> The order glyphs are drawn in, left to right. HarfBuzz returns its output in visual order, reversing right-to-left runs as the last step of positioning.</p>
+<p><strong>Vowel constraints.</strong> Microsoft’s list of sequences, such as an independent vowel followed by a vowel sign, that would look like another letter. HarfBuzz breaks them with a dotted circle, against spoofing.</p>
+<p><strong>Whence.</strong> Where a serializer link’s offset is counted from: the start of the parent object (head), its end (tail) or the start of the table (absolute).</p>
+<p><strong>Work budget.</strong> The number of operations HarfBuzz will spend drawing or painting, 2²⁴ per glyph, so that no font can make it draw for ever.</p>
+<p><strong>Zawgyi.</strong> A font encoding for Burmese that uses the Myanmar code points in its own way. HarfBuzz shapes it, as the private script <code>Qaag</code>, with a shaper that does almost nothing.</p>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="regenerating-the-unicode-and-shaping-tables.html">← Regenerating the Unicode and shaping tables</a><a rel="next" href="bibliography.html">Bibliography →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,857 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>hb_shape and its backends · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part III · Text in</p>
+<h1 id="hb_shape-and-its-backends">12. hb_shape and its backends</h1>
+<p id="ix-1">An application that wants glyphs calls <code>hb_shape</code>. It hands over a font, a buffer of Unicode text whose script, direction and language are set, and perhaps some features, and it gets the buffer back full of positioned glyphs. All of the shaping this book describes happens inside that call, but <code>hb_shape</code> itself does very little. It finds a shape plan, and the plan names a <strong>backend</strong>: a complete shaping engine with one entry point, which does the actual work. HarfBuzz can be built with up to nine of them.</p>
+<p id="ix-2">In practice one backend, <code>ot</code>, does nearly all the shaping in the world. It is HarfBuzz’s own engine for OpenType and AAT fonts, the one that Parts III to VI take apart. The others are there for particular fonts (Graphite fonts, and fonts that carry their own WebAssembly shaper), for comparison with other engines (HarfRust, Core Text, DirectWrite, Uniscribe, kb_text_shape), and as a last resort (<code>fallback</code>). This chapter is about how the choice between them is made, why it almost always comes out as <code>ot</code>, what each of the others is and gives up, and the small piece of machinery that lets every backend keep data of its own on faces and fonts.</p>
+<p id="ix-3">The examples use one small test font, <code>backends.ttf</code>, built from <code>fonts/hb_shape-and-its-backends/backends.fea</code>. It has an <em>fi</em> ligature, a kerning pair <code>A V</code>, a combining acute with an anchor on <code>e</code> (but no precomposed <code>é</code>), and the Arabic letter beh in its four joining forms. Its glyphs are boxes. Two fonts from HarfBuzz’s own test suite appear too. Every result on this page was produced by running HarfBuzz 15.1.0 when the page was built, with the book’s build of it, which has none of the optional backends compiled in.</p>
+<h2 id="two-things-called-a-shaper">Two things called a shaper</h2>
+<p id="ix-4">HarfBuzz uses the word “shaper” for two different things, and it helps to separate them first.</p>
+<p id="ix-5">A <strong>backend shaper</strong> is one of the entries in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper-list.hh"><code>hb-shaper-list.hh</code></a>: <code>ot</code>, <code>fallback</code>, <code>graphite2</code> and the rest. Each is a function with the same signature, <code>hb_shape_func_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper.hh#L33"><code>hb-shaper.hh:33</code></a>), which takes a plan, a font, a buffer and the user’s features and does all the shaping. This chapter is about these.</p>
+<p id="ix-6">A <strong>script shaper</strong> is one of the parts of the <code>ot</code> backend that knows a family of scripts: the Arabic shaper, the Indic shaper, the Universal Shaping Engine. They are <code>hb_ot_shaper_t</code> structs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh"><code>hb-ot-shaper.hh</code></a>), and they only exist inside <code>ot</code>. <a href="why-shaping-exists.html#runs-and-the-three-things-harfbuzz-must-be-told">Why shaping exists</a> introduced them, and <a href="choosing-a-script-shaper.html">Choosing a script shaper</a> explains how one is picked. None of the other backends uses them.</p>
+<p id="ix-7">The source keeps the two apart by name: backend files are <code>hb-&lt;name&gt;-shape.cc</code> or <code>hb-&lt;name&gt;.cc</code>, script shapers are <code>hb-ot-shaper-&lt;name&gt;.cc</code>. This chapter says “backend” for the first kind wherever there could be doubt.</p>
+<h2 id="hb_shape-and-hb_shape_full">hb_shape and hb_shape_full</h2>
+<p id="ix-8"><code>hb_shape</code> is a one-line wrapper (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape.cc#L185"><code>hb-shape.cc:185</code></a>). It calls <code>hb_shape_full</code> with no shaper list, and throws away the result:</p>
+<pre><code class="language-c++">void
+hb_shape (hb_font_t *font, hb_buffer_t *buffer,
+          const hb_feature_t *features, unsigned int num_features)
+{
+  hb_shape_full (font, buffer, features, num_features, nullptr);
+}
+</code></pre>
+<p id="ix-9"><code>hb_shape_full</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape.cc#L127"><code>hb-shape.cc:127</code></a>) is the real entry point. Here it is with the verification details trimmed:</p>
+<pre><code class="language-c++">hb_bool_t
+hb_shape_full (hb_font_t *font, hb_buffer_t *buffer,
+               const hb_feature_t *features, unsigned int num_features,
+               const char * const *shaper_list)
+{
+  if (unlikely (!buffer-&gt;len))
+    return true;
+
+  hb_buffer_t *text_buffer = nullptr;
+  if (buffer-&gt;flags &amp; HB_BUFFER_FLAG_VERIFY)
+  { /* keep a copy of the text, to check the result against */ }
+
+  hb_shape_plan_t *shape_plan = hb_shape_plan_create_cached2 (font-&gt;face, &amp;buffer-&gt;props,
+                                    features, num_features,
+                                    font-&gt;coords, font-&gt;has_nonzero_coords ? font-&gt;num_coords : 0,
+                                    shaper_list);
+
+  hb_bool_t res = hb_shape_plan_execute (shape_plan, font, buffer, features, num_features);
+
+  hb_shape_plan_destroy (shape_plan);
+
+  if (text_buffer)
+  { /* buffer-&gt;verify (): reshape in pieces and compare */ }
+
+  return res;
+}
+</code></pre>
+<p id="ix-10">That is the whole of it. There are two steps: get a plan, and run it.</p>
+<p id="ix-11">The plan comes from a cache on the face, keyed by the buffer’s segment properties, the user’s features, the font’s variation coordinates (only when some are non-zero, so a variable font at its default shares plans with a static one) and the shaper list. What a plan holds, and how the cache compares keys, is the subject of <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a>. What matters here is one field of the plan’s key: <code>shaper_func</code>, the backend that will run it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.hh"><code>hb-shape-plan.hh</code></a>). The backend is chosen when the plan is made, and every later call that finds the same plan in the cache uses the same backend without choosing again.</p>
+<p id="ix-12">Running the plan, <code>hb_shape_plan_execute</code>, calls that one backend. If it succeeds and the buffer still says it holds Unicode, its content type is set to glyphs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L478"><code>hb-shape-plan.cc:478</code></a>).</p>
+<p id="ix-13">The buffer has to be ready before any of this. <code>_hb_shape_plan_execute_internal</code> asserts that it holds Unicode text (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L421"><code>hb-shape-plan.cc:421</code></a>), and a plan can’t be made for a buffer whose direction isn’t set: <code>hb_shape_plan_create2</code> returns the empty plan (<code>:255</code>), which can’t be executed, so shaping fails. That is why applications call <code>hb_buffer_guess_segment_properties</code> or set the properties themselves. <a href="buffers.html">Buffers</a> covers both.</p>
+<blockquote>
+<p id="ix-14">For programmers: <code>hb_shape</code> returns nothing. If you need to know whether shaping worked, call <code>hb_shape_full</code> with a null shaper list, which does exactly what <code>hb_shape</code> does, and check its result <em>and</em> <code>hb_buffer_allocation_successful</code>. As the section on failure below explains, the <code>ot</code> backend always returns true and reports trouble only through the buffer.</p>
+</blockquote>
+<h2 id="the-shaper-list">The shaper list</h2>
+<p id="ix-15">Every backend HarfBuzz knows about is named once, in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper-list.hh"><code>hb-shaper-list.hh</code></a>. Without its license header, the whole file is this:</p>
+<pre><code class="language-c++">#ifndef HB_NO_SHAPER
+
+/* v--- Add new shapers in the right place here. */
+
+#ifdef HAVE_WASM
+/* Only picks up fonts that have a &quot;Wasm&quot; table. */
+HB_SHAPER_IMPLEMENT (wasm)
+#endif
+
+#ifdef HAVE_GRAPHITE2
+/* Only picks up fonts that have a &quot;Silf&quot; table. */
+HB_SHAPER_IMPLEMENT (graphite2)
+#endif
+
+#ifndef HB_NO_OT_SHAPE
+HB_SHAPER_IMPLEMENT (ot) /* &lt;--- This is our main shaper. */
+#endif
+
+#ifdef HAVE_UNISCRIBE
+HB_SHAPER_IMPLEMENT (uniscribe)
+#endif
+#ifdef HAVE_DIRECTWRITE
+HB_SHAPER_IMPLEMENT (directwrite)
+#endif
+#ifdef HAVE_CORETEXT
+HB_SHAPER_IMPLEMENT (coretext)
+#endif
+
+#ifdef HAVE_HARFRUST
+HB_SHAPER_IMPLEMENT (harfrust)
+#endif
+
+#ifdef HAVE_KBTS
+HB_SHAPER_IMPLEMENT (kbts)
+#endif
+
+#ifndef HB_NO_FALLBACK_SHAPE
+HB_SHAPER_IMPLEMENT (fallback) /* &lt;--- This should be last. */
+#endif
+
+#endif
+</code></pre>
+<p id="ix-16">The file has no header guard of its own (its guard lines are marked “Dummy header guards”). It is an <em>X-macro</em> list: other files define <code>HB_SHAPER_IMPLEMENT</code> to mean something, include the list, and undefine it again, so the list is expanded into whatever code they need. It is included this way eight times:</p>
+<table>
+<thead>
+<tr>
+<th>Where</th>
+<th><code>HB_SHAPER_IMPLEMENT(name)</code> becomes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-17"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper.hh#L39"><code>hb-shaper.hh:39</code></a></td>
+<td id="ix-18">a declaration of the backend’s entry point, <code>_hb_name_shape</code></td>
+</tr>
+<tr>
+<td id="ix-19"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper.hh#L61"><code>hb-shaper.hh:61</code></a></td>
+<td id="ix-20">an enumerator <code>HB_SHAPER_ORDER_name</code>, numbering the backends from 1</td>
+</tr>
+<tr>
+<td id="ix-21"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper.hh#L117"><code>hb-shaper.hh:117</code></a>, <code>:123</code>, <code>:129</code></td>
+<td id="ix-22">a lazy loader for the backend’s data, and its <code>init0</code> and <code>fini</code></td>
+</tr>
+<tr>
+<td id="ix-23"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.hh#L43"><code>hb-face.hh:43</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L107"><code>hb-font.hh:107</code></a></td>
+<td>the types and create/destroy functions of that data, for faces and for fonts</td>
+</tr>
+<tr>
+<td id="ix-24"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper.cc#L33"><code>hb-shaper.cc:33</code></a></td>
+<td id="ix-25">an entry <code>{&quot;name&quot;, _hb_name_shape}</code> in the array <code>_hb_all_shapers</code></td>
+</tr>
+<tr>
+<td id="ix-26"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L129"><code>hb-shape-plan.cc:129</code></a>, <code>:142</code></td>
+<td id="ix-27">a test in the loops that choose a backend</td>
+</tr>
+<tr>
+<td id="ix-28"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L444"><code>hb-shape-plan.cc:444</code></a></td>
+<td id="ix-29">a branch in the code that runs the chosen one</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-30">So adding a backend means adding one line here, writing its shape function and its four data functions, and nothing else. The order of the lines is the order of preference, which is why the comment says “in the right place”.</p>
+<p id="ix-31">Each line is guarded by a build option, and only two are on by default. HarfBuzz is built with <a href="building-harfbuzz.html#meson-and-ninja">Meson</a>, which reads its options from <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson_options.txt"><code>meson_options.txt</code></a>. There the options <code>wasm</code>, <code>graphite2</code>, <code>harfrust</code>, <code>kbts</code>, <code>coretext</code>, <code>directwrite</code> and <code>gdi</code> (which brings Uniscribe) are all <code>disabled</code> unless asked for, while <code>ot</code> and <code>fallback</code> are left out only by the compile-time macros <code>HB_NO_OT_SHAPE</code> (implied by <code>HB_NO_SHAPER</code> and <code>HB_NO_OT</code>) and <code>HB_NO_FALLBACK_SHAPE</code> (implied by <code>HB_NO_LEGACY</code>), in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh#L125-L175"><code>hb-config.hh:125–175</code></a>. A build with every backend compiled out fails to compile, on purpose: “No shaper enabled.” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper.cc#L38"><code>hb-shaper.cc:38</code></a>).</p>
+<p id="ix-32"><code>hb_shape_list_shapers</code> returns the names in order (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape.cc#L101"><code>hb-shape.cc:101</code></a>), and <code>hb-shape --list-shapers</code> prints them. The book’s build has the default two:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">backends.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--list-shapers</td><td class="out"><code>ot
+fallback</code></td></tr></tbody></table></div>
+<p>(The font and text are ignored: <code>--list-shapers</code> prints the list and stops.)</p>
+<h2 id="how-the-backend-is-chosen">How the backend is chosen</h2>
+<p id="ix-33">The choice is made in <code>hb_shape_plan_key_t::init</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L75"><code>hb-shape-plan.cc:75</code></a>), which fills in the key of a new plan. After the segment properties, features and variation state are copied into the key, this runs (trimmed slightly):</p>
+<pre><code class="language-c++">#define HB_SHAPER_PLAN(shaper) \
+  if (face-&gt;data.shaper) \
+  { \
+    this-&gt;shaper_func = _hb_##shaper##_shape; \
+    this-&gt;shaper_name = #shaper; \
+    return true; \
+  }
+
+  if (unlikely (shaper_list))
+  {
+    for (; *shaper_list; shaper_list++)
+      if (false) ;
+#define HB_SHAPER_IMPLEMENT(shaper) \
+      else if (0 == strcmp (*shaper_list, #shaper)) \
+        HB_SHAPER_PLAN (shaper);
+#include &quot;hb-shaper-list.hh&quot;
+  }
+  else
+  {
+    const hb_shaper_entry_t *shapers = _hb_shapers_get ();
+    for (unsigned int i = 0; i &lt; HB_SHAPERS_COUNT; i++)
+      if (false) ;
+#define HB_SHAPER_IMPLEMENT(shaper) \
+      else if (shapers[i].func == _hb_##shaper##_shape) \
+        HB_SHAPER_PLAN (shaper);
+#include &quot;hb-shaper-list.hh&quot;
+  }
+</code></pre>
+<p id="ix-34">Both loops do the same thing. They go through a list of backends in order, and for each one they test <code>face-&gt;data.shaper</code>: does this backend have data for this face? The first that does is chosen. The only difference is where the list comes from: the caller’s list of names, or HarfBuzz’s own list.</p>
+<p id="ix-35"><code>face-&gt;data.shaper</code> looks like a field, but it is a lazy loader, of the same kind as the table loaders in <a href="blobs-faces-and-lazy-tables.html#lazy-tables">Blobs, faces and lazy tables</a>. Testing it as a boolean creates the data if it hasn’t been created yet, by calling the backend’s <code>_hb_&lt;name&gt;_shaper_face_data_create</code>. So the question “will you shape this face?” is put to each backend in the form “make your data for this face”, and a backend says no by returning <code>NULL</code>. The answer is remembered, so each backend is asked once per face, not once per plan.</p>
+<p id="ix-36">Only <em>face</em> data is asked for here. The backend’s <em>font</em> data, which depends on size and variation coordinates, isn’t created until the plan is run.</p>
+<h3 id="why-ot-always-wins">Why <code>ot</code> always wins</h3>
+<p id="ix-37">Now the list and the test together explain the behavior. Here is what each backend’s face data needs:</p>
+<table>
+<thead>
+<tr>
+<th>Order</th>
+<th id="ix-38">Backend</th>
+<th>Its face data is created if…</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td id="ix-39"><code>wasm</code></td>
+<td id="ix-40">the face has a non-empty <code>Wasm</code> table, and the WebAssembly runtime loads it as a module</td>
+<td id="ix-41"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-wasm-shape.cc#L168"><code>hb-wasm-shape.cc:168</code></a></td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>graphite2</code></td>
+<td id="ix-42">the face has a non-empty <code>Silf</code> table, and libgraphite2 accepts the face</td>
+<td id="ix-43"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-graphite2.cc#L114"><code>hb-graphite2.cc:114</code></a></td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>ot</code></td>
+<td>always</td>
+<td id="ix-44"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L413"><code>hb-ot-shape.cc:413</code></a></td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>uniscribe</code></td>
+<td>Windows GDI accepts a renamed copy of the font file</td>
+<td id="ix-45"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-uniscribe.cc#L418"><code>hb-uniscribe.cc:418</code></a></td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>directwrite</code></td>
+<td>DirectWrite makes an <code>IDWriteFontFace</code> from the font file</td>
+<td id="ix-46"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-directwrite-shape.cc#L41"><code>hb-directwrite-shape.cc:41</code></a></td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>coretext</code></td>
+<td>Core Text makes a <code>CGFont</code> from the font file</td>
+<td id="ix-47"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext-shape.cc#L39"><code>hb-coretext-shape.cc:39</code></a></td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>harfrust</code></td>
+<td id="ix-48">HarfRust can read the face’s tables</td>
+<td id="ix-49"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/rust/shape.rs#L74"><code>rust/shape.rs:74</code></a></td>
+</tr>
+<tr>
+<td>8</td>
+<td id="ix-50"><code>kbts</code></td>
+<td>kb_text_shape can read the font file</td>
+<td id="ix-51"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-kbts.cc#L173"><code>hb-kbts.cc:173</code></a></td>
+</tr>
+<tr>
+<td>9</td>
+<td><code>fallback</code></td>
+<td>always</td>
+<td id="ix-52"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-fallback-shape.cc#L38"><code>hb-fallback-shape.cc:38</code></a></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-53">The <code>ot</code> backend’s face data is no data at all:</p>
+<pre><code class="language-c++">struct hb_ot_face_data_t {};
+
+hb_ot_face_data_t *
+_hb_ot_shaper_face_data_create (hb_face_t *face)
+{
+  return (hb_ot_face_data_t *) HB_SHAPER_DATA_SUCCEEDED;
+}
+</code></pre>
+<p id="ix-54"><code>HB_SHAPER_DATA_SUCCEEDED</code> is the pointer value 2 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper.hh#L72"><code>hb-shaper.hh:72</code></a>): not a real object, just something that isn’t <code>NULL</code>. The <code>ot</code> backend keeps everything it needs about a face in the face’s own lazy tables, so it has nothing to make. It never says no, whatever the font: one with no <code>GSUB</code>, no <code>GPOS</code>, no <code>cmap</code>, or a face made from an empty blob. The one face it can’t take is the static empty face, <code>hb_face_get_empty ()</code>. That face is inert: its lazy loaders build nothing, for any backend, so no backend accepts it and shaping with it fails.</p>
+<p>So, with no shaper list:</p>
+<ul>
+<li id="ix-55">Only the two backends <em>before</em> <code>ot</code> can ever be chosen instead of it, and both decline every font that lacks their own table. A font is shaped by <code>graphite2</code> only if HarfBuzz was built with Graphite <em>and</em> the font has <code>Silf</code>, and by <code>wasm</code> only if HarfBuzz was built with WebAssembly <em>and</em> the font has <code>Wasm</code>.</li>
+<li id="ix-56">No backend <em>after</em> <code>ot</code> is ever reached. Uniscribe, DirectWrite, Core Text, HarfBuzz’s Rust twin and kb_text_shape run only when they are asked for by name.</li>
+<li><code>fallback</code> is reached only in a build without <code>ot</code>. Its comment says it “should be last”, and since its face data, like <code>ot</code>’s, always succeeds, anything after it could never be reached even by name.</li>
+</ul>
+<p id="ix-57">That is the whole of “why <code>ot</code> always wins”. It isn’t a rule written anywhere: it is the position of one line in a list, and a create function that can’t fail.</p>
+<p id="ix-58">It also means the presence of a table decides nothing unless the backend for it is compiled in. Here is the font HarfBuzz’s own tests use for the Graphite backend, <code>graphite2-expansion.ttf</code>. It is three glyphs and a <code>Silf</code> table, with no OpenType layout at all:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">hb:test/api/fonts/graphite2-expansion.ttf</td><td class="opt">--list-tables</td><td class="out"><pre><code>Table information:
+
+Tag	Size
+------------
+Glat       16 bytes
+Gloc       16 bytes
+Silf      347 bytes
+cmap       44 bytes
+head       54 bytes
+hhea       36 bytes
+hmtx       12 bytes
+maxp       32 bytes</code></pre></td></tr></tbody></table></div>
+<p id="ix-59">Its Graphite rule replaces every <code>a</code> with 41 glyphs (<code>test/api/fonts/README</code>), and the test that uses it asks for <code>graphite2</code> by name and checks that it gets 164 glyphs from “aaaa” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/test-graphite2-buffer.cc"><code>test-graphite2-buffer.cc</code></a>). The book’s build has no Graphite, so <code>graphite2</code> isn’t in its list, <code>ot</code> takes the font, and <code>ot</code> sees only the <code>cmap</code> and the advances:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hb:test/api/fonts/graphite2-expansion.ttf</td><td class="in"><span class="txt">aa</span><span class="cps">U+0061 U+0061</span></td><td class="opt">--language=en</td><td class="out"><code>[gid1=0+500|gid1=1+500]</code></td></tr></tbody></table></div>
+<blockquote>
+<p id="ix-60">For type designers: a Graphite font, or a font with a WebAssembly shaper in it, will meet many builds of HarfBuzz that lack the backend for it. None of the optional backends is on in a default build. Such a font should carry OpenType tables as well, so that <code>ot</code> has something to work with. SIL’s fonts do: Harmattan, in HarfBuzz’s subsetter tests, has <code>Silf</code>, <code>Glat</code> and <code>Gloc</code> beside a full <code>GSUB</code> and <code>GPOS</code>, which is why the <code>ot</code> backend can join its Arabic here.</p>
+</blockquote>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hb:test/subset/data/fonts/Harmattan-Regular.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[uni0628.fina=2+2042|uni0628.medi=1+580|uni0628.init=0+409]</code></td></tr></tbody></table></div>
+<h2 id="asking-for-a-backend-by-name">Asking for a backend by name</h2>
+<p>There are two ways to ask.</p>
+<h3 id="the-shaper-list_1">The shaper list</h3>
+<p id="ix-61"><code>hb_shape_full</code>’s last argument, and the same argument of <code>hb_shape_plan_create</code>, <code>hb_shape_plan_create2</code> and the cached versions, is a <code>NULL</code>-terminated list of backend names. The first loop above walks it in the caller’s order. Names that aren’t compiled into this build match nothing and are passed over without complaint. The first named backend whose face data can be created is chosen.</p>
+<p id="ix-62">If none can, the key isn’t made, <code>hb_shape_plan_create_cached2</code> returns the empty plan (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L566"><code>hb-shape-plan.cc:566</code></a>), and <code>hb_shape_full</code> returns false with the buffer untouched: still Unicode, still unshaped. HarfBuzz doesn’t add <code>ot</code> to the end of a list on its own. A caller who wants “Core Text if possible, otherwise HarfBuzz” writes <code>{&quot;coretext&quot;, &quot;ot&quot;, NULL}</code>.</p>
+<p id="ix-63"><code>hb-shape --shapers</code> passes its argument as this list. It is stricter than the library: it checks every name against <code>hb_shape_list_shapers</code> and stops with “Unknown or unsupported shaper” if one isn’t there (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-options.hh#L276"><code>util/shape-options.hh:276</code></a>). With the two backends of this build, the order of the list is all that matters, since both always accept the face:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">backends.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--shapers=ot,fallback --language=en</td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">backends.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--shapers=fallback,ot --language=en</td><td class="out"><code>[f=0+500|i=1+500]</code></td></tr></tbody></table></div>
+<p id="ix-64">The plan’s key compares backends by <code>shaper_func</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L184"><code>hb-shape-plan.cc:184</code></a>), not by the list that produced it. So two lists that end up choosing the same backend share cached plans, and the same text shaped with <code>ot</code> and with <code>fallback</code> gets two plans.</p>
+<h3 id="hb_shaper_list"><code>HB_SHAPER_LIST</code></h3>
+<p id="ix-65">The second way changes the default list itself. The first time HarfBuzz needs the list, <code>_hb_shapers_get</code> reads the environment variable <code>HB_SHAPER_LIST</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper.cc#L48"><code>hb-shaper.cc:48</code></a>). If it is set, HarfBuzz copies <code>_hb_all_shapers</code> and moves the backends it names, in the order named, to the front. Names that aren’t compiled in are ignored, and the backends not named keep their order after them.</p>
+<p id="ix-66">The variable reorders the list; it doesn’t replace it. <code>HB_SHAPER_LIST=fallback</code> gives the list <code>fallback, ot</code>, in which <code>fallback</code> takes every font, while <code>HB_SHAPER_LIST=coretext</code> on a Mac build gives <code>coretext</code> followed by the rest in their usual order, in which Core Text takes every font it can read, and <code>ot</code> still takes the rest. The reordered list is also what <code>hb_shape_list_shapers</code> returns, and so what <code>hb-shape --list-shapers</code> prints.</p>
+<p id="ix-67">The list is made once per process, by a lazy loader, and freed at exit (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper.cc#L43-L90"><code>hb-shaper.cc:43–90</code></a>). Changing the variable afterward has no effect. Builds with <code>HB_NO_GETENV</code>, which <code>HB_LEAN</code> and <code>HB_TINY</code> imply, don’t read it at all (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L440"><code>hb.hh:440</code></a>). It exists for testing: running a whole program, or a whole test suite, through another backend without changing a line of it. <code>hb-shape</code>’s own option code describes it as the variable that “Overrides the default shaper list” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-options.hh#L470"><code>util/shape-options.hh:470</code></a>).</p>
+<h2 id="running-the-plan-and-failing">Running the plan, and failing</h2>
+<p id="ix-68">The plan is run by <code>_hb_shape_plan_execute_internal</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L406"><code>hb-shape-plan.cc:406</code></a>). After its checks, it dispatches on the backend recorded in the key:</p>
+<pre><code class="language-c++">#define HB_SHAPER_EXECUTE(shaper) \
+  HB_STMT_START { \
+    buffer-&gt;enter (); \
+    bool ret = font-&gt;data.shaper &amp;&amp; \
+               _hb_##shaper##_shape (shape_plan, font, buffer, features, num_features); \
+    buffer-&gt;leave (); \
+    return ret; \
+  } HB_STMT_END
+
+  if (false) ;
+#define HB_SHAPER_IMPLEMENT(shaper) \
+  else if (shape_plan-&gt;key.shaper_func == _hb_##shaper##_shape) \
+    HB_SHAPER_EXECUTE (shaper);
+#include &quot;hb-shaper-list.hh&quot;
+
+  return false;
+</code></pre>
+<p>Three things follow from these few lines.</p>
+<p id="ix-69"><strong>The font data is made here.</strong> <code>font-&gt;data.shaper</code> is the lazy loader for the backend’s font data, created on first use for each font. If it can’t be made (Core Text refusing to make a <code>CTFont</code> at this size, say), the call returns false.</p>
+<p id="ix-70"><strong>There is no second choice.</strong> If the font data fails, or the backend returns false, <code>execute</code> returns false. It doesn’t go back to the list and try the next backend. The list was consulted once, with the face, when the plan was made.</p>
+<p id="ix-71"><strong>The buffer’s limits apply to every backend.</strong> <code>buffer-&gt;enter()</code> sets the per-text limits <code>max_len</code> and <code>max_ops</code> from the buffer’s length, and <code>leave()</code> restores the defaults (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L326"><code>hb-buffer.cc:326</code></a>). A comment there explains that <code>enter()</code> used to run only from <code>hb_shape</code>, and now runs here, on every shape, so that calling <code>hb_shape_plan_execute</code> directly is as bounded as calling <code>hb_shape</code>.</p>
+<p id="ix-72">What a backend’s return value means differs between them. The <code>ot</code> backend always returns true (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L1214"><code>hb-ot-shape.cc:1214</code></a>). When it runs out of memory or of its operation budget, it says so by setting the buffer’s <code>successful</code> flag to false, which callers read with <code>hb_buffer_allocation_successful</code>, and the buffer may be left half shaped. The HarfRust backend does the same, so that callers of <code>hb_shape</code>, which can’t see a return value, can find out (a comment at <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-harfrust.cc#L176"><code>hb-harfrust.cc:176</code></a> explains this; <code>NEWS</code> lists it for 15.1.0). The other backends return false when they fail. A program that wants to know whether shaping worked has to check both.</p>
+<h2 id="per-shaper-data">Per-shaper data</h2>
+<p id="ix-73">Each backend may keep one object per face and one per font. <code>hb_face_t</code> and <code>hb_font_t</code> each have a member <code>data</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.hh#L63"><code>hb-face.hh:63</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L155"><code>hb-font.hh:155</code></a>) of type <code>hb_shaper_object_dataset_t</code>, which is, again, made from the list (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper.hh#L111"><code>hb-shaper.hh:111</code></a>, trimmed):</p>
+<pre><code class="language-c++">template &lt;typename Object&gt;
+struct hb_shaper_object_dataset_t
+{
+  Object *parent_data; /* MUST be JUST before the lazy loaders. */
+#define HB_SHAPER_IMPLEMENT(shaper) \
+        hb_shaper_lazy_loader_t&lt;Object, HB_SHAPER_ORDER(shaper), \
+                                hb_##shaper##_##object##_data_t&gt; shaper;
+#include &quot;hb-shaper-list.hh&quot;
+};
+</code></pre>
+<p id="ix-74">So a face in a default build has <code>face-&gt;data.ot</code> and <code>face-&gt;data.fallback</code>, and a build with Graphite also has <code>face-&gt;data.graphite2</code>. Each member is a single pointer, null until first use.</p>
+<p>Two details make this cheap.</p>
+<p id="ix-75">A loader has to know which face or font it belongs to, in order to pass it to the create function. Storing a pointer back in each loader would cost one pointer per backend per object. Instead, the one pointer <code>parent_data</code> comes first, and each loader finds it by counting back from its own address. Its position in the list is its <code>HB_SHAPER_ORDER</code>, numbered from 1, so the <em>n</em>th loader is <em>n</em> pointers after <code>parent_data</code>, and <code>hb_data_wrapper_t::get_data</code> reads <code>*(((Data **) this) - WheresData)</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-machinery.hh#L160"><code>hb-machinery.hh:160</code></a>). That is why the comment insists the pointer be “JUST before the lazy loaders”.</p>
+<p id="ix-76">A failed create has to be remembered, or the <code>graphite2</code> loader would look for <code>Silf</code> again on every plan for every non-Graphite font. But a loader’s empty value is <code>NULL</code>, so <code>NULL</code> can’t also mean “tried and failed”. The loaders therefore set <code>tag_null</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper.hh#L104"><code>hb-shaper.hh:104</code></a>): a failure is stored as the null value with its lowest bit set, which isn’t null, and is read back as null. <a href="blobs-faces-and-lazy-tables.html#failure-is-cached-as-null">Blobs, faces and lazy tables</a> describes the same trick for table accelerators. It is also why <code>HB_SHAPER_DATA_SUCCEEDED</code> is 2 and not 1: “Low bit is taken by the lazy-loader’s tag_null” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper.hh#L71"><code>hb-shaper.hh:71</code></a>).</p>
+<p id="ix-77">Creation uses the same lock-free compare-and-swap as the table loaders (<a href="blobs-faces-and-lazy-tables.html#loading-without-a-lock">Loading without a lock</a>): two threads may both create the data, and the one that loses the race destroys its copy. A face’s shaper data lives as long as the face. A font’s is thrown away whenever the font changes: <code>hb_font_t::changed()</code> ends with <code>data.fini ()</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L1159"><code>hb-font.hh:1159</code></a>), so a new size or new variation coordinates mean every backend makes its font data again on the next shape. <a href="fonts-and-font-functions.html#serial-numbers">Fonts and font functions</a> lists the setters that call it.</p>
+<p id="ix-78">The data has one more user besides the backends. HarfBuzz’s Core Text and DirectWrite <em>font functions</em> get their native font objects from the matching backend’s font data, <code>font-&gt;data.coretext</code> and <code>font-&gt;data.directwrite</code>, so the two layers share one object, as <a href="fonts-and-font-functions.html#the-other-funcs">Fonts and font functions</a> explains.</p>
+<h2 id="the-backends">The backends</h2>
+<h3 id="ot"><code>ot</code></h3>
+<p id="ix-79">HarfBuzz’s own engine. It shapes OpenType fonts with <code>GSUB</code> and <code>GPOS</code>, and AAT fonts with <code>morx</code>, <code>kerx</code> and <code>trak</code> in their place: there is no separate AAT backend, and the choice between the two kinds of table is made inside <code>ot</code>, as <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a> explains. Its font data is a cache for the variation store in <code>GDEF</code>, which holds the deltas that a variable font’s <code>GPOS</code> values and <code>GDEF</code> carets refer to (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L433"><code>hb-ot-shape.cc:433</code></a>). A font whose <code>GDEF</code> has no variation store gets the shared Null cache, which is still not <code>NULL</code>, so this can’t fail either. Its entry point, <code>_hb_ot_shape</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L1205"><code>hb-ot-shape.cc:1205</code></a>), wraps everything in a context and calls <code>hb_ot_shape_internal</code>, which <a href="pipeline-step-by-step.html">The pipeline, step by step</a> follows from start to end.</p>
+<p id="ix-80">It also builds every plan’s <code>ot</code> half, whichever backend is chosen. <code>hb_shape_plan_create2</code> calls <code>shape_plan-&gt;ot.init0</code> unconditionally once the key is made (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L280"><code>hb-shape-plan.cc:280</code></a>), so even a plan that <code>graphite2</code> will run has its OpenType features compiled into lookups.</p>
+<h3 id="fallback"><code>fallback</code></h3>
+<p id="ix-81">The simplest backend there could be. Here it is, nearly whole (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-fallback-shape.cc#L72"><code>hb-fallback-shape.cc:72</code></a>):</p>
+<pre><code class="language-c++">  hb_codepoint_t space;
+  bool has_space = (bool) font-&gt;get_nominal_glyph (' ', &amp;space);
+
+  buffer-&gt;clear_positions ();
+
+  for (unsigned int i = 0; i &lt; count; i++)
+  {
+    if (has_space &amp;&amp; unicode-&gt;is_default_ignorable (info[i].codepoint)) {
+      info[i].codepoint = space;
+      pos[i].x_advance = 0;
+      pos[i].y_advance = 0;
+      continue;
+    }
+    (void) font-&gt;get_nominal_glyph (info[i].codepoint, &amp;info[i].codepoint);
+    font-&gt;get_glyph_advance_for_direction (info[i].codepoint, direction,
+                                           &amp;pos[i].x_advance, &amp;pos[i].y_advance);
+    font-&gt;subtract_glyph_origin_for_direction (info[i].codepoint, direction,
+                                               &amp;pos[i].x_offset, &amp;pos[i].y_offset);
+  }
+
+  if (HB_DIRECTION_IS_BACKWARD (direction))
+    hb_buffer_reverse (buffer);
+
+  buffer-&gt;clear_glyph_flags ();
+</code></pre>
+<p id="ix-82">Each character becomes the glyph <code>cmap</code> gives it, or glyph 0. Each glyph gets its advance from the font funcs. Default ignorables become a zero-width space, if the font has a space. Right-to-left text is reversed into visual order. That is all. There is no normalization, no ligature, no kerning, no mark positioning, no joining and no reordering, and each character stays in a cluster of its own. Side by side with <code>ot</code> on the test font:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">backends.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--shapers=ot --language=en</td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">backends.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--shapers=fallback --language=en</td><td class="out"><code>[f=0+500|i=1+500]</code></td></tr><tr><td class="font">backends.ttf</td><td class="in"><span class="txt">AV</span><span class="cps">U+0041 U+0056</span></td><td class="opt">--shapers=ot --language=en</td><td class="out"><code>[A=0+450|V=1+600]</code></td></tr><tr><td class="font">backends.ttf</td><td class="in"><span class="txt">AV</span><span class="cps">U+0041 U+0056</span></td><td class="opt">--shapers=fallback --language=en</td><td class="out"><code>[A=0+600|V=1+600]</code></td></tr><tr><td class="font">backends.ttf</td><td class="in"><span class="txt">é</span><span class="cps">U+00E9</span></td><td class="opt">--shapers=ot --language=en</td><td class="out"><code>[e=0+500|acutecomb=0@-250,150+0]</code></td></tr><tr><td class="font">backends.ttf</td><td class="in"><span class="txt">é</span><span class="cps">U+00E9</span></td><td class="opt">--shapers=fallback --language=en</td><td class="out"><code>[.notdef=0+500]</code></td></tr><tr><td class="font">backends.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--shapers=ot --language=ar</td><td class="out"><code>[beh.fina=2+600|beh.medi=1+400|beh.init=0+400]</code></td></tr><tr><td class="font">backends.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--shapers=fallback --language=ar</td><td class="out"><code>[beh=2+600|beh=1+600|beh=0+600]</code></td></tr></tbody></table></div>
+<p id="ix-83">The <code>é</code> shows the cost of skipping normalization. The font has no precomposed <code>é</code>, so <code>ot</code> decomposes it into <code>e</code> and the combining acute, both of which it has, and then positions the acute on its anchor. <code>fallback</code> asks <code>cmap</code> for U+00E9 and gets <code>.notdef</code>. The behs come out in the right order, because reversing is the one thing <code>fallback</code> does for right-to-left text, but isolated.</p>
+<p id="ix-84">Clearing the glyph flags is correct here. Each glyph depends only on its own character, so the text can be broken and reshaped anywhere and come out the same.</p>
+<p id="ix-85">This backend is not what HarfBuzz means elsewhere by “fallback”. The <code>ot</code> backend has fallbacks of its own, for fonts without some table: mark positioning without <code>GPOS</code>, Arabic shaping from presentation forms without <code>GSUB</code>, spaces from Unicode properties. Those are in <a href="fallbacks.html">Fallbacks</a>, and they run inside the full pipeline. The <code>fallback</code> backend is a different and much simpler thing (its file’s copyright is from 2011), whose job is only to make sure a build without <code>ot</code> still turns characters into glyphs.</p>
+<h3 id="graphite2"><code>graphite2</code></h3>
+<p id="ix-86">SIL’s Graphite puts a font’s shaping rules in its own tables (<code>Silf</code> for the rules, <code>Glat</code> and <code>Gloc</code> for glyph attributes, <code>Feat</code> for features) and runs them with its own library, libgraphite2. HarfBuzz has had a backend for it since 0.9.2, whose <code>NEWS</code> calls it “New experimental Graphite2 backend”. It is built with <code>-Dgraphite2=enabled</code>.</p>
+<p id="ix-87">Its face data checks for <code>Silf</code>, then makes a <code>gr_face</code> whose table callback fetches tables through the HarfBuzz face and keeps a list of the blobs it has handed out, added to without a lock (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-graphite2.cc#L74"><code>hb-graphite2.cc:74</code></a>, <code>:114</code>). Its font data is nothing.</p>
+<p id="ix-88">The shape function (<code>:233</code>) turns the buffer’s language into Graphite’s feature defaults, sets any of the user’s features the font defines, and makes a Graphite segment from the buffer’s code points. It then has to translate Graphite’s results into HarfBuzz’s. Graphite reports slots and their origins, and which characters each slot came from. HarfBuzz rebuilds clusters from those (merging any that Graphite reorders across one another), gives each cluster one advance, turns origins into offsets, and reverses for right-to-left text. At the end it marks the whole buffer unsafe to break (<code>:482</code>), since nothing is known about where it could be broken.</p>
+<p id="ix-89">What it gives up is the HarfBuzz font. The segment is made with no Graphite font (<code>gr_make_seg (nullptr, …)</code>, <code>:282</code>), so Graphite works in design units from its own reading of <code>cmap</code> and <code>hmtx</code>, and HarfBuzz scales the result by <code>x_scale / upem</code> (<code>:340</code>). The font funcs aren’t consulted: not for glyphs, not for advances, and not for variations, which Graphite doesn’t have. The <code>TODO vertical</code> comment at <code>:255</code> marks the other gap.</p>
+<h3 id="wasm"><code>wasm</code></h3>
+<p id="ix-90">The WebAssembly backend lets a font carry its own shaping engine, compiled to WebAssembly and stored in a table tagged <code>Wasm</code>. It arrived in 8.0.0 and is still called experimental, in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson_options.txt"><code>meson_options.txt</code></a> and in <code>NEWS</code>. It needs the wasm-micro-runtime library and <code>-Dwasm=enabled</code>, and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/wasm-shaper.md"><code>docs/wasm-shaper.md</code></a> documents it in full.</p>
+<p id="ix-91">Its face data loads the table as a WebAssembly module (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-wasm-shape.cc#L168"><code>hb-wasm-shape.cc:168</code></a>). To shape, it needs an <em>instance</em> of the module, with its own memory: 32 KiB of stack and 2 MiB of heap (<code>:217</code>). Instances are made as needed, and one is kept in the face data for reuse. When an instance is made, HarfBuzz calls the module’s <code>shape_plan_create(face)</code> if it exports one, so the module can prepare per-face state. Then for each run it calls the module’s <code>shape(plan, font, buffer, features, num_features)</code>, which returns zero for failure. If it fails while the buffer still holds Unicode, HarfBuzz throws the instance away and tries once more with a fresh one (<code>:436</code>).</p>
+<p id="ix-92">The module works through an API that HarfBuzz exports to it (<code>hb-wasm-api-*.hh</code>): copying the buffer’s contents in and out, asking the font for glyphs, advances, extents, outlines and coordinates, reading tables. And one more function, <code>shape_with</code>, which runs another backend on the same font and buffer (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-wasm-api-shape.hh#L36"><code>hb-wasm-api-shape.hh:36</code></a>). It calls <code>hb_shape_full</code> with a one-name shaper list, and refuses the name <code>wasm</code>, so a module can’t start itself again. The documentation’s examples use it to let <code>ot</code> do the ordinary work and then change the result. HarfBuzz’s own source has a larger example: <code>src/wasm/graphite/</code> builds Graphite itself into a module and adds it to fonts such as Charis SIL, so that they shape with Graphite in a HarfBuzz that has WebAssembly but no <code>graphite2</code>.</p>
+<p id="ix-93">The backend trusts the module with the buffer. A comment after the call says “TODO Regularize clusters according to direction &amp; cluster level, such that client doesn’t crash with unmet expectations” (<code>:439</code>), and the documentation asks modules to keep clusters monotonic. Glyph flags are cleared and the whole buffer is marked unsafe to break (<code>:452</code>). Another comment admits that initializing the runtime isn’t thread-safe (<code>:122</code>). <code>NEWS</code> for 15.0.0 records hardening “against malicious fonts”, which is what a font that runs code invites.</p>
+<blockquote>
+<p id="ix-94">For type designers: with <code>wasm</code> first in the list, a <code>Wasm</code> table overrides everything else in the font, in a HarfBuzz built with it. In any other build, and in every other engine, the table is ignored, so the font’s OpenType tables are what most readers will see.</p>
+</blockquote>
+<h3 id="harfrust"><code>harfrust</code></h3>
+<p id="ix-95">HarfRust is a port of HarfBuzz’s shaping to Rust, from the HarfBuzz project itself. <code>NEWS</code> for 11.2.1 introduced the backend as “harfruzz”, “an ongoing Rust port of HarfBuzz shaping… mainly used for testing the output of the Rust implementation”, and 11.3.0 renamed it after the upstream rename. It is built with <code>-Dharfrust=enabled</code>, and this release uses HarfRust 0.15 (<code>src/rust/Cargo.toml</code>). <a href="harfrust.html">HarfRust</a> is about HarfRust itself.</p>
+<p id="ix-96">The glue is in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-harfrust.cc"><code>hb-harfrust.cc</code></a> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/rust/shape.rs"><code>rust/shape.rs</code></a>. Face data is a HarfRust <code>Font</code> that fetches tables from the HarfBuzz face (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/rust/shape.rs#L74"><code>shape.rs:74</code></a>). Font data is an instance of it at the font’s normalized coordinates, with its scale and point size (<code>:220</code>). HarfRust’s own plan is cached in the HarfBuzz plan, in a field that exists only for it (<code>hb_shape_plan_t::harfrust_data</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.hh"><code>hb-shape-plan.hh</code></a>). For each run, the buffer’s code points, clusters, flags, cluster level and pre- and post-context are copied into a HarfRust buffer, shaped, and the glyphs and positions copied back (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/rust/shape.rs#L336"><code>shape.rs:336</code></a>).</p>
+<p id="ix-97">Unlike the other backends, it uses the HarfBuzz font. <code>HBHarfBuzzFontFuncs</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/rust/shape.rs#L116"><code>shape.rs:116</code></a>) answers HarfRust’s questions about nominal and variation glyphs, advances, vertical origins and extents by calling <code>hb_font_get_*</code>, so custom font funcs and synthetic bold reach it just as they reach <code>ot</code>. That is what makes it useful for testing: with the same font answers going in, any difference in the output is a difference between the two shaping implementations.</p>
+<h3 id="kbts"><code>kbts</code></h3>
+<p id="ix-98">kb_text_shape is a single-header C shaping library by another author, compiled straight into HarfBuzz (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-kbts.cc"><code>hb-kbts.cc</code></a>). <code>NEWS</code> for 11.4.0 is blunt about it: “purely for testing and performance evaluation and we do NOT recommend using it for any other purposes.” 15.0.0 updated it to kb_text_shape 2.28g and added variations.</p>
+<p id="ix-99">Its face data is the whole font file, read by kb_text_shape (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-kbts.cc#L173"><code>hb-kbts.cc:173</code></a>), and its font data the variation coordinates (<code>:220</code>). It takes advances from the font itself, not from the font funcs, and scales them (<code>:345</code>). It refuses vertical text (<code>:278</code>), and marks the whole buffer unsafe to break (<code>:362</code>).</p>
+<h3 id="the-platform-backends-coretext-directwrite-uniscribe">The platform backends: <code>coretext</code>, <code>directwrite</code>, <code>uniscribe</code></h3>
+<p id="ix-100">These three hand the text to the operating system’s own shaping engine. (The faces and font funcs that wrap the same platform libraries are another matter: <a href="integrations.html#the-platforms-core-text-directwrite-gdi-and-uniscribe">Integrations</a>.) The Uniscribe and Core Text backends came with 0.9.2, whose <code>NEWS</code> calls both “primarily for testing”, and DirectWrite later. Their purpose is comparison: HarfBuzz has to match what these engines do with the same fonts, and the quickest way to find out is to ask them.</p>
+<ul>
+<li id="ix-101"><strong><code>coretext</code></strong> (Apple platforms, <code>-Dcoretext=enabled</code>) makes a <code>CGFont</code> from the face’s file, or reuses the one a Core Text face was made from (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext.cc#L261"><code>hb-coretext.cc:261</code></a>). It can’t open any face of a collection but the first: “TTC index %u not supported” (<code>:222</code>). Its font data is a <code>CTFont</code> at the font’s <code>ptem</code> size, or 12 points if none is set (<code>HB_CORETEXT_DEFAULT_FONT_SIZE</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout.hh#L36"><code>hb-aat-layout.hh:36</code></a>), with the font’s variation coordinates. OpenType feature tags are translated into AAT feature types and selectors where a mapping exists (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext-shape.cc#L220"><code>hb-coretext-shape.cc:220</code></a>).</li>
+<li id="ix-102"><strong><code>directwrite</code></strong> (Windows, <code>-Ddirectwrite=enabled</code>) makes an <code>IDWriteFontFace</code> from the face’s file. It supports variations and user features since 11.0.0, when <code>NEWS</code> says it “graduated from experimental”.</li>
+<li id="ix-103"><strong><code>uniscribe</code></strong> (Windows, <code>-Dgdi=enabled</code>) has the oldest problem to solve: GDI selects fonts by name, so HarfBuzz copies the font, gives it a new <code>name</code> table naming it with a random name made from a UUID (<code>F_</code> and 24 characters, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-uniscribe.cc#L300"><code>hb-uniscribe.cc:300</code></a>), and installs it privately with <code>AddFontMemResourceEx</code> (<code>:443</code>). Its font data is a GDI font at the font’s <code>y_ppem</code>, or at the units per em. It has no variations.</li>
+</ul>
+<p id="ix-104">All three take glyphs and positions from the system, not from the font funcs, and HarfBuzz only scales the system’s numbers into its own. All three mark the whole buffer unsafe to break, and none handles vertical text.</p>
+<h2 id="the-backends-side-by-side">The backends side by side</h2>
+<table>
+<thead>
+<tr>
+<th id="ix-105">Backend</th>
+<th>Build option</th>
+<th>Chosen by default for</th>
+<th id="ix-106">Uses the font funcs</th>
+<th>Variations</th>
+<th id="ix-107">Glyph flags</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-108"><code>wasm</code></td>
+<td><code>-Dwasm</code> (experimental)</td>
+<td id="ix-109">fonts with <code>Wasm</code></td>
+<td>if the module asks</td>
+<td>through the font</td>
+<td>all unsafe to break</td>
+</tr>
+<tr>
+<td><code>graphite2</code></td>
+<td><code>-Dgraphite2</code></td>
+<td id="ix-110">fonts with <code>Silf</code></td>
+<td id="ix-111">no (scale only)</td>
+<td>no</td>
+<td>all unsafe to break</td>
+</tr>
+<tr>
+<td><code>ot</code></td>
+<td>on</td>
+<td>every other font</td>
+<td>yes</td>
+<td>yes</td>
+<td>computed</td>
+</tr>
+<tr>
+<td><code>uniscribe</code></td>
+<td><code>-Dgdi</code></td>
+<td>none</td>
+<td>no</td>
+<td>no</td>
+<td>all unsafe to break</td>
+</tr>
+<tr>
+<td><code>directwrite</code></td>
+<td><code>-Ddirectwrite</code></td>
+<td>none</td>
+<td>no</td>
+<td>yes</td>
+<td>all unsafe to break</td>
+</tr>
+<tr>
+<td><code>coretext</code></td>
+<td><code>-Dcoretext</code></td>
+<td>none</td>
+<td>no</td>
+<td>yes</td>
+<td>all unsafe to break</td>
+</tr>
+<tr>
+<td><code>harfrust</code></td>
+<td><code>-Dharfrust</code></td>
+<td>none</td>
+<td>yes</td>
+<td>yes</td>
+<td id="ix-112">computed by HarfRust</td>
+</tr>
+<tr>
+<td id="ix-113"><code>kbts</code></td>
+<td><code>-Dkbts</code></td>
+<td>none</td>
+<td>no</td>
+<td>yes</td>
+<td>all unsafe to break</td>
+</tr>
+<tr>
+<td><code>fallback</code></td>
+<td>on</td>
+<td>none, unless <code>ot</code> is compiled out</td>
+<td>yes</td>
+<td>through the font</td>
+<td>none (all safe)</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-114">The “glyph flags” column matters to applications that break lines by reshaping only the part of a paragraph that changed. With the backends that mark everything unsafe to break, every change means reshaping the whole run. <a href="for-applications.html">For applications</a> covers what the flags are for.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape.cc"><code>src/hb-shape.cc</code></a></td>
+<td><code>hb_shape</code>, <code>hb_shape_full</code>, <code>hb_shape_list_shapers</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper-list.hh"><code>src/hb-shaper-list.hh</code></a></td>
+<td>the list of backends, in order of preference</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper.hh"><code>src/hb-shaper.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper.cc"><code>src/hb-shaper.cc</code></a></td>
+<td>the shape function type, the per-shaper data loaders and dataset, <code>_hb_all_shapers</code>, <code>HB_SHAPER_LIST</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc"><code>src/hb-shape-plan.cc</code></a></td>
+<td>choosing a backend (<code>hb_shape_plan_key_t::init</code>) and running it (<code>_hb_shape_plan_execute_internal</code>)</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-machinery.hh"><code>src/hb-machinery.hh</code></a></td>
+<td>the lazy loader, <code>get_data</code>, and <code>tag_null</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>src/hb-ot-shape.cc</code></a></td>
+<td>the <code>ot</code> backend’s data and entry point</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-fallback-shape.cc"><code>src/hb-fallback-shape.cc</code></a></td>
+<td>the <code>fallback</code> backend</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-graphite2.cc"><code>src/hb-graphite2.cc</code></a></td>
+<td>the <code>graphite2</code> backend</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-wasm-shape.cc"><code>src/hb-wasm-shape.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-wasm-api*.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/wasm-shaper.md"><code>docs/wasm-shaper.md</code></a>, <code>src/wasm/</code></td>
+<td>the <code>wasm</code> backend, the API it gives modules, its documentation and examples</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-harfrust.cc"><code>src/hb-harfrust.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/rust/shape.rs"><code>src/rust/shape.rs</code></a></td>
+<td>the <code>harfrust</code> backend and its Rust glue</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-kbts.cc"><code>src/hb-kbts.cc</code></a></td>
+<td>the <code>kbts</code> backend</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext-shape.cc"><code>src/hb-coretext-shape.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-directwrite-shape.cc"><code>src/hb-directwrite-shape.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-uniscribe.cc"><code>src/hb-uniscribe.cc</code></a></td>
+<td>the platform backends</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson_options.txt"><code>meson_options.txt</code></a></td>
+<td>which backends a build includes</td>
+</tr>
+</tbody>
+</table>
+<p>To see which backends a build has, run <code>hb-shape --list-shapers</code>. To shape with one, use <code>hb-shape --shapers=NAME</code>, or set <code>HB_SHAPER_LIST</code> to run a whole program through it.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li><code>hb_shape</code> gets a plan from the face’s cache and runs it. The plan names one backend, chosen when the plan is made.</li>
+<li>With no shaper list, the first backend in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper-list.hh"><code>hb-shaper-list.hh</code></a> that can make data for the face wins. Only <code>wasm</code> and <code>graphite2</code> come before <code>ot</code>, and they accept only fonts with a <code>Wasm</code> or <code>Silf</code> table, in builds that include them. <code>ot</code> accepts every face, so nothing after it is chosen by default.</li>
+<li>Uniscribe, DirectWrite, Core Text, HarfRust and kb_text_shape run only when named, in a shaper list or in <code>HB_SHAPER_LIST</code>, which reorders the default list for the whole process.</li>
+<li>There is no falling through: if the chosen backend fails, shaping fails. <code>ot</code> reports failure through the buffer, not its return value, so check <code>hb_buffer_allocation_successful</code>.</li>
+<li>Each backend keeps lazily made data on faces and fonts. Font data is rebuilt whenever the font changes, and failures are remembered.</li>
+<li>The <code>fallback</code> backend maps characters to glyphs and does nothing else. It is not the <code>ot</code> backend’s fallback shaping.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="buffers.html">← Buffers</a><a rel="next" href="shape-plans-and-their-cache.html">Shape plans and their cache →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

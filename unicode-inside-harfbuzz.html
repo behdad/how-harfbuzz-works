@@ -1,0 +1,792 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Unicode inside HarfBuzz · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part III · Text in</p>
+<h1 id="unicode-inside-harfbuzz">10. Unicode inside HarfBuzz</h1>
+<p id="ix-1">A font knows about glyphs. Unicode knows about characters. Before HarfBuzz can apply a single lookup, it needs to know a few things about every character in the buffer that no font says: whether it is a letter or a mark, how strongly a mark binds, whether it has a mirror image, which script it belongs to, and how it decomposes. It also needs to know which characters are meant to be invisible, and which of those still have work to do.</p>
+<p id="ix-2">This chapter is about where those facts come from and where HarfBuzz keeps them. They come from a small table of callbacks, the <strong>Unicode funcs</strong>, which by default read HarfBuzz’s own compressed copy of the Unicode Character Database. They are kept in sixteen bits of each glyph, the <strong>Unicode properties</strong>, worked out once at the start of shaping. And a few properties aren’t taken from Unicode at all, but from lists written by hand in HarfBuzz’s source. The most important is HarfBuzz’s own idea of a <em>default ignorable</em> character, and of the few ignorables that are <em>hidden</em>.</p>
+<p id="ix-3">The examples use one small test font, <code>unicode.ttf</code>, built from <code>fonts/unicode-inside-harfbuzz/unicode.fea</code> by a script beside it. It has a few Latin letters with an <em>fi</em> ligature and one kerning pair, a soft hyphen that it can draw, parentheses, two Hebrew letters and two Hebrew points, a Thai consonant with two marks below it, and one variation sequence. Its glyphs are boxes. Every shaping result and trace on this page was produced by running HarfBuzz 15.1.0 on that font when the page was built.</p>
+<h2 id="what-harfbuzz-asks-of-unicode">What HarfBuzz asks of Unicode</h2>
+<p id="ix-4">The questions are listed once, in an X macro at <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh#L43"><code>hb-unicode.hh:43</code></a>, in the same way as the font funcs’ callbacks (see <a href="fonts-and-font-functions.html#one-list-of-callbacks">Fonts and font functions</a>):</p>
+<pre><code class="language-c++">#define HB_UNICODE_FUNCS_IMPLEMENT_CALLBACKS \
+  HB_UNICODE_FUNC_IMPLEMENT (combining_class) \
+  HB_IF_NOT_DEPRECATED (HB_UNICODE_FUNC_IMPLEMENT (eastasian_width)) \
+  HB_UNICODE_FUNC_IMPLEMENT (general_category) \
+  HB_UNICODE_FUNC_IMPLEMENT (mirroring) \
+  HB_UNICODE_FUNC_IMPLEMENT (script) \
+  HB_UNICODE_FUNC_IMPLEMENT (compose) \
+  HB_UNICODE_FUNC_IMPLEMENT (decompose) \
+  HB_IF_NOT_DEPRECATED (HB_UNICODE_FUNC_IMPLEMENT (decompose_compatibility)) \
+  /* ^--- Add new callbacks here */
+</code></pre>
+<p>Two of the eight are deprecated, since 2.0.0, and the shaper never calls them. The other six, and where the shaper asks them:</p>
+<table>
+<thead>
+<tr>
+<th>Callback</th>
+<th>Unicode property</th>
+<th id="ix-5">Where HarfBuzz uses it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>general_category</code></td>
+<td>General_Category (Lu, Mn, Cf…)</td>
+<td id="ix-6">for every character, when its properties are set up (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.hh#L228"><code>hb-ot-layout.hh:228</code></a>); by the Arabic shaper for the characters of pre- and post-context; by the Indic, Khmer and USE shapers’ <code>compose</code></td>
+</tr>
+<tr>
+<td><code>combining_class</code></td>
+<td>Canonical_Combining_Class</td>
+<td id="ix-7">for every mark, through <code>modified_combining_class</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.hh#L263"><code>hb-ot-layout.hh:263</code></a>)</td>
+</tr>
+<tr>
+<td><code>mirroring</code></td>
+<td>Bidi_Mirroring_Glyph</td>
+<td id="ix-8">in right-to-left text, before normalization (<code>hb_ot_rotate_chars</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L667"><code>hb-ot-shape.cc:667</code></a>)</td>
+</tr>
+<tr>
+<td><code>script</code></td>
+<td id="ix-9">Script</td>
+<td id="ix-10">only when guessing the buffer’s script (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L753"><code>hb-buffer.cc:753</code></a>)</td>
+</tr>
+<tr>
+<td><code>decompose</code></td>
+<td>canonical Decomposition_Mapping, one step</td>
+<td id="ix-11">in normalization, and in the Indic, Khmer and USE shapers’ own versions of it</td>
+</tr>
+<tr>
+<td><code>compose</code></td>
+<td>the canonical composition of a pair</td>
+<td>the same, and in the Hebrew shaper</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-12">Each answers for one code point, or for a pair in the case of <code>compose</code>. <code>decompose</code> splits a character into at most two: a character whose canonical decomposition is longer is decomposed again, recursively, by the normalizer. That process is the subject of <a href="normalization.html">Normalization</a>.</p>
+<p id="ix-13"><code>script</code> is asked less than you might expect. Only <code>hb_buffer_guess_segment_properties</code> uses it, to take the first character whose script isn’t Common, Inherited or Unknown as the script of the whole buffer. Nothing in the pipeline asks for a character’s script after that: splitting text into runs of one script is the application’s job, as <a href="buffers.html">Buffers</a> explains.</p>
+<p id="ix-14"><code>mirroring</code> shows how little HarfBuzz needs. In right-to-left text, each character with a mirror image is replaced by it, if the font has a glyph for it. If the font doesn’t, the character keeps its own glyph and gets the mask bit of the <code>rtlm</code> feature instead, so that the font can mirror it itself:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">(a)</span><span class="cps">U+0028 U+0061 U+0029</span></td><td class="opt"></td><td class="out"><code>[parenleft=0+300|a=1+500|parenright=2+300]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">(א)</span><span class="cps">U+0028 U+05D0 U+0029</span></td><td class="opt"></td><td class="out"><code>[parenleft=2+300|alef=1+500|parenright=0+300]</code></td></tr></tbody></table></div>
+<p id="ix-15">The Hebrew letter makes the second run right-to-left. The output is in visual order, so it reads <code>parenleft</code>, <code>alef</code>, <code>parenright</code>, as it should on the page, but the cluster numbers show that the glyph on the left is the last character typed. The first character, U+0028 LEFT PARENTHESIS, was turned into U+0029 before the <code>cmap</code> was asked for it. Without mirroring, the reversed run would have its parentheses facing outwards.</p>
+<h3 id="what-harfbuzz-doesnt-ask">What HarfBuzz doesn’t ask</h3>
+<p id="ix-16">The callbacks are a small part of the Unicode data HarfBuzz uses. The rest is compiled in, and doesn’t change whichever callbacks are installed:</p>
+<ul>
+<li id="ix-17">Arabic joining types, Indic syllabic and positional categories, the Universal Shaping Engine’s categories and the vowel constraints come from tables generated from the Unicode data files by their own scripts (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-table.py"><code>gen-arabic-table.py</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py"><code>gen-indic-table.py</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-use-table.py"><code>gen-use-table.py</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-vowel-constraints.py"><code>gen-vowel-constraints.py</code></a>). Those are covered with the shapers that use them, and the scripts in <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a>.</li>
+<li id="ix-18">Extended_Pictographic, for emoji sequences, comes from <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode-emoji-table.hh"><code>hb-unicode-emoji-table.hh</code></a>, generated from <code>emoji-data.txt</code>.</li>
+<li id="ix-19">Four properties are hand-written functions in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh"><code>hb-unicode.hh</code></a> itself: <code>is_default_ignorable</code> (<code>:167</code>), <code>is_variation_selector</code> (<code>:119</code>), <code>space_fallback_type</code> (<code>:219</code>), which says how wide each space character should be when the font has no glyph for it, and <code>vertical_char_for</code> (<code>:245</code>), which maps punctuation to its vertical presentation form when a font has no <code>vert</code> feature.</li>
+</ul>
+<p id="ix-20">So an application that installs ICU’s Unicode functions changes where general categories and combining classes come from, but not which characters are hidden, and not how Arabic joins.</p>
+<h2 id="unicode-funcs-objects">Unicode funcs objects</h2>
+<p id="ix-21">An <code>hb_unicode_funcs_t</code> holds one function pointer, one user-data pointer and one destroy callback per callback in the list. Every buffer has one. A new buffer gets the default (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L289"><code>hb-buffer.cc:289</code></a>), and <code>hb_buffer_set_unicode_funcs</code> replaces it.</p>
+<p id="ix-22">The <em>nil</em> functions in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.cc#L60"><code>hb-unicode.cc:60</code></a> say what a buffer gets when nothing answers. They are worth knowing, because they are what any callback left unset falls back on:</p>
+<table>
+<thead>
+<tr>
+<th>Callback</th>
+<th>Nil answer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>general_category</code></td>
+<td>Lo, other letter</td>
+</tr>
+<tr>
+<td><code>combining_class</code></td>
+<td>0, not reordered</td>
+</tr>
+<tr>
+<td><code>mirroring</code></td>
+<td id="ix-23">the character itself</td>
+</tr>
+<tr>
+<td><code>script</code></td>
+<td>Unknown</td>
+</tr>
+<tr>
+<td><code>compose</code>, <code>decompose</code></td>
+<td>false</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-24">So with nil functions every character is a letter, nothing is a mark, and nothing is normalized, but the font’s lookups still apply. <code>hb_unicode_funcs_get_empty</code> returns this nil object (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.cc#L228"><code>hb-unicode.cc:228</code></a>), unlike <code>hb_font_funcs_get_empty</code>, which returns the <em>default</em> font funcs.</p>
+<p id="ix-25"><code>hb_unicode_funcs_create</code> takes a parent (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.cc#L182"><code>hb-unicode.cc:182</code></a>). The new object starts as a copy of the parent’s function and user-data pointers, and keeps a reference to the parent, which is made immutable. Setting a callback replaces one slot, and setting it to <code>NULL</code> copies the parent’s back (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.cc#L386"><code>hb-unicode.cc:386</code></a>). So, to change one property, a client creates funcs with the default as parent and sets one callback. Unlike a font’s parent, this parent is never asked anything while shaping: its pointers were copied when the child was made.</p>
+<h3 id="three-implementations">Three implementations</h3>
+<p id="ix-26">Which implementation is the default is decided when HarfBuzz is compiled (<code>hb_unicode_funcs_get_default</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.cc#L152"><code>hb-unicode.cc:152</code></a>; <a href="integrations.html#unicode-from-icu-or-glib-hb-icu-and-hb-glib">Integrations</a> covers the ICU and GLib layers):</p>
+<pre><code class="language-c++">#if !defined(HB_NO_UNICODE_FUNCS) &amp;&amp; !defined(HB_NO_UCD)
+  return hb_ucd_get_unicode_funcs ();
+#elif !defined(HB_NO_UNICODE_FUNCS) &amp;&amp; defined(HAVE_GLIB)
+  return hb_glib_get_unicode_funcs ();
+#elif !defined(HB_NO_UNICODE_FUNCS) &amp;&amp; defined(HAVE_ICU) &amp;&amp; defined(HAVE_ICU_BUILTIN)
+  return hb_icu_get_unicode_funcs ();
+#else
+  /* … the nil funcs … */
+#endif
+</code></pre>
+<p id="ix-27">That is: HarfBuzz’s own tables, unless the build leaves them out with <code>HB_NO_UCD</code>, then GLib’s, then ICU’s. A build with none of them stops with an <code>#error</code> (<code>:166</code>), unless <code>HB_NO_UNICODE_FUNCS</code> is defined. Each is a static, immutable object, created lazily and freed at exit (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd.cc#L224"><code>hb-ucd.cc:224</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-glib.cc#L146"><code>hb-glib.cc:146</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-icu.cc#L242"><code>hb-icu.cc:242</code></a>):</p>
+<ul>
+<li id="ix-28"><strong>hb-ucd</strong> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd.cc"><code>hb-ucd.cc</code></a>) reads the tables in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd-table.hh"><code>hb-ucd-table.hh</code></a>, described in the next section.</li>
+<li id="ix-29"><strong>GLib</strong> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-glib.cc"><code>hb-glib.cc</code></a>) calls <code>g_unichar_type</code>, <code>g_unichar_combining_class</code> and the rest, converting GLib’s script codes to HarfBuzz’s.</li>
+<li id="ix-30"><strong>ICU</strong> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-icu.cc"><code>hb-icu.cc</code></a>) maps ICU’s categories onto HarfBuzz’s enum, and composes and decomposes with ICU’s NFC normalizer: <code>unorm2_composePair</code>, and <code>unorm2_getRawDecomposition</code>, which gives the one-step mapping HarfBuzz wants. It is a separate library, <code>libharfbuzz-icu</code>, unless HarfBuzz is configured with <code>icu_builtin</code>, the only way ICU can become the default.</li>
+</ul>
+<blockquote>
+<p id="ix-31">For programmers: the three needn’t agree. Each knows the version of Unicode its library knows, and a system’s ICU or GLib may be older than HarfBuzz’s tables, so that a character one calls unassigned another calls a mark. HarfBuzz’s own tables make shaping depend on nothing but the HarfBuzz version. Installing ICU’s funcs makes HarfBuzz agree with an ICU-based text stack about categories and combining classes, but changes nothing about default ignorables, joining or the script shapers’ categories.</p>
+</blockquote>
+<h2 id="the-built-in-tables">The built-in tables</h2>
+<p id="ix-32">HarfBuzz’s own Unicode data is in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd-table.hh"><code>hb-ucd-table.hh</code></a>, a generated header of more than 400 KB. Its first lines say how it was made:</p>
+<pre><code class="language-c++">/*
+ * The following table is generated by running:
+ *
+ *   ./gen-ucd-table.py ucd.nounihan.grouped.xml hb-script-list.h
+ *
+ * on file with this description: Unicode 18.0.0
+ */
+</code></pre>
+<p id="ix-33">The input is the XML form of the Unicode Character Database, without the Unihan data. The script, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ucd-table.py"><code>gen-ucd-table.py</code></a>, extracts five properties for every code point and packs them with <a href="https://github.com/harfbuzz/packtab">packTab</a>, a table packer from the HarfBuzz project. The comment at <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ucd-table.py#L39"><code>gen-ucd-table.py:39</code></a> says how each is encoded:</p>
+<ul>
+<li id="ix-34"><strong>gc</strong>, General_Category, as its value in HarfBuzz’s enum, which lists the 30 categories alphabetically, Cc to Zs, so it fits in five bits;</li>
+<li id="ix-35"><strong>ccc</strong>, Canonical_Combining_Class, as itself;</li>
+<li id="ix-36"><strong>sc</strong>, Script, as an index into the 179 values listed in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-script-list.h"><code>hb-script-list.h</code></a>;</li>
+<li id="ix-37"><strong>bmg</strong>, Bidi_Mirroring_Glyph, as the difference between the mirror and the character, through a palette of the 39 differences that occur;</li>
+<li id="ix-38"><strong>dm</strong>, Decomposition_Mapping, as an index into four lists of decompositions, described below.</li>
+</ul>
+<p id="ix-39">HarfBuzz first carried a copy of UCDN, a small Unicode library, from 0.9.5, and made it the default in 1.4.1, in January 2017. 2.5.0, in May 2019, replaced it with “a new Unicode Character Database implementation that is half the size of previously-used UCDN” (<code>NEWS</code>). That is this one.</p>
+<h3 id="looking-a-property-up">Looking a property up</h3>
+<p id="ix-40">Each property is read by one inline function. Here is the general category (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd-table.hh#L2736"><code>hb-ucd-table.hh:2736</code></a>):</p>
+<pre><code class="language-c++">static inline uint8_t _hb_ucd_gc (unsigned u)
+{
+  /* packtab: [2^8,2^5,2^3,2^1] */
+  return u&lt;1114110u ? (uint8_t)(_hb_ucd_u8[7944u+((_hb_ucd_u8[2176u+_hb_ucd_u16[((_hb_ucd_u8[((((((u)&gt;&gt;1))&gt;&gt;3))&gt;&gt;5)])&lt;&lt;5)+((((((u)&gt;&gt;1))&gt;&gt;3))&amp;31)]+((((u)&gt;&gt;1))&amp;7)])&lt;&lt;1)+((u)&amp;1)]) : 2;
+}
+</code></pre>
+<p id="ix-41">It is a multi-level table. The code point is cut into fields of bits. The highest bits index a first array; what is found there, plus the next field, indexes a second; and so on, until the last array gives the value. The saving comes from sharing: identical blocks, such as those of the hundreds of thousands of unassigned code points, are stored once. All the properties’ arrays share two pools, <code>_hb_ucd_u8</code> and <code>_hb_ucd_u16</code>. Past the last value stored, the answer is the default, here 2, Cn. A lookup is a few loads and shifts, with one branch.</p>
+<h3 id="three-sizes">Three sizes</h3>
+<p>The header holds three complete sets of these arrays, and the build chooses one:</p>
+<table>
+<thead>
+<tr>
+<th>Build</th>
+<th>Selected by</th>
+<th id="ix-42">gc, ccc, sc, bmg, dm arrays</th>
+<th>With the decomposition lists</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>default</td>
+<td>nothing</td>
+<td>42,627 bytes</td>
+<td>51,029 bytes</td>
+</tr>
+<tr>
+<td>compact</td>
+<td id="ix-43"><code>HB_OPTIMIZE_SIZE</code></td>
+<td>37,735 bytes</td>
+<td>46,137 bytes</td>
+</tr>
+<tr>
+<td>sloppy</td>
+<td id="ix-44"><code>HB_OPTIMIZE_SIZE</code> and <code>HB_NO_UCD_UNASSIGNED</code></td>
+<td>26,427 bytes</td>
+<td>34,829 bytes</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-45">The sizes are worked out from the array lengths. The compact set holds the same data as the default, packed harder, with deeper lookups. The sloppy one doesn’t: for it, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ucd-table.py#L257"><code>gen-ucd-table.py:257</code></a> first gives every unassigned code point the general category and script of its neighbor, within each block of 128. Identical values pack better, and an unassigned code point gets a plausible answer instead of Cn and Unknown. <code>HB_TINY</code> turns on both macros (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh"><code>hb-config.hh</code></a>); see <a href="compile-time-configuration.html">Compile-time configuration</a>.</p>
+<h3 id="decomposition-and-composition">Decomposition and composition</h3>
+<p id="ix-46">Only canonical decompositions are stored (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ucd-table.py#L63"><code>gen-ucd-table.py:63</code></a>), each to one character or two. Compatibility decompositions, such as <em>ﬁ</em> to <em>f i</em>, aren’t, which is why <code>hb-ucd</code> doesn’t implement the deprecated <code>decompose_compatibility</code>. Hangul syllables are left out too: <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd.cc#L56"><code>hb-ucd.cc:56</code></a> composes and decomposes them by arithmetic, as Unicode defines it.</p>
+<p id="ix-47">The <code>dm</code> index points into four lists: one-character mappings into plane 0, then into plane 2, then pairs packed into 32 bits, then pairs packed into 64. A pair fits in 32 bits when its first character is below U+0800, its second is in U+0300 to U+037F, and the composite is small enough. That covers most accented Latin, Greek and Cyrillic. The same pair lists, sorted by pair, serve composition, by binary search (<code>hb_ucd_compose</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd.cc#L128"><code>hb-ucd.cc:128</code></a>). A composite that mustn’t be recomposed, because it is a composition exclusion or has a non-zero combining class, is stored as 0, and composing its pair fails. <code>gen-ucd-table.py --rust</code> writes the same tables as Rust.</p>
+<h2 id="the-properties-each-glyph-carries">The properties each glyph carries</h2>
+<p id="ix-48">The callbacks are asked once per character, at the start of shaping. The answers are kept in the glyph itself, in 16 bits of its private <code>var2</code> field, named <code>unicode_props()</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.hh#L154"><code>hb-ot-layout.hh:154</code></a>). It is allocated first in <code>hb_ot_shape_internal</code> and freed last (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L1176"><code>hb-ot-shape.cc:1176</code></a>), so it lasts the whole of shaping, long after <code>codepoint</code> has become a glyph ID. That is how GSUB knows that a glyph came from a zero-width joiner. The buffer’s other scratch fields are in <a href="buffers.html">Buffers</a>.</p>
+<p id="ix-49">The design comment at <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.hh#L187"><code>hb-ot-layout.hh:187</code></a> explains how the bits are shared out. The low byte means the same for every character. The high byte’s meaning depends on the general category:</p>
+<table>
+<thead>
+<tr>
+<th>Bits</th>
+<th id="ix-50">Mask</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0–4</td>
+<td><code>UPROPS_MASK_GEN_CAT</code></td>
+<td id="ix-51">the general category, slightly modified</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>UPROPS_MASK_IGNORABLE</code></td>
+<td>default ignorable, by HarfBuzz’s definition</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>UPROPS_MASK_HIDDEN</code></td>
+<td id="ix-52">hidden: ignorable, but not to be passed over in GSUB</td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>UPROPS_MASK_CONTINUATION</code></td>
+<td>continues the grapheme before it</td>
+</tr>
+<tr>
+<td>8–15, for Mn, Mc, Me</td>
+<td></td>
+<td id="ix-53">the modified combining class</td>
+</tr>
+<tr>
+<td>8–15, for Cf</td>
+<td><code>UPROPS_MASK_Cf_ZWJ</code>, <code>_ZWNJ</code>, <code>_VS</code>, <code>_AAT_DELETED</code></td>
+<td id="ix-54">a zero-width joiner, a zero-width non-joiner, a variation selector, or a glyph deleted by <code>morx</code></td>
+</tr>
+<tr>
+<td>8–15, for Zs</td>
+<td></td>
+<td id="ix-55">which kind of space, if it needs the space fallback</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-56">Worked out by hand, as an illustration: U+0301 COMBINING ACUTE ACCENT is Mn (12), a continuation, with combining class 230, which makes 0xE68C. U+200D ZERO WIDTH JOINER is Cf (1), ignorable, a ZWJ and a continuation: 0x01A1. The getters check the category before they trust the high byte, so <code>_hb_glyph_info_is_zwj</code> is false for anything that isn’t Cf, and a non-mark’s combining class is 0.</p>
+<h3 id="setting-them">Setting them</h3>
+<p id="ix-57"><code>_hb_glyph_info_set_unicode_props</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.hh#L224"><code>hb-ot-layout.hh:224</code></a>) does it, for one glyph. Here it is with its comments shortened:</p>
+<pre><code class="language-c++">  hb_unicode_funcs_t *unicode = buffer-&gt;unicode;
+  unsigned int u = info-&gt;codepoint;
+  unsigned int gen_cat = (unsigned int) unicode-&gt;general_category (u);
+  unsigned int props = gen_cat;
+
+  if (u &gt;= 0x80u)
+  {
+    if (unlikely (unicode-&gt;is_default_ignorable (u)))
+    {
+      buffer-&gt;scratch_flags |= HB_BUFFER_SCRATCH_FLAG_HAS_DEFAULT_IGNORABLES;
+      props |=  UPROPS_MASK_IGNORABLE;
+      if (u == 0x200Cu) props |= UPROPS_MASK_Cf_ZWNJ;
+      else if (u == 0x200Du) props |= UPROPS_MASK_Cf_ZWJ;
+      /* Mongolian Free Variation Selectors: issue #234 */
+      else if (unlikely (hb_in_ranges&lt;hb_codepoint_t&gt; (u, 0x180Bu, 0x180Du, 0x180Fu, 0x180Fu))) props |= UPROPS_MASK_HIDDEN;
+      /* TAG characters: issue #463 */
+      else if (unlikely (hb_in_range&lt;hb_codepoint_t&gt; (u, 0xE0020u, 0xE007Fu))) props |= UPROPS_MASK_HIDDEN;
+      /* COMBINING GRAPHEME JOINER: issue #554 */
+      else if (unlikely (u == 0x034Fu))
+      {
+        buffer-&gt;scratch_flags |= HB_BUFFER_SCRATCH_FLAG_HAS_CGJ;
+        props |= UPROPS_MASK_HIDDEN;
+      }
+    }
+
+    if (unlikely (HB_UNICODE_GENERAL_CATEGORY_IS_MARK (gen_cat)))
+    {
+      buffer-&gt;scratch_flags |= HB_BUFFER_SCRATCH_FLAG_HAS_CONTINUATIONS;
+      props |= UPROPS_MASK_CONTINUATION;
+      props |= unicode-&gt;modified_combining_class (u)&lt;&lt;8;
+    }
+  }
+
+  info-&gt;unicode_props() = props;
+</code></pre>
+<p id="ix-58">ASCII is never ignorable and never a mark, so for it only the category is looked up. <code>is_default_ignorable</code> and the modified class table are HarfBuzz’s own, whichever funcs are installed. And the function sets <strong>scratch flags</strong> on the buffer: “has default ignorables”, “has a CGJ”, “has continuations”. Later steps check them first, so a buffer of plain Latin letters never runs the code that hides ignorables.</p>
+<h3 id="when-properties-change">When properties change</h3>
+<p id="ix-59">The category is “modified” because HarfBuzz changes it in a few places. A variation selector that the <code>cmap</code> doesn’t consume moves from Mn to Cf, so that the <code>_VS</code> flag fits, and moves back after positioning. A ligature formed from a non-spacing mark becomes Lo, as the <a href="gsub.html#edge-cases-the-code-handles">GSUB chapter</a> says. The Thai shaper makes the NIKHAHIT it splits from SARA AM a mark (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-thai.cc#L342"><code>hb-ot-shaper-thai.cc:342</code></a>). A glyph that <code>morx</code> deletes becomes Cf with the <code>_AAT_DELETED</code> and hidden bits until it is removed (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.hh#L431"><code>hb-ot-layout.hh:431</code></a>). The combining class changes too: the Arabic shaper renumbers marks it moves (below), and for a font with no GPOS, fallback mark positioning replaces script-specific classes with the positional ones it can place (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-fallback.cc#L183"><code>hb-ot-shape-fallback.cc:183</code></a>, and <a href="fallbacks.html">Fallbacks</a>), after normalization has used them.</p>
+<h2 id="continuations-just-enough-of-graphemes">Continuations: just enough of graphemes</h2>
+<p id="ix-60">The continuation bit says that a character belongs with the one before it, in one <em>grapheme</em>: what a reader sees as one character. Forming clusters merges each grapheme into one cluster at the cluster levels that work by graphemes, including the default, and text reversed into its native direction is reversed grapheme by grapheme, so that a mark stays after its base. Both are in <a href="buffers.html">Buffers</a>.</p>
+<p id="ix-61">Unicode defines graphemes in UAX #29. HarfBuzz implements only “enough of Unicode Graphemes here that shaping in reverse-direction wouldn’t break graphemes” (<code>hb_set_unicode_props</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L474"><code>hb-ot-shape.cc:474</code></a>). It marks as continuations:</p>
+<ul>
+<li id="ix-62">every mark, Mn, Mc or Me (done in <code>_hb_glyph_info_set_unicode_props</code>, above);</li>
+<li>the emoji skin-tone modifiers, U+1F3FB to U+1F3FF;</li>
+<li>the second of a pair of regional indicators, which together make a flag (HarfBuzz issue #2265);</li>
+<li id="ix-63">a zero-width joiner, and an Extended_Pictographic character straight after it, which is how emoji ZWJ sequences hold together;</li>
+<li id="ix-64">the halfwidth katakana voiced sound marks, U+FF9E and U+FF9F (issue #3844), and the TAG characters, U+E0020 to U+E007F, which make emoji subdivision flags (issue #1556).</li>
+</ul>
+<p id="ix-65">The last group is Unicode’s Other_Grapheme_Extend, less ZWNJ, because “keeping it separate results in more granular clusters”. (The same loop notices U+2044 FRACTION SLASH, so that <code>frac</code> masks are only set up for text that has one.) The difference shows in the clusters:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">❤⟨ZWJ⟩❤</span><span class="cps">U+2764 U+200D U+2764</span></td><td class="opt"></td><td class="out"><code>[.notdef=0+500|space=0+0|.notdef=0+500]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">a⟨ZWJ⟩a</span><span class="cps">U+0061 U+200D U+0061</span></td><td class="opt"></td><td class="out"><code>[a=0+500|space=0+0|a=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-66">The second heart follows a ZWJ and is Extended_Pictographic, so all three characters are cluster 0. After <em>a</em>, the ZWJ joins the <em>a</em>’s cluster, but the next <em>a</em> starts its own, 2. (The hearts are .notdef, and the ZWJ is a zero-width space glyph, for reasons explained below.)</p>
+<h2 id="modified-combining-classes">Modified combining classes</h2>
+<p id="ix-67">Unicode’s canonical combining classes exist to put marks into a canonical order, so that equivalent strings compare equal. They weren’t chosen with fonts in mind, and for some scripts the canonical order isn’t the one fonts expect. So HarfBuzz’s normalizer sorts marks by its own <strong>modified combining classes</strong>: Unicode’s class, passed through a table of 256 entries (<code>_hb_modified_combining_class</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.cc#L500"><code>hb-unicode.cc:500</code></a>), plus three single-character exceptions (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh#L106"><code>hb-unicode.hh:106</code></a>):</p>
+<pre><code class="language-c++">    /* Reorder SAKOT to ensure it comes after any tone marks. */
+    if (unlikely (u == 0x1A60u)) return 254;
+    /* Reorder PADMA to ensure it comes after any vowel marks. */
+    if (unlikely (u == 0x0FC6u)) return 254;
+    /* Reorder TSA -PHRU to reorder before U+0F74 */
+    if (unlikely (u == 0x0F39u)) return 127;
+</code></pre>
+<p id="ix-68">Most of the table is the identity. The changes, as the comments in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh"><code>hb-unicode.hh</code></a> explain them:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-69">Script</th>
+<th>Unicode classes</th>
+<th>What HarfBuzz does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hebrew</td>
+<td>10–26, one per point</td>
+<td>permutes them into the order of the SBL Hebrew manual: shin and sin dots first, then dagesh, rafe, holam, the vowels, and meteg and varika last</td>
+</tr>
+<tr>
+<td>Arabic</td>
+<td>27–35</td>
+<td>moves shadda (33) before the other harakat</td>
+</tr>
+<tr>
+<td>Telugu</td>
+<td>84, 91</td>
+<td>makes the two length marks 4 and 5, so that they no longer reorder with the virama (9)</td>
+</tr>
+<tr>
+<td>Thai</td>
+<td>103</td>
+<td>makes SARA U and SARA UU 3, so that they come before PHINTHU (9), as Uniscribe does</td>
+</tr>
+<tr>
+<td>Tibetan</td>
+<td>130, 132</td>
+<td>swaps the vowel signs I and U, so that U comes first, for Dzongkha</td>
+</tr>
+</tbody>
+</table>
+<p>The effect, with Hebrew and Thai:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">בָּ</span><span class="cps">U+05D1 U+05B8 U+05BC</span></td><td class="opt">--no-positions</td><td class="out"><code>[qamats=0|dagesh=0|bet=0]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">בָּ</span><span class="cps">U+05D1 U+05BC U+05B8</span></td><td class="opt">--no-positions</td><td class="out"><code>[qamats=0|dagesh=0|bet=0]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">กฺุ</span><span class="cps">U+0E01 U+0E3A U+0E38</span></td><td class="opt">--no-positions</td><td class="out"><code>[kokai=0|saraU=0|phinthu=0]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">กฺุ</span><span class="cps">U+0E01 U+0E38 U+0E3A</span></td><td class="opt">--no-positions</td><td class="out"><code>[kokai=0|saraU=0|phinthu=0]</code></td></tr></tbody></table></div>
+<p id="ix-70">In canonical order QAMATS (class 18) comes before DAGESH (21), as in the first line and in any normalized text. HarfBuzz gives dagesh 12 and qamats 21, so both lines come out the same, with the dagesh first: read the visual-order output from the right, <code>bet</code>, <code>dagesh</code>, <code>qamats</code>. Both Thai lines come out with SARA U before PHINTHU, the reverse of Unicode’s order. The trace shows the sort, in normalization’s second round:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape unicode.ttf "בָּ"  --trace</code></div><table><tbody><tr><td class="what">start reorder</td><td class="buf"><code>&lt;U+05D1=0|U+05B8=0|U+05BC=0&gt;</code></td></tr><tr><td class="what">end reorder</td><td class="buf"><code>&lt;U+05D1=0|U+05BC=0|U+05B8=0&gt;</code></td></tr></tbody></table></div>
+<p id="ix-71">The result isn’t in canonical order, but only the font’s lookups ever see it. What matters is that every canonically equivalent input gives the same order, which sorting by any fixed set of classes does.</p>
+<blockquote>
+<p id="ix-72">For type designers: when you write contextual lookups or mark-to-mark attachment for a sequence of marks, the sequence your lookups see is the one sorted by HarfBuzz’s modified classes, not the one typed and not Unicode’s canonical order. <code>hb-shape --trace</code> shows it, at “end reorder”.</p>
+</blockquote>
+<p id="ix-73">The modified class is what the high byte of <code>unicode_props</code> holds. The Arabic shaper’s <code>reorder_marks</code> hook changes it once more: it moves the “modifier combining marks”, such as hamza above and below, to the front of their run, and renumbers them 25 or 26 (the modified classes HarfBuzz names <code>CCC22</code> and <code>CCC26</code>) so that the run stays sorted, because the CGJ handling below relies on that (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc#L762"><code>hb-ot-shaper-arabic.cc:762</code></a>). <a href="joining-scripts.html">Joining scripts</a> has the rest.</p>
+<h2 id="default-ignorables">Default ignorables</h2>
+<p id="ix-74">Unicode’s Default_Ignorable_Code_Point property marks characters that should be invisible if a renderer doesn’t support them: joiners, the soft hyphen, bidirectional controls, variation selectors, invisible operators, TAG characters, and reserved code points for more of the same. Fonts rarely have glyphs for them, and drawing .notdef would be wrong.</p>
+<p id="ix-75">HarfBuzz doesn’t get this property from the Unicode funcs. <code>is_default_ignorable</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh#L167"><code>hb-unicode.hh:167</code></a>) is a hand-written switch, whose comment lists Unicode’s set as of Unicode 14.0, and the differences:</p>
+<blockquote>
+<p id="ix-76">Note: While U+115F, U+1160, U+3164 and U+FFA0 are Default_Ignorable, we do NOT want to hide them, as the way Uniscribe has implemented them is with regular spacing glyphs, and that’s the way fonts are made to work. As such, we make exceptions for those four. Also ignoring U+1BCA0..1BCA3.</p>
+</blockquote>
+<p>The four are the Hangul fillers. The last four are the shorthand format controls, used with Duployan (HarfBuzz issue #503). Everything else in that list is in HarfBuzz’s. Being in the source, the list changes only when someone edits it, not when the tables are regenerated.</p>
+<p id="ix-77">Being default ignorable does three things to a glyph, at three points in the pipeline:</p>
+<ol>
+<li id="ix-78"><strong>In GSUB and GPOS matching</strong>, it may be passed over. Most default ignorables are skipped when a lookup looks for the next glyph, with special rules for the joiners, as the <a href="gsub.html#joiners">GSUB chapter</a> explains.</li>
+<li id="ix-79"><strong>After positioning</strong>, its advance is set to zero, and its offset along the line too (<code>hb_ot_zero_width_default_ignorables</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L772"><code>hb-ot-shape.cc:772</code></a>).</li>
+<li id="ix-80"><strong>At the very end</strong>, its glyph is replaced with an invisible one, or removed (<code>hb_ot_hide_default_ignorables</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L817"><code>hb-ot-shape.cc:817</code></a>).</li>
+</ol>
+<p id="ix-81">So until the end of positioning, a default ignorable is an ordinary glyph, with whatever glyph and advance the font gives it. The test font has a glyph for the soft hyphen, 300 units wide, and kerning between <em>a</em> and <em>b</em>:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape unicode.ttf "a­b"  --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;latn&#x27;</td><td class="buf"><code>[a=0|softhyphen=1|b=2]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;latn&#x27;</td><td class="buf"><code>[a=0|softhyphen=1|b=2]</code></td></tr><tr><td class="what">start table GPOS script tag &#x27;latn&#x27;</td><td class="buf"><code>[a=0+500|softhyphen=1+300|b=2+500]</code></td></tr><tr><td class="what">start lookup 0 feature &#x27;kern&#x27;</td><td class="buf"><code>[a=0+500|softhyphen=1+300|b=2+500]</code></td></tr><tr><td class="what">try kerning glyphs at 0,2</td><td class="buf"><code>[a=0+500|softhyphen=1+300|b=2+500]</code></td></tr><tr><td class="what">kerned glyphs at 0,2</td><td class="buf"><code>[a=0+400|softhyphen=1+300|b=2+500]</code></td></tr><tr><td class="what">tried kerning glyphs at 0,2</td><td class="buf"><code>[a=0+400|softhyphen=1+300|b=2+500]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;kern&#x27;</td><td class="buf"><code>[a=0+400|softhyphen=1+300|b=2+500]</code></td></tr><tr><td class="what">end table GPOS script tag &#x27;latn&#x27;</td><td class="buf"><code>[a=0+400|softhyphen=1+300|b=2+500]</code></td></tr></tbody></table></div>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">a­b</span><span class="cps">U+0061 U+00AD U+0062</span></td><td class="opt"></td><td class="out"><code>[a=0+400|space=1+0|b=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-82">Through GSUB and GPOS, the soft hyphen is the glyph <code>softhyphen</code>, 300 units wide. The kerning lookup passes over it to kern the <em>a</em> against the <em>b</em>. Only then is it zeroed and replaced. Doing it this late lets invisible characters take part in lookups that ask for them.</p>
+<h3 id="hidden-preserved-or-removed">Hidden, preserved or removed</h3>
+<p id="ix-83">Step 3 puts in the buffer’s <strong>invisible glyph</strong>, set with <code>hb_buffer_set_invisible_glyph</code> (since 2.0.0), or if there is none, the font’s glyph for the space character: hence the zero-width <code>space</code> glyphs in this chapter. If the font has no space glyph either, the ignorables are deleted.</p>
+<p>Two buffer flags change this:</p>
+<ul>
+<li id="ix-84"><code>HB_BUFFER_FLAG_PRESERVE_DEFAULT_IGNORABLES</code> turns steps 2 and 3 off. The characters keep the glyphs and advances the font gave them.</li>
+<li id="ix-85"><code>HB_BUFFER_FLAG_REMOVE_DEFAULT_IGNORABLES</code> (since 1.8.0) turns step 2 off and makes step 3 delete the glyphs. Where a deletion would leave a character with no glyph in its cluster, clusters are merged (<code>delete_glyphs_inplace</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L694"><code>hb-buffer.cc:694</code></a>).</li>
+</ul>
+<p id="ix-86">If both are set, preserving wins. <code>hb-shape</code> has an option for each, and <code>--invisible-glyph</code> to set the invisible glyph:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">a­a</span><span class="cps">U+0061 U+00AD U+0061</span></td><td class="opt"></td><td class="out"><code>[a=0+500|space=1+0|a=2+500]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">a­a</span><span class="cps">U+0061 U+00AD U+0061</span></td><td class="opt">--preserve-default-ignorables</td><td class="out"><code>[a=0+500|softhyphen=1+300|a=2+500]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">a­a</span><span class="cps">U+0061 U+00AD U+0061</span></td><td class="opt">--remove-default-ignorables</td><td class="out"><code>[a=0+500|a=2+500]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">a​a</span><span class="cps">U+0061 U+200B U+0061</span></td><td class="opt"></td><td class="out"><code>[a=0+500|space=1+0|a=2+500]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">a​a</span><span class="cps">U+0061 U+200B U+0061</span></td><td class="opt">--preserve-default-ignorables</td><td class="out"><code>[a=0+500|.notdef=1+500|a=2+500]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">aㅤa</span><span class="cps">U+0061 U+3164 U+0061</span></td><td class="opt"></td><td class="out"><code>[a=0+500|.notdef=1+500|a=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-87">The soft hyphen is hidden, then drawn with the font’s own glyph, then gone. U+200B ZERO WIDTH SPACE has no glyph in this font, so preserving it draws .notdef, at full width. U+3164 HANGUL FILLER is default ignorable to Unicode but not to HarfBuzz, so it is never hidden.</p>
+<h3 id="substituted-so-no-longer-ignorable">Substituted, so no longer ignorable</h3>
+<p id="ix-88">A default ignorable that GSUB has substituted is not default ignorable any more. The test is in <code>_hb_glyph_info_is_default_ignorable</code> itself (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.hh#L349"><code>hb-ot-layout.hh:349</code></a>):</p>
+<pre><code class="language-c++">  return (info-&gt;unicode_props() &amp; UPROPS_MASK_IGNORABLE) &amp;&amp;
+         !_hb_glyph_info_substituted (info);
+</code></pre>
+<p id="ix-89">The bit is still set, but a glyph with the <code>SUBSTITUTED</code> property, which GSUB gives every glyph it writes, is neither skipped by later lookups nor hidden: a font that substitutes an invisible character has something to draw for it. The test font’s <code>ss01</code> replaces the soft hyphen with a hyphen:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">a­a</span><span class="cps">U+0061 U+00AD U+0061</span></td><td class="opt">--features=ss01</td><td class="out"><code>[a=0+500|hyphen=1+300|a=2+500]</code></td></tr></tbody></table></div>
+<blockquote>
+<p id="ix-90">For type designers: this is how a font can make an invisible character visible, in HarfBuzz at least: substitute it, even with a copy of itself under another name. Mapping it in the <code>cmap</code> isn’t enough, because the glyph it maps to is hidden unless the application asks to preserve default ignorables.</p>
+</blockquote>
+<p id="ix-91">The <code>fallback</code> backend hides ignorables too. It replaces them with the space glyph, at zero width, using the same hand-written list (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-fallback-shape.cc#L90"><code>hb-fallback-shape.cc:90</code></a>). See <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a>.</p>
+<h2 id="the-hidden-ones">The hidden ones</h2>
+<p id="ix-92">A few default ignorables are there to change the shaping of the characters around them. If GSUB passed over them, they couldn’t. These get the <strong>hidden</strong> bit as well as the ignorable one:</p>
+<ul>
+<li id="ix-93">the Mongolian free variation selectors, FVS1 to FVS4: U+180B to U+180D, and U+180F (HarfBuzz issue #234);</li>
+<li id="ix-94">the TAG characters, U+E0020 to U+E007F (issue #463);</li>
+<li>U+034F COMBINING GRAPHEME JOINER, but only some of the time (issue #554);</li>
+<li id="ix-95">and, internally, glyphs that <code>morx</code> has deleted.</li>
+</ul>
+<p id="ix-96">The bit is used in the matcher’s <code>may_skip</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L891"><code>hb-ot-layout-gsubgpos.hh:891</code></a>), which the GSUB chapter describes. A default ignorable may be skipped only if it isn’t a ZWNJ or ZWJ that the lookup must respect, and isn’t hidden:</p>
+<pre><code class="language-c++">    if (unlikely (_hb_glyph_info_is_default_ignorable (&amp;info) &amp;&amp;
+                  (ignore_zwnj || !_hb_glyph_info_is_zwnj (&amp;info)) &amp;&amp;
+                  (ignore_zwj || !_hb_glyph_info_is_zwj (&amp;info)) &amp;&amp;
+                  (ignore_hidden || !_hb_glyph_info_is_hidden (&amp;info))))
+      return SKIP_MAYBE;
+</code></pre>
+<p id="ix-97"><code>ignore_hidden</code> is true only for GPOS (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L848"><code>hb-ot-layout-gsubgpos.hh:848</code></a>). So in GSUB a hidden character always stops a match. Here is the <em>fi</em> ligature with an invisible character between the letters each time:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">f⁠i</span><span class="cps">U+0066 U+2060 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900|space=0+0]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">f­i</span><span class="cps">U+0066 U+00AD U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900|space=0+0]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">f᠋i</span><span class="cps">U+0066 U+180B U+0069</span></td><td class="opt"></td><td class="out"><code>[f=0+500|space=0+0|i=2+500]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">f󠁧i</span><span class="cps">U+0066 U+E0067 U+0069</span></td><td class="opt"></td><td class="out"><code>[f=0+500|space=0+0|i=2+500]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">f⟨ZWNJ⟩i</span><span class="cps">U+0066 U+200C U+0069</span></td><td class="opt"></td><td class="out"><code>[f=0+500|space=1+0|i=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-98">U+2060 WORD JOINER and the soft hyphen are ordinary default ignorables, and the ligature forms across them, leaving the invisible character after it, in its cluster. FVS1 and the TAG character U+E0067 are hidden, and block it, as ZWNJ does for its own reasons. In the output they are hidden like any other default ignorable, in the <em>f</em>’s cluster, since both are continuations.</p>
+<p id="ix-99">Each of these characters says something about the one before it. A Mongolian FVS selects a form of the letter it follows, which a font does with lookups that match the two together. If GSUB passed over the FVS, lookups written for the letter alone would apply as though it weren’t there. (Mongolian is shaped by the Universal Shaping Engine, which uses the Arabic shaper’s joining code, and that code copies each letter’s joining form onto the FVS after it, so that both get the same feature masks: <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc#L380"><code>hb-ot-shaper-arabic.cc:380</code></a>; <a href="joining-scripts.html">Joining scripts</a>.) TAG characters likewise follow an emoji, as in subdivision flags, and spell out what it should become.</p>
+<h3 id="cgj-sometimes">CGJ, sometimes</h3>
+<p id="ix-100">The combining grapheme joiner is a mark with combining class 0. A class-0 character between two marks stops reordering from moving one past the other, and that is CGJ’s main use: to keep marks in an order that normalization would otherwise change, in Hebrew for example. The GSUB chapter’s table lists CGJ as always blocking. That is true of a CGJ doing this job. After reordering, HarfBuzz checks whether each CGJ kept anything apart (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc#L403"><code>hb-ot-shape-normalize.cc:403</code></a>):</p>
+<pre><code class="language-c++">    for (unsigned int i = 1; i + 1 &lt; count; i++)
+      if (info[i].codepoint == 0x034Fu/*CGJ*/ &amp;&amp;
+          (info_cc(info[i+1]) == 0 || info_cc(info[i-1]) &lt;= info_cc(info[i+1])))
+      {
+        _hb_glyph_info_unhide (&amp;info[i]);
+      }
+</code></pre>
+<p id="ix-101">If the character after it isn’t a mark, or the marks on either side were in order anyway, the CGJ prevented nothing, and loses its hidden bit. GSUB can then pass over it. The comparison uses the modified classes. Both cases:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">f◌͏i</span><span class="cps">U+0066 U+034F U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900|space=0+0]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">בָ◌͏ּ</span><span class="cps">U+05D1 U+05B8 U+034F U+05BC</span></td><td class="opt">--no-positions</td><td class="out"><code>[dagesh=0|space=0|qamats=0|bet=0]</code></td></tr></tbody></table></div>
+<p id="ix-102">Between two letters, a CGJ blocks no reordering, so the ligature forms across it. Between QAMATS and DAGESH, which HarfBuzz would otherwise swap, it stays hidden, and the marks keep their typed order: from the right, <code>bet</code>, <code>qamats</code>, the CGJ, <code>dagesh</code>.</p>
+<h3 id="in-gpos">In GPOS</h3>
+<p id="ix-103">GPOS passes over all of them. Until 10.0.0, hidden characters blocked positioning lookups as well as substitutions. That release’s <code>NEWS</code> says: “CGJ and Mongolian Variation Selectors are now ignored during glyph positioning, previously they would block both glyph substitution and positioning across them.” GPOS also passes over ZWNJ, always, and ZWJ, unless the feature has manual ZWJ, as only <code>mark</code> and <code>mkmk</code> do for the default shaper. So kerning works across any invisible character:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">ab</span><span class="cps">U+0061 U+0062</span></td><td class="opt"></td><td class="out"><code>[a=0+400|b=1+500]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">a᠋b</span><span class="cps">U+0061 U+180B U+0062</span></td><td class="opt"></td><td class="out"><code>[a=0+400|space=0+0|b=2+500]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">a󠁧b</span><span class="cps">U+0061 U+E0067 U+0062</span></td><td class="opt"></td><td class="out"><code>[a=0+400|space=0+0|b=2+500]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">a⟨ZWNJ⟩b</span><span class="cps">U+0061 U+200C U+0062</span></td><td class="opt"></td><td class="out"><code>[a=0+400|space=1+0|b=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-104">Each <em>a</em> is kerned against the <em>b</em> by −100, whatever is between them. Fallback mark positioning, too, passes over hidden and ignorable glyphs when it gathers a base’s marks (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-fallback.cc#L442"><code>hb-ot-shape-fallback.cc:442</code></a>). And when HarfBuzz synthesizes glyph classes for a font without GDEF, it never makes a default ignorable a mark, though CGJ and the FVSes are Mn (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L856"><code>hb-ot-shape.cc:856</code></a>), as the GSUB chapter mentions.</p>
+<h2 id="variation-selectors">Variation selectors</h2>
+<p id="ix-105">The variation selectors VS1 to VS256, U+FE00 to U+FE0F and U+E0100 to U+E01EF, follow a base character to ask for a particular form of it. The Mongolian FVSes don’t count: <code>is_variation_selector</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh#L119"><code>hb-unicode.hh:119</code></a>) leaves them to the Arabic shaper.</p>
+<p id="ix-106">Normalization gives up on a cluster that holds a variation selector (“it’s just too hard”, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc#L208"><code>hb-ot-shape-normalize.cc:208</code></a>). It asks the font’s <code>variation_glyph</code> func, which for hb-ot reads a format 14 <code>cmap</code> subtable, for a glyph for the pair. If there is one, the base and the selector become that glyph. If not, both go on with their nominal glyphs, for GSUB to deal with, and the selector is marked with the <code>_VS</code> bit. If it is still there at the end, it is hidden like any default ignorable. Since 10.0.0 an application can ask for a glyph of its choice instead, with <code>hb_buffer_set_not_found_variation_selector_glyph</code>: the selector then isn’t ignorable (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc#L227"><code>hb-ot-shape-normalize.cc:227</code></a>), and gets that glyph at zero width (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L795"><code>hb-ot-shape.cc:795</code></a>), so the client can see that the font didn’t support the sequence and use “a different font for example” (<code>NEWS</code>). The test font maps <em>a</em> with VS1 to <code>a.vs1</code>, and nothing else:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">a︀</span><span class="cps">U+0061 U+FE00</span></td><td class="opt"></td><td class="out"><code>[a.vs1=0+500]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">a︁</span><span class="cps">U+0061 U+FE01</span></td><td class="opt"></td><td class="out"><code>[a=0+500|space=0+0]</code></td></tr><tr><td class="font">unicode.ttf</td><td class="in"><span class="txt">a︁</span><span class="cps">U+0061 U+FE01</span></td><td class="opt">--not-found-variation-selector-glyph=0</td><td class="out"><code>[a=0+500|.notdef=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-107">With VS1 the pair becomes one glyph. With VS2 the base keeps its usual glyph and the selector is hidden. With a not-found glyph set, here glyph 0, the selector shows as that glyph, in the base’s cluster.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.h"><code>src/hb-unicode.h</code></a></td>
+<td>the public API: the callbacks’ types, the general category and combining class enums</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh"><code>src/hb-unicode.hh</code></a></td>
+<td><code>hb_unicode_funcs_t</code>; the hard-coded <code>is_default_ignorable</code>, <code>is_variation_selector</code>, <code>space_fallback_type</code> and <code>vertical_char_for</code>; <code>modified_combining_class</code> and the definitions of the modified classes</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.cc"><code>src/hb-unicode.cc</code></a></td>
+<td>the nil funcs, choosing the default, creating funcs from a parent, the modified combining class table</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd.cc"><code>src/hb-ucd.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd-table.hh"><code>src/hb-ucd-table.hh</code></a></td>
+<td>the built-in implementation, and its generated tables in three sizes</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ucd-table.py"><code>src/gen-ucd-table.py</code></a></td>
+<td>the generator, with the encoding of each property</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-icu.cc"><code>src/hb-icu.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-glib.cc"><code>src/hb-glib.cc</code></a></td>
+<td>the ICU and GLib implementations</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.hh"><code>src/hb-ot-layout.hh</code></a></td>
+<td><code>unicode_props()</code>, its bits, <code>_hb_glyph_info_set_unicode_props</code>, and the getters and setters</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>src/hb-ot-shape.cc</code></a></td>
+<td><code>hb_set_unicode_props</code> and continuations, mirroring, zeroing and hiding default ignorables, variation selectors not found</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc"><code>src/hb-ot-shape-normalize.cc</code></a></td>
+<td>reordering by modified class, unhiding CGJ, variation selector clusters</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh"><code>src/hb-ot-layout-gsubgpos.hh</code></a></td>
+<td><code>may_skip</code>, where ignorable and hidden glyphs are passed over or not</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode-emoji-table.hh"><code>src/hb-unicode-emoji-table.hh</code></a></td>
+<td>Extended_Pictographic</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>HarfBuzz asks Unicode six questions: general category, combining class, mirroring, script, decomposition and composition. They are answered by an <code>hb_unicode_funcs_t</code>, normally HarfBuzz’s own, with GLib and ICU as alternatives.</li>
+<li>The built-in tables are generated from the UCD (here Unicode 18.0.0) by <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ucd-table.py"><code>gen-ucd-table.py</code></a> and packed into multi-level tables of about 35 to 51 KB, depending on the build.</li>
+<li>Default ignorables, variation selectors, space widths, vertical forms, emoji, joining and the script shapers’ categories don’t come from the funcs. They are compiled in, and the same whatever funcs are installed.</li>
+<li>Each glyph carries 16 bits of Unicode properties for the whole of shaping: a general category, ignorable, hidden and continuation bits, and a byte whose meaning depends on the category.</li>
+<li>Marks are reordered by HarfBuzz’s modified combining classes, which suit fonts better than Unicode’s for Hebrew, Arabic, Telugu, Thai and Tibetan.</li>
+<li>Default ignorables take part in GSUB and GPOS, then lose their advance, then are replaced by an invisible glyph, unless the buffer says to preserve or remove them. One that GSUB has substituted is no longer ignorable.</li>
+<li>Hidden characters, the Mongolian FVSes, TAG characters, and a CGJ that kept marks apart, are never passed over in GSUB. Since 10.0.0 they are passed over in GPOS.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="where-metrics-come-from.html">← Where metrics come from</a><a rel="next" href="buffers.html">Buffers →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

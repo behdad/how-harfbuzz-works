@@ -1,0 +1,1250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Compile-time configuration · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Appendix E</p>
+<h1 id="compile-time-configuration">Compile-time configuration</h1>
+<p id="ix-1">HarfBuzz can be built without most of what it can do. A browser wants all of it; a game console that shapes one Latin font wants <code>hb_shape</code> and little else, and would rather not carry an AAT engine, a color-font painter and a subsetter in its binary. Nearly every part of the library can be removed by defining a preprocessor macro, most of them named <code>HB_NO_</code> and the thing removed.</p>
+<p id="ix-2">This appendix lists them. It starts with how the macros are processed, then the three ready-made sets of them, the macros that change speed and size rather than features, every <code>HB_NO_*</code> macro in the 15.1.0 source, the other switches, and the Meson build options. Chapters that mention a macro link here; the table of <code>HB_NO_*</code> macros links back to the chapter that explains what each one removes.</p>
+<h2 id="how-the-macros-are-processed">How the macros are processed</h2>
+<p id="ix-3">All configuration goes through one header, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh"><code>hb-config.hh</code></a>. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh"><code>hb.hh</code></a> includes it before anything else it includes (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L168"><code>hb.hh:168</code></a>), and every source file includes <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh"><code>hb.hh</code></a> first, so every file sees the same answers. The header does its work in this order:</p>
+<ol>
+<li id="ix-4"><code>config.h</code>, if the build system made one (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh#L34"><code>hb-config.hh:34</code></a>). Meson writes the <code>HAVE_*</code> macros there.</li>
+<li id="ix-5"><code>HB_NO_SUBSET_DEPEND</code>, unless <code>HB_EXPERIMENTAL_API</code> is defined (<code>:38</code>).</li>
+<li id="ix-6">The three tiers: <code>HB_TINY</code> (<code>:42</code>), which defines the other two, then <code>HB_LEAN</code> (<code>:56</code>) and <code>HB_MINI</code> (<code>:93</code>).</li>
+<li id="ix-7"><code>HB_OPTIMIZE_SIZE</code>, if the compiler defines <code>__OPTIMIZE_SIZE__</code> (<code>:100</code>).</li>
+<li id="ix-8">The first <strong>override header</strong> (<code>:106</code>).</li>
+<li id="ix-9">The <strong>closure of options</strong> (<code>:113</code>), the header’s own name for it: umbrella macros define the narrower macros they stand for.</li>
+<li id="ix-10">The second override header, <code>HB_CONFIG_OVERRIDE_LAST_H</code> (<code>:192</code>).</li>
+<li id="ix-11"><code>HB_OPTIMIZE_SIZE_VAL</code> and <code>HB_MINIMIZE_MEMORY_USAGE_VAL</code>, the same two settings as 0 or 1 for use in ordinary <code>if</code> statements (<code>:199</code>).</li>
+</ol>
+<p id="ix-12">Implications flow down this list and never back up. <code>HB_MINI</code> defines <code>HB_NO_LEGACY</code> in step 3, and in step 6 <code>HB_NO_LEGACY</code> defines six narrower macros. Here are the two blocks, trimmed:</p>
+<pre><code class="language-c++">#ifdef HB_MINI
+#define HB_NO_AAT
+#define HB_NO_LEGACY
+#define HB_NO_BEYOND_64K
+#define HB_NO_CUBIC_GLYF
+#endif
+...
+#ifdef HB_NO_LEGACY
+#define HB_NO_CMAP_LEGACY_SUBTABLES
+#define HB_NO_FALLBACK_SHAPE
+#define HB_NO_OT_KERN
+#define HB_NO_OT_LAYOUT_BLOCKLIST
+#define HB_NO_AAT_LAYOUT_BLOCKLIST
+#define HB_NO_OT_SHAPE_FALLBACK
+#endif
+</code></pre>
+<p id="ix-13">and <code>HB_NO_OT_SHAPE_FALLBACK</code> defines five more a few lines further on (<code>:174</code>). One macro on the command line can remove a dozen things.</p>
+<p id="ix-14"><strong>Undoing part of a tier.</strong> There is no command-line way to say “<code>HB_MINI</code>, but keep <code>kern</code>” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/CONFIG.md"><code>CONFIG.md</code></a> says so), so the override headers exist. Define <code>HB_CONFIG_OVERRIDE_H</code> as the name of a header, in quotes, and it is included at step 5. Defining <code>HAVE_CONFIG_OVERRIDE_H</code> instead includes <code>config-override.h</code>, the fixed name used up to 3.1.2. The position matters. At step 5 the tiers have run but the closure hasn’t, so <code>#undef HB_NO_LEGACY</code> there brings back everything <code>HB_NO_LEGACY</code> would have removed. But <code>#undef HB_NO_OT_KERN</code> there achieves nothing while <code>HB_NO_LEGACY</code> is still defined, because the closure defines it again at step 6. A narrow macro set by the closure can only be undone in the second header, <code>HB_CONFIG_OVERRIDE_LAST_H</code> (or <code>config-override-last.h</code> with <code>HAVE_CONFIG_OVERRIDE_LAST_H</code>), which runs after it. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/CONFIG.md"><code>CONFIG.md</code></a> documents only the first header.</p>
+<p id="ix-15"><strong>Defined is enough.</strong> The <code>HB_NO_*</code> macros are tested with <code>#ifdef</code> and <code>#ifndef</code>, so their value is ignored: <code>-DHB_NO_VAR=0</code> removes variations just as <code>-DHB_NO_VAR</code> does. The exceptions, tested with <code>#if</code> or <code>if</code>, are <code>HB_USE_ATEXIT</code>, <code>HB_FAST_NUM_ACCESS</code>, <code>HB_BUFFER_MESSAGE_MORE</code> and the <code>HB_DEBUG_*</code> levels, below.</p>
+<p><strong>What removal looks like.</strong> A macro takes code out in one of three ways, and often in all three:</p>
+<ul>
+<li id="ix-16"><strong>Whole files.</strong> <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-math.cc"><code>hb-ot-math.cc</code></a> is wrapped in <code>#ifndef HB_NO_MATH</code> from top to bottom (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-math.cc#L29"><code>hb-ot-math.cc:29</code></a>), so in such a build the <code>hb_ot_math_*</code> functions don’t exist. The public headers are not changed (the only <code>HB_NO_*</code> test in them is <code>HB_NO_SUBSET_DEPEND</code>, in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-depend.h#L73"><code>hb-subset-depend.h:73</code></a>), so a program that calls a removed function still compiles, and fails to link.</li>
+<li id="ix-17"><strong>Early returns.</strong> <code>_hb_preprocess_text_vowel_constraints</code> begins with <code>#ifdef HB_NO_OT_SHAPER_VOWEL_CONSTRAINTS return; #endif</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-vowel-constraints.cc#L42"><code>hb-ot-shaper-vowel-constraints.cc:42</code></a>). The function is still there and still called; it just does nothing.</li>
+<li id="ix-18"><strong>Table slots.</strong> <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-face-table-list.hh"><code>hb-ot-face-table-list.hh</code></a> lists the tables a face keeps a lazy slot for, and many entries are guarded, so a face in a build without color has no slot for <code>COLR</code> at all (<a href="blobs-faces-and-lazy-tables.html#one-pointer-per-table">Blobs, faces and lazy tables</a>).</li>
+</ul>
+<h2 id="the-tiers">The tiers</h2>
+<p id="ix-19">The three predefined sets are meant for size-constrained builds. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/CONFIG.md"><code>CONFIG.md</code></a> describes them as: <code>HB_MINI</code>, “a capable OpenType shaper only”; <code>HB_LEAN</code>, which “disables various non-shaping functionality in the library, as well as esoteric or rarely-used shaping features”; and <code>HB_TINY</code>, both of those and more. They are used like any other macro, with <code>meson setup build -Dcpp_args=-DHB_MINI -Dc_args=-DHB_MINI</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Defines</th>
+<th>What is lost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-20"><code>HB_MINI</code></td>
+<td id="ix-21"><code>HB_NO_AAT</code>, <code>HB_NO_LEGACY</code>, <code>HB_NO_BEYOND_64K</code>, <code>HB_NO_CUBIC_GLYF</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh#L93"><code>hb-config.hh:93</code></a>)</td>
+<td id="ix-22">AAT tables and shaping; the <code>kern</code> table; fallback mark positioning and kerning; the legacy-font paths in the Arabic, Hebrew and Thai shapers, Zawgyi and vowel constraints; the fallback shaper; the blocklists of broken fonts; symbol and Mac <code>cmap</code> handling; formats for more than 65,535 glyphs; cubic curves in <code>glyf</code></td>
+</tr>
+<tr>
+<td id="ix-23"><code>HB_LEAN</code></td>
+<td id="ix-24">27 macros (<code>:56</code>), plus <code>HB_NO_COLOR</code>, <code>HB_NO_DRAW</code> and <code>HB_NO_PAINT</code> unless a drawing library is in the build (<code>:85</code>)</td>
+<td id="ix-25">variations; vertical text; color, drawing and painting; the <code>MATH</code>, <code>meta</code>, <code>name</code>, <code>STAT</code> and metrics APIs; buffer messages, serialization and verification; reading fonts from files; Device-table hinting; glyph names; several rarely used layout functions; deprecated API; environment variables, <code>errno</code>, locales and <code>atexit</code></td>
+</tr>
+<tr>
+<td id="ix-26"><code>HB_TINY</code></td>
+<td id="ix-27"><code>HB_LEAN</code> and <code>HB_MINI</code>, plus <code>HB_NO_SVG</code>, <code>HB_OPTIMIZE_SIZE</code>, <code>HB_OPTIMIZE_SIZE_MORE</code>, <code>HB_MINIMIZE_MEMORY_USAGE</code>, <code>HB_NO_MT</code>, <code>HB_NO_UCD_UNASSIGNED</code> and <code>NDEBUG</code> (<code>:42</code>)</td>
+<td id="ix-28">all of the above; thread safety; the speed-ups that cost size; the three caches; assertions; exact Unicode properties for unassigned code points</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-29"><code>HB_LEAN</code>’s 27 are <code>HB_DISABLE_DEPRECATED</code>, <code>HB_NO_ATEXIT</code>, <code>HB_NO_BUFFER_MESSAGE</code>, <code>HB_NO_BUFFER_SERIALIZE</code>, <code>HB_NO_BUFFER_VERIFY</code>, <code>HB_NO_BITMAP</code>, <code>HB_NO_ERRNO</code>, <code>HB_NO_FACE_COLLECT_UNICODES</code>, <code>HB_NO_GETENV</code>, <code>HB_NO_HINTING</code>, <code>HB_NO_LAYOUT_FEATURE_PARAMS</code>, <code>HB_NO_LAYOUT_COLLECT_GLYPHS</code>, <code>HB_NO_LAYOUT_RARELY_USED</code>, <code>HB_NO_LAYOUT_UNUSED</code>, <code>HB_NO_MATH</code>, <code>HB_NO_META</code>, <code>HB_NO_METRICS</code>, <code>HB_NO_MMAP</code>, <code>HB_NO_NAME</code>, <code>HB_NO_OPEN</code>, <code>HB_NO_OT_FETCH</code>, <code>HB_NO_OT_FONT_GLYPH_NAMES</code>, <code>HB_NO_SETLOCALE</code>, <code>HB_NO_STYLE</code>, <code>HB_NO_SUBSET_DEPEND</code>, <code>HB_NO_VERTICAL</code> and <code>HB_NO_VAR</code>.</p>
+<p id="ix-30">Two consequences are easy to miss. <code>HB_NO_DRAW</code> implies <code>HB_NO_OT_FONT_CFF</code> (<code>:139</code>), so a lean build without a drawing library has no glyph extents or glyph names from CFF fonts, as well as no outlines (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L831"><code>hb-ot-font.cc:831</code></a>, <code>:851</code>). And <code>HB_NO_STYLE</code> turns off <code>trak</code> (<a href="aat-positioning.html#when-it-applies">AAT positioning</a>), because tracking is applied only when the font also has a <code>STAT</code> table (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L217"><code>hb-ot-shape.cc:217</code></a>).</p>
+<p id="ix-31"><strong>When <code>HB_LEAN</code> keeps drawing.</strong> The test at <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh#L85"><code>hb-config.hh:85</code></a> asks whether <code>HB_HAS_CAIRO</code>, <code>HB_HAS_RASTER</code>, <code>HB_HAS_VECTOR</code> or <code>HB_HAS_GPU</code> is defined. Those come from <code>hb-features.h</code>, the header Meson generates for applications, and no library source includes it. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz-world.cc"><code>harfbuzz-world.cc</code></a>, the single-file build, does, if <code>HB_FEATURES_H</code> names it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz-world.cc#L1"><code>harfbuzz-world.cc:1</code></a>), and anyone can define the macros by hand. A Meson build doesn’t: <code>config.h</code> has <code>HAVE_RASTER</code>, not <code>HB_HAS_RASTER</code>. Preprocessing <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh"><code>hb.hh</code></a> with <code>-DHB_LEAN</code> against the book’s own Meson build, where the raster and vector libraries are on, gives <code>HB_NO_DRAW</code> defined. So in a Meson build <code>HB_LEAN</code> always removes drawing, painting and color, and the libraries that need them are left without (checked with the preprocessor only; what then happens to those libraries was not tried).</p>
+<blockquote>
+<p id="ix-32">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/c90000dd8ee5a593bc60e65930d3aed501aca5bf"><code>c90000d</code></a> (17 November 2026), so main’s test accepts the <code>HAVE_*</code> macros too, and in a Meson build with a renderer <code>HB_LEAN</code> keeps drawing.</p>
+</blockquote>
+<p id="ix-33">Many macros belong to no tier. Some are for unusual builds (<code>HB_NO_OT_SHAPE</code> for a library with only the Core Text backend, <code>HB_NO_UCD</code> for one that brings its own Unicode data); others are single features nobody has grouped: <code>HB_NO_AVAR2</code>, <code>HB_NO_BASE</code>, <code>HB_NO_CFF</code>, <code>HB_NO_EMOJI_SEQUENCES</code>, <code>HB_NO_LANGUAGE_LONG</code>, <code>HB_NO_OT_SHAPE_FRACTIONS</code>, <code>HB_NO_SUBSET_LAYOUT</code>, <code>HB_NO_WIN1256</code> and more. The table below marks them “—” in the third column.</p>
+<h2 id="size-and-speed">Size and speed</h2>
+<p>Four macros change how the code is compiled rather than what it can do.</p>
+<p id="ix-34"><strong><code>HB_OPTIMIZE_SIZE</code></strong> trades speed for size. It is defined automatically whenever the compiler defines <code>__OPTIMIZE_SIZE__</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh#L100"><code>hb-config.hh:100</code></a>), which GCC and Clang do under <code>-Os</code> and <code>-Oz</code>, and so under Meson’s <code>--buildtype=minsize</code>. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/CONFIG.md"><code>CONFIG.md</code></a> recommends that for size-constrained builds and notes that Chrome builds HarfBuzz that way. It is tested in about 40 places:</p>
+<table>
+<thead>
+<tr>
+<th>What changes</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-35"><code>HB_ALWAYS_INLINE</code> is dropped from hot functions, leaving inlining to the compiler</td>
+<td id="ix-36">the sanitizer’s range checks (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L273"><code>hb-sanitize.hh:273</code></a>), the skipping iterator and <code>match_input</code>, <code>match_backtrack</code>, <code>match_lookahead</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L865"><code>hb-ot-layout-gsubgpos.hh:865</code></a>–<code>:2235</code>), the AAT state-machine transitions (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-common.hh#L57"><code>hb-aat-layout-common.hh:57</code></a>), <code>unsafe_to_concat</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.hh#L523"><code>hb-buffer.hh:523</code></a>), <code>Coverage::sanitize</code>, the priority queue</td>
+</tr>
+<tr>
+<td>loops unrolled four times are left rolled</td>
+<td id="ix-37">delta decoding and adding (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L1807"><code>hb-open-type.hh:1807</code></a>–<code>:2087</code>), <code>gvar</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-gvar-table.hh#L691"><code>hb-ot-var-gvar-table.hh:691</code></a>)</td>
+</tr>
+<tr>
+<td id="ix-38">smaller, slower lookup tables</td>
+<td id="ix-39">the Unicode tables (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd-table.hh#L764"><code>hb-ucd-table.hh:764</code></a>) and the USE categories (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use-table.hh#L106"><code>hb-ot-shaper-use-table.hh:106</code></a>): <a href="unicode-inside-harfbuzz.html#three-sizes">Unicode inside HarfBuzz</a>, <a href="universal-shaping-engine.html#where-they-come-from">The Universal Shaping Engine</a></td>
+</tr>
+<tr>
+<td>fast paths that test for special cases are skipped</td>
+<td id="ix-40">context rule sets search linearly (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L3356"><code>hb-ot-layout-gsubgpos.hh:3356</code></a>); ligature sets don’t filter on the second glyph (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/LigatureSet.hh#L100"><code>LigatureSet.hh:100</code></a>, <a href="gsub.html#the-second-glyph-fast-path">GSUB</a>); the region scalar doesn’t skip zero peaks eight bytes at a time (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-common.hh#L161"><code>hb-ot-var-common.hh:161</code></a>); hashing doesn’t take an aligned path (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-algs.hh#L464"><code>hb-algs.hh:464</code></a>)</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-41">The comment at <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-common.hh#L52"><code>hb-aat-layout-common.hh:52</code></a> puts a figure on one of these: forcing the AAT transitions inline “is worth 3-10% instructions on morx/kerx-heavy fonts, for about 16KB of code”.</p>
+<p id="ix-42"><strong><code>HB_OPTIMIZE_SIZE_MORE</code></strong>, set only by <code>HB_TINY</code>, goes a little further: it defines <code>HB_NO_OT_RULESETS_FAST_PATH</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh#L182"><code>hb-config.hh:182</code></a>), which turns the rule-set and ligature fast paths off even without <code>HB_OPTIMIZE_SIZE</code>, and drops the <code>fasthash32</code> specialization of byte-array hashing (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-array.hh#L510"><code>hb-array.hh:510</code></a>).</p>
+<p id="ix-43"><strong><code>HB_MINIMIZE_MEMORY_USAGE</code></strong>, also <code>HB_TINY</code> only, defines <code>HB_NO_GDEF_CACHE</code>, <code>HB_NO_OT_LAYOUT_LOOKUP_CACHE</code> and <code>HB_NO_OT_FONT_CMAP_CACHE</code> (<code>:186</code>), removing the three caches that face and lookup accelerators allocate. Its <code>_VAL</code> form is defined at <code>:205</code> and used nowhere.</p>
+<p id="ix-44"><strong><code>HB_FAST_NUM_ACCESS</code></strong> says whether big-endian numbers in font data can be read with one load and a byte swap rather than byte by byte. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-algs.hh#L116"><code>hb-algs.hh:116</code></a> turns it on when optimizing, on big-endian machines or little-endian ones with the <code>__builtin_bswap</code> builtins, and off for GCC 12 and older (issue 5456). It can be preset to 0 or 1.</p>
+<h2 id="every-hb_no_-macro">Every HB_NO_ macro</h2>
+<p id="ix-45">These are all the <code>HB_NO_*</code> macros that the 15.1.0 source in <code>src/</code> tests or defines, 83 of them. “Set by” gives the macros that define this one directly, with the tier they belong to; “—” means only by hand. Line numbers without a file are in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh"><code>hb-config.hh</code></a>.</p>
+<div class="macros">
+<table>
+<thead>
+<tr>
+<th>Macro</th>
+<th>What it removes</th>
+<th>Set by</th>
+<th>Explained in</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-46"><code>HB_NO_AAT</code></td>
+<td id="ix-47">the AAT table slots (<code>morx</code>, <code>mort</code>, <code>kerx</code>, <code>ankr</code>, <code>trak</code>, <code>ltag</code>, <code>feat</code>), and with them AAT shaping and the <code>feat</code>/<code>ltag</code> API</td>
+<td id="ix-48"><code>HB_MINI</code></td>
+<td><a href="aat-inside-harfbuzz.html#feat-and-ltag">AAT inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td id="ix-49"><code>HB_NO_AAT_LAYOUT_BLOCKLIST</code></td>
+<td id="ix-50">the check for known-broken <code>morx</code> tables</td>
+<td id="ix-51"><code>HB_NO_LEGACY</code> (<code>HB_MINI</code>)</td>
+<td id="ix-52"><a href="trust-nothing-the-sanitizer.html#a-list-of-known-bad-fonts">Trust nothing: the sanitizer</a></td>
+</tr>
+<tr>
+<td id="ix-53"><code>HB_NO_AAT_SHAPE</code></td>
+<td id="ix-54">applying <code>morx</code>, <code>mort</code>, <code>kerx</code> and <code>trak</code>, the public <code>hb_aat_layout_*</code> functions, and <code>kern</code> formats 1 and 3</td>
+<td id="ix-55"><code>HB_NO_AAT</code>, <code>HB_NO_OT_SHAPE</code>, <code>HB_NO_SHAPER</code></td>
+<td><a href="aat-inside-harfbuzz.html#when-morx-is-used">AAT inside HarfBuzz</a>, <a href="aat-positioning.html">AAT positioning</a></td>
+</tr>
+<tr>
+<td id="ix-56"><code>HB_NO_ATEXIT</code></td>
+<td id="ix-57">freeing lazily made static objects at exit (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L483"><code>hb.hh:483</code></a>)</td>
+<td id="ix-58"><code>HB_LEAN</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td id="ix-59"><code>HB_NO_AVAR2</code></td>
+<td id="ix-60"><code>avar</code> version 2 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-avar-table.hh#L516"><code>hb-ot-var-avar-table.hh:516</code></a>)</td>
+<td>—</td>
+<td id="ix-61"><a href="design-space.html#avar-version-2">Design space</a></td>
+</tr>
+<tr>
+<td id="ix-62"><code>HB_NO_BASE</code></td>
+<td id="ix-63">the <code>BASE</code> table: <code>hb_ot_layout_get_baseline</code> and friends, and its subsetting</td>
+<td>—</td>
+<td><a href="other-tables.html">Other tables</a></td>
+</tr>
+<tr>
+<td id="ix-64"><code>HB_NO_BEYOND_64K</code></td>
+<td id="ix-65">24-bit glyph IDs and offsets: Coverage formats 3 and 4, the wide lookup formats, <code>COLR</code>’s PaintGlyph format 33, 24-bit composite components in <code>glyf</code>, <code>cmap</code> format 15</td>
+<td id="ix-66"><code>HB_MINI</code></td>
+<td><a href="fonts-as-bytes.html#smalltypes-and-mediumtypes">Fonts as bytes</a></td>
+</tr>
+<tr>
+<td id="ix-67"><code>HB_NO_BITMAP</code></td>
+<td id="ix-68">nothing directly: an umbrella for <code>HB_NO_OT_FONT_BITMAP</code></td>
+<td id="ix-69"><code>HB_LEAN</code></td>
+<td><a href="color.html#bitmaps-sbix-and-cbdt">Color</a></td>
+</tr>
+<tr>
+<td id="ix-70"><code>HB_NO_BUFFER_MESSAGE</code></td>
+<td id="ix-71">the message callback and every message sent (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.hh#L132"><code>hb-buffer.hh:132</code></a>)</td>
+<td id="ix-72"><code>HB_LEAN</code></td>
+<td><a href="buffers.html#messages">Buffers</a></td>
+</tr>
+<tr>
+<td id="ix-73"><code>HB_NO_BUFFER_SERIALIZE</code></td>
+<td id="ix-74"><code>hb_buffer_serialize*</code> and <code>hb_buffer_deserialize*</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer-serialize.cc#L29"><code>hb-buffer-serialize.cc:29</code></a>)</td>
+<td id="ix-75"><code>HB_LEAN</code></td>
+<td><a href="buffers.html#comparing-and-writing-out">Buffers</a></td>
+</tr>
+<tr>
+<td id="ix-76"><code>HB_NO_BUFFER_VERIFY</code></td>
+<td id="ix-77"><code>HB_BUFFER_FLAG_VERIFY</code>’s checks (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer-verify.cc#L29"><code>hb-buffer-verify.cc:29</code></a>)</td>
+<td id="ix-78"><code>HB_LEAN</code></td>
+<td><a href="buffers.html#verification">Buffers</a></td>
+</tr>
+<tr>
+<td id="ix-79"><code>HB_NO_CFF</code></td>
+<td id="ix-80">the <code>CFF </code> and <code>CFF2</code> slots, and so CFF outlines, extents and subsetting</td>
+<td>—</td>
+<td><a href="drawing-outlines.html#cff-and-cff2-running-charstrings">Drawing outlines</a></td>
+</tr>
+<tr>
+<td id="ix-81"><code>HB_NO_CMAP_LEGACY_SUBTABLES</code></td>
+<td id="ix-82">the special handling of symbol (3,0), MacRoman and other Mac <code>cmap</code> subtables, including the Arabic PUA maps (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cmap-table.hh#L2199"><code>hb-ot-cmap-table.hh:2199</code></a>)</td>
+<td id="ix-83"><code>HB_NO_LEGACY</code> (<code>HB_MINI</code>)</td>
+<td id="ix-84"><a href="joining-scripts.html#legacy-encodings">Joining scripts</a></td>
+</tr>
+<tr>
+<td id="ix-85"><code>HB_NO_COLOR</code></td>
+<td id="ix-86">the <code>COLR</code>, <code>CPAL</code>, <code>CBDT</code>, <code>sbix</code> and <code>SVG </code> slots and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-color.cc"><code>hb-ot-color.cc</code></a></td>
+<td id="ix-87"><code>HB_LEAN</code>, if no drawing library</td>
+<td><a href="color.html#compiled-out">Color</a></td>
+</tr>
+<tr>
+<td id="ix-88"><code>HB_NO_CUBIC_GLYF</code></td>
+<td id="ix-89">cubic curves in <code>glyf</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/path-builder.hh#L44"><code>OT/glyf/path-builder.hh:44</code></a>)</td>
+<td id="ix-90"><code>HB_MINI</code></td>
+<td><a href="drawing-outlines.html#cubic-curves-in-glyf">Drawing outlines</a></td>
+</tr>
+<tr>
+<td id="ix-91"><code>HB_NO_DRAW</code></td>
+<td id="ix-92">the draw API (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-draw.cc"><code>hb-draw.cc</code></a>) and every font funcs’ outline callback</td>
+<td id="ix-93"><code>HB_LEAN</code>, if no drawing library</td>
+<td><a href="drawing-outlines.html#the-draw-api">Drawing outlines</a></td>
+</tr>
+<tr>
+<td id="ix-94"><code>HB_NO_EMOJI_SEQUENCES</code></td>
+<td id="ix-95">keeping an Extended_Pictographic character after a ZWJ in the same cluster (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L516"><code>hb-ot-shape.cc:516</code></a>)</td>
+<td>—</td>
+<td><a href="unicode-inside-harfbuzz.html#continuations-just-enough-of-graphemes">Unicode inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td id="ix-96"><code>HB_NO_ERRNO</code></td>
+<td id="ix-97"><code>&lt;cerrno&gt;</code>: <code>errno</code> becomes a dummy variable (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L443"><code>hb.hh:443</code></a>)</td>
+<td id="ix-98"><code>HB_LEAN</code>; old Windows CE (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L427"><code>hb.hh:427</code></a>)</td>
+<td>—</td>
+</tr>
+<tr>
+<td id="ix-99"><code>HB_NO_FACE_COLLECT_UNICODES</code></td>
+<td id="ix-100"><code>hb_face_collect_unicodes</code>, <code>hb_face_collect_nominal_glyph_mapping</code> and the two variation-selector collectors (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc#L970"><code>hb-face.cc:970</code></a>)</td>
+<td id="ix-101"><code>HB_LEAN</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td id="ix-102"><code>HB_NO_FALLBACK_SHAPE</code></td>
+<td id="ix-103">the <code>fallback</code> backend (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shaper-list.hh#L68"><code>hb-shaper-list.hh:68</code></a>)</td>
+<td id="ix-104"><code>HB_NO_LEGACY</code> (<code>HB_MINI</code>)</td>
+<td id="ix-105"><a href="hb_shape-and-its-backends.html#fallback">hb_shape and its backends</a></td>
+</tr>
+<tr>
+<td id="ix-106"><code>HB_NO_GDEF_CACHE</code></td>
+<td id="ix-107">GDEF’s cache of glyph properties and its mark-glyph-set bitmaps (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GDEF/GDEF.hh#L990"><code>GDEF.hh:990</code></a>)</td>
+<td id="ix-108"><code>HB_MINIMIZE_MEMORY_USAGE</code> (<code>HB_TINY</code>)</td>
+<td id="ix-109"><a href="gsub.html#glyph-properties">GSUB</a></td>
+</tr>
+<tr>
+<td id="ix-110"><code>HB_NO_GETENV</code></td>
+<td id="ix-111">reading <code>HB_SHAPER_LIST</code>, <code>HB_FONT_FUNCS</code> and <code>HB_FACE_LOADER</code>: <code>getenv</code> returns null (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L439"><code>hb.hh:439</code></a>)</td>
+<td id="ix-112"><code>HB_LEAN</code>; Windows CE and non-desktop Windows (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L422"><code>hb.hh:422</code></a>)</td>
+<td id="ix-113"><a href="hb_shape-and-its-backends.html#hb_shaper_list">hb_shape and its backends</a>, <a href="blobs-faces-and-lazy-tables.html#face-loaders">Blobs, faces and lazy tables</a></td>
+</tr>
+<tr>
+<td id="ix-114"><code>HB_NO_HINTING</code></td>
+<td id="ix-115">hinting Device tables and anchor format 2’s contour points (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L6410"><code>hb-ot-layout-common.hh:6410</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/AnchorFormat2.hh#L30"><code>AnchorFormat2.hh:30</code></a>)</td>
+<td id="ix-116"><code>HB_LEAN</code></td>
+<td id="ix-117"><a href="gpos.html#device-tables">GPOS</a></td>
+</tr>
+<tr>
+<td id="ix-118"><code>HB_NO_LANGUAGE_LONG</code></td>
+<td id="ix-119">complex BCP 47 tags and three-letter language codes in tag conversion (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-tag.cc#L328"><code>hb-ot-tag.cc:328</code></a>)</td>
+<td>—</td>
+<td id="ix-120"><a href="choosing-a-script-shaper.html#from-a-language-to-language-system-tags">Choosing a script shaper</a></td>
+</tr>
+<tr>
+<td id="ix-121"><code>HB_NO_LANGUAGE_PRIVATE_SUBTAG</code></td>
+<td id="ix-122">the <code>-hbsc-</code> and <code>-hbot-</code> private-use subtags (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-tag.cc#L450"><code>hb-ot-tag.cc:450</code></a>)</td>
+<td>—</td>
+<td id="ix-123"><a href="choosing-a-script-shaper.html#naming-the-tags-directly">Choosing a script shaper</a></td>
+</tr>
+<tr>
+<td id="ix-124"><code>HB_NO_LAYOUT_COLLECT_GLYPHS</code></td>
+<td id="ix-125"><code>hb_ot_layout_lookup_collect_glyphs</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L1386"><code>hb-ot-layout.cc:1386</code></a>)</td>
+<td id="ix-126"><code>HB_LEAN</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td id="ix-127"><code>HB_NO_LAYOUT_FEATURE_PARAMS</code></td>
+<td id="ix-128"><code>hb_ot_layout_get_size_params</code>, <code>hb_ot_layout_feature_get_name_ids</code>, <code>hb_ot_layout_feature_get_characters</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L1769"><code>hb-ot-layout.cc:1769</code></a>)</td>
+<td id="ix-129"><code>HB_LEAN</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td id="ix-130"><code>HB_NO_LAYOUT_RARELY_USED</code></td>
+<td id="ix-131"><code>hb_ot_layout_lookup_get_glyph_alternates</code>, <code>…_collect_glyph_alternates</code>, <code>…_get_optical_bound</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L2672"><code>hb-ot-layout.cc:2672</code></a>)</td>
+<td id="ix-132"><code>HB_LEAN</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td id="ix-133"><code>HB_NO_LAYOUT_UNUSED</code></td>
+<td id="ix-134"><code>hb_ot_layout_get_attach_points</code>, <code>hb_ot_layout_get_ligature_carets</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L343"><code>hb-ot-layout.cc:343</code></a>)</td>
+<td id="ix-135"><code>HB_LEAN</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td id="ix-136"><code>HB_NO_LEGACY</code></td>
+<td>nothing directly: an umbrella for six macros (<code>:150</code>)</td>
+<td id="ix-137"><code>HB_MINI</code></td>
+<td id="ix-138"><a href="fallbacks.html#configuration">Fallbacks</a></td>
+</tr>
+<tr>
+<td id="ix-139"><code>HB_NO_MATH</code></td>
+<td id="ix-140">the <code>MATH</code> slot, <code>hb_ot_math_*</code>, and <code>MATH</code> in subsetting and <code>hb-depend</code></td>
+<td id="ix-141"><code>HB_LEAN</code></td>
+<td><a href="other-tables.html">Other tables</a></td>
+</tr>
+<tr>
+<td id="ix-142"><code>HB_NO_META</code></td>
+<td id="ix-143">the <code>meta</code> slot and <code>hb_ot_meta_*</code></td>
+<td id="ix-144"><code>HB_LEAN</code></td>
+<td><a href="other-tables.html">Other tables</a></td>
+</tr>
+<tr>
+<td id="ix-145"><code>HB_NO_METRICS</code></td>
+<td id="ix-146"><code>hb_ot_metrics_*</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-metrics.cc#L109"><code>hb-ot-metrics.cc:109</code></a>), and the x-height used for a fallback baseline</td>
+<td id="ix-147"><code>HB_LEAN</code></td>
+<td><a href="where-metrics-come-from.html#mvar">Where metrics come from</a></td>
+</tr>
+<tr>
+<td id="ix-148"><code>HB_NO_MMAP</code></td>
+<td id="ix-149">mapping font files into memory; they are read instead (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.cc#L543"><code>hb-blob.cc:543</code></a>)</td>
+<td id="ix-150"><code>HB_LEAN</code></td>
+<td><a href="blobs-faces-and-lazy-tables.html#from-a-file">Blobs, faces and lazy tables</a></td>
+</tr>
+<tr>
+<td id="ix-151"><code>HB_NO_MT</code></td>
+<td id="ix-152">thread safety: atomics become plain variables and mutexes do nothing (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-atomic.hh#L61"><code>hb-atomic.hh:61</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-mutex.hh#L83"><code>hb-mutex.hh:83</code></a>)</td>
+<td id="ix-153"><code>HB_TINY</code></td>
+<td><a href="blobs-faces-and-lazy-tables.html#loading-without-a-lock">Blobs, faces and lazy tables</a></td>
+</tr>
+<tr>
+<td id="ix-154"><code>HB_NO_NAME</code></td>
+<td id="ix-155">the <code>name</code> slot and <code>hb_ot_name_*</code></td>
+<td id="ix-156"><code>HB_LEAN</code></td>
+<td><a href="other-tables.html">Other tables</a></td>
+</tr>
+<tr>
+<td id="ix-157"><code>HB_NO_OPEN</code></td>
+<td id="ix-158"><code>hb_blob_create_from_file*</code> and <code>hb_face_create_from_file_or_fail</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.cc#L512"><code>hb-blob.cc:512</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc#L303"><code>hb-face.cc:303</code></a>)</td>
+<td id="ix-159"><code>HB_LEAN</code></td>
+<td><a href="blobs-faces-and-lazy-tables.html#from-a-file">Blobs, faces and lazy tables</a></td>
+</tr>
+<tr>
+<td id="ix-160"><code>HB_NO_OT</code></td>
+<td>nothing directly: an umbrella for the four below it (<code>:163</code>)</td>
+<td>—</td>
+<td id="ix-161"><a href="hb_shape-and-its-backends.html#ot">hb_shape and its backends</a></td>
+</tr>
+<tr>
+<td id="ix-162"><code>HB_NO_OT_FETCH</code></td>
+<td id="ix-163"><code>hb_ot_fetch_bits</code> and <code>hb_ot_fetch_number</code> (new in 14.3.0)</td>
+<td id="ix-164"><code>HB_LEAN</code></td>
+<td><a href="other-tables.html">Other tables</a></td>
+</tr>
+<tr>
+<td id="ix-165"><code>HB_NO_OT_FONT</code></td>
+<td id="ix-166">the hb-ot font funcs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L29"><code>hb-ot-font.cc:29</code></a>); fonts must be given others</td>
+<td id="ix-167"><code>HB_NO_OT</code></td>
+<td id="ix-168"><a href="fonts-and-font-functions.html#hb-ot-the-default-funcs">Fonts and font functions</a></td>
+</tr>
+<tr>
+<td id="ix-169"><code>HB_NO_OT_FONT_BITMAP</code></td>
+<td id="ix-170">hb-ot’s extents and painting from <code>sbix</code> and <code>CBDT</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L820"><code>hb-ot-font.cc:820</code></a>, <code>:952</code>)</td>
+<td id="ix-171"><code>HB_NO_BITMAP</code> (<code>HB_LEAN</code>)</td>
+<td><a href="color.html#bitmaps-sbix-and-cbdt">Color</a></td>
+</tr>
+<tr>
+<td id="ix-172"><code>HB_NO_OT_FONT_CFF</code></td>
+<td id="ix-173">hb-ot’s CFF extents, glyph names and outlines (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L831"><code>hb-ot-font.cc:831</code></a>)</td>
+<td id="ix-174"><code>HB_NO_CFF</code>, <code>HB_NO_DRAW</code></td>
+<td><a href="drawing-outlines.html#cff-and-cff2-running-charstrings">Drawing outlines</a></td>
+</tr>
+<tr>
+<td id="ix-175"><code>HB_NO_OT_FONT_CMAP_CACHE</code></td>
+<td id="ix-176">the 1 KB cache of recent <code>cmap</code> lookups (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cmap-table.hh#L2190"><code>hb-ot-cmap-table.hh:2190</code></a>)</td>
+<td id="ix-177"><code>HB_MINIMIZE_MEMORY_USAGE</code> (<code>HB_TINY</code>)</td>
+<td><a href="blobs-faces-and-lazy-tables.html#two-kinds-of-loader">Blobs, faces and lazy tables</a></td>
+</tr>
+<tr>
+<td id="ix-178"><code>HB_NO_OT_FONT_GLYPH_NAMES</code></td>
+<td id="ix-179">the glyph-name callbacks of hb-ot and the platform font funcs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L839"><code>hb-ot-font.cc:839</code></a>)</td>
+<td id="ix-180"><code>HB_LEAN</code></td>
+<td id="ix-181"><a href="fonts-and-font-functions.html#hb-ot-the-default-funcs">Fonts and font functions</a></td>
+</tr>
+<tr>
+<td id="ix-182"><code>HB_NO_OT_KERN</code></td>
+<td id="ix-183">the <code>kern</code> table slot and <code>hb_ot_layout_has_kerning</code></td>
+<td id="ix-184"><code>HB_NO_LEGACY</code> (<code>HB_MINI</code>)</td>
+<td><a href="legacy-kern.html">Legacy kern</a></td>
+</tr>
+<tr>
+<td id="ix-185"><code>HB_NO_OT_LAYOUT</code></td>
+<td id="ix-186">the GDEF, GSUB and GPOS slots and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>hb-ot-layout.cc</code></a></td>
+<td id="ix-187"><code>HB_NO_OT</code></td>
+<td id="ix-188"><a href="gsub.html">GSUB</a></td>
+</tr>
+<tr>
+<td id="ix-189"><code>HB_NO_OT_LAYOUT_BLOCKLIST</code></td>
+<td id="ix-190">the check for known-broken GDEF, GSUB and GPOS tables (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L156"><code>hb-ot-layout.cc:156</code></a>)</td>
+<td id="ix-191"><code>HB_NO_LEGACY</code> (<code>HB_MINI</code>)</td>
+<td id="ix-192"><a href="trust-nothing-the-sanitizer.html#a-list-of-known-bad-fonts">Trust nothing: the sanitizer</a></td>
+</tr>
+<tr>
+<td id="ix-193"><code>HB_NO_OT_LAYOUT_LOOKUP_CACHE</code></td>
+<td id="ix-194">the per-subtable caches of the first eight subtables (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L1443"><code>hb-ot-layout-gsubgpos.hh:1443</code></a>)</td>
+<td id="ix-195"><code>HB_MINIMIZE_MEMORY_USAGE</code> (<code>HB_TINY</code>)</td>
+<td id="ix-196"><a href="gpos.html#pair-adjustment">GPOS</a></td>
+</tr>
+<tr>
+<td id="ix-197"><code>HB_NO_OT_NAME_LANGUAGE</code></td>
+<td id="ix-198">turning a <code>name</code> record’s language ID into an <code>hb_language_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/name/name.hh#L99"><code>OT/name/name.hh:99</code></a>)</td>
+<td id="ix-199"><code>HB_NO_NAME</code> (<code>HB_LEAN</code>)</td>
+<td><a href="other-tables.html">Other tables</a></td>
+</tr>
+<tr>
+<td id="ix-200"><code>HB_NO_OT_NAME_LANGUAGE_AAT</code></td>
+<td id="ix-201">the same through <code>ltag</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/name/name.hh#L109"><code>OT/name/name.hh:109</code></a>)</td>
+<td id="ix-202"><code>HB_NO_AAT</code> (<code>HB_MINI</code>)</td>
+<td><a href="aat-inside-harfbuzz.html#feat-and-ltag">AAT inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td id="ix-203"><code>HB_NO_OT_RULESETS_FAST_PATH</code></td>
+<td id="ix-204">the second-glyph filter in context rule sets and ligature sets (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L3355"><code>hb-ot-layout-gsubgpos.hh:3355</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/LigatureSet.hh#L99"><code>LigatureSet.hh:99</code></a>)</td>
+<td id="ix-205"><code>HB_OPTIMIZE_SIZE_MORE</code> (<code>HB_TINY</code>)</td>
+<td id="ix-206"><a href="gsub.html#the-second-glyph-fast-path">GSUB</a></td>
+</tr>
+<tr>
+<td id="ix-207"><code>HB_NO_OT_SHAPE</code></td>
+<td id="ix-208">the <code>ot</code> backend: the shape planner, normalizer and every script shaper</td>
+<td id="ix-209"><code>HB_NO_OT</code>, <code>HB_NO_SHAPER</code></td>
+<td id="ix-210"><a href="hb_shape-and-its-backends.html#ot">hb_shape and its backends</a></td>
+</tr>
+<tr>
+<td id="ix-211"><code>HB_NO_OT_SHAPE_FALLBACK</code></td>
+<td id="ix-212">fallback mark positioning, mark recategorizing and kerning through the font funcs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-fallback.cc#L173"><code>hb-ot-shape-fallback.cc:173</code></a>), and hb-ft’s kerning callback</td>
+<td id="ix-213"><code>HB_NO_LEGACY</code> (<code>HB_MINI</code>)</td>
+<td id="ix-214"><a href="fallbacks.html#configuration">Fallbacks</a></td>
+</tr>
+<tr>
+<td id="ix-215"><code>HB_NO_OT_SHAPE_FRACTIONS</code></td>
+<td id="ix-216">automatic <code>frac</code>, <code>numr</code> and <code>dnom</code> around U+2044 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L349"><code>hb-ot-shape.cc:349</code></a>)</td>
+<td>—</td>
+<td id="ix-217"><a href="from-features-to-lookups.html#which-features-are-asked-for">From features to lookups</a></td>
+</tr>
+<tr>
+<td id="ix-218"><code>HB_NO_OT_SHAPER_ARABIC_FALLBACK</code></td>
+<td id="ix-219">Arabic shaping from presentation forms, and the PUA <code>cmap</code> maps (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc#L421"><code>hb-ot-shaper-arabic.cc:421</code></a>)</td>
+<td id="ix-220"><code>HB_NO_OT_SHAPE_FALLBACK</code></td>
+<td id="ix-221"><a href="joining-scripts.html#shaping-without-gsub">Joining scripts</a></td>
+</tr>
+<tr>
+<td id="ix-222"><code>HB_NO_OT_SHAPER_HEBREW_FALLBACK</code></td>
+<td id="ix-223">composing Hebrew presentation forms (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-hebrew.cc#L77"><code>hb-ot-shaper-hebrew.cc:77</code></a>)</td>
+<td id="ix-224"><code>HB_NO_OT_SHAPE_FALLBACK</code></td>
+<td><a href="hebrew-thai-lao-and-hangul.html#presentation-forms-for-old-fonts">Hebrew, Thai, Lao and Hangul</a></td>
+</tr>
+<tr>
+<td id="ix-225"><code>HB_NO_OT_SHAPER_MYANMAR_ZAWGYI</code></td>
+<td id="ix-226">the Zawgyi shaper and its <code>Qaag</code> script (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh#L266"><code>hb-ot-shaper.hh:266</code></a>)</td>
+<td id="ix-227"><code>HB_NO_OT_SHAPE_FALLBACK</code></td>
+<td id="ix-228"><a href="choosing-a-script-shaper.html#myanmar-and-zawgyi">Choosing a script shaper</a></td>
+</tr>
+<tr>
+<td id="ix-229"><code>HB_NO_OT_SHAPER_THAI_FALLBACK</code></td>
+<td id="ix-230">Thai and Lao shaping with PUA glyphs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-thai.cc#L225"><code>hb-ot-shaper-thai.cc:225</code></a>)</td>
+<td id="ix-231"><code>HB_NO_OT_SHAPE_FALLBACK</code></td>
+<td><a href="hebrew-thai-lao-and-hangul.html#old-fonts-and-the-private-use-area">Hebrew, Thai, Lao and Hangul</a></td>
+</tr>
+<tr>
+<td id="ix-232"><code>HB_NO_OT_SHAPER_VOWEL_CONSTRAINTS</code></td>
+<td id="ix-233">the dotted circles inserted for forbidden vowel sequences (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-vowel-constraints.cc#L42"><code>hb-ot-shaper-vowel-constraints.cc:42</code></a>)</td>
+<td id="ix-234"><code>HB_NO_OT_SHAPE_FALLBACK</code></td>
+<td id="ix-235"><a href="dotted-circles-and-broken-clusters.html#vowel-constraints">Dotted circles and broken clusters</a></td>
+</tr>
+<tr>
+<td id="ix-236"><code>HB_NO_OT_TAG</code></td>
+<td id="ix-237"><code>hb_ot_tag*</code> conversions; <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>hb-ot-layout.cc</code></a> and Uniscribe refuse to compile without them</td>
+<td id="ix-238"><code>HB_NO_OT</code></td>
+<td id="ix-239"><a href="choosing-a-script-shaper.html">Choosing a script shaper</a></td>
+</tr>
+<tr>
+<td id="ix-240"><code>HB_NO_OUTLINE</code></td>
+<td id="ix-241">synthetic bold and slant of drawn outlines (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L695"><code>hb-font.hh:695</code></a>)</td>
+<td id="ix-242"><code>HB_NO_DRAW</code></td>
+<td id="ix-243"><a href="fonts-and-font-functions.html#synthetic-bold-and-slant">Fonts and font functions</a></td>
+</tr>
+<tr>
+<td id="ix-244"><code>HB_NO_PAINT</code></td>
+<td id="ix-245">the paint API and every font funcs’ paint callback (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint.cc#L27"><code>hb-paint.cc:27</code></a>)</td>
+<td id="ix-246"><code>HB_NO_DRAW</code>; <code>HB_LEAN</code>, if no drawing library</td>
+<td><a href="color.html#the-paint-api">Color</a></td>
+</tr>
+<tr>
+<td id="ix-247"><code>HB_NO_PRAGMA_GCC_DIAGNOSTIC</code></td>
+<td id="ix-248">the <code>#pragma</code>s that set HarfBuzz’s warnings (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L38"><code>hb.hh:38</code></a>)</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr>
+<td id="ix-249"><code>HB_NO_PRAGMA_GCC_DIAGNOSTIC_ERROR</code></td>
+<td id="ix-250">the warnings promoted to errors (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L69"><code>hb.hh:69</code></a>)</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr>
+<td id="ix-251"><code>HB_NO_PRAGMA_GCC_DIAGNOSTIC_IGNORED</code></td>
+<td id="ix-252">the warnings silenced (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L136"><code>hb.hh:136</code></a>)</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr>
+<td id="ix-253"><code>HB_NO_PRAGMA_GCC_DIAGNOSTIC_WARNING</code></td>
+<td id="ix-254">the warnings turned on (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L55"><code>hb.hh:55</code></a>)</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr>
+<td id="ix-255"><code>HB_NO_RESOURCE_FORK</code></td>
+<td id="ix-256">reading a Mac file’s resource fork when its data fork is empty (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.cc#L514"><code>hb-blob.cc:514</code></a>)</td>
+<td>—</td>
+<td><a href="fonts-as-bytes.html#collections-and-resource-forks">Fonts as bytes</a></td>
+</tr>
+<tr>
+<td id="ix-257"><code>HB_NO_SETLOCALE</code></td>
+<td id="ix-258">parsing and printing numbers in the C locale with <code>newlocale</code>/<code>uselocale</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.cc#L1056"><code>hb-common.cc:1056</code></a>)</td>
+<td id="ix-259"><code>HB_LEAN</code>; automatically without <code>newlocale</code> and <code>uselocale</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L505"><code>hb.hh:505</code></a>)</td>
+<td>—</td>
+</tr>
+<tr>
+<td id="ix-260"><code>HB_NO_SHAPER</code></td>
+<td id="ix-261"><code>hb_shape</code>, shape plans and every backend; also implies <code>HB_NO_OT_SHAPE</code> (<code>:125</code>)</td>
+<td>—</td>
+<td id="ix-262"><a href="hb_shape-and-its-backends.html#the-shaper-list">hb_shape and its backends</a></td>
+</tr>
+<tr>
+<td id="ix-263"><code>HB_NO_SINGLE_HEADER_ERROR</code></td>
+<td id="ix-264">the <code>#error</code> when a public header such as <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.h"><code>hb-buffer.h</code></a> is included on its own</td>
+<td id="ix-265">the header test in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L1326"><code>src/meson.build:1326</code></a></td>
+<td>—</td>
+</tr>
+<tr>
+<td id="ix-266"><code>HB_NO_STYLE</code></td>
+<td id="ix-267">the <code>STAT</code> slot, <code>hb_style_get_value</code>, and so <code>trak</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-style.cc#L27"><code>hb-style.cc:27</code></a>)</td>
+<td id="ix-268"><code>HB_LEAN</code></td>
+<td><a href="other-tables.html">Other tables</a>, <a href="aat-positioning.html#when-it-applies">AAT positioning</a></td>
+</tr>
+<tr>
+<td id="ix-269"><code>HB_NO_SUBSET_CFF</code></td>
+<td id="ix-270">subsetting CFF and CFF2 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-cff1.cc"><code>hb-subset-cff1.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-cff2.cc"><code>hb-subset-cff2.cc</code></a>)</td>
+<td id="ix-271"><code>HB_NO_CFF</code></td>
+<td><a href="subsetting.html">Subsetting</a></td>
+</tr>
+<tr>
+<td id="ix-272"><code>HB_NO_SUBSET_DEPEND</code></td>
+<td id="ix-273">the public <code>hb_subset_depend_*</code> API (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-depend.h#L73"><code>hb-subset-depend.h:73</code></a>)</td>
+<td id="ix-274"><code>HB_LEAN</code>; every build without <code>HB_EXPERIMENTAL_API</code> (<code>:38</code>)</td>
+<td id="ix-275"><a href="hb-depend.html#status-and-limits">hb-depend</a></td>
+</tr>
+<tr>
+<td id="ix-276"><code>HB_NO_SUBSET_LAYOUT</code></td>
+<td id="ix-277">the layout stage of subsetting: GDEF, GSUB, GPOS, <code>kern</code> and the AAT tables are dropped (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.cc#L236"><code>hb-subset.cc:236</code></a>)</td>
+<td>—</td>
+<td><a href="subsetting.html#the-layout-stage">Subsetting</a></td>
+</tr>
+<tr>
+<td id="ix-278"><code>HB_NO_SVG</code></td>
+<td id="ix-279">the <code>SVG </code> slot and its painting (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-color.cc#L279"><code>hb-ot-color.cc:279</code></a>)</td>
+<td id="ix-280"><code>HB_TINY</code></td>
+<td><a href="color.html#svg">Color</a></td>
+</tr>
+<tr>
+<td id="ix-281"><code>HB_NO_UCD</code></td>
+<td id="ix-282">HarfBuzz’s own Unicode tables (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd.cc#L254"><code>hb-ucd.cc:254</code></a>)</td>
+<td>—</td>
+<td><a href="unicode-inside-harfbuzz.html#three-implementations">Unicode inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td id="ix-283"><code>HB_NO_UCD_UNASSIGNED</code></td>
+<td id="ix-284">exact properties for unassigned code points, in the size-optimized tables only (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd-table.hh#L2767"><code>hb-ucd-table.hh:2767</code></a>)</td>
+<td id="ix-285"><code>HB_TINY</code></td>
+<td><a href="unicode-inside-harfbuzz.html#three-sizes">Unicode inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td id="ix-286"><code>HB_NO_UNICODE_FUNCS</code></td>
+<td id="ix-287">any default Unicode funcs, and the <code>#error</code> when none is found (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.cc#L166"><code>hb-unicode.cc:166</code></a>)</td>
+<td>—</td>
+<td><a href="unicode-inside-harfbuzz.html#three-implementations">Unicode inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td id="ix-288"><code>HB_NO_VAR</code></td>
+<td id="ix-289">font variations: the <code>fvar</code>, <code>avar</code>, <code>cvar</code>, <code>gvar</code> and <code>MVAR</code> slots, FeatureVariations, <code>hb_ot_var_*</code>, <code>hb_font_set_variations</code> and the rest, and <code>hb_shape_justify</code></td>
+<td id="ix-290"><code>HB_LEAN</code></td>
+<td id="ix-291"><a href="design-space.html">Design space</a></td>
+</tr>
+<tr>
+<td id="ix-292"><code>HB_NO_VAR_COMPOSITES</code></td>
+<td id="ix-293">the <code>VARC</code> table (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.hh"><code>OT/Var/VARC/VARC.hh</code></a>)</td>
+<td id="ix-294"><code>HB_NO_VAR</code> (<code>HB_LEAN</code>)</td>
+<td id="ix-295"><a href="variable-components.html">Variable components</a></td>
+</tr>
+<tr>
+<td id="ix-296"><code>HB_NO_VERTICAL</code></td>
+<td id="ix-297">the <code>vhea</code>, <code>vmtx</code> and <code>VORG</code> slots and vertical metrics and origins</td>
+<td id="ix-298"><code>HB_LEAN</code></td>
+<td><a href="vertical-text.html#compiled-out">Vertical text</a></td>
+</tr>
+<tr>
+<td id="ix-299"><code>HB_NO_VISIBILITY</code></td>
+<td id="ix-300">hiding internal symbols with <code>visibility(&quot;hidden&quot;)</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L295"><code>hb.hh:295</code></a>)</td>
+<td id="ix-301">automatically on MinGW, Cygwin, MSVC and Sun compilers (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L305"><code>hb.hh:305</code></a>)</td>
+<td>—</td>
+</tr>
+<tr>
+<td id="ix-302"><code>HB_NO_WIN1256</code></td>
+<td id="ix-303">Arabic fallback shaping for fonts in the Windows-1256 encoding (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic-fallback.hh#L236"><code>hb-ot-shaper-arabic-fallback.hh:236</code></a>)</td>
+<td>—</td>
+<td id="ix-304"><a href="joining-scripts.html#legacy-encodings">Joining scripts</a></td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 id="the-other-switches">The other switches</h2>
+<table>
+<thead>
+<tr>
+<th>Macro</th>
+<th>What it does</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-305"><code>HB_EXPERIMENTAL_API</code></td>
+<td id="ix-306">adds the experimental API: <code>hb_shape_justify</code>, <code>hb_subset_input_override_name_table</code>, <code>hb_subset_input_to_string_or_fail</code>, the raw CFF charstring accessors, the subset flags <code>IFTB_REQUIREMENTS</code> and <code>RETAIN_NUM_GLYPHS</code>, and <code>hb_subset_depend_*</code></td>
+<td id="ix-307">off; Meson’s <code>experimental_api</code> defines it</td>
+</tr>
+<tr>
+<td id="ix-308"><code>HB_DISABLE_DEPRECATED</code></td>
+<td id="ix-309">removes deprecated functions, and makes <code>HB_IF_NOT_DEPRECATED (x)</code> expand to nothing (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh#L119"><code>hb-config.hh:119</code></a>)</td>
+<td id="ix-310">off; set by <code>HB_LEAN</code></td>
+</tr>
+<tr>
+<td id="ix-311"><code>HB_BUFFER_MESSAGE_MORE</code></td>
+<td id="ix-312">sends messages from inside lookups as well as between them (“ligating glyphs at 0,2”); since 12.0.0 it needs a rebuild (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-debug.hh#L452"><code>hb-debug.hh:452</code></a>)</td>
+<td id="ix-313"><code>HB_DEBUG</code>, so 0</td>
+</tr>
+<tr>
+<td id="ix-314"><code>HB_DEBUG</code>, <code>HB_DEBUG_*</code></td>
+<td>debug output to <code>stderr</code>, described below</td>
+<td>0</td>
+</tr>
+<tr>
+<td id="ix-315"><code>HB_CUSTOM_MALLOC</code></td>
+<td id="ix-316">routes every allocation through <code>hb_malloc_impl</code>, <code>hb_calloc_impl</code>, <code>hb_realloc_impl</code> and <code>hb_free_impl</code>, which the embedder supplies; defining all four implies it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L547"><code>hb.hh:547</code></a>)</td>
+<td id="ix-317">off: the C library’s</td>
+</tr>
+<tr>
+<td id="ix-318"><code>hb_mutex_impl_init</code>, <code>…_lock</code>, <code>…_unlock</code>, <code>…_finish</code></td>
+<td id="ix-319">a mutex of the embedder’s own, with <code>hb_mutex_impl_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-mutex.hh#L40"><code>hb-mutex.hh:40</code></a>)</td>
+<td>pthreads, Windows critical sections, or <code>std::mutex</code></td>
+</tr>
+<tr>
+<td id="ix-320"><code>HB_MUTEX_IMPL_STD_MUTEX</code></td>
+<td id="ix-321">uses <code>std::mutex</code> even where pthreads or Windows are available (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-mutex.hh#L50"><code>hb-mutex.hh:50</code></a>)</td>
+<td>off</td>
+</tr>
+<tr>
+<td id="ix-322"><code>HB_USE_ATEXIT</code></td>
+<td id="ix-323">whether to free static objects at exit, which keeps leak checkers quiet; <code>hb_atexit</code> can also be defined directly (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L454"><code>hb.hh:454</code></a>)</td>
+<td id="ix-324">1 on glibc 2.3+, Windows, Android and Apple platforms when <code>atexit</code> exists; 0 elsewhere and under <code>HB_NO_ATEXIT</code></td>
+</tr>
+<tr>
+<td id="ix-325"><code>HB_CONFIG_OVERRIDE_H</code>, <code>HB_CONFIG_OVERRIDE_LAST_H</code></td>
+<td id="ix-326">headers included before and after the closure of options</td>
+<td>none</td>
+</tr>
+<tr>
+<td id="ix-327"><code>HB_OPTIMIZE_SIZE</code>, <code>HB_OPTIMIZE_SIZE_MORE</code>, <code>HB_MINIMIZE_MEMORY_USAGE</code>, <code>HB_FAST_NUM_ACCESS</code></td>
+<td>size and speed, above</td>
+<td>see above</td>
+</tr>
+<tr>
+<td><code>NDEBUG</code></td>
+<td id="ix-328">the usual: removes <code>assert</code> (<code>hb_always_assert</code> stays, for the tests: <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L594"><code>hb.hh:594</code></a>)</td>
+<td id="ix-329">off; set by <code>HB_TINY</code></td>
+</tr>
+<tr>
+<td id="ix-330"><code>HB_INTERNAL</code>, <code>HB_EXTERN</code>, <code>HB_DLL_EXPORT</code></td>
+<td id="ix-331">symbol visibility and export (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L197"><code>hb.hh:197</code></a>, <code>:294</code>)</td>
+<td id="ix-332">hidden internals; exported API</td>
+</tr>
+<tr>
+<td id="ix-333"><code>HB_ALWAYS_INLINE</code>, <code>HB_NEVER_INLINE</code>, <code>HB_HOT</code></td>
+<td id="ix-334">the inlining attributes, which can be preset to nothing (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L329"><code>hb.hh:329</code></a>)</td>
+<td>compiler attributes</td>
+</tr>
+<tr>
+<td id="ix-335"><code>HB_WASM_NO_MODULES</code></td>
+<td id="ix-336">builds the <code>wasm</code> backend without loading modules; <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-wasm-shape.cc#L62"><code>hb-wasm-shape.cc:62</code></a> defines it unless told otherwise</td>
+<td>on</td>
+</tr>
+<tr>
+<td id="ix-337"><code>HB_GPU_ATLAS_2D</code>, <code>HB_GPU_NO_MSAA</code></td>
+<td id="ix-338">not C macros: preprocessor switches in hb-gpu’s shaders, for WebGL 2 and for turning off multisampling</td>
+<td>off</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-339">The limits in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>hb-limits.hh</code></a> (<code>HB_MAX_NESTING_LEVEL</code>, <code>HB_BUFFER_MAX_LEN_FACTOR</code> and the rest) are compile-time switches too, each with an <code>#ifndef</code> so a build can change it. <a href="limits.html">Limits</a> lists them.</p>
+<p id="ix-340"><strong>The debug macros.</strong> Setting <code>HB_DEBUG_SANITIZE=N</code>, say, prints a trace of every sanitize call up to N levels deep. <code>HB_DEBUG</code> sets the default for all of them at once (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-debug.hh#L35"><code>hb-debug.hh:35</code></a>); each is <code>HB_DEBUG+0</code> unless defined. They come in three groups:</p>
+<table>
+<thead>
+<tr>
+<th>Group</th>
+<th>Macros</th>
+<th>What they trace</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Walks over table structures, with <code>TRACE_*</code> macros</td>
+<td id="ix-341"><code>HB_DEBUG_APPLY</code>, <code>HB_DEBUG_SANITIZE</code>, <code>HB_DEBUG_SERIALIZE</code>, <code>HB_DEBUG_SUBSET</code>, <code>HB_DEBUG_PAINT</code>, and <code>HB_DEBUG_DISPATCH</code>, which is their sum</td>
+<td id="ix-342">lookups as they are applied, sanitizing (<a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a>), writing and subsetting tables, <code>COLR</code> painting, and which format each dispatch chose</td>
+</tr>
+<tr>
+<td>Parts of the library</td>
+<td id="ix-343"><code>HB_DEBUG_BLOB</code>, <code>HB_DEBUG_OBJECT</code>, <code>HB_DEBUG_SHAPE_PLAN</code>, <code>HB_DEBUG_ARABIC</code>, <code>HB_DEBUG_JUSTIFY</code>, <code>HB_DEBUG_DEPEND</code>, <code>HB_DEBUG_SUBSET_REPACK</code></td>
+<td id="ix-344">blob modes, reference counts, plan creation (<a href="shape-plans-and-their-cache.html">Shape plans and their cache</a>), Arabic stretching, <code>hb_shape_justify</code>, the dependency graph, the repacker (<a href="writing-tables.html">Writing tables</a>)</td>
+</tr>
+<tr>
+<td id="ix-345">Backends</td>
+<td id="ix-346"><code>HB_DEBUG_CORETEXT</code>, <code>HB_DEBUG_DIRECTWRITE</code>, <code>HB_DEBUG_UNISCRIBE</code>, <code>HB_DEBUG_FT</code>, <code>HB_DEBUG_WASM</code>, <code>HB_DEBUG_KBTS</code></td>
+<td>the platform shapers and font funcs</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p id="ix-347">For programmers: debug output is not buffer messages. <code>HB_DEBUG_*</code> writes to <code>stderr</code> from inside the library and needs a rebuild. Buffer messages go to a callback the application installs, and a normal build sends the coarse ones; only the fine ones need <code>HB_BUFFER_MESSAGE_MORE</code>. This book’s traces use a second build made with <code>CXXFLAGS=-DHB_BUFFER_MESSAGE_MORE=1</code> (<code>tools/build-harfbuzz.sh:19</code>).</p>
+</blockquote>
+<h2 id="the-meson-options">The Meson options</h2>
+<p id="ix-348">The options in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson_options.txt"><code>meson_options.txt</code></a> decide what is built and linked. Most of them work by setting a <code>HAVE_*</code> macro in <code>config.h</code>; the library’s own optional parts are selected that way, not by <code>HB_NO_*</code> macros. Configuration by macro and configuration by option meet only in <code>HB_EXPERIMENTAL_API</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Default</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-349"><code>glib</code></td>
+<td>auto</td>
+<td id="ix-350"><code>HAVE_GLIB</code>: <code>libharfbuzz</code>’s GLib Unicode funcs and script conversion</td>
+</tr>
+<tr>
+<td><code>gobject</code></td>
+<td>auto</td>
+<td><code>HAVE_GOBJECT</code>: <code>libharfbuzz-gobject</code></td>
+</tr>
+<tr>
+<td><code>introspection</code></td>
+<td>auto</td>
+<td>GObject introspection data</td>
+</tr>
+<tr>
+<td><code>icu</code></td>
+<td>auto</td>
+<td id="ix-351"><code>HAVE_ICU</code>: <code>libharfbuzz-icu</code>, ICU’s Unicode funcs</td>
+</tr>
+<tr>
+<td><code>icu_builtin</code></td>
+<td>false</td>
+<td id="ix-352"><code>HAVE_ICU_BUILTIN</code>: puts the ICU funcs in <code>libharfbuzz</code> itself, where they can be the default (<a href="unicode-inside-harfbuzz.html#three-implementations">Unicode inside HarfBuzz</a>)</td>
+</tr>
+<tr>
+<td><code>freetype</code></td>
+<td>auto</td>
+<td id="ix-353"><code>HAVE_FREETYPE</code>: hb-ft, FreeType font funcs</td>
+</tr>
+<tr>
+<td><code>fontations</code></td>
+<td>disabled</td>
+<td id="ix-354"><code>HAVE_FONTATIONS</code>: font funcs from the Rust fontations crates (<a href="fonts-and-font-functions.html#the-other-funcs">Fonts and font functions</a>)</td>
+</tr>
+<tr>
+<td><code>cairo</code></td>
+<td>auto</td>
+<td><code>HAVE_CAIRO</code>: <code>libharfbuzz-cairo</code>, and <code>hb-view</code></td>
+</tr>
+<tr>
+<td><code>chafa</code></td>
+<td>auto</td>
+<td><code>HAVE_CHAFA</code>: terminal output in the image tools</td>
+</tr>
+<tr>
+<td><code>png</code></td>
+<td>auto</td>
+<td id="ix-355"><code>HAVE_PNG</code>: PNG in hb-raster and its tool</td>
+</tr>
+<tr>
+<td id="ix-356"><code>zlib</code></td>
+<td>auto</td>
+<td id="ix-357"><code>HAVE_ZLIB</code>: gzip-compressed <code>SVG </code> documents, and PDF output in hb-vector</td>
+</tr>
+<tr>
+<td><code>graphite2</code></td>
+<td>disabled</td>
+<td id="ix-358"><code>HAVE_GRAPHITE2</code>: the <code>graphite2</code> backend</td>
+</tr>
+<tr>
+<td><code>graphite</code></td>
+<td>disabled</td>
+<td>the same, deprecated</td>
+</tr>
+<tr>
+<td id="ix-359"><code>harfrust</code>, <code>kbts</code>, <code>wasm</code></td>
+<td>disabled</td>
+<td id="ix-360">the <code>harfrust</code>, <code>kbts</code> and <code>wasm</code> backends (<a href="hb_shape-and-its-backends.html#the-backends">hb_shape and its backends</a>); <code>wasm</code> also sets <code>HB_WASM_MODULE_DIR</code></td>
+</tr>
+<tr>
+<td><code>coretext</code>, <code>directwrite</code>, <code>gdi</code></td>
+<td>disabled</td>
+<td id="ix-361">the platform backends and font funcs; <code>gdi</code> brings Uniscribe</td>
+</tr>
+<tr>
+<td><code>subset</code></td>
+<td>enabled</td>
+<td><code>libharfbuzz-subset</code></td>
+</tr>
+<tr>
+<td><code>raster</code>, <code>vector</code>, <code>gpu</code></td>
+<td>enabled</td>
+<td id="ix-362"><code>libharfbuzz-raster</code>, <code>-vector</code> and <code>-gpu</code> (<a href="hb-raster.html">hb-raster</a>, <a href="hb-vector.html">hb-vector</a> and <a href="hb-gpu.html">hb-gpu</a>)</td>
+</tr>
+<tr>
+<td><code>gpu_demo</code></td>
+<td>auto</td>
+<td id="ix-363">the hb-gpu demo, which needs GLEW, GLFW and GL</td>
+</tr>
+<tr>
+<td><code>experimental_api</code></td>
+<td>false</td>
+<td id="ix-364"><code>HB_EXPERIMENTAL_API</code></td>
+</tr>
+<tr>
+<td><code>utilities</code></td>
+<td>enabled</td>
+<td><code>hb-shape</code>, <code>hb-view</code>, <code>hb-subset</code> and the other tools</td>
+</tr>
+<tr>
+<td><code>tests</code>, <code>benchmark</code></td>
+<td>enabled, disabled</td>
+<td id="ix-365">the test suites (<a href="testing-harfbuzz.html">Testing HarfBuzz</a>) and the benchmarks</td>
+</tr>
+<tr>
+<td id="ix-366"><code>docs</code>, <code>doc_tests</code></td>
+<td>auto, false</td>
+<td>the gtk-doc reference, and its checks</td>
+</tr>
+<tr>
+<td><code>with_libstdcxx</code></td>
+<td>false</td>
+<td id="ix-367">links with a C++ linker; by default HarfBuzz is linked with a C linker and doesn’t depend on libstdc++ (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L497"><code>src/meson.build:497</code></a>)</td>
+</tr>
+<tr>
+<td><code>ragel_subproject</code></td>
+<td>false</td>
+<td id="ix-368">builds Ragel if no suitable one is installed (<a href="indic-model.html#ragel">The Indic model</a>)</td>
+</tr>
+<tr>
+<td><code>fuzzer_ldflags</code></td>
+<td>empty</td>
+<td id="ix-369">extra link flags for the fuzzers</td>
+</tr>
+<tr>
+<td><code>cmakepackagedir</code></td>
+<td><code>libdir/cmake</code></td>
+<td>where the CMake package files go</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-370">Meson also writes <code>hb-features.h</code>, installed for applications, which defines an <code>HB_HAS_*</code> macro for each optional part that was built. Its list (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L587"><code>src/meson.build:587</code></a>) looks up <code>HAVE_GRAPHITE</code> and <code>HAVE_GPU</code>, which no Meson file sets (the option sets <code>HAVE_GRAPHITE2</code>, and the <code>gpu</code> option sets nothing). In the book’s build, where hb-gpu is built, <code>hb-features.h</code> has <code>#undef HB_HAS_GPU</code>.</p>
+<blockquote>
+<p id="ix-371">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/2b873b805800dcad37827f90a5c28ccb6ccc4ba8"><code>2b873b8</code></a> and <a href="https://github.com/harfbuzz/harfbuzz/commit/506cc943b3c2ad82c5398361afdaf6e9eaad6b0f"><code>506cc94</code></a> (17 November 2026), so main’s <code>hb-features.h</code> defines <code>HB_HAS_GPU</code> when hb-gpu is built, and <code>HB_HAS_GRAPHITE</code> when graphite2 is.</p>
+</blockquote>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh"><code>src/hb-config.hh</code></a></td>
+<td>the tiers, the override headers and the closure of options</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh"><code>src/hb.hh</code></a></td>
+<td><code>HB_NO_GETENV</code>, <code>HB_NO_ERRNO</code>, <code>HB_NO_SETLOCALE</code>, <code>HB_USE_ATEXIT</code>, <code>HB_CUSTOM_MALLOC</code>, <code>HB_NO_VISIBILITY</code> and the pragmas</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-debug.hh"><code>src/hb-debug.hh</code></a></td>
+<td><code>HB_DEBUG</code>, every <code>HB_DEBUG_*</code> macro, <code>HB_BUFFER_MESSAGE_MORE</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-mutex.hh"><code>src/hb-mutex.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-atomic.hh"><code>src/hb-atomic.hh</code></a></td>
+<td>the mutex choices and <code>HB_NO_MT</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-face-table-list.hh"><code>src/hb-ot-face-table-list.hh</code></a></td>
+<td>the table slots and the macros that remove them</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-algs.hh"><code>src/hb-algs.hh</code></a></td>
+<td><code>HB_FAST_NUM_ACCESS</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>src/hb-limits.hh</code></a></td>
+<td>the limits a build can change</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz-world.cc"><code>src/harfbuzz-world.cc</code></a></td>
+<td>the single-file build, selected with <code>HB_HAS_*</code> (<a href="building-harfbuzz.html#single-file-builds">Building HarfBuzz</a>)</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/CONFIG.md"><code>CONFIG.md</code></a></td>
+<td>upstream’s guide to small builds</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson_options.txt"><code>meson_options.txt</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build"><code>meson.build</code></a></td>
+<td>the build options and the <code>HAVE_*</code> macros they set</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>All configuration is in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh"><code>hb-config.hh</code></a>, which every file sees first. Implications flow downward: tiers, then the first override header, then the closure of options, then the last override header.</li>
+<li><code>HB_MINI</code> keeps an OpenType shaper and drops AAT, <code>kern</code>, the legacy-font paths and fonts beyond 64K glyphs. <code>HB_LEAN</code> drops most of what isn’t shaping. <code>HB_TINY</code> is both, plus no threads, the size-optimized code and fewer caches.</li>
+<li>The <code>HB_NO_*</code> macros only need to be defined. They remove whole files, empty function bodies or remove table slots, and the public headers don’t change, so calling a removed function fails at link time.</li>
+<li><code>-Os</code> turns on <code>HB_OPTIMIZE_SIZE</code> by itself. It gives up forced inlining, unrolled loops, fast paths and the larger lookup tables.</li>
+<li><code>HB_BUFFER_MESSAGE_MORE</code> and the <code>HB_DEBUG_*</code> macros need a rebuild; <code>HB_EXPERIMENTAL_API</code> is the one macro with a Meson option.</li>
+<li>In a Meson build, <code>HB_LEAN</code> always removes drawing, painting and color, because it can’t see <code>hb-features.h</code>.</li>
+</ul>
+<blockquote>
+<p>Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/c90000dd8ee5a593bc60e65930d3aed501aca5bf"><code>c90000d</code></a> (17 November 2026), so in a Meson build with a renderer main’s <code>HB_LEAN</code> keeps drawing (the item on <code>HB_LEAN</code>).</p>
+</blockquote>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="limits.html">← Limits</a><a rel="next" href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

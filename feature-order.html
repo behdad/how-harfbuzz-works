@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Feature order · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Appendix A</p>
+<h1 id="feature-order">Feature order</h1>
+<p id="ix-1">“Does my <code>calt</code> run before my <code>ccmp</code>?” has no single answer. It depends on the script shaper, and on the order of the lookups in the font. This appendix gives the order for each of HarfBuzz’s shapers, as HarfBuzz 15.1.0 runs it. Each table is generated automatically by running HarfBuzz when the book is built, so it can’t drift from the code.</p>
+<h2 id="the-rule">The rule</h2>
+<p id="ix-2">Planning sorts features into <strong>stages</strong> (<a href="from-features-to-lookups.html#stages-and-pauses">From features to lookups</a>):</p>
+<ul>
+<li id="ix-3">Stages run one after another, in a fixed order that the shaper sets.</li>
+<li id="ix-4">Within a stage, lookups run in LookupList order, whatever features they belong to (<a href="gsub.html#the-order-lookups-run-in">GSUB</a>). The order in which the features are listed, requested or written doesn’t count.</li>
+<li id="ix-5">GPOS always has one stage. All its lookups run in LookupList order, after all of GSUB.</li>
+</ul>
+<p id="ix-6">So each table below lists stages, not features. Within one stage, the features are listed alphabetically, because their order there is the font’s, not HarfBuzz’s.</p>
+<p id="ix-7">Between the stages, the tables show the other steps HarfBuzz’s trace reports, in italics, under the names the trace gives them:</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>What it is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><em>preprocess-text</em></td>
+<td id="ix-8">the shaper’s work on the characters before shaping, such as composing Hangul jamo (<a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a>)</td>
+</tr>
+<tr>
+<td><em>decompose</em>, <em>reorder</em>, <em>compose</em></td>
+<td id="ix-9">normalization’s three rounds (<a href="normalization.html">Normalization</a>)</td>
+</tr>
+<tr>
+<td><em>reordering …</em></td>
+<td id="ix-10">a shaper moving glyphs between stages: the Indic, Khmer, Myanmar and USE reorderings</td>
+</tr>
+<tr>
+<td><em>postprocess-glyphs</em></td>
+<td id="ix-11">the shaper’s work after GPOS, such as stretching for Arabic <code>stch</code> (<a href="joining-scripts.html">Joining scripts</a>)</td>
+</tr>
+<tr>
+<td><em>fallback mark</em>, <em>fallback kern</em></td>
+<td id="ix-12">HarfBuzz positioning marks or kerning itself, for a font without the GPOS features (<a href="fallbacks.html">Fallbacks</a>)</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-13">Only steps that the shaped text needs appear. A step that leaves no message in the trace isn’t shown either. Finding syllables, for example, leaves no message, but it ends a stage.</p>
+<h2 id="how-the-tables-are-made">How the tables are made</h2>
+<p id="ix-14"><code>fonts/feature-order/build-fonts.py</code> builds a pair of fonts for each script. Each font has one lookup for every feature tag that any of HarfBuzz’s shapers asks for, 58 in all, plus <code>smcp</code> to stand for a feature an application asks for. Each lookup acts on a glyph that is never in the text, so it changes nothing. It is there to be seen: HarfBuzz’s trace reports every lookup in the plan, in the order it runs, whether or not it matches.</p>
+<p id="ix-15">The two fonts differ only in how their lookups are numbered: alphabetically by feature tag in one, and in reverse in the other. Within a stage, LookupList order decides, so the two fonts give opposite orders. Across stages, the stage order decides, so they agree. A stage therefore ends exactly where the lookups run so far are the same set in both fonts. The <code>order</code> block in <code>tools/build-site.mjs</code> shapes both fonts and finds the stages that way.</p>
+<p id="ix-16">A feature that is missing from a table wasn’t asked for. Under the Indic shaper, for example, <code>liga</code> is turned off, so it never runs, even though the fonts have it.</p>
+<h2 id="the-default-shaper">The default shaper</h2>
+<p id="ix-17">The default shaper handles Latin, Greek, Cyrillic, Han and most other scripts, and Thai and Lao use its features too (<a href="choosing-a-script-shaper.html#from-tags-to-a-shaper">From tags to a shaper</a>). It adds no pauses, so after <code>rvrn</code> everything is one stage: the font’s lookup order decides everything else.</p>
+<div class="trace order"><div class="trace-head"><code>hb-shape order-latn-a.ttf "a" --features=smcp --trace</code>, and the same with order-latn-b.ttf</div><table><thead><tr><th>Stage</th><th>Features, or another step</th></tr></thead><tbody><tr class="event"><td></td><td><i>decompose</i></td></tr><tr><td class="stage">GSUB 1</td><td><code>rvrn</code></td></tr><tr><td class="stage">GSUB 2</td><td><code>BUZZ</code> <code>Buzz</code> <code>HARF</code> <code>Harf</code> <code>calt</code> <code>ccmp</code> <code>clig</code> <code>dnom</code> <code>frac</code> <code>liga</code> <code>locl</code> <code>ltra</code> <code>ltrm</code> <code>numr</code> <code>rand</code> <code>rclt</code> <code>rlig</code> <code>smcp</code></td></tr><tr><td class="stage">GPOS 1</td><td><code>abvm</code> <code>blwm</code> <code>curs</code> <code>dist</code> <code>kern</code> <code>mark</code> <code>mkmk</code></td></tr></tbody></table></div>
+<p id="ix-18">In right-to-left text, as with the Hebrew shaper, <code>rtla</code> and <code>rtlm</code> take the place of <code>ltra</code> and <code>ltrm</code>:</p>
+<div class="trace order"><div class="trace-head"><code>hb-shape order-hebr-a.ttf "א" --features=smcp --trace</code>, and the same with order-hebr-b.ttf</div><table><thead><tr><th>Stage</th><th>Features, or another step</th></tr></thead><tbody><tr class="event"><td></td><td><i>decompose</i></td></tr><tr><td class="stage">GSUB 1</td><td><code>rvrn</code></td></tr><tr><td class="stage">GSUB 2</td><td><code>BUZZ</code> <code>Buzz</code> <code>HARF</code> <code>Harf</code> <code>calt</code> <code>ccmp</code> <code>clig</code> <code>dnom</code> <code>frac</code> <code>liga</code> <code>locl</code> <code>numr</code> <code>rand</code> <code>rclt</code> <code>rlig</code> <code>rtla</code> <code>rtlm</code> <code>smcp</code></td></tr><tr><td class="stage">GPOS 1</td><td><code>abvm</code> <code>blwm</code> <code>curs</code> <code>dist</code> <code>kern</code> <code>mark</code> <code>mkmk</code></td></tr></tbody></table></div>
+<p id="ix-19">In vertical text, <code>vert</code> replaces the horizontal features <code>calt</code>, <code>clig</code>, <code>curs</code>, <code>dist</code>, <code>kern</code>, <code>liga</code> and <code>rclt</code>:</p>
+<div class="trace order"><div class="trace-head"><code>hb-shape order-latn-a.ttf "a" --features=smcp --direction=ttb --trace</code>, and the same with order-latn-b.ttf</div><table><thead><tr><th>Stage</th><th>Features, or another step</th></tr></thead><tbody><tr class="event"><td></td><td><i>decompose</i></td></tr><tr><td class="stage">GSUB 1</td><td><code>rvrn</code></td></tr><tr><td class="stage">GSUB 2</td><td><code>BUZZ</code> <code>Buzz</code> <code>HARF</code> <code>Harf</code> <code>ccmp</code> <code>dnom</code> <code>frac</code> <code>locl</code> <code>numr</code> <code>rand</code> <code>rlig</code> <code>smcp</code> <code>vert</code></td></tr><tr><td class="stage">GPOS 1</td><td><code>abvm</code> <code>blwm</code> <code>mark</code> <code>mkmk</code></td></tr></tbody></table></div>
+<h2 id="arabic">Arabic</h2>
+<p id="ix-20">The Arabic shaper is used for Arabic in horizontal text, and for Syriac in horizontal text if the font has a Syriac script tag. The other joining scripts, such as Mongolian and N’Ko, are shaped by USE (<a href="joining-scripts.html#joining-scripts-under-use">Joining scripts</a>); <a href="choosing-a-script-shaper.html#from-tags-to-a-shaper">Choosing a script shaper</a> has the conditions. It puts a pause after each joining feature, and after <code>rlig</code>, so <code>isol</code>, <code>fina</code>, <code>fin2</code>, <code>fin3</code>, <code>medi</code>, <code>med2</code>, <code>init</code> and <code>rlig</code> each run on their own, in that order (<a href="joining-scripts.html#the-features-in-order">Joining scripts</a>):</p>
+<div class="trace order"><div class="trace-head"><code>hb-shape order-arab-a.ttf "بب" --features=smcp --trace</code>, and the same with order-arab-b.ttf</div><table><thead><tr><th>Stage</th><th>Features, or another step</th></tr></thead><tbody><tr class="event"><td></td><td><i>decompose</i></td></tr><tr><td class="stage">GSUB 1</td><td><code>rvrn</code></td></tr><tr><td class="stage">GSUB 2</td><td><code>HARF</code> <code>Harf</code> <code>dnom</code> <code>frac</code> <code>numr</code> <code>rand</code> <code>rtla</code> <code>rtlm</code> <code>stch</code></td></tr><tr><td class="stage">GSUB 3</td><td><code>ccmp</code> <code>locl</code></td></tr><tr><td class="stage">GSUB 4</td><td><code>isol</code></td></tr><tr><td class="stage">GSUB 5</td><td><code>fina</code></td></tr><tr><td class="stage">GSUB 6</td><td><code>fin2</code></td></tr><tr><td class="stage">GSUB 7</td><td><code>fin3</code></td></tr><tr><td class="stage">GSUB 8</td><td><code>medi</code></td></tr><tr><td class="stage">GSUB 9</td><td><code>med2</code></td></tr><tr><td class="stage">GSUB 10</td><td><code>init</code></td></tr><tr><td class="stage">GSUB 11</td><td><code>rlig</code></td></tr><tr><td class="stage">GSUB 12</td><td><code>BUZZ</code> <code>Buzz</code> <code>calt</code> <code>clig</code> <code>liga</code> <code>mset</code> <code>rclt</code> <code>smcp</code></td></tr><tr><td class="stage">GPOS 1</td><td><code>abvm</code> <code>blwm</code> <code>curs</code> <code>dist</code> <code>kern</code> <code>mark</code> <code>mkmk</code></td></tr><tr class="event"><td></td><td><i>postprocess-glyphs</i></td></tr></tbody></table></div>
+<h2 id="indic">Indic</h2>
+<p id="ix-21">The nine Indic scripts, under their <code>2</code> tags or their old ones (<a href="indic-model.html#features-and-stages">The Indic model</a>). Syllables are found before the shaper’s first feature, and the glyphs are reordered twice: after <code>locl</code> and <code>ccmp</code>, and after the basic features. Each basic feature has a stage of its own, so each sees what the one before made. The presentation features then share the last stage with the common ones and the application’s.</p>
+<div class="trace order"><div class="trace-head"><code>hb-shape order-dev2-a.ttf "कि" --features=smcp --trace</code>, and the same with order-dev2-b.ttf</div><table><thead><tr><th>Stage</th><th>Features, or another step</th></tr></thead><tbody><tr class="event"><td></td><td><i>preprocess-text</i></td></tr><tr class="event"><td></td><td><i>decompose</i></td></tr><tr class="event"><td></td><td><i>reorder</i></td></tr><tr class="event"><td></td><td><i>compose</i></td></tr><tr><td class="stage">GSUB 1</td><td><code>rvrn</code></td></tr><tr><td class="stage">GSUB 2</td><td><code>HARF</code> <code>Harf</code> <code>dnom</code> <code>frac</code> <code>ltra</code> <code>ltrm</code> <code>numr</code> <code>rand</code></td></tr><tr><td class="stage">GSUB 3</td><td><code>ccmp</code> <code>locl</code></td></tr><tr class="event"><td></td><td><i>reordering indic initial</i></td></tr><tr><td class="stage">GSUB 4</td><td><code>nukt</code></td></tr><tr><td class="stage">GSUB 5</td><td><code>akhn</code></td></tr><tr><td class="stage">GSUB 6</td><td><code>rphf</code></td></tr><tr><td class="stage">GSUB 7</td><td><code>rkrf</code></td></tr><tr><td class="stage">GSUB 8</td><td><code>pref</code></td></tr><tr><td class="stage">GSUB 9</td><td><code>blwf</code></td></tr><tr><td class="stage">GSUB 10</td><td><code>abvf</code></td></tr><tr><td class="stage">GSUB 11</td><td><code>half</code></td></tr><tr><td class="stage">GSUB 12</td><td><code>pstf</code></td></tr><tr><td class="stage">GSUB 13</td><td><code>vatu</code></td></tr><tr><td class="stage">GSUB 14</td><td><code>cjct</code></td></tr><tr class="event"><td></td><td><i>reordering indic final</i></td></tr><tr><td class="stage">GSUB 15</td><td><code>BUZZ</code> <code>Buzz</code> <code>abvs</code> <code>blws</code> <code>calt</code> <code>clig</code> <code>haln</code> <code>init</code> <code>pres</code> <code>psts</code> <code>rclt</code> <code>rlig</code> <code>smcp</code></td></tr><tr><td class="stage">GPOS 1</td><td><code>abvm</code> <code>blwm</code> <code>curs</code> <code>dist</code> <code>kern</code> <code>mark</code> <code>mkmk</code></td></tr></tbody></table></div>
+<h2 id="khmer">Khmer</h2>
+<p id="ix-22">Khmer reorders first, before any of its own features. Then the basic features share one stage (<a href="khmer-and-myanmar.html">Khmer and Myanmar</a>):</p>
+<div class="trace order"><div class="trace-head"><code>hb-shape order-khmr-a.ttf "ក" --features=smcp --trace</code>, and the same with order-khmr-b.ttf</div><table><thead><tr><th>Stage</th><th>Features, or another step</th></tr></thead><tbody><tr class="event"><td></td><td><i>decompose</i></td></tr><tr><td class="stage">GSUB 1</td><td><code>rvrn</code></td></tr><tr><td class="stage">GSUB 2</td><td><code>HARF</code> <code>Harf</code> <code>dnom</code> <code>frac</code> <code>ltra</code> <code>ltrm</code> <code>numr</code> <code>rand</code></td></tr><tr class="event"><td></td><td><i>reordering khmer</i></td></tr><tr><td class="stage">GSUB 3</td><td><code>abvf</code> <code>blwf</code> <code>ccmp</code> <code>cfar</code> <code>locl</code> <code>pref</code> <code>pstf</code></td></tr><tr><td class="stage">GSUB 4</td><td><code>BUZZ</code> <code>Buzz</code> <code>abvs</code> <code>blws</code> <code>calt</code> <code>clig</code> <code>pres</code> <code>psts</code> <code>rclt</code> <code>rlig</code> <code>smcp</code></td></tr><tr><td class="stage">GPOS 1</td><td><code>abvm</code> <code>blwm</code> <code>curs</code> <code>dist</code> <code>kern</code> <code>mark</code> <code>mkmk</code></td></tr></tbody></table></div>
+<h2 id="myanmar">Myanmar</h2>
+<p id="ix-23">Under <code>mym2</code>, Myanmar reorders after <code>locl</code> and <code>ccmp</code>, and its basic features each have a stage of their own (<a href="khmer-and-myanmar.html">Khmer and Myanmar</a>):</p>
+<div class="trace order"><div class="trace-head"><code>hb-shape order-mym2-a.ttf "က" --features=smcp --trace</code>, and the same with order-mym2-b.ttf</div><table><thead><tr><th>Stage</th><th>Features, or another step</th></tr></thead><tbody><tr class="event"><td></td><td><i>decompose</i></td></tr><tr><td class="stage">GSUB 1</td><td><code>rvrn</code></td></tr><tr><td class="stage">GSUB 2</td><td><code>HARF</code> <code>Harf</code> <code>dnom</code> <code>frac</code> <code>ltra</code> <code>ltrm</code> <code>numr</code> <code>rand</code></td></tr><tr><td class="stage">GSUB 3</td><td><code>ccmp</code> <code>locl</code></td></tr><tr class="event"><td></td><td><i>reordering myanmar</i></td></tr><tr><td class="stage">GSUB 4</td><td><code>rphf</code></td></tr><tr><td class="stage">GSUB 5</td><td><code>pref</code></td></tr><tr><td class="stage">GSUB 6</td><td><code>blwf</code></td></tr><tr><td class="stage">GSUB 7</td><td><code>pstf</code></td></tr><tr><td class="stage">GSUB 8</td><td><code>BUZZ</code> <code>Buzz</code> <code>abvs</code> <code>blws</code> <code>calt</code> <code>clig</code> <code>liga</code> <code>pres</code> <code>psts</code> <code>rclt</code> <code>rlig</code> <code>smcp</code></td></tr><tr><td class="stage">GPOS 1</td><td><code>abvm</code> <code>blwm</code> <code>curs</code> <code>dist</code> <code>kern</code> <code>mark</code> <code>mkmk</code></td></tr></tbody></table></div>
+<h2 id="the-universal-shaping-engine">The Universal Shaping Engine</h2>
+<p id="ix-24">USE covers the scripts in its list, and the nine Indic scripts under the unregistered <code>3</code> tags, such as <code>dev3</code> (<a href="universal-shaping-engine.html#features-and-stages">The Universal Shaping Engine</a>). The order is the same for all of them. Balinese is the example here:</p>
+<div class="trace order"><div class="trace-head"><code>hb-shape order-bali-a.ttf "ᬓ" --features=smcp --trace</code>, and the same with order-bali-b.ttf</div><table><thead><tr><th>Stage</th><th>Features, or another step</th></tr></thead><tbody><tr class="event"><td></td><td><i>preprocess-text</i></td></tr><tr class="event"><td></td><td><i>decompose</i></td></tr><tr><td class="stage">GSUB 1</td><td><code>rvrn</code></td></tr><tr><td class="stage">GSUB 2</td><td><code>HARF</code> <code>Harf</code> <code>dnom</code> <code>frac</code> <code>ltra</code> <code>ltrm</code> <code>numr</code> <code>rand</code></td></tr><tr><td class="stage">GSUB 3</td><td><code>akhn</code> <code>ccmp</code> <code>locl</code> <code>nukt</code></td></tr><tr><td class="stage">GSUB 4</td><td><code>rphf</code></td></tr><tr><td class="stage">GSUB 5</td><td><code>pref</code></td></tr><tr><td class="stage">GSUB 6</td><td><code>abvf</code> <code>blwf</code> <code>cjct</code> <code>half</code> <code>pstf</code> <code>rkrf</code> <code>vatu</code></td></tr><tr class="event"><td></td><td><i>reordering USE</i></td></tr><tr><td class="stage">GSUB 7</td><td><code>fina</code> <code>init</code> <code>isol</code> <code>medi</code></td></tr><tr><td class="stage">GSUB 8</td><td><code>BUZZ</code> <code>Buzz</code> <code>abvs</code> <code>blws</code> <code>calt</code> <code>clig</code> <code>haln</code> <code>liga</code> <code>pres</code> <code>psts</code> <code>rclt</code> <code>rlig</code> <code>smcp</code></td></tr><tr><td class="stage">GPOS 1</td><td><code>abvm</code> <code>blwm</code> <code>curs</code> <code>dist</code> <code>kern</code> <code>mark</code> <code>mkmk</code></td></tr></tbody></table></div>
+<p id="ix-25">Only <code>rphf</code> and <code>pref</code> have stages of their own, because what each one did is recorded before the next. The specification leaves the order within each group to the font.</p>
+<h2 id="hangul">Hangul</h2>
+<p id="ix-26">The Hangul shaper composes or decomposes the jamo before shaping, and its <code>ljmo</code>, <code>vjmo</code> and <code>tjmo</code> share the default shaper’s single stage (<a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a>):</p>
+<div class="trace order"><div class="trace-head"><code>hb-shape order-hang-a.ttf "한" --features=smcp --trace</code>, and the same with order-hang-b.ttf</div><table><thead><tr><th>Stage</th><th>Features, or another step</th></tr></thead><tbody><tr class="event"><td></td><td><i>preprocess-text</i></td></tr><tr class="event"><td></td><td><i>decompose</i></td></tr><tr><td class="stage">GSUB 1</td><td><code>rvrn</code></td></tr><tr><td class="stage">GSUB 2</td><td><code>BUZZ</code> <code>Buzz</code> <code>HARF</code> <code>Harf</code> <code>calt</code> <code>ccmp</code> <code>clig</code> <code>dnom</code> <code>frac</code> <code>liga</code> <code>ljmo</code> <code>locl</code> <code>ltra</code> <code>ltrm</code> <code>numr</code> <code>rand</code> <code>rclt</code> <code>rlig</code> <code>smcp</code> <code>tjmo</code> <code>vjmo</code></td></tr><tr><td class="stage">GPOS 1</td><td><code>abvm</code> <code>blwm</code> <code>curs</code> <code>dist</code> <code>kern</code> <code>mark</code> <code>mkmk</code></td></tr></tbody></table></div>
+<h2 id="aat-fonts">AAT fonts</h2>
+<p id="ix-27">A font with a <code>morx</code> table that HarfBuzz uses gets none of the GSUB stages: <code>morx</code> runs in GSUB’s place (<a href="aat-inside-harfbuzz.html#when-morx-is-used">When morx is used</a>). Its order is the font’s own: chains run in the order they are stored, and the subtables in each chain likewise. Feature tags only turn subtables on and off (<a href="aat-inside-harfbuzz.html#from-feature-tags-to-feature-types">From feature tags to feature types</a>).</p>
+<h2 id="what-it-means-for-a-font">What it means for a font</h2>
+<ul>
+<li id="ix-28">Under the default shaper, the order of lookups in the LookupList is the order in which they run, apart from <code>rvrn</code>. In a feature file, that is the order the lookups are written in.</li>
+<li id="ix-29">Under the default shaper, no feature is “early” or “late” except <code>rvrn</code>. <code>calt</code> runs late only if its lookups come late in the LookupList. Under the Arabic, Indic, Khmer, Myanmar and USE shapers it really is late, in the last stage with the presentation features.</li>
+<li id="ix-30">Under a shaper with stages, a lookup can’t see the output of a feature in a later stage, wherever it is in the LookupList. A <code>ccmp</code> lookup never sees what <code>init</code> made, under the Arabic shaper or the Indic one.</li>
+<li id="ix-31"><code>rvrn</code> always runs first, in a stage of its own.</li>
+<li id="ix-32">An application’s features, such as <code>smcp</code> or <code>ss01</code>, always run in the last stage, after all reordering, so they can’t change how a syllable is reordered.</li>
+<li id="ix-33">GPOS runs after all of GSUB, so its lookups see only the final glyphs.</li>
+</ul>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>What</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>The features every shaper asks for, and in what order</td>
+<td><code>hb_ot_shape_collect_features</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L321"><code>src/hb-ot-shape.cc:321</code></a></td>
+</tr>
+<tr>
+<td>Running the stages, and the trace’s lookup messages</td>
+<td><code>hb_ot_map_t::apply</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L2083"><code>src/hb-ot-layout.cc:2083</code></a></td>
+</tr>
+<tr>
+<td>Each shaper’s features and pauses</td>
+<td><code>collect_features_*</code> in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc"><code>src/hb-ot-shaper-arabic.cc</code></a>, <code>-indic.cc</code>, <code>-khmer.cc</code>, <code>-myanmar.cc</code>, <code>-use.cc</code>, <code>-hangul.cc</code></td>
+</tr>
+<tr>
+<td>The fonts</td>
+<td><code>fonts/feature-order/build-fonts.py</code></td>
+</tr>
+<tr>
+<td>The <code>order</code> block</td>
+<td><code>blockOrder</code>, <code>tools/build-site.mjs</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Features run in stages: in order across stages, and in LookupList order within one.</li>
+<li>The default shaper has one stage after <code>rvrn</code>, so the font decides the order.</li>
+<li>The Arabic, Indic, Khmer, Myanmar and USE shapers add stages, and reorder glyphs between them.</li>
+<li>An application’s features run last in GSUB, and GPOS runs after GSUB, in one stage.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="family.html">← The family</a><a rel="next" href="reading-feature-files.html">Reading feature files →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

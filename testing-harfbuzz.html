@@ -1,0 +1,1287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Testing HarfBuzz · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part XII · HarfBuzz and its relatives</p>
+<h1 id="testing-harfbuzz">47. Testing HarfBuzz</h1>
+<p id="ix-1">HarfBuzz is checked in three ways. A run can be watched from inside: the buffer reports each step as it happens, a debug build prints the work of the table code, and a flag makes the library reshape its own output and compare. The repository holds test suites that compare results with recorded ones: shaping results in <code>test/shape</code>, the C API in <code>test/api</code>, subset fonts in <code>test/subset</code>, and a few more. And fuzzers feed it malformed fonts without end, looking for crashes rather than wrong answers.</p>
+<p id="ix-2">This chapter describes each, from the code and from the files in <code>test/</code>. The book’s build of HarfBuzz 15.1.0 has the tests turned off (<code>-Dtests=disabled</code> in <code>tools/build-harfbuzz.sh</code>), so nothing from the suites runs here, except one test line that the build can run because it needs only <code>hb-shape</code> and a font. Traces and verification do run live.</p>
+<p>The last part shows how to test HarfBuzz with a small font of your own, then the possible bugs found while this book’s examples were being built that way, and what they suggest about where bugs are left to find.</p>
+<h2 id="looking-inside-a-run">Looking inside a run</h2>
+<h3 id="buffer-messages">Buffer messages</h3>
+<p id="ix-3"><a href="buffers.html#messages">Buffers</a> describes the mechanism. <code>hb_buffer_set_message_func</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L2396"><code>hb-buffer.cc:2396</code></a>) installs a callback that HarfBuzz calls with a short message, formatted into 100 bytes (<code>:2445</code>), before and after each step it is willing to report. Returning false skips the step about to start. Since 13.0.0 a callback may change glyph IDs too, if it then calls <code>hb_buffer_changed</code>.</p>
+<p id="ix-4"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>hb-ot-layout.cc</code></a> sends “start table GSUB” and “start table GPOS” (<code>:2139</code>, <code>:2151</code>), “start lookup” and “end lookup” around each lookup (<code>:2096</code>, <code>:2119</code>), and “skipped lookup … because no glyph matches” when the buffer’s digest rules a lookup out. Normalization, the AAT tables, legacy <code>kern</code> and the script shapers send their own, and the verifier sends its failures the same way.</p>
+<p id="ix-5"><code>hb-shape --trace</code> installs a callback that prints each message and then the whole buffer, serialized just as the final output is, on standard error (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-output.hh#L136"><code>util/shape-output.hh:136</code></a>):</p>
+<pre><code>trace: start lookup 3 feature 'calt'	buffer: [space=0|e=1|e=2]
+</code></pre>
+<p id="ix-6">The <strong>detailed messages</strong> come from inside lookups: which glyph a single substitution is about to replace, which glyphs a ligature is about to join, and each recursion from a contextual lookup into a nested one. They cost time even when nobody is listening, so 12.0.0 turned them off; <code>NEWS</code> says that tools that need them “should define <code>HB_BUFFER_MESSAGE_MORE</code> to 1 when building HarfBuzz”. The macro defaults to <code>HB_DEBUG+0</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-debug.hh#L452"><code>hb-debug.hh:452</code></a>), and every such message is guarded by it, as here in the code that recurses from a contextual rule (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L2770"><code>hb-ot-layout-gsubgpos.hh:2770</code></a>, trimmed):</p>
+<pre><code class="language-c++">if (HB_BUFFER_MESSAGE_MORE &amp;&amp; c-&gt;buffer-&gt;messaging ())
+{
+  if (buffer-&gt;have_output)
+    c-&gt;buffer-&gt;sync_so_far ();
+  c-&gt;buffer-&gt;message (c-&gt;font,
+                      &quot;start recursing to lookup %u at %u&quot;,
+                      (unsigned) lookupRecord[i].lookupListIndex,
+                      buffer-&gt;idx);
+}
+</code></pre>
+<p id="ix-7">When the macro is 0, the compiler removes the whole block. This is why <code>tools/build-harfbuzz.sh</code> builds HarfBuzz more than once: <code>build/</code> as released, and <code>build-msg/</code> with <code>-DHB_BUFFER_MESSAGE_MORE=1</code>, which only the traces in this book use (<a href="building-harfbuzz.html#a-second-build-for-traces">Building HarfBuzz</a>); a third, <code>build-ft/</code>, adds FreeType. Here is the <code>calt</code> lookup of <a href="gsub.html">GSUB</a>’s test font on a space and two <code>e</code>s, with every line included:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape gsub/ligatures.ttf "␣ee" --language=en --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;latn&#x27;</td><td class="buf"><code>[space=0|e=1|e=2]</code></td></tr><tr><td class="what">start lookup 0 feature &#x27;liga&#x27;</td><td class="buf"><code>[space=0|e=1|e=2]</code></td></tr><tr><td class="what">skipped lookup 0 feature &#x27;liga&#x27; because no glyph matches</td><td class="buf"><code>[space=0|e=1|e=2]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;liga&#x27;</td><td class="buf"><code>[space=0|e=1|e=2]</code></td></tr><tr><td class="what">start lookup 3 feature &#x27;calt&#x27;</td><td class="buf"><code>[space=0|e=1|e=2]</code></td></tr><tr><td class="what">start recursing to lookup 2 at 1</td><td class="buf"><code>[space=0|e=1|e=2]</code></td></tr><tr><td class="what">replacing glyph at 1 (single substitution)</td><td class="buf"><code>[space=0|e=1|e=2]</code></td></tr><tr><td class="what">replaced glyph at 1 (single substitution)</td><td class="buf"><code>[space=0|e.init=1|e=2]</code></td></tr><tr><td class="what">end recursing to lookup 2</td><td class="buf"><code>[space=0|e.init=1|e=2]</code></td></tr><tr><td class="what">start recursing to lookup 2 at 2</td><td class="buf"><code>[space=0|e.init=1|e=2]</code></td></tr><tr><td class="what">replacing glyph at 2 (single substitution)</td><td class="buf"><code>[space=0|e.init=1|e=2]</code></td></tr><tr><td class="what">replaced glyph at 2 (single substitution)</td><td class="buf"><code>[space=0|e.init=1|e.init=2]</code></td></tr><tr><td class="what">end recursing to lookup 2</td><td class="buf"><code>[space=0|e.init=1|e.init=2]</code></td></tr><tr><td class="what">end lookup 3 feature &#x27;calt&#x27;</td><td class="buf"><code>[space=0|e.init=1|e.init=2]</code></td></tr><tr><td class="what">start lookup 4 feature &#x27;ccmp&#x27;</td><td class="buf"><code>[space=0|e.init=1|e.init=2]</code></td></tr><tr><td class="what">skipped lookup 4 feature &#x27;ccmp&#x27; because no glyph matches</td><td class="buf"><code>[space=0|e.init=1|e.init=2]</code></td></tr><tr><td class="what">end lookup 4 feature &#x27;ccmp&#x27;</td><td class="buf"><code>[space=0|e.init=1|e.init=2]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;latn&#x27;</td><td class="buf"><code>[space=0|e.init=1|e.init=2]</code></td></tr></tbody></table></div>
+<p id="ix-8">A released build prints the “start”, “end” and “skipped” lines. The four “recursing” lines and the four “replacing” and “replaced” lines come only from <code>build-msg/</code>. They show what a contextual lookup does at each position, which the lines around a lookup can’t: here the rule matched twice, at glyphs 1 and 2, and each time it ran lookup 2 on one glyph.</p>
+<h3 id="debug-output">Debug output</h3>
+<p id="ix-9">Below the messages is a second mechanism, for HarfBuzz’s own developers. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-debug.hh"><code>hb-debug.hh</code></a> defines a family of compile-time macros, <code>HB_DEBUG_APPLY</code>, <code>HB_DEBUG_SANITIZE</code>, <code>HB_DEBUG_SUBSET</code>, <code>HB_DEBUG_PAINT</code>, <code>HB_DEBUG_SHAPE_PLAN</code> and a dozen more, each defaulting to <code>HB_DEBUG+0</code>, so that <code>-DHB_DEBUG=…</code> turns them all on. A released library prints nothing.</p>
+<p id="ix-10">Each value is a depth. Code that wants tracing opens a trace object at the top of a function, and <code>return_trace</code> closes it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-debug.hh#L308"><code>hb-debug.hh:308</code></a>). With <code>HB_DEBUG_SANITIZE</code> set, every <code>sanitize ()</code> method in the library starts like this (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-debug.hh#L384"><code>hb-debug.hh:384</code></a>, trimmed):</p>
+<pre><code class="language-c++">#define TRACE_SANITIZE(this) \
+	hb_auto_trace_t&lt;HB_DEBUG_SANITIZE, bool&gt; trace \
+	(&amp;c-&gt;debug_depth, c-&gt;get_name (), this, HB_FUNC, &quot; &quot;)
+</code></pre>
+<p id="ix-11"><code>hb_auto_trace_t</code> prints the function’s name and the object’s address on standard error when it is entered, indented by the nesting depth, and the value and source line when it returns; only calls nested less deeply than the macro’s value are printed (<code>_hb_debug</code>, <code>:45</code>). So <code>-DHB_DEBUG_SANITIZE=4</code> prints the top four levels of the sanitizer’s descent through a table, and a large value prints all of it. With the macro at 0 the trace object is an empty struct, <code>hb_no_trace_t</code>, which the compiler removes (HarfBuzz pull request #605). <a href="compile-time-configuration.html">Compile-time configuration</a> lists these macros with the rest.</p>
+<h3 id="verification">Verification</h3>
+<p id="ix-12">The third tool is in the library itself, since 3.4.0. With <code>HB_BUFFER_FLAG_VERIFY</code> set on the buffer, <code>hb_shape_full</code> copies the text before shaping (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape.cc#L137"><code>hb-shape.cc:137</code></a>) and afterward checks the result against it: that clusters are monotone, and that cutting the text where the result says it is safe to break, or safe to concatenate, and shaping the pieces gives the same glyphs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer-verify.cc#L380"><code>hb-buffer-verify.cc:380</code></a>). A failure goes to the message callback if there is one, and otherwise to standard error, and <code>hb_shape_full</code> returns false. <code>hb-shape --verify</code> sets the flag. <a href="for-applications.html">For applications</a> explains what the checks mean for line breaking, and <a href="buffers.html#verification">Buffers</a> how they are made.</p>
+<p id="ix-13">Verification is the one check that needs no expected answer: it compares HarfBuzz with itself. That is why the test runner, the threading test and the shaping fuzzer below all turn it on. It is also its limit. A result that is wrong in the same way whether the text is shaped whole or in pieces passes.</p>
+<h2 id="the-shaping-tests">The shaping tests</h2>
+<p id="ix-14"><code>test/shape</code> holds the suite that matters most for this book. Its tests are text files, each line a shaping run and its expected result, kept in three sets under <code>test/shape/data/</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Set</th>
+<th>Files</th>
+<th>Test lines</th>
+<th>Where it comes from</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>in-house</code></td>
+<td>90</td>
+<td>5,277</td>
+<td>HarfBuzz’s own, one file per subject (<code>arabic-stch.tests</code>, <code>indic-init.tests</code>, <code>vertical.tests</code> …)</td>
+</tr>
+<tr>
+<td id="ix-15"><code>aots</code></td>
+<td>128</td>
+<td>276</td>
+<td id="ix-16">Adobe’s Annotated OpenType Specification tests, one per lookup type and format</td>
+</tr>
+<tr>
+<td><code>text-rendering-tests</code></td>
+<td>94</td>
+<td>753</td>
+<td>the Unicode Consortium’s text-rendering-tests repository</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-17">(Test lines count every line that isn’t blank, a comment or a directive.) There is no Microsoft suite in the tree at 15.1.0. What comes from Microsoft is data: <code>src/ms-use/</code> holds the USE category overrides and the vowel-constraint list that the generators read (<a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a>). Microsoft’s own shapers appear only as backends: <code>uniscribe.tests</code> and <code>directwrite.tests</code> compare them with the <code>ot</code> shaper, on Windows.</p>
+<h3 id="the-format-of-a-test">The format of a test</h3>
+<p id="ix-18">A line has four fields separated by semicolons: the font, the <code>hb-shape</code> options, the text as code points, and the expected output. Here is the first line of <code>in-house/tests/arabic-stch.tests</code>, a Syriac word with an abbreviation mark, which the <code>stch</code> feature stretches across the word (<a href="joining-scripts.html">Joining scripts</a>):</p>
+<pre><code>../fonts/d9b8bc10985f24796826c29f7ccba3d0ae11ec02.ttf;--no-glyph-names;U+0718,U+070F,U+0718,U+0718,U+002E;[1=4+168|3=3+502|3=2+502|4=1@-1004,0+0|5=1@-876,0+0|5=1@-799,0+0|5=1@-722,0+0|5=1@-645,0+0|4=1@-566,0+0|5=1@-438,0+0|5=1@-361,0+0|5=1@-284,0+0|5=1@-207,0+0|4=1@-128,0+0|3=0+502]
+</code></pre>
+<p id="ix-19">The font path is relative to the test file. In-house fonts are named by the SHA-1 of their contents, because <code>record-test.sh</code> makes them: given an <code>hb-shape</code> command, it subsets the font to the characters of the test with fontTools’ <code>pyftsubset</code>, checks that the subset gives the same result as the original (or, for fonts without glyph names, the same picture through <code>hb-view</code>), and saves it under its hash (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/shape/README.md"><code>test/shape/README.md</code></a>). The expected output is what <code>hb-shape</code> printed when the test was recorded. A <code>*</code> in its place means “any result”: the test only checks that shaping finishes.</p>
+<p id="ix-20">Three other kinds of line can appear. A line beginning <code>#</code> and a space is a comment; <code>#</code> followed directly by a test is a test turned off. A line beginning <code>@</code> is a directive that applies to the rest of the file: <code>@shapers=ot,uniscribe</code>, <code>@font-funcs=ot,ft</code>, or with a minus, <code>@font-funcs-=ft</code>, to leave some out. And a font given as an absolute path, with a hash after an <code>@</code>, is a system font: <code>macos.tests</code> tests Apple’s fonts by path, and a test is skipped if the font is missing or its hash differs (<code>run-tests.py:204</code>).</p>
+<p id="ix-21">The book’s build can run that line, because the test font is in HarfBuzz’s source tree. These are the options the runner adds to it, described next:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hb:test/shape/data/in-house/fonts/d9b8bc10985f24796826c29f7ccba3d0ae11ec02.ttf</td><td class="in"><span class="txt">ܘ܏ܘܘ.</span><span class="cps">U+0718 U+070F U+0718 U+0718 U+002E</span></td><td class="opt">--no-glyph-names --verify --unsafe-to-concat --safe-to-insert-tatweel</td><td class="out"><code>[1=4+168|3=3+502|3=2+502|4=1@-1004,0+0|5=1@-876,0+0|5=1@-799,0+0|5=1@-722,0+0|5=1@-645,0+0|4=1@-566,0+0|5=1@-438,0+0|5=1@-361,0+0|5=1@-284,0+0|5=1@-207,0+0|4=1@-128,0+0|3=0+502]</code></td></tr><tr><td class="font">hb:test/shape/data/in-house/fonts/d9b8bc10985f24796826c29f7ccba3d0ae11ec02.ttf</td><td class="in"><span class="txt">ܘ܏ܘܘ.</span><span class="cps">U+0718 U+070F U+0718 U+0718 U+002E</span></td><td class="opt"></td><td class="out"><code>[period=4+168|uni0718=3+502|uni0718=2+502|syrcAbbrDot=1@-1004,0+0|syrcAbbrLine=1@-876,0+0|syrcAbbrLine=1@-799,0+0|syrcAbbrLine=1@-722,0+0|syrcAbbrLine=1@-645,0+0|syrcAbbrDot=1@-566,0+0|syrcAbbrLine=1@-438,0+0|syrcAbbrLine=1@-361,0+0|syrcAbbrLine=1@-284,0+0|syrcAbbrLine=1@-207,0+0|syrcAbbrDot=1@-128,0+0|uni0718=0+502]</code></td></tr></tbody></table></div>
+<p id="ix-22">The first row is the expected output exactly, and verification passed. The second gives the same run with glyph names: three <code>syrcAbbrDot</code> glyphs, at −1004, −566 and −128, with four <code>syrcAbbrLine</code> tiles between each pair, all in cluster 1, the mark’s, laid back over the letters.</p>
+<h3 id="how-a-test-is-run">How a test is run</h3>
+<p id="ix-23"><code>run-tests.py</code> is given the path of <code>hb-shape</code> and a list of test files, and prints its results in TAP, the format Meson’s test runner reads (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/shape/meson.build"><code>test/shape/meson.build</code></a> registers one test per set). It starts one <code>hb-shape --batch</code> and writes each test to it as a line of arguments joined by semicolons, reading one line of output back (<code>run-tests.py:25</code>), restarting it if a test crashes it. The environment is <code>LC_ALL=C</code>, so that the language never comes from the locale.</p>
+<p>For each line, the runner builds the command from the font, <code>--unicodes</code> and the line’s options, and adds <code>--verify --unsafe-to-concat --safe-to-insert-tatweel</code> unless the expected output is <code>*</code> (<code>:284</code>). So every test of the suite is also a verification test, with the unsafe-to-concat and tatweel flags computed and checked too.</p>
+<p id="ix-24">Then it runs the line once for each backend it should test. Before reading any test it asks <code>hb-shape</code> for its <code>--list-shapers</code>, <code>--list-face-loaders</code> and <code>--list-font-funcs</code>. Shapers and face loaders default to <code>ot</code> only, unless the environment variables <code>HB_SHAPER_LIST</code> and <code>HB_FACE_LOADER</code> name more (<code>:146</code>), but font functions default to every kind the build has: <code>ot</code>, and also <code>ft</code>, <code>fontations</code>, <code>coretext</code> and <code>directwrite</code> where they were built in (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2608"><code>hb-font.cc:2608</code></a>). A line runs with <code>--font-funcs=ot</code>, again with <code>--font-funcs=ft</code>, and so on, and every run must give the expected output, so the suite also checks that the font functions agree on advances, origins and glyph names. A directive or an option narrows the list, and a backend the build lacks is counted as skipped, not failed. The book’s build has only <code>ot</code>.</p>
+<p id="ix-25">A last detail: if the output names glyphs as <code>gid…</code> because the font has no names, and it differs from what was expected, the runner converts both to bare glyph IDs with <code>--glyphs --no-glyph-names</code> and compares those, so that glyph names coming from one backend and not another don’t fail the test (issue #5169, <code>:323</code>).</p>
+<h3 id="where-the-other-sets-come-from">Where the other sets come from</h3>
+<p id="ix-26">The AOTS set is generated. <code>aots/update.py</code> clones Adobe’s <code>aots</code> repository, builds its test fonts, compiles <code>hb-aots-tester.cpp</code> against HarfBuzz and runs it, which writes the <code>.tests</code> files. Its lines turn on a feature called <code>test</code> and print without clusters or names:</p>
+<pre><code>../fonts/gpos1_1_simple_f1.otf;--features=&quot;test&quot; --single-par --no-clusters --no-glyph-names --ned;U+0011,U+0012,U+0013,U+0014,U+0015;[17|18@1300,0|19@3000,0|20@4300,0|21@6000,0]
+</code></pre>
+<p id="ix-27">The text-rendering-tests set is imported by its own <code>update.py</code> from the Unicode Consortium’s repository (<code>text-rendering-tests/README</code>). Its files begin with <code>@font-funcs=ot,ft</code>, and a <code>DISABLED</code> file lists the few it doesn’t run: one for a non-Unicode <code>cmap</code>, five for rounding differences.</p>
+<h3 id="other-golden-file-tests">Other golden-file tests</h3>
+<p id="ix-28"><code>test/vector</code> does for <code>hb-vector</code> what <code>test/shape</code> does for <code>hb-shape</code>: lines of font, options, code points and an expected SVG file, compared by its own <code>run-tests.py</code>. And <code>src/</code> holds 38 unit tests (<a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/test-*.cc</code></a>) of internal pieces with no public API: the repacker, the serializer, the instancer’s solver, geometry and others.</p>
+<h2 id="the-api-tests">The API tests</h2>
+<p id="ix-29"><code>test/api</code> tests the public C API, one file per subject: <code>test-buffer.c</code>, <code>test-font.c</code>, <code>test-ot-layout.c</code>, <code>test-subset-glyf.c</code> and about seventy more. They use GLib’s test framework, so they are built only when GLib is found (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/api/meson.build#L1"><code>test/api/meson.build:1</code></a>), and the files for FreeType, Graphite, CoreText, DirectWrite and cairo only when those are. <code>hb-test.h</code> wraps the framework so that a test is registered by its function’s name: <code>hb_test_add (test_buffer_properties)</code> becomes the test path <code>/buffer/properties</code>.</p>
+<p id="ix-30">The tests are ordinary assertions: create an object, call the API, <code>g_assert_true</code> on what comes back. Their fonts are in <code>test/api/fonts</code>, some made by Python scripts beside them, such as <code>generate-cff2-nested-delta-font.py</code>, which build edge cases no font editor would produce. <code>results-paint/</code> holds the expected output of the paint API.</p>
+<h2 id="the-subsetting-tests">The subsetting tests</h2>
+<p id="ix-31"><code>test/subset</code> checks the subsetter by its output files. Each of its 104 test files (<code>data/tests/*.tests</code>) lists fonts, profiles and subsets:</p>
+<pre><code>FONTS:
+Roboto-Regular.abc.ttf
+NanumMyeongjo-Regular-subset.ttf
+
+PROFILES:
+default.txt
+drop-hints.txt
+retain-gids.txt
+
+SUBSETS:
+a
+abc
+*
+</code></pre>
+<p id="ix-32">That is part of <code>basics.tests</code>, shortened. Each profile in <code>data/profiles/</code> is a file of <code>hb-subset</code> options, and each subset is a set of characters (<code>*</code> is all). Every combination is a test, and its expected result is a whole font in <code>data/expected/&lt;test name&gt;/</code>, named after the font, profile and code points: <code>NanumMyeongjo-Regular-subset.default.61,62,63.ttf</code>.</p>
+<p id="ix-33"><code>run-tests.py</code> subsets with <code>hb-subset</code> and compares the output with the expected font byte for byte (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/subset/run-tests.py#L115"><code>test/subset/run-tests.py:115</code></a>). If they differ, it dumps both with fontTools and prints the difference of the TTX, so that a failure says which table changed; and if <code>ots-sanitize</code> (the OpenType Sanitizer) is installed, it checks every output with that too.</p>
+<p id="ix-34">The expected fonts are not just whatever HarfBuzz once produced. <code>generate-expected-outputs.py</code> makes them by running both subsetters, HarfBuzz’s and fontTools’ (with <code>--no-harfbuzz-repacker</code>, “so we aren’t comparing to ourself”), and stops if their TTX dumps differ (<code>:90</code>), unless a test is marked <code>no_fonttools</code>. So an expected subset is one that two independent implementations agree on. <a href="subsetting.html">Subsetting</a> and <a href="instancing.html">Instancing</a> describe what is being checked; the repacker has tests of its own here too (<code>repack_tests/</code>, <code>run-repack-tests.py</code>).</p>
+<h2 id="threads-and-benchmarks">Threads and benchmarks</h2>
+<p id="ix-35"><code>test/threads</code> has two programs in Meson’s <code>slow</code> suite. <code>hb-shape-threads.cc</code> shares one <code>hb_font_t</code> among several threads (three by default) that wait on a condition variable, then all start shaping the same texts at once, each with its own buffer and with <code>HB_BUFFER_FLAG_VERIFY</code> set, once for each kind of font functions. <code>hb-subset-threads.cc</code> does the same for subsetting. Neither compares results between threads. They give a thread checker something to find: HarfBuzz’s continuous integration builds with ThreadSanitizer, as well as AddressSanitizer with UndefinedBehaviorSanitizer and MemorySanitizer (<code>.github/workflows/sanitizers.yml</code>).</p>
+<p id="ix-36"><code>perf/</code> holds benchmarks written with Google Benchmark, built only with <code>-Dbenchmark=enabled</code>: <code>benchmark-shape</code>, <code>benchmark-font</code>, <code>benchmark-subset</code>, <code>benchmark-set</code>, <code>benchmark-map</code>, <code>benchmark-ot</code> and <code>benchmark-gpu</code>. They run on fonts in <code>perf/fonts/</code> (Roboto, Amiri, Noto Nastaliq Urdu, Gulzar, Noto Sans Duployan) and <code>test/subset/data/fonts/</code>, with texts in <code>perf/texts/</code>: <em>The Little Prince</em> in English and Persian, and word lists in English, Persian and Hindi. The README calls <code>benchmark-font</code> the most useful.</p>
+<h2 id="fuzzing">Fuzzing</h2>
+<p id="ix-37">A <strong>fuzzer</strong> runs a program over and over on inputs mutated from a corpus of examples, and watches for the program crashing, hanging, or using too much memory; mutations that reach new code are kept and mutated further. <code>test/fuzzing</code> has fuzzers for shaping, subsetting, the repacker, and the three renderers (raster, vector, GPU), and, when HarfBuzz is built with <code>-Dexperimental_api=true</code>, for hb-depend (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/fuzzing/meson.build"><code>test/fuzzing/meson.build</code></a>). Each defines the one function libFuzzer calls, <code>LLVMFuzzerTestOneInput</code>, which takes a byte string and treats it as a font, perhaps with options at its end. The shaping fuzzer, trimmed (<code>hb-shape-fuzzer.cc:7</code>):</p>
+<pre><code class="language-c++">extern &quot;C&quot; int LLVMFuzzerTestOneInput (const uint8_t *data, size_t size)
+{
+  alloc_state = _fuzzing_alloc_state (data, size);
+
+  _fuzzing_shape_input_t input;
+  if (_fuzzing_prepare_shape_input (data, size, 12, 12, &amp;input)
+      == HB_FUZZING_SHAPE_INPUT_MALFORMED)
+    return 0;
+
+  {
+    hb_buffer_t *buffer = hb_buffer_create ();
+    hb_buffer_set_flags (buffer, HB_BUFFER_FLAG_VERIFY);
+    hb_buffer_add_utf8 (buffer, &quot;ABCDEXYZ123@_%&amp;)*$!&quot;, -1, 0, -1);
+    hb_buffer_guess_segment_properties (buffer);
+    hb_shape (input.font, buffer, nullptr, 0);
+    hb_buffer_destroy (buffer);
+  }
+
+  /* ... then shape 16 code points taken from the input,
+     after running test_font () over the font's other APIs ... */
+}
+</code></pre>
+<p id="ix-38">The input is the font, at a scale of 12. Its last 64 bytes are read again as 16 code points to shape, and its last byte as a number of variation coordinates, taken from the bytes before it (<code>hb-shape-input.hh:243</code>). A newer, extended form ends with the magic <code>HBSUBFZ2</code> and a list of operations (add text, set an axis), so that a fuzzer can reach variations and text on purpose. <code>test_font ()</code> comes from <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/api/test-ot-face.c"><code>test/api/test-ot-face.c</code></a>: it calls many of the face and font APIs on the font, so the shaping fuzzer covers those too.</p>
+<p id="ix-39"><strong>The corpus.</strong> <code>test/fuzzing/fonts/</code> holds 532 fonts, and <code>graphs/</code> ten inputs for the repacker. Most are named like <code>clusterfuzz-testcase-minimized-hb-subset-fuzzer-6461128124465152</code>: inputs that once made a fuzzer fail, minimized, and kept after the fix, under the names ClusterFuzz gave them. When HarfBuzz is built normally, with tests, the fuzzers aren’t linked with libFuzzer but with <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/main.cc"><code>main.cc</code></a>, which reads each file named on its command line and passes it to <code>LLVMFuzzerTestOneInput</code> once, printing TAP (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/fuzzing/main.cc"><code>test/fuzzing/main.cc</code></a>). Meson runs them over the corpus, 64 files a test, as the <code>fuzzing</code> suite. So every crash ever found becomes a regression test that runs on every build. <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a> is the code most of those crashes hardened.</p>
+<p id="ix-40"><strong>Continuous fuzzing.</strong> <code>NEWS</code> for 1.0.5, in 2015, reports memory access bugs “discovered using libFuzzer”, and “we now have continuous fuzzing set up, to avoid issues like these creeping in again.” The repository’s own part of that is <code>.github/workflows/cifuzz.yml</code>: on every pull request, OSS-Fuzz’s CIFuzz action builds the fuzzers of the OSS-Fuzz project <code>harfbuzz</code> and runs them for 600 seconds, failing the pull request if they find a crash.</p>
+<p id="ix-41"><strong>Failing allocations.</strong> Code that handles running out of memory rarely runs. When the fuzzers are built for libFuzzer (<code>-Dfuzzer_ldflags=…</code>), HarfBuzz is compiled with <code>HB_CUSTOM_MALLOC</code> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/failing-alloc.c"><code>src/failing-alloc.c</code></a> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L659"><code>src/meson.build:659</code></a>), whose <code>hb_malloc_impl</code>, <code>hb_calloc_impl</code> and <code>hb_realloc_impl</code> return null about one time in sixteen:</p>
+<pre><code class="language-c">void* hb_malloc_impl (size_t size)
+{
+  return (fastrand () % 16) ? malloc (size) : NULL;
+}
+</code></pre>
+<p id="ix-42"><code>fastrand</code> is a linear congruential generator seeded with <code>alloc_state</code>, which each fuzzer sets from its input: the input’s size, or 0 (never fail) when the input’s last byte is below 0x80 (<code>hb-fuzzer.hh:28</code>). So half the inputs run with a working allocator, and the other half fail allocations at points that are random but the same every time the input is run, which is what makes a crash reproducible. <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a> has the “carry on, check once” style this forces on the code.</p>
+<p id="ix-43"><strong>What fuzzing can’t find.</strong> A fuzzer needs a failure it can detect, and wrong output isn’t one. The shaping fuzzer sets <code>HB_BUFFER_FLAG_VERIFY</code>, but <code>hb_shape</code> returns nothing, and a failed check only prints a message (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer-verify.cc#L49"><code>hb-buffer-verify.cc:49</code></a>), so a verification failure doesn’t stop a fuzzing run (inferred from the code: nothing in the fuzzer reads the message). The exception is <code>hb-depend-closure-parity</code>, which runs on valid fonts, computes a glyph closure from hb-depend’s graph and from the subsetter, and fails if they differ (<a href="hb-depend.html">hb-depend</a>). It is a correctness check that a machine can run without being told the answer, and so the only one of its kind here.</p>
+<h2 id="testing-with-a-font-of-your-own">Testing with a font of your own</h2>
+<p id="ix-44">Many of HarfBuzz’s own shaping tests use small fonts, each made for one question, with the output it should give (<a href="#the-shaping-tests">The shaping tests</a>). The same method works for anyone who wants to know what HarfBuzz does with a rule: build a font that has that rule and little else, and shape some text with it. This book’s examples were all made that way, and so were the bugs it found, in the next section. It is also how to cut a misbehaving font down to the lookups in question.</p>
+<p id="ix-45">Shaping never looks at outlines, so the glyphs can be plain boxes. What matters is their names, the <code>cmap</code>, the advances and the layout tables. This program builds such a font from a feature file (<a href="reading-feature-files.html">Reading feature files</a> explains enough of the language to read one) with fontTools, given the characters it needs and any glyphs the rules make that no character maps to:</p>
+<figure class="listing"><figcaption><a href="https://github.com/Lorp/how-harfbuzz-works/blob/main/examples/test-font/make-test-font.py"><code>examples/test-font/make-test-font.py</code></a></figcaption><pre><code class="language-python">&quot;&quot;&quot;Make a small font to ask HarfBuzz a question about some layout rules.
+
+usage: python3 make-test-font.py FEATURES.fea OUT.ttf TEXT [GLYPH ...]
+
+TEXT is the characters the font needs: each gets a glyph named as in the
+Adobe Glyph List (a, T, acutecomb...), or uniXXXX. Each GLYPH is an extra,
+unencoded glyph that the feature file&#x27;s rules make, such as f_i.
+
+Every glyph is a box. Shaping doesn&#x27;t look at outlines: only the glyph
+names, the cmap, the advances and the layout tables matter. Ligatures
+(names with _) are wider, and combining marks have no advance.
+
+Needs fontTools (pip install fonttools).
+&quot;&quot;&quot;
+import sys
+import unicodedata
+
+from fontTools.agl import UV2AGL
+from fontTools.feaLib.builder import addOpenTypeFeatures
+from fontTools.fontBuilder import FontBuilder
+from fontTools.pens.ttGlyphPen import TTGlyphPen
+
+
+def box(width):
+    pen = TTGlyphPen(None)
+    pen.moveTo((50, 0))
+    pen.lineTo((50, 500))
+    pen.lineTo((max(width, 100) - 50, 500))
+    pen.lineTo((max(width, 100) - 50, 0))
+    pen.closePath()
+    return pen.glyph()
+
+
+def main(fea, out, text, extra):
+    cmap = {}
+    for char in text:
+        cmap[ord(char)] = UV2AGL.get(ord(char), f&quot;uni{ord(char):04X}&quot;)
+    marks = {name for cp, name in cmap.items() if unicodedata.combining(chr(cp))}
+    names = [&quot;.notdef&quot;] + sorted(set(cmap.values())) + list(extra)
+
+    advances = {}
+    for name in names:
+        if name in marks:
+            advances[name] = 0
+        elif &quot;_&quot; in name:
+            advances[name] = 900
+        else:
+            advances[name] = 500
+
+    builder = FontBuilder(1000, isTTF=True)
+    builder.setupGlyphOrder(names)
+    builder.setupCharacterMap(cmap)
+    builder.setupGlyf({name: box(advances[name]) for name in names})
+    builder.setupHorizontalMetrics({name: (advances[name], 50) for name in names})
+    builder.setupHorizontalHeader(ascent=800, descent=-200)
+    builder.setupNameTable({&quot;familyName&quot;: &quot;Test&quot;, &quot;styleName&quot;: &quot;Regular&quot;})
+    builder.setupOS2(sTypoAscender=800, usWinAscent=800, usWinDescent=200)
+    builder.setupPost()
+    addOpenTypeFeatures(builder.font, fea)
+    builder.save(out)
+
+
+if __name__ == &quot;__main__&quot;:
+    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:])
+</code></pre></figure>
+
+<p id="ix-46">The font below was built by this program, from a feature file that asks a question: does <code>calt</code> see the ligature <code>liga</code> made?</p>
+<pre><code>feature liga {
+  sub f i by f_i;
+} liga;
+
+feature calt {
+  sub f_i' T by f_i.short;
+} calt;
+</code></pre>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">question.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--language=en</td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">question.ttf</td><td class="in"><span class="txt">fiT</span><span class="cps">U+0066 U+0069 U+0054</span></td><td class="opt">--language=en</td><td class="out"><code>[f_i.short=0+900|T=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-47">It does: <code>liga</code>’s lookup comes first in the LookupList, and under the default shaper the two run in one stage, in that order (<a href="feature-order.html">Feature order</a>). The trace shows each step:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape question.ttf "fiT" --language=en --trace</code></div><table><tbody><tr><td class="what">start lookup 0 feature &#x27;liga&#x27;</td><td class="buf"><code>[f=0|i=1|T=2]</code></td></tr><tr><td class="what">ligating glyphs at 0,1</td><td class="buf"><code>[f=0|i=1|T=2]</code></td></tr><tr><td class="what">ligated glyph at 0</td><td class="buf"><code>[f_i=0|T=2]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;liga&#x27;</td><td class="buf"><code>[f_i=0|T=2]</code></td></tr><tr><td class="what">start lookup 1 feature &#x27;calt&#x27;</td><td class="buf"><code>[f_i=0|T=2]</code></td></tr><tr><td class="what">start recursing to lookup 2 at 0</td><td class="buf"><code>[f_i=0|T=2]</code></td></tr><tr><td class="what">replacing glyph at 0 (single substitution)</td><td class="buf"><code>[f_i=0|T=2]</code></td></tr><tr><td class="what">replaced glyph at 0 (single substitution)</td><td class="buf"><code>[f_i.short=0|T=2]</code></td></tr><tr><td class="what">end recursing to lookup 2</td><td class="buf"><code>[f_i.short=0|T=2]</code></td></tr><tr><td class="what">end lookup 1 feature &#x27;calt&#x27;</td><td class="buf"><code>[f_i.short=0|T=2]</code></td></tr></tbody></table></div>
+<p>Some things this book learned to do in its own test fonts:</p>
+<ul>
+<li id="ix-48"><strong>Ask one question per font.</strong> Two fonts that differ in one thing, such as the order of two feature blocks, answer a question better than one font with everything in it.</li>
+<li id="ix-49"><strong>Number lookups on purpose.</strong> A lookup’s place in the LookupList decides when it runs within a stage, and feaLib numbers lookups in the order it meets them. The fonts behind <a href="feature-order.html">Feature order</a> number theirs in opposite orders, to find where stages end.</li>
+<li id="ix-50"><strong>Pass <code>--language</code></strong> in every <code>hb-shape</code> command whose result could depend on it. Otherwise <code>hb-shape</code> takes the language from the locale.</li>
+<li id="ix-51"><strong>Use <code>--trace</code></strong>, which needs a HarfBuzz built with detailed traces (<a href="building-harfbuzz.html">Building HarfBuzz</a>), and <code>--verify</code>, <code>--show-flags</code> and <code>--show-extents</code> (<a href="command-line-tools.html">The command-line tools</a>).</li>
+</ul>
+<h2 id="the-bugs-this-book-found">The bugs this book found</h2>
+<p id="ix-52">Writing this book meant building small fonts that exercise one thing each, shaping text with them, and checking every result against the code and the specifications. Some results didn’t match. Those are drafted as bug reports in <a href="https://github.com/Lorp/how-harfbuzz-works/blob/main/notes/upstream-bug-reports.md"><code>notes/upstream-bug-reports.md</code></a>, in the book’s repository, eighty-two so far, each reproduced on HarfBuzz 15.1.0 (commit <code>3df40d9b</code>), most with a font or a command that needs nothing from this book.</p>
+<p><strong>None is yet on HarfBuzz’s issue tracker.</strong> The first sixty-five went to HarfBuzz’s author directly, and many are already fixed (see the last column below), but they are still drafts, written by the book’s authors. Some are certainly bugs, some are matters of policy that HarfBuzz’s developers may well decide the other way, and a few were found by reading code and have no example yet.</p>
+<p>The tables below give each draft’s number in that file, a one-line summary, the chapter that describes the behavior, and how it was checked:</p>
+<ul>
+<li><strong>Live.</strong> The chapter shows the behavior in a block, built from HarfBuzz 15.1.0 when the page is built.</li>
+<li id="ix-53"><strong>Run.</strong> Reproduced with HarfBuzz’s tools or a small program, but not shown live.</li>
+<li><strong>Read.</strong> Found by reading the code.</li>
+</ul>
+<p id="ix-54">The last column records what has happened upstream. Drafts 1–65 were shown to HarfBuzz’s author, Behdad Esfahbod, on 17 November 2026, and he fixed many of them on the <code>main</code> branch the same day. Every draft was checked against <code>main</code> at commit <code>454f9c4</code> (17 November) on 18 November 2026, by rerunning its example or, for those found by reading, reading the code again. The column gives the commit that fixed a draft, with its pull request; “partly fixed” where some of a draft’s items are fixed; “changed” where the behavior is different but the problem remains; and “in progress” where a pull request that addresses it is open but not merged. An empty cell means the draft still describes <code>main</code>. Related issues come from a keyword search of HarfBuzz’s issues and pull requests, which isn’t exhaustive.</p>
+<!-- Generated by hand from notes/upstream-bug-reports.md. To add a draft: give it a
+     row in the group that fits, with its number, a summary, the chapter that shows it
+     and how it was checked; update the counts in the paragraph after the tables. -->
+<h3 id="shaping-results">Shaping results</h3>
+<p id="ix-55">Wrong glyphs or positions from <code>hb_shape</code>, in fonts and text that are valid.</p>
+<div class="bugs">
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Summary</th>
+<th>Chapter</th>
+<th>Checked</th>
+<th>Upstream</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>5</td>
+<td id="ix-56">Two glyph-flag functions treat cluster level 3 as monotone</td>
+<td><a href="buffers.html">Buffers</a></td>
+<td>Read</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/7f0fe35618c08a7089af610b7546fa1cba484c29"><code>7f0fe35</code></a> (pull request #6706)</td>
+</tr>
+<tr>
+<td>8</td>
+<td id="ix-57">A ranged request then a global one for the same feature clears the global bit, turning off every global feature in the range</td>
+<td id="ix-58"><a href="from-features-to-lookups.html">From features to lookups</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/5d9dfde259979dd91439903d09e708d16a41bbf7"><code>5d9dfde</code></a> (pull request #6704)</td>
+</tr>
+<tr>
+<td>10</td>
+<td id="ix-59">In the Indic shapers’ normalization mode, text without marks is decomposed but never recomposed</td>
+<td id="ix-60"><a href="normalization.html">Normalization</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/bc7dff9a51e900d25d35ee1a903ab496caf0feae"><code>bc7dff9</code></a> (pull request #6705)</td>
+</tr>
+<tr>
+<td>11</td>
+<td id="ix-61">A variation-selector cluster ignores the not-found glyph</td>
+<td id="ix-62"><a href="normalization.html">Normalization</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/97d879446fe4de6f09ece771ef645127947f7795"><code>97d8794</code></a> (pull request #6699)</td>
+</tr>
+<tr>
+<td>12</td>
+<td id="ix-63">A mark skips a base whose <code>mark</code> bit is off and attaches to an earlier one</td>
+<td id="ix-64"><a href="gpos.html">GPOS: positioning glyphs</a></td>
+<td>Live</td>
+<td>In progress: pull request #6736, not merged</td>
+</tr>
+<tr>
+<td>15</td>
+<td id="ix-65">A cross-stream <code>kern</code> value of 0x8000 isn’t treated as a reset</td>
+<td><a href="legacy-kern.html">Legacy kern</a></td>
+<td>Live</td>
+<td>In progress: pull request #6732, not merged</td>
+</tr>
+<tr>
+<td>16</td>
+<td id="ix-66">Fallback mark positioning ignores the base’s x offset</td>
+<td id="ix-67"><a href="fallbacks.html">Fallbacks</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/641971dd14283a97f5e7cf8a7f12ac6337db74f7"><code>641971d</code></a> (pull request #6701)</td>
+</tr>
+<tr>
+<td>17</td>
+<td>Fallback positioning centers LEFT and RIGHT marks, contrary to its comment</td>
+<td id="ix-68"><a href="fallbacks.html">Fallbacks</a></td>
+<td>Live</td>
+<td>In progress: pull request #6742, not merged. It rewrites the comment and keeps the centering</td>
+</tr>
+<tr>
+<td>18</td>
+<td id="ix-69">Vertical <code>kern</code> subtables can never apply</td>
+<td><a href="legacy-kern.html">Legacy kern</a></td>
+<td>Live</td>
+<td>In progress: pull request #6734, not merged</td>
+</tr>
+<tr>
+<td>19</td>
+<td id="ix-70">The Hangul shaper’s dotted circle copies the tone mark’s properties</td>
+<td><a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/2831a8a45c77c180373987312958d31b3575a72c"><code>2831a8a</code></a> (pull request #6711)</td>
+</tr>
+<tr>
+<td>20</td>
+<td id="ix-71">Two dotted circles before a Hangul tone mark at the start of text</td>
+<td><a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/59fa8f0c28df047b6786a60febf2c8b53a694e05"><code>59fa8f0</code></a> (pull request #6712)</td>
+</tr>
+<tr>
+<td>21</td>
+<td id="ix-72">Hebrew: a <code>mark</code> feature under <code>DFLT</code> stops composition, but GPOS isn’t applied</td>
+<td><a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></td>
+<td>Live</td>
+<td>In progress: pull request #6738, not merged</td>
+</tr>
+<tr>
+<td>22</td>
+<td id="ix-73">Indic <code>init</code> ignores pre-context</td>
+<td><a href="indic-model.html">The Indic model</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/5795f8699503de6c64206cb939eaae9086b279f1"><code>5795f86</code></a> (pull request #6713)</td>
+</tr>
+<tr>
+<td>24</td>
+<td id="ix-74"><code>stch</code> tiles are shifted when they fit the word exactly</td>
+<td id="ix-75"><a href="joining-scripts.html">Joining scripts</a></td>
+<td>Live</td>
+<td>In progress: pull request #6733, not merged</td>
+</tr>
+<tr>
+<td>29</td>
+<td id="ix-76">Khmer moves a second COENG + RO in front of the first</td>
+<td><a href="khmer-and-myanmar.html">Khmer and Myanmar</a></td>
+<td>Live</td>
+<td>In progress: pull request #6735, not merged</td>
+</tr>
+<tr>
+<td>30</td>
+<td id="ix-77">USE: a mark after a space attaches to the space</td>
+<td id="ix-78"><a href="universal-shaping-engine.html">The Universal Shaping Engine</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>31</td>
+<td id="ix-79">USE: a space doesn’t end a word for topographical forms</td>
+<td id="ix-80"><a href="universal-shaping-engine.html">The Universal Shaping Engine</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>32</td>
+<td id="ix-81">USE: ZWNJ after a virama doesn’t stop a half form</td>
+<td id="ix-82"><a href="universal-shaping-engine.html">The Universal Shaping Engine</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>33</td>
+<td id="ix-83">Indic: a broken cluster starting with RA + virama loses its reph</td>
+<td id="ix-84"><a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>34</td>
+<td>A ZWJ defeats the vowel constraints</td>
+<td id="ix-85"><a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>35</td>
+<td id="ix-86">The vowel-constraint dotted circle copies the next character’s properties</td>
+<td id="ix-87"><a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/74fc8c86c594ec594904fde28b548f5fc6ef2384"><code>74fc8c8</code></a> (pull request #6710)</td>
+</tr>
+<tr>
+<td>38</td>
+<td id="ix-88">With GSUB, GPOS and <code>kerx</code>, <code>kerx</code> never applies and marks stop being zeroed</td>
+<td><a href="aat-positioning.html">AAT positioning</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>39</td>
+<td id="ix-89"><code>trak</code> vertical tracking is added with the wrong sign</td>
+<td><a href="aat-positioning.html">AAT positioning</a></td>
+<td>Live</td>
+<td id="ix-90">Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/45c7759a025ace1fd7ca632114ec7111808d5fc5"><code>45c7759</code></a> (pull request #6700), with <a href="https://github.com/harfbuzz/harfbuzz/commit/1e2cf5dafa790d809dec0ef05850b1dd3703d1b5"><code>1e2cf5d</code></a> (#6716) for the Core Text font functions</td>
+</tr>
+<tr>
+<td>40</td>
+<td id="ix-91"><code>kerx</code> format 4 control-point attachment does nothing with the <code>ot</code> font functions</td>
+<td><a href="aat-positioning.html">AAT positioning</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>58</td>
+<td id="ix-92">Cross-stream kerning in legacy <code>kern</code> and <code>kerx</code> raises every later glyph but marks only the pair unsafe to break</td>
+<td><a href="for-applications.html">For applications</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>59</td>
+<td id="ix-93">Hangul at cluster level 1 leaves a trailing jamo in its own cluster, unflagged</td>
+<td><a href="for-applications.html">For applications</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/8e6c16eefc3dc7480326faa81de903b388fff151"><code>8e6c16e</code></a> (pull request #6709)</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="limits-and-budgets">Limits and budgets</h3>
+<p>Places where a limit meant to stop malicious fonts changes the result for valid ones. <a href="limits.html">Limits</a> lists every limit.</p>
+<div class="bugs">
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Summary</th>
+<th>Chapter</th>
+<th>Checked</th>
+<th>Upstream</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td id="ix-94">A null or unknown-format Coverage in a format 1 single lookup charges about 2 billion operations to the sanitizer, which then drops the whole GSUB or GPOS</td>
+<td><a href="fonts-as-bytes.html">Fonts as bytes</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/6426ee4ca8a218ecf7e8b8dd92997f6d435ff03f"><code>6426ee4</code></a> (pull request #6696)</td>
+</tr>
+<tr>
+<td>9</td>
+<td id="ix-95">Mask bit 30 is never handed out, so 26 bits are free for features, not 27</td>
+<td id="ix-96"><a href="from-features-to-lookups.html">From features to lookups</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/ec9476415057f3437019eed9b773984438d1d802"><code>ec94764</code></a> (pull request #6697)</td>
+</tr>
+<tr>
+<td>13</td>
+<td id="ix-97">Cursive chains that run against the buffer’s direction break after 64 links</td>
+<td id="ix-98"><a href="gpos.html">GPOS: positioning glyphs</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>23</td>
+<td id="ix-99">Syllables longer than 64 glyphs are reordered in pieces</td>
+<td><a href="indic-model.html">The Indic model</a></td>
+<td id="ix-100">Run</td>
+<td id="ix-101">Changed, not fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/fd57025171ff9ba3c77525d02f558a780cb0f32c"><code>fd57025</code></a> (pull request #6558) keeps the pieces the same in every pass and makes the whole syllable one cluster, but this draft’s example is still reordered wrongly at the cut</td>
+</tr>
+<tr>
+<td>28</td>
+<td id="ix-102">A CFF charstring with no <code>endchar</code> runs to 200,000 operations and uses up the drawing budget for later glyphs</td>
+<td><a href="drawing-outlines.html">Drawing outlines</a></td>
+<td id="ix-103">Run</td>
+<td>In progress: pull request #6737, not merged</td>
+</tr>
+<tr>
+<td>43</td>
+<td id="ix-104">The subsetter’s GSUB closure stops after 14 passes, losing glyphs from long nested chains that shaping reaches</td>
+<td><a href="subsetting.html">Subsetting</a></td>
+<td>Live</td>
+<td id="ix-105">Changed, not fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/0209ec2865b55e892897966e95dfb8915a1309e9"><code>0209ec2</code></a> (pull request #6725, for draft 44) allows 18 passes, so the example’s chain of 20 now stops at <code>s18</code>. Related, not the same: <a href="https://github.com/harfbuzz/harfbuzz/issues/5993">issue #5993</a>, closed: the limit is kept because glyphs reached only by applying a lookup again and again aren’t reachable by shaping. The glyphs in this draft are reached by one shaping run</td>
+</tr>
+<tr>
+<td>44</td>
+<td id="ix-106"><code>HB_CLOSURE_MAX_STAGES</code> is 12, though its comment requires more than the Indic shaper’s 14 pauses</td>
+<td><a href="subsetting.html">Subsetting</a></td>
+<td>Read</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/0209ec2865b55e892897966e95dfb8915a1309e9"><code>0209ec2</code></a> (pull request #6725)</td>
+</tr>
+<tr>
+<td>47</td>
+<td id="ix-107">The sanitizer’s operation budget rejects a whole valid GSUB whose few single substitutions cover many glyphs by range</td>
+<td><a href="limits.html">Limits</a></td>
+<td id="ix-108">Run</td>
+<td></td>
+</tr>
+<tr>
+<td>48</td>
+<td id="ix-109">The subsetter’s 256× buffer cap makes a valid subset fail when a tiny table legitimately grows</td>
+<td><a href="writing-tables.html">Writing tables</a></td>
+<td id="ix-110">Run</td>
+<td></td>
+</tr>
+<tr>
+<td>54</td>
+<td id="ix-111">Texts of 524,289 to 1,048,575 characters go almost unshaped: the operation budget starts negative</td>
+<td><a href="limits.html">Limits</a></td>
+<td id="ix-112">Run</td>
+<td id="ix-113">Changed, not fixed: on <code>main</code> the budget still starts negative, and from 524,300 characters not even the first ligature forms</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="extents-drawing-and-subset-fonts">Extents, drawing and subset fonts</h3>
+<div class="bugs">
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Summary</th>
+<th>Chapter</th>
+<th>Checked</th>
+<th>Upstream</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3</td>
+<td id="ix-114">With synthetic bold, grade or slant, an empty glyph’s extents are <code>&lt;0,-1,-1,1&gt;</code></td>
+<td id="ix-115"><a href="fonts-and-font-functions.html">Fonts and font functions</a></td>
+<td id="ix-116">Run</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/46ab0d095f021f98ad20c4480814ebdcc2a3d690"><code>46ab0d0</code></a> (pull request #6685)</td>
+</tr>
+<tr>
+<td>4</td>
+<td id="ix-117">Scaled glyph extents are rounded inwards vertically, so the box doesn’t cover the ink</td>
+<td><a href="where-metrics-come-from.html">Where metrics come from</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/f5e925cd256fd856f30298b89fe98772be5f6bf9"><code>f5e925c</code></a> (pull request #6707)</td>
+</tr>
+<tr>
+<td>25</td>
+<td id="ix-118">CBDT format 19 images are never painted</td>
+<td><a href="color.html">Color</a></td>
+<td>Read</td>
+<td></td>
+</tr>
+<tr>
+<td>27</td>
+<td id="ix-119">Point matching in nested composites counts from the wrong start</td>
+<td><a href="drawing-outlines.html">Drawing outlines</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>36</td>
+<td><code>hb-vector</code>’s PDF output drops PNG alpha</td>
+<td id="ix-120"><a href="hb-vector.html#color-glyphs-in-pdf">hb-vector</a></td>
+<td id="ix-121">Run</td>
+<td></td>
+</tr>
+<tr>
+<td>45</td>
+<td id="ix-122">MATH variants and italics corrections are lost for glyphs that only GSUB produces</td>
+<td><a href="subsetting.html">Subsetting</a></td>
+<td>Live</td>
+<td>In progress: pull request #6745, not merged</td>
+</tr>
+<tr>
+<td>50</td>
+<td id="ix-123">A reordering custom glyph map breaks PairPos and ClassDef in the subset</td>
+<td><a href="subsetting.html">Subsetting</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>51</td>
+<td id="ix-124">Subsetting a symbol font drops its only, (3,0), <code>cmap</code> subtable</td>
+<td><a href="subsetting.html">Subsetting</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>52</td>
+<td id="ix-125">The keep-<code>.notdef</code>-outline flag is ignored for CFF</td>
+<td><a href="subsetting.html">Subsetting</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>61</td>
+<td id="ix-126">Small instancing differences from fontTools: an <code>avar</code> map one unit off after limiting, a misleading VARC refusal, an unreachable <code>MVAR</code> region</td>
+<td><a href="instancing.html">Instancing</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>66</td>
+<td id="ix-127"><code>hb_color_lerp</code> reverses a color’s bytes, so every PDF sweep, and SVG sweeps that cross 0°, have the wrong colors</td>
+<td id="ix-128"><a href="hb-vector.html#color-glyphs-in-pdf">hb-vector</a></td>
+<td id="ix-129">Run</td>
+<td></td>
+</tr>
+<tr>
+<td>67</td>
+<td><code>hb-vector</code>’s PDF sweeps leave a square hole at their center, from 16-bit mesh coordinates</td>
+<td id="ix-130"><a href="hb-vector.html#color-glyphs-in-pdf">hb-vector</a></td>
+<td id="ix-131">Run</td>
+<td></td>
+</tr>
+<tr>
+<td>68</td>
+<td id="ix-132"><code>hb-vector</code>’s PDF output ignores custom palette colors</td>
+<td id="ix-133"><a href="hb-vector.html#color-glyphs-in-pdf">hb-vector</a></td>
+<td id="ix-134">Run</td>
+<td></td>
+</tr>
+<tr>
+<td>69</td>
+<td id="ix-135"><code>hb-vector</code>’s PDF compositing isn’t isolated, so SCREEN and DIFFERENCE blend with the white page</td>
+<td id="ix-136"><a href="hb-vector.html#color-glyphs-in-pdf">hb-vector</a></td>
+<td id="ix-137">Run</td>
+<td></td>
+</tr>
+<tr>
+<td>70</td>
+<td id="ix-138">hb-gpu drops a fill whose only clip is a rectangle, though its comment says rectangles are just ignored</td>
+<td id="ix-139"><a href="hb-gpu.html#what-isnt-supported">hb-gpu</a></td>
+<td id="ix-140">Run</td>
+<td></td>
+</tr>
+<tr>
+<td>75</td>
+<td id="ix-141"><code>hb-vector --show-extents</code> and <code>hb-raster --show-extents</code> draw each box after the first at twice its pen position</td>
+<td><a href="command-line-tools.html#a-bug-in-show-extents">The command-line tools</a></td>
+<td id="ix-142">Run</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="api-and-format-consistency">API and format consistency</h3>
+<p>The same thing done differently in two places, or defined differently in two documents.</p>
+<div class="bugs">
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Summary</th>
+<th>Chapter</th>
+<th>Checked</th>
+<th>Upstream</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>6</td>
+<td id="ix-143">Three slips in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc"><code>hb-shape-plan.cc</code></a>: a loop index, a null check after the dereference, a missing null-face guard</td>
+<td id="ix-144"><a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></td>
+<td>Read</td>
+<td>Fixed: commits <a href="https://github.com/harfbuzz/harfbuzz/commit/caf12a809a78332fb320bc1375eca31ab838a0f6"><code>caf12a8</code></a> (pull request #6693) and <a href="https://github.com/harfbuzz/harfbuzz/commit/93d26d851047e13459eac70197f00298bfdd34ad"><code>93d26d8</code></a> (#6698)</td>
+</tr>
+<tr>
+<td>7</td>
+<td id="ix-145">FeatureVariations minor version 1 means one thing to HarfBuzz and another to the ISO draft, and a font following the draft loses its GSUB</td>
+<td id="ix-146"><a href="from-features-to-lookups.html">From features to lookups</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>14</td>
+<td id="ix-147">With <code>HB_NO_HINTING</code>, y Device tables fall through into the variation branch, unlike x</td>
+<td id="ix-148"><a href="gpos.html">GPOS: positioning glyphs</a></td>
+<td>Read</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/489157f826ff7c32493d6d0a05b7e608605c27f8"><code>489157f</code></a> (pull request #6694)</td>
+</tr>
+<tr>
+<td>26</td>
+<td id="ix-149">The bitmap tables are tried in one order for images and extents, the other for painting</td>
+<td><a href="color.html">Color</a></td>
+<td>Read</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/7e97cd8a182651f2ca3d2311f0910ca0ce64e927"><code>7e97cd8</code></a> (pull request #6723)</td>
+</tr>
+<tr>
+<td>37</td>
+<td id="ix-150">Smaller <code>hb-vector</code> and <code>hb-gpu</code> differences: PDF gradients that only pad, palette functions with other types than their twins, stale comments</td>
+<td id="ix-151"><a href="hb-vector.html#color-glyphs-in-pdf">hb-vector</a>, <a href="hb-gpu.html">hb-gpu</a></td>
+<td>Read</td>
+<td>Partly fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/24fe9f0e258bfe008beea1a79c2efb3bae81b2bb"><code>24fe9f0</code></a> (pull request #6691) corrects the stale comments and documentation, and <a href="https://github.com/harfbuzz/harfbuzz/commit/aa3cd40bcff9f4180f61da69a728411397bacad8"><code>aa3cd40</code></a> (#6730) documents that PDF gradients only pad; the API differences remain</td>
+</tr>
+<tr>
+<td>41</td>
+<td id="ix-152">Of two requests for one feature, AAT keeps the first and OpenType the last</td>
+<td><a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/f346ea17a9cedce7ba98f45782aa27faa597a0e3"><code>f346ea1</code></a> (pull request #6714)</td>
+</tr>
+<tr>
+<td>55</td>
+<td id="ix-153"><code>HB_LEAN</code> removes drawing and painting in every Meson build</td>
+<td><a href="compile-time-configuration.html">Compile-time configuration</a></td>
+<td id="ix-154">Run</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/c90000dd8ee5a593bc60e65930d3aed501aca5bf"><code>c90000d</code></a> (pull request #6724)</td>
+</tr>
+<tr>
+<td>56</td>
+<td id="ix-155"><code>hb-features.h</code> never defines <code>HB_HAS_GPU</code> or <code>HB_HAS_GRAPHITE</code></td>
+<td><a href="compile-time-configuration.html">Compile-time configuration</a></td>
+<td id="ix-156">Run</td>
+<td>Fixed: commits <a href="https://github.com/harfbuzz/harfbuzz/commit/2b873b805800dcad37827f90a5c28ccb6ccc4ba8"><code>2b873b8</code></a> (pull request #6721) and <a href="https://github.com/harfbuzz/harfbuzz/commit/506cc943b3c2ad82c5398361afdaf6e9eaad6b0f"><code>506cc94</code></a> (#6722)</td>
+</tr>
+<tr>
+<td>62</td>
+<td id="ix-157"><code>hb_style_get_value</code> returns OS/2 optical sizes in twentieths of a point</td>
+<td><a href="other-tables.html">Other tables</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/b14a94e52fed2ebb39744a4596ec2c840beffef3"><code>b14a94e</code></a> (pull request #6695)</td>
+</tr>
+<tr>
+<td>63</td>
+<td id="ix-158">BASE min/max: missing values read as 0, and MinMax without BaseValues hides <code>DFLT</code></td>
+<td><a href="other-tables.html">Other tables</a></td>
+<td id="ix-159">Run</td>
+<td></td>
+</tr>
+<tr>
+<td>64</td>
+<td id="ix-160"><code>STAT::get_value</code> takes the first axis value, and STAT suppresses synthetic slant</td>
+<td><a href="other-tables.html">Other tables</a></td>
+<td>Live</td>
+<td>The synthetic slant is in progress: pull request #6743, not merged</td>
+</tr>
+<tr>
+<td>72</td>
+<td id="ix-161"><code>HB_FEATURES_H</code> is both <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz-world.cc"><code>harfbuzz-world.cc</code></a>’s header name and <code>hb-features.h</code>’s include guard, so Meson’s header can’t be named</td>
+<td><a href="building-harfbuzz.html#single-file-builds">Building HarfBuzz</a></td>
+<td id="ix-162">Run</td>
+<td></td>
+</tr>
+<tr>
+<td>77</td>
+<td id="ix-163">Smaller things in the build: Graphite in the single-file build, the <code>libs</code> target without hb-gpu, <code>meson build</code> without <code>setup</code>, an undefined <code>HAVE_ISATTY</code></td>
+<td><a href="building-harfbuzz.html#single-file-builds">Building HarfBuzz</a></td>
+<td id="ix-164">Run</td>
+<td id="ix-165">The Graphite item is fixed by commit <a href="https://github.com/harfbuzz/harfbuzz/commit/506cc943b3c2ad82c5398361afdaf6e9eaad6b0f"><code>506cc94</code></a> (pull request #6722)</td>
+</tr>
+<tr>
+<td>79</td>
+<td id="ix-166"><code>hb_directwrite_font_set_funcs</code> takes a reference to the DirectWrite font face that nothing releases, where the Core Text version takes none</td>
+<td><a href="integrations.html#directwrite">Integrations</a></td>
+<td>Read</td>
+<td></td>
+</tr>
+<tr>
+<td>80</td>
+<td id="ix-167"><code>_hb_gdi_reference_table</code> returns before its <code>ReleaseDC</code> guard when <code>SelectObject</code> fails, leaking the screen DC</td>
+<td><a href="integrations.html#gdi-and-uniscribe">Integrations</a></td>
+<td>Read</td>
+<td></td>
+</tr>
+<tr>
+<td>82</td>
+<td id="ix-168">USE: the generator’s list of generic bases (U+2015, U+2022, U+25FB to U+25FE) never applies, and they come out <code>O</code></td>
+<td id="ix-169"><a href="universal-shaping-engine.html#the-categories">The Universal Shaping Engine</a></td>
+<td id="ix-170">Run</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="documentation-and-messages">Documentation and messages</h3>
+<div class="bugs">
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Summary</th>
+<th>Chapter</th>
+<th>Checked</th>
+<th>Upstream</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2</td>
+<td id="ix-171">The “start table GPOS” trace message prints GSUB’s chosen script</td>
+<td id="ix-172"><a href="choosing-a-script-shaper.html">Choosing a script shaper</a></td>
+<td>Live</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/24795efd37271e6fac4e1e44316ccf690b63e31f"><code>24795ef</code></a> (pull request #6686)</td>
+</tr>
+<tr>
+<td>42</td>
+<td id="ix-173">hb-depend: errors in its header and design notes, a declared function that doesn’t exist, a wrong build option in the fuzzing README</td>
+<td id="ix-174"><a href="hb-depend.html">hb-depend</a></td>
+<td id="ix-175">Run</td>
+<td>Partly fixed: commits <a href="https://github.com/harfbuzz/harfbuzz/commit/88bb79a408620943fb475857777c2eceabb76ffb"><code>88bb79a</code></a> (pull request #6703) and <a href="https://github.com/harfbuzz/harfbuzz/commit/202b3e2c282a36f710834e61f460d8f48e6a10b9"><code>202b3e2</code></a> (#6692) correct the documentation; removing the unused declaration and fields is in progress (pull request #6744); the parity test’s order remains</td>
+</tr>
+<tr>
+<td>46</td>
+<td id="ix-176"><code>hb_set_invert</code> is documented as “Since: 3.0.0”, but <code>NEWS</code> has it before 1.6.1</td>
+<td id="ix-177"><a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></td>
+<td>Read</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/72e4cf3a3479c08a5ae6d34255eb7be51c320379"><code>72e4cf3</code></a> (pull request #6690)</td>
+</tr>
+<tr>
+<td>49</td>
+<td id="ix-178"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/serializer.md"><code>docs/serializer.md</code></a> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/repacker.md"><code>docs/repacker.md</code></a> are out of date</td>
+<td><a href="writing-tables.html">Writing tables</a></td>
+<td>Read</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/4d41c69d42fa9e73885a93a6396acbb582c9dee8"><code>4d41c69</code></a> (pull request #6702)</td>
+</tr>
+<tr>
+<td>53</td>
+<td id="ix-179">Small faults in the data generators, none affecting the tables</td>
+<td><a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the tables</a></td>
+<td>Read</td>
+<td>Partly fixed: commits <a href="https://github.com/harfbuzz/harfbuzz/commit/ebfcf19c720f3328754ecdde620eb45c2fa8088c"><code>ebfcf19</code></a> (pull request #6688), <a href="https://github.com/harfbuzz/harfbuzz/commit/c66b1a505795d701b27c67702809814ee250d6cd"><code>c66b1a5</code></a> (#6689) and <a href="https://github.com/harfbuzz/harfbuzz/commit/b873113f410f0fa0b215f225aec5d76eb55c22e3"><code>b873113</code></a> (#6715); most of the rest is in progress (pull requests #6739 and #6740)</td>
+</tr>
+<tr>
+<td>57</td>
+<td>Configuration macros and limits defined but unused, or used but undocumented</td>
+<td><a href="compile-time-configuration.html">Compile-time configuration</a></td>
+<td>Read</td>
+<td id="ix-180">Partly fixed: commits <a href="https://github.com/harfbuzz/harfbuzz/commit/91722141bb48a8414284cb3b4001b0c98cce9a19"><code>9172214</code></a> (pull request #6728) and <a href="https://github.com/harfbuzz/harfbuzz/commit/9e6b1a989857e1e2809186d045bb33416120c834"><code>9e6b1a9</code></a> (#6727) remove the unused macros and correct <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/CONFIG.md"><code>CONFIG.md</code></a>’s <code>HB_MINI</code>; the other items remain</td>
+</tr>
+<tr>
+<td>60</td>
+<td><code>hb-shape --text-before</code> echoes its value to stderr</td>
+<td><a href="for-applications.html">For applications</a></td>
+<td id="ix-181">Run</td>
+<td>Fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/55ecd750d40e20207cb56aadbaf597bbd084246f"><code>55ecd75</code></a> (pull request #6687)</td>
+</tr>
+<tr>
+<td>65</td>
+<td id="ix-182">Smaller things in <code>name</code>, BASE and MATH: <code>hb-info --list-names</code>, a sign error, a quadratic risk, a missed script tag</td>
+<td><a href="other-tables.html">Other tables</a></td>
+<td>Live</td>
+<td>Partly fixed: commit <a href="https://github.com/harfbuzz/harfbuzz/commit/eaf004a2c5a745f790e60df5e7177db765a84b7b"><code>eaf004a</code></a> (pull request #6708) fixes the sign error; <code>hb-info --list-names</code> is in progress (pull request #6741)</td>
+</tr>
+<tr>
+<td>71</td>
+<td id="ix-183">hb-gpu’s stem darkening is documented, and used by its viewer, with pixels per font unit for its ppem</td>
+<td id="ix-184"><a href="hb-gpu.html#small-sizes">hb-gpu</a></td>
+<td>Read</td>
+<td></td>
+</tr>
+<tr>
+<td>73</td>
+<td><code>hb-shape -v</code> turns on <code>--ned</code> as well as <code>--verbose</code></td>
+<td><a href="command-line-tools.html#reading-the-output">The command-line tools</a></td>
+<td>Live</td>
+<td></td>
+</tr>
+<tr>
+<td>74</td>
+<td id="ix-185"><code>--features</code> and <code>--variations</code> split at spaces, so the CSS forms their help offers don’t work</td>
+<td><a href="command-line-tools.html#features">The command-line tools</a></td>
+<td id="ix-186">Run</td>
+<td></td>
+</tr>
+<tr>
+<td>76</td>
+<td id="ix-187">Smaller things in the renderers: hb-raster’s HSL luminosity weights, stale hb-vector and hb-gpu documentation</td>
+<td id="ix-188"><a href="hb-raster.html#groups-and-the-composite-modes">hb-raster</a>, <a href="hb-gpu.html">hb-gpu</a></td>
+<td id="ix-189">Run</td>
+<td></td>
+</tr>
+<tr>
+<td>78</td>
+<td>Smaller things in the command-line tools: <code>--font-size</code> help, an unused <code>refuse_tty</code>, <code>hb-fc-list -V</code></td>
+<td><a href="command-line-tools.html#the-tools-that-arent-installed">The command-line tools</a></td>
+<td id="ix-190">Run</td>
+<td></td>
+</tr>
+<tr>
+<td>81</td>
+<td id="ix-191">Smaller things in the integration documentation: <code>hb_ft_font_set_funcs</code> and <code>hb_ft_hb_font_changed</code>, swapped cairo scale factors, missing <code>Since:</code> lines, <code>NEWS</code> for 11.0.0, the user manual’s integration chapter</td>
+<td><a href="integrations.html">Integrations</a></td>
+<td>Read</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p id="ix-192">Of the eighty-two, forty-three are shown live in the book, twenty-four were run outside it, and fifteen were found by reading. On <code>main</code>, twenty-seven are fixed and six partly fixed, three behave differently but aren’t fixed, and ten have a pull request open; the other thirty-six still apply. The live blocks are built from 15.1.0, so they still show the bugs that <code>main</code> has fixed.</p>
+<h2 id="where-the-bugs-are">Where the bugs are</h2>
+<p id="ix-193">None of the eighty-two is a crash, a hang or a read out of bounds, though the book’s fonts include broken ones on purpose. That part of HarfBuzz is well defended: a decade of continuous fuzzing has turned every such failure into a test, and the sanitizer and the budgets stop the rest. What is left is output that is wrong but well formed, and, in two Windows integrations read but not run, a reference that is never released (79, 80). No fuzzer can see it, because nothing tells a fuzzer what the right answer is, and <a href="#verification">verification</a> can’t either if the answer is consistently wrong. Only a test with an expected answer catches it, and only on the paths the tests take.</p>
+<p>The drafts show where those paths stop.</p>
+<p id="ix-194"><strong>Combinations.</strong> Most of the shaping results need two things at once that are each tested alone: a ranged feature and a global request for the same tag (8), a tone mark at the start of text where two dotted-circle paths both apply (20), a font with GSUB, GPOS <em>and</em> <code>kerx</code> (38), a Hebrew <code>mark</code> feature under <code>DFLT</code> rather than <code>hebr</code> (21), vertical text with a <code>kern</code> table (18), a kerned base with a fallback-positioned mark (16). The in-house tests are recorded one subject to a file, so a combination is tested once someone has met it (inferred from how <code>record-test.sh</code> works). A small font built with exactly the two features finds it directly.</p>
+<p id="ix-195"><strong>Paths the tests miss.</strong> In-house <code>arabic-stch.tests</code> passes, with verification, on every font-functions backend, yet <code>stch</code> is wrong for a word that its tiles fit exactly (24), because the test’s words always take the other branch. Cluster level 3 arrived in 11.0.0, and two functions written before it were never taught about it (5). CBDT format 19 is never painted (25), and nested point-matched composites attach to the wrong point (27): rare formats, rare structures.</p>
+<p id="ix-196"><strong>Copies that drifted apart.</strong> Something done in several places gets fixed or extended in one of them. The GPOS trace message copies the GSUB code above it and kept its index (2). <code>get_y_delta</code> lost the guard that <code>get_x_delta</code> has (14). Four paths insert dotted circles, and they give the circle three different sets of Unicode properties (19, 35). The AAT and OpenType maps merge repeated features in opposite orders (41), and the bitmap tables are tried in different orders by different callers (26). Comparing the copies finds these; testing one copy doesn’t.</p>
+<p id="ix-197"><strong>Limits that real text reaches.</strong> Fuzzing pushes for limits, and the limits are needed. But a limit set to stop a hostile font is sometimes within reach of a legitimate one: 64 links of cursive attachment in Nastaliq (13), a 64-glyph syllable (23), a closure cut at 14 passes (43, 44), 26 mask bits (9). Each degrades quietly, by design: the output is merely wrong. The worst cases are 1 and 47, where the sanitizer’s budget costs a valid font every substitution it has, and 54, where a text of over half a million characters is left almost unshaped.</p>
+<p id="ix-198"><strong>Comments and documentation.</strong> A comment says LEFT and RIGHT marks aren’t positioned, and they are (17); another states a rule its own constant breaks (44); hb-depend’s notes describe an earlier design (42); a <code>Since:</code> line is wrong (46).</p>
+<p id="ix-199">The pattern suggests where to look next. Most of these drafts came from fonts small enough to have one feature, one lookup or one table of interest, and every one of those fonts could become a test line in <code>test/shape/data/in-house/</code> as it stands. <code>record-test.sh</code> would subset it, hash it and print the line.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc"><code>src/hb-buffer.cc</code></a></td>
+<td><code>hb_buffer_set_message_func</code>, <code>message_impl</code>, <code>hb_buffer_changed</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-debug.hh"><code>src/hb-debug.hh</code></a></td>
+<td><code>HB_DEBUG_*</code>, <code>hb_auto_trace_t</code>, the <code>TRACE_*</code> macros, <code>HB_BUFFER_MESSAGE_MORE</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer-verify.cc"><code>src/hb-buffer-verify.cc</code></a></td>
+<td><code>HB_BUFFER_FLAG_VERIFY</code>’s three checks and how they report</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape.cc"><code>src/hb-shape.cc</code></a></td>
+<td><code>hb_shape_full</code>, which keeps the text and calls the verifier</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-output.hh"><code>util/shape-output.hh</code></a></td>
+<td><code>hb-shape --trace</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/shape/run-tests.py"><code>test/shape/run-tests.py</code></a>, <code>test/shape/record-test.sh</code></td>
+<td>running and recording shaping tests</td>
+</tr>
+<tr>
+<td><code>test/shape/data/{in-house,aots,text-rendering-tests}/</code></td>
+<td>the three sets of <code>.tests</code> files and their fonts</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/api/hb-test.h"><code>test/api/hb-test.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/test/api"><code>test/api/test-*.c</code></a></td>
+<td>the GLib-based API tests</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/subset/run-tests.py"><code>test/subset/run-tests.py</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/subset/generate-expected-outputs.py"><code>test/subset/generate-expected-outputs.py</code></a></td>
+<td>subset tests, and expected fonts checked against fontTools</td>
+</tr>
+<tr>
+<td><code>test/threads/</code>, <code>perf/</code></td>
+<td>the threading tests and the benchmarks</td>
+</tr>
+<tr>
+<td><code>test/fuzzing/</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/failing-alloc.c"><code>src/failing-alloc.c</code></a></td>
+<td>the fuzzers, their corpus, the TAP runner, the failing allocator</td>
+</tr>
+<tr>
+<td><code>.github/workflows/cifuzz.yml</code>, <code>sanitizers.yml</code></td>
+<td>fuzzing on pull requests; the sanitizer builds</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Buffer messages report each step of a run and can skip it; the detailed messages from inside lookups need a build with <code>HB_BUFFER_MESSAGE_MORE</code>, which is why this book builds HarfBuzz separately for its traces.</li>
+<li><code>HB_DEBUG_*</code> are compile-time switches for HarfBuzz’s developers, each a depth to which the work of the table code is printed.</li>
+<li><code>HB_BUFFER_FLAG_VERIFY</code> makes HarfBuzz reshape its result in pieces and compare. It needs no expected answer, so it runs everywhere, but a consistently wrong result passes.</li>
+<li><code>test/shape</code> holds about 6,300 test lines in three sets. Each runs with verification, once for every kind of font functions the build has, through one <code>hb-shape --batch</code> process.</li>
+<li><code>test/api</code> checks the C API with GLib’s framework; <code>test/subset</code> compares subset fonts byte for byte with expected fonts that fontTools agrees with.</li>
+<li>The fuzzers look for crashes, hangs and runaway memory, with allocations that fail at random. Every failure they find is kept and rerun as a test on every build.</li>
+<li>A font of boxes with a rule or two, built from a feature file, is the quickest way to find out what HarfBuzz does with a rule.</li>
+<li>The book’s eighty-two draft bug reports, none yet on HarfBuzz’s issue tracker, are nearly all wrong-but-valid output: combinations no test has, branches the tests miss, copies that drifted apart, limits real text can reach, and comments that no longer match the code. Checked against <code>main</code> on 18 November 2026, twenty-seven were fixed, six partly, and ten had pull requests open.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="other-tables.html">← Other tables</a><a rel="next" href="harfrust.html">HarfRust →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

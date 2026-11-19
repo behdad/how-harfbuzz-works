@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Choosing a script shaper · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part IV · Planning</p>
+<h1 id="choosing-a-script-shaper">15. Choosing a script shaper</h1>
+<p id="ix-1">A shape plan holds a script shaper: default, Arabic, Indic, the Universal Shaping Engine or one of the others. <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a> showed where it is kept. This chapter is about how it is picked, and the answer is less obvious than “by the script of the text”. HarfBuzz first turns the run’s script and language into OpenType tags, then looks for those tags in the font, and only then chooses a shaper, from the text’s script <em>and</em> the script tag it found. The same Devanagari text gets the Indic shaper in one font, the Universal Shaping Engine in another, and no script shaping at all in a third.</p>
+<p id="ix-2">This chapter follows that order. What the chosen tags lead to, the features and their lookups, is the subject of the <a href="from-features-to-lookups.html">previous chapter</a>.</p>
+<p id="ix-3">The examples use test fonts built by <code>fonts/choosing-a-script-shaper/build-fonts.py</code>. Each family is compiled from one feature file, and its fonts differ only in the script tags written into it. Every result and trace on this page was produced by running HarfBuzz 15.1.0 on them when the page was built.</p>
+<h2 id="from-a-script-to-script-tags">From a script to script tags</h2>
+<p id="ix-4">HarfBuzz’s scripts are <a href="https://www.unicode.org/iso15924/iso15924-codes.html">ISO 15924 codes</a> (<code>Deva</code>, <code>Arab</code>), as <a href="why-shaping-exists.html#runs-and-the-three-things-harfbuzz-must-be-told">Why shaping exists</a> said. A font’s ScriptList uses OpenType’s own <strong>script tags</strong>, <a href="https://learn.microsoft.com/en-us/typography/opentype/spec/scripttags">registered in the specification</a>, and one script can have several. <code>hb_ot_all_tags_from_script</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-tag.cc#L157"><code>hb-ot-tag.cc:157</code></a>) lists them, newest first:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-5">Script</th>
+<th>Tags tried, in order</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Bengali, Devanagari, Gujarati, Gurmukhi, Kannada, Malayalam, Oriya, Tamil, Telugu</td>
+<td id="ix-6"><code>bng3</code> <code>bng2</code> <code>beng</code>, <code>dev3</code> <code>dev2</code> <code>deva</code>, and so on</td>
+</tr>
+<tr>
+<td>Myanmar</td>
+<td id="ix-7"><code>mym2</code> <code>mymr</code></td>
+</tr>
+<tr>
+<td>Hiragana, Katakana</td>
+<td id="ix-8"><code>kana</code></td>
+</tr>
+<tr>
+<td>Lao, Yi, N’Ko, Vai</td>
+<td><code>lao </code>, <code>yi  </code>, <code>nko </code>, <code>vai </code></td>
+</tr>
+<tr>
+<td>everything else</td>
+<td id="ix-9">the ISO 15924 code with its first letter lowercased: <code>arab</code>, <code>latn</code>, <code>syrc</code></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-10">The nine Indic scripts have three generations of tag. The old tags, such as <code>deva</code>, go with the shaping model of the first OpenType Indic specifications, and the <code>2</code> tags with a later model that changed the order of glyphs some lookups see (more on that below). A <code>3</code> tag isn’t a third Indic model: as <code>NEWS</code> for 2.0.0 says, “Indic3 tags (‘dev3’, etc) are passed to USE shaper.” Myanmar has no <code>mym3</code> (<code>:166</code>).</p>
+<p id="ix-11">The <code>3</code> tags aren’t OpenType tags. The <a href="https://learn.microsoft.com/en-us/typography/opentype/spec/scripttags">registry</a> lists <code>deva</code> and <code>dev2</code>, and nothing ending in <code>3</code>, for any script. HarfBuzz added them in 2018 (2.0.0), following Apple’s Core Text: the <a href="https://github.com/harfbuzz/harfbuzz/issues/539">issue that asked for them</a> says “Apple does that and we want to put it in OpenType itself,” and that hasn’t happened. DirectWrite doesn’t support them (as reported by a reviewer; not checked here). They are an experiment shared by HarfBuzz and Apple, not a standard, and a font that uses them still needs its lookups under the <code>2</code> tag for other engines.</p>
+<p id="ix-12">The old tags are made by lowercasing, with a switch for the exceptions (<code>hb_ot_old_tag_from_script</code>, <code>:37</code>). Text with no script of its own, such as digits alone, has the script <code>HB_SCRIPT_INVALID</code>, which gets no tags. At most three tags are kept (<code>HB_OT_MAX_TAGS_PER_SCRIPT</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.h#L99"><code>hb-ot-layout.h:99</code></a>).</p>
+<p id="ix-13"><code>hb-shape --script</code> takes an ISO 15924 code (<a href="command-line-tools.html#direction-script-and-language">The command-line tools</a>). <code>hb_script_from_iso15924_tag</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.cc#L445"><code>hb-common.cc:445</code></a>) fixes its case, so <code>--script=deva</code> is Devanagari, but <code>--script=dev2</code> is no code at all and becomes <code>HB_SCRIPT_UNKNOWN</code>.</p>
+<h2 id="from-a-language-to-language-system-tags">From a language to language system tags</h2>
+<p id="ix-14">The language is turned into OpenType <strong>language system tags</strong>, <a href="https://learn.microsoft.com/en-us/typography/opentype/spec/languagetags">registered in the specification</a>, also up to three (<code>HB_OT_MAX_TAGS_PER_LANGUAGE</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.h#L107"><code>hb-ot-layout.h:107</code></a>). The language comes from the application, which usually takes it from the document, such as an HTML <code>lang</code> attribute (<a href="why-shaping-exists.html#runs-and-the-three-things-harfbuzz-must-be-told">Why shaping exists</a>). It arrives as an <code>hb_language_t</code>, a BCP 47 string that <code>hb_language_from_string</code> has already lowercased, with <code>_</code> read as <code>-</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.cc#L167"><code>hb-common.cc:167</code></a>; <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a> has more), so <code>TR</code>, <code>tr</code> and <code>tr_TR</code> are handled like <code>tr</code> and <code>tr-tr</code>. <code>hb_ot_tags_from_language</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-tag.cc#L322"><code>hb-ot-tag.cc:322</code></a>) reads it in this order:</p>
+<ol>
+<li id="ix-15">Some tags of several subtags have mappings of their own, tested first by <code>hb_ot_tags_from_complex_language</code>: <code>zh-Hant</code>, <code>zh-HK</code>, <code>el-polyton</code>, and variants such as <code>-fonipa</code> (<code>IPPH</code>) and <code>-syre</code> (<code>SYRE</code>).</li>
+<li id="ix-16">If the second subtag is a three-letter extended language subtag, as in <code>zh-yue</code>, it is used instead of the first.</li>
+<li>A two-letter primary subtag is looked up in <code>ot_languages2</code>, a three-letter one in <code>ot_languages3</code> and then in a table of codes with several tags: binary searches, each with a one-entry “Poor man’s cache” (<code>:355</code>).</li>
+<li>A three-letter code in <code>ot_languages3_blocked</code> gets no tag. These are ISO 639-3 codes that spell some other OpenType tag: <code>far</code> is Fataleka, not Persian (<code>FAR </code>).</li>
+<li>Any other three-letter code is assumed to be ISO 639-3, upper-cased, and used as it is (<code>:421</code>). A two-letter code that isn’t in the table gets no tag.</li>
+</ol>
+<p id="ix-17">Some languages have more than one tag, tried in order: Korean <code>ko</code> gives <code>KOR</code> then <code>KOH</code> (Old Hangul), and Armenian <code>hy</code> gives <code>HYE0</code> then <code>HYE</code>.</p>
+<p id="ix-18">The tables are in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-tag-table.hh"><code>hb-ot-tag-table.hh</code></a>, made by <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-tag-table.py"><code>gen-tag-table.py</code></a> from the OpenType specification’s page of language system tags and the IANA language subtag registry. It matches the two by the ISO 639 codes the OpenType page lists for each tag, turned into two-letter codes where one exists (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-tag-table.py#L451"><code>gen-tag-table.py:451</code></a>), with corrections by hand, and adds each macrolanguage’s individual languages. The header records the registry’s <code>File-Date: 2026-09-17</code>.</p>
+<p id="ix-19">The test font <code>indic-dev2.ttf</code> has a Marathi language system, <code>MAR</code>, whose <code>locl</code> swaps RA for another glyph, standing in for Marathi’s eyelash RA:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">indic-dev2.ttf</td><td class="in"><span class="txt">र</span><span class="cps">U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ra=0+500]</code></td></tr><tr><td class="font">indic-dev2.ttf</td><td class="in"><span class="txt">र</span><span class="cps">U+0930</span></td><td class="opt">--language=mr</td><td class="out"><code>[ra.mar=0+500]</code></td></tr><tr><td class="font">indic-dev2.ttf</td><td class="in"><span class="txt">र</span><span class="cps">U+0930</span></td><td class="opt">--language=mr-IN</td><td class="out"><code>[ra.mar=0+500]</code></td></tr><tr><td class="font">indic-dev2.ttf</td><td class="in"><span class="txt">र</span><span class="cps">U+0930</span></td><td class="opt">--language=mar</td><td class="out"><code>[ra.mar=0+500]</code></td></tr><tr><td class="font">indic-dev2.ttf</td><td class="in"><span class="txt">र</span><span class="cps">U+0930</span></td><td class="opt">--language=xyz</td><td class="out"><code>[ra=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-20"><code>hi</code> gives <code>HIN</code>, which this font doesn’t have, so the default language system is used. <code>mr</code>, <code>mr-IN</code> and the ISO 639-3 code <code>mar</code> all give <code>MAR</code>. <code>xyz</code> gives the tag <code>XYZ </code>, which the font doesn’t have either.</p>
+<h2 id="naming-the-tags-directly">Naming the tags directly</h2>
+<p id="ix-21">An application that knows exactly which tags it wants can say so with two <strong>private-use subtags</strong> in the language (<code>parse_private_use_subtag</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-tag.cc#L444"><code>hb-ot-tag.cc:444</code></a>). After an <code>x-</code> singleton, <code>-hbsc</code> followed by a tag forces the script tag, and <code>-hbot</code> followed by a tag forces the language system tag. <code>hi-x-hbscdev2</code> is Hindi with the script tag <code>dev2</code>. <code>x-hbotMAR</code> is the language system <code>MAR</code>. A tag that can’t be spelled in letters and digits can be given in hex: <code>-hbsc-64657632</code> is <code>dev2</code> too.</p>
+<p id="ix-22">A forced tag replaces the whole list, so only that tag is tried (and then the fallbacks of the next section). The case is normalized: script tags to lower case, language tags to upper case. That would turn the two default tags into each other’s spelling, so there is one exception: <code>-hbscdflt</code> gives <code>DFLT</code>, and <code>-hbotdflt</code> gives <code>dflt</code> (<code>:483</code>).</p>
+<p id="ix-23"><code>indic-both.ttf</code> has both <code>dev2</code> and <code>deva</code>, with the same lookups under each:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">indic-both.ttf</td><td class="in"><span class="txt">क्र</span><span class="cps">U+0915 U+094D U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|rakar=0+0]</code></td></tr><tr><td class="font">indic-both.ttf</td><td class="in"><span class="txt">क्र</span><span class="cps">U+0915 U+094D U+0930</span></td><td class="opt">--language=hi-x-hbscdeva</td><td class="out"><code>[ka=0+600|ra=0+500|virama=0+0]</code></td></tr><tr><td class="font">indic-both.ttf</td><td class="in"><span class="txt">क्र</span><span class="cps">U+0915 U+094D U+0930</span></td><td class="opt">--language=hi-x-hbsc-64657661</td><td class="out"><code>[ka=0+600|ra=0+500|virama=0+0]</code></td></tr><tr><td class="font">indic-dev2.ttf</td><td class="in"><span class="txt">र</span><span class="cps">U+0930</span></td><td class="opt">--language=x-hbotMAR</td><td class="out"><code>[ra.mar=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-24">Forced to <code>deva</code>, the same font gives a different result, for reasons that come below. The trace shows the tag chosen:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape indic-both.ttf "क्र" --language=hi-x-hbscdeva --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;deva&#x27;</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">start reordering indic initial</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">skipped inserting dotted-circles because there is no broken syllables</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">end reordering indic initial</td><td class="buf"><code>[ka=0|ra=0|virama=0]</code></td></tr></tbody></table></div>
+<p id="ix-25">The subtags also run the other way. <code>hb_ot_tags_to_script_and_language</code> (<code>:653</code>), which turns a font’s tags back into an <code>hb_script_t</code> and an <code>hb_language_t</code>, writes them when it must: a language tag with no BCP 47 equivalent becomes <code>x-hbot-</code> and its hex, and a script tag that isn’t the script’s first choice is appended as <code>-x-hbsc-</code> and its hex. For Devanagari the first choice is <code>dev3</code>, so <code>dev2</code> with <code>MAR</code> comes back as <code>mr-x-hbsc-64657632</code>. With the default language system the language is null, and the script tag is lost: <code>deva</code> with <code>dflt</code> comes back as plain Devanagari (checked with a small C program, not part of the book’s build). A build with <code>HB_NO_LANGUAGE_PRIVATE_SUBTAG</code> ignores the subtags.</p>
+<blockquote>
+<p id="ix-26">For programmers: <code>hb_ot_tags_from_script_and_language</code> (since 2.0.0) is the public form of all this. It fills two arrays with the script and language tags the planner would try. It replaced <code>hb_ot_tags_from_script</code> and <code>hb_ot_tag_from_language</code>, now deprecated.</p>
+</blockquote>
+<h2 id="finding-them-in-the-font">Finding them in the font</h2>
+<p id="ix-27">The map builder’s constructor (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.cc#L45"><code>hb-ot-map.cc:45</code></a>) takes the tags to the font, once for GSUB and once for GPOS, with two functions.</p>
+<p id="ix-28"><code>hb_ot_layout_table_select_script</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L564"><code>hb-ot-layout.cc:564</code></a>) tries each script tag in order. If none is in the ScriptList, it tries three more:</p>
+<ol>
+<li id="ix-29"><code>DFLT</code>, the default script;</li>
+<li id="ix-30"><code>dflt</code>, which isn’t a script tag at all, but “MS site has had typos and many fonts use it now :(”;</li>
+<li id="ix-31"><code>latn</code>, because “some old fonts put their features there even though they’re really trying to support Thai, for example :(”.</li>
+</ol>
+<p id="ix-32">Failing those, no script is chosen, and the <strong>chosen script</strong> is <code>HB_TAG_NONE</code>. The function returns true only for a requested tag, and the map keeps both answers for each table: <code>chosen_script</code> and <code>found_script</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.hh#L174"><code>hb-ot-map.hh:174</code></a>).</p>
+<p id="ix-33"><code>hb_ot_layout_script_select_language2</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L772"><code>hb-ot-layout.cc:772</code></a>) does the same within that script: each language tag in order, then a language system record tagged <code>dflt</code> if there is one, and otherwise the script’s default language system.</p>
+<p id="ix-34">Both are binary searches (<code>RecordArrayOf::find_index</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L948"><code>hb-ot-layout-common.hh:948</code></a>), so they rely on the lists being sorted by tag, as the specification requires; a tag out of order can be missed (inferred). <code>hb-info --list-scripts</code> shows what a font has:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">indic-both.ttf</td><td class="opt">--list-scripts</td><td class="out"><pre><code>Layout script information:
+
+Table: GSUB
+	Script: Deva (dev2)
+		Language: mr (MAR )
+	Script: Deva (deva)
+		Language: mr (MAR )
+Table: GPOS</code></pre></td></tr></tbody></table></div>
+<p id="ix-35">Only a script’s <em>presence</em> counts: a <code>dev2</code> with no features is still chosen over a <code>DFLT</code> that has them. HarfBuzz’s manual says it “falls back on the lookups under the DFLT tag … if there are actually no lookups for the tag requested” (<code>docs/usermanual-opentype-features.xml:289</code>), but the code falls back only when the tag is missing.</p>
+<h3 id="gsub-and-gpos-choose-separately">GSUB and GPOS choose separately</h3>
+<p id="ix-36">So GSUB and GPOS can settle on different scripts: a font may keep its Devanagari substitutions under <code>dev2</code> and its kerning under <code>DFLT</code>. Each table’s features come from its own choice. Only GSUB’s picks the shaper; GPOS’s matters to Hebrew, as a later section shows.</p>
+<p id="ix-37">The trace line “start table GPOS script tag” doesn’t show GPOS’s choice. It prints GSUB’s chosen script (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L2149"><code>hb-ot-layout.cc:2149</code></a> formats <code>chosen_script[0]</code>, not <code>chosen_script[1]</code>), so in a font with no GSUB it says <code>''</code> even when GPOS found a script. The Hebrew trace below shows it.</p>
+<blockquote>
+<p id="ix-38">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/24795efd37271e6fac4e1e44316ccf690b63e31f"><code>24795ef</code></a> (17 November 2026), so main’s trace prints the script GPOS chose.</p>
+</blockquote>
+<h2 id="from-tags-to-a-shaper">From tags to a shaper</h2>
+<p id="ix-39">With the scripts chosen, the planner picks the shaper (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L84"><code>hb-ot-shape.cc:84</code></a>):</p>
+<pre><code class="language-c++">hb_ot_shape_planner_t::hb_ot_shape_planner_t (hb_face_t *face,
+                                              const hb_segment_properties_t &amp;props) :
+  face (face), props (props), map (face, props),
+  aat_map (face, props), apply_morx (_hb_apply_morx (face, props))
+{
+  shaper = hb_ot_shaper_categorize (props.script, props.direction, map.chosen_script[0]);
+
+  script_zero_marks = shaper-&gt;zero_width_marks != HB_OT_SHAPE_ZERO_WIDTH_MARKS_NONE;
+  script_fallback_position = shaper-&gt;fallback_position;
+
+  /* https://github.com/harfbuzz/harfbuzz/issues/1528 */
+  if (apply_morx &amp;&amp; shaper != &amp;_hb_ot_shaper_default)
+    shaper = &amp;_hb_ot_shaper_dumber;
+}
+</code></pre>
+<p id="ix-40">(trimmed of its <code>#ifndef HB_NO_AAT_SHAPE</code> lines). <code>map</code> is the map builder, so the tags have been searched for before the body runs.</p>
+<p id="ix-41"><code>hb_ot_shaper_categorize</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh#L177"><code>hb-ot-shaper.hh:177</code></a>) is one <code>switch</code> on the script. Here are its rules, read from the code:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-42">Script</th>
+<th>Shaper</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Arabic</td>
+<td>Arabic, if the text is horizontal; otherwise default</td>
+</tr>
+<tr>
+<td>Syriac</td>
+<td id="ix-43">Arabic, if horizontal and GSUB’s chosen script isn’t <code>DFLT</code>; otherwise default</td>
+</tr>
+<tr>
+<td>Thai, Lao</td>
+<td>Thai</td>
+</tr>
+<tr>
+<td>Hangul</td>
+<td>Hangul</td>
+</tr>
+<tr>
+<td>Hebrew</td>
+<td>Hebrew</td>
+</tr>
+<tr>
+<td>Khmer</td>
+<td>Khmer</td>
+</tr>
+<tr>
+<td id="ix-44">the nine Indic scripts</td>
+<td id="ix-45">default if the chosen script is <code>DFLT</code> or <code>latn</code>; the USE if it ends in <code>3</code>; otherwise Indic</td>
+</tr>
+<tr>
+<td>Myanmar</td>
+<td id="ix-46">default if the chosen script is <code>DFLT</code>, <code>latn</code> or <code>mymr</code>; otherwise Myanmar</td>
+</tr>
+<tr>
+<td id="ix-47"><code>Qaag</code> (Zawgyi)</td>
+<td id="ix-48">Myanmar Zawgyi</td>
+</tr>
+<tr>
+<td id="ix-49">a list of 91 more scripts, from Tibetan to the Unicode 18.0 additions</td>
+<td id="ix-50">default if the chosen script is <code>DFLT</code> or <code>latn</code>; otherwise the USE</td>
+</tr>
+<tr>
+<td>everything else, Latin, Cyrillic, Greek and Han among them</td>
+<td>default</td>
+</tr>
+</tbody>
+</table>
+<p>The Indic case is short enough to quote (<code>:234</code>):</p>
+<pre><code class="language-c++">/* If the designer designed the font for the 'DFLT' script,
+ * (or we ended up arbitrarily pick 'latn'), use the default shaper.
+ * Otherwise, use the specific shaper.
+ *
+ * If it's indy3 tag, send to USE. */
+if (gsub_script == HB_TAG ('D','F','L','T') ||
+    gsub_script == HB_TAG ('l','a','t','n'))
+  return &amp;_hb_ot_shaper_default;
+else if ((gsub_script &amp; 0x000000FF) == '3')
+  return &amp;_hb_ot_shaper_use;
+else
+  return &amp;_hb_ot_shaper_indic;
+</code></pre>
+<h3 id="the-same-text-in-seven-fonts">The same text in seven fonts</h3>
+<p id="ix-51">The Devanagari test fonts are compiled from one feature file, <code>indic.fea</code>. Its <code>akhn</code> makes the conjunct K.SSA, and its <code>blwf</code> turns virama + RA into a below-base form, written in the order the <code>2</code> model uses, virama first:</p>
+<pre><code class="language-c++">feature akhn {
+    sub ka virama ssa by k_ssa;
+} akhn;
+
+feature blwf {
+    sub virama ra by rakar;
+} blwf;
+</code></pre>
+<p id="ix-52">(trimmed). <code>indic-typo.ttf</code> has the misspelling <code>dflt</code>, patched in after compiling since feaLib won’t write it, and <code>indic-none.ttf</code> has no GSUB or GPOS. Here are three syllables, KA with the vowel sign I, the conjunct K.SSA, and KA with RA below it, in each font (two in the last three):</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">indic-dev2.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra=0+250|ka=0+600]</code></td></tr><tr><td class="font">indic-dev2.ttf</td><td class="in"><span class="txt">क्ष</span><span class="cps">U+0915 U+094D U+0937</span></td><td class="opt">--language=hi</td><td class="out"><code>[k_ssa=0+800]</code></td></tr><tr><td class="font">indic-dev2.ttf</td><td class="in"><span class="txt">क्र</span><span class="cps">U+0915 U+094D U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|rakar=0+0]</code></td></tr><tr><td class="font">indic-dev3.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra=0+250|ka=0+600]</code></td></tr><tr><td class="font">indic-dev3.ttf</td><td class="in"><span class="txt">क्ष</span><span class="cps">U+0915 U+094D U+0937</span></td><td class="opt">--language=hi</td><td class="out"><code>[k_ssa=0+800]</code></td></tr><tr><td class="font">indic-dev3.ttf</td><td class="in"><span class="txt">क्र</span><span class="cps">U+0915 U+094D U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|rakar=0+0]</code></td></tr><tr><td class="font">indic-deva.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra=0+250|ka=0+600]</code></td></tr><tr><td class="font">indic-deva.ttf</td><td class="in"><span class="txt">क्ष</span><span class="cps">U+0915 U+094D U+0937</span></td><td class="opt">--language=hi</td><td class="out"><code>[k_ssa=0+800]</code></td></tr><tr><td class="font">indic-deva.ttf</td><td class="in"><span class="txt">क्र</span><span class="cps">U+0915 U+094D U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|ra=0+500|virama=0+0]</code></td></tr><tr><td class="font">indic-DFLT.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|iMatra=0+250]</code></td></tr><tr><td class="font">indic-DFLT.ttf</td><td class="in"><span class="txt">क्ष</span><span class="cps">U+0915 U+094D U+0937</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|virama=0@-300,0+0|ssa=2+600]</code></td></tr><tr><td class="font">indic-DFLT.ttf</td><td class="in"><span class="txt">क्र</span><span class="cps">U+0915 U+094D U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|virama=0@-300,0+0|ra=2+500]</code></td></tr><tr><td class="font">indic-latn.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|iMatra=0+250]</code></td></tr><tr><td class="font">indic-latn.ttf</td><td class="in"><span class="txt">क्र</span><span class="cps">U+0915 U+094D U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|virama=0@-300,0+0|ra=2+500]</code></td></tr><tr><td class="font">indic-typo.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra=0+250|ka=0+600]</code></td></tr><tr><td class="font">indic-typo.ttf</td><td class="in"><span class="txt">क्र</span><span class="cps">U+0915 U+094D U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|ra=0+500|virama=0+0]</code></td></tr><tr><td class="font">indic-none.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra=0+250|ka=0+600]</code></td></tr><tr><td class="font">indic-none.ttf</td><td class="in"><span class="txt">क्र</span><span class="cps">U+0915 U+094D U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|virama=0+0|ra=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-53">Under <code>dev2</code> everything works: the vowel sign moves before KA, the conjunct forms, and RA goes below. Under <code>dev3</code> the result is the same here, from a different shaper; <a href="universal-shaping-engine.html">The Universal Shaping Engine</a> shows where the two part company. Under <code>DFLT</code> and <code>latn</code> nothing works. The vowel sign stays after KA, and <code>akhn</code> and <code>blwf</code> never run, though their lookups are under the very script that was chosen: they are Indic features, which only the Indic shaper and the USE ask for. The virama is placed by fallback mark positioning, which the default shaper has and the Indic shaper doesn’t.</p>
+<p id="ix-54">The traces show which shaper ran by the steps that appear. Under <code>dev2</code>, the Indic shaper’s <code>preprocess_text</code> runs, and its two reordering passes run as pauses inside GSUB:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape indic-dev2.ttf "क्र" --language=hi --trace</code></div><table><tbody><tr><td class="what">start preprocess-text</td><td class="buf"><code>&lt;U+0915=0|U+094D=0|U+0930=2&gt;</code></td></tr><tr><td class="what">end preprocess-text</td><td class="buf"><code>&lt;U+0915=0|U+094D=0|U+0930=2&gt;</code></td></tr><tr><td class="what">start decompose</td><td class="buf"><code>&lt;U+0915=0|U+094D=0|U+0930=2&gt;</code></td></tr><tr><td class="what">end decompose</td><td class="buf"><code>&lt;U+0915=0|U+094D=0|U+0930=2&gt;</code></td></tr><tr><td class="what">start reorder</td><td class="buf"><code>&lt;U+0915=0|U+094D=0|U+0930=2&gt;</code></td></tr><tr><td class="what">end reorder</td><td class="buf"><code>&lt;U+0915=0|U+094D=0|U+0930=2&gt;</code></td></tr><tr><td class="what">start compose</td><td class="buf"><code>&lt;U+0915=0|U+094D=0|U+0930=2&gt;</code></td></tr><tr><td class="what">end compose</td><td class="buf"><code>&lt;U+0915=0|U+094D=0|U+0930=2&gt;</code></td></tr><tr><td class="what">start table GSUB script tag &#x27;dev2&#x27;</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">start reordering indic initial</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">skipped inserting dotted-circles because there is no broken syllables</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">end reordering indic initial</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">start lookup 1 feature &#x27;akhn&#x27;</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">end lookup 1 feature &#x27;akhn&#x27;</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">start lookup 2 feature &#x27;blwf&#x27;</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">ligating glyphs at 1,2</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">ligated glyph at 1</td><td class="buf"><code>[ka=0|rakar=0]</code></td></tr><tr><td class="what">end lookup 2 feature &#x27;blwf&#x27;</td><td class="buf"><code>[ka=0|rakar=0]</code></td></tr><tr><td class="what">start reordering indic final</td><td class="buf"><code>[ka=0|rakar=0]</code></td></tr><tr><td class="what">end reordering indic final</td><td class="buf"><code>[ka=0|rakar=0]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;dev2&#x27;</td><td class="buf"><code>[ka=0|rakar=0]</code></td></tr></tbody></table></div>
+<p id="ix-55">Under <code>DFLT</code>, there is no <code>preprocess-text</code>, no reordering and no lookups, but there is a fallback step after GSUB:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape indic-DFLT.ttf "क्र" --language=hi --trace</code></div><table><tbody><tr><td class="what">start decompose</td><td class="buf"><code>&lt;U+0915=0|U+094D=0|U+0930=2&gt;</code></td></tr><tr><td class="what">end decompose</td><td class="buf"><code>&lt;U+0915=0|U+094D=0|U+0930=2&gt;</code></td></tr><tr><td class="what">start reorder</td><td class="buf"><code>&lt;U+0915=0|U+094D=0|U+0930=2&gt;</code></td></tr><tr><td class="what">end reorder</td><td class="buf"><code>&lt;U+0915=0|U+094D=0|U+0930=2&gt;</code></td></tr><tr><td class="what">start compose</td><td class="buf"><code>&lt;U+0915=0|U+094D=0|U+0930=2&gt;</code></td></tr><tr><td class="what">end compose</td><td class="buf"><code>&lt;U+0915=0|U+094D=0|U+0930=2&gt;</code></td></tr><tr><td class="what">start table GSUB script tag &#x27;DFLT&#x27;</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;DFLT&#x27;</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">start fallback mark</td><td class="buf"><code>[ka=0+600|virama=0+0|ra=2+500]</code></td></tr><tr><td class="what">end fallback mark</td><td class="buf"><code>[ka=0+600|virama=0@-300,0+0|ra=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-56">Under <code>dev3</code>, the USE has its own reordering step, after the basic features:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape indic-dev3.ttf "क्र" --language=hi --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;dev3&#x27;</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">start lookup 1 feature &#x27;akhn&#x27;</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">end lookup 1 feature &#x27;akhn&#x27;</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">start lookup 2 feature &#x27;blwf&#x27;</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">ligating glyphs at 1,2</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">ligated glyph at 1</td><td class="buf"><code>[ka=0|rakar=0]</code></td></tr><tr><td class="what">end lookup 2 feature &#x27;blwf&#x27;</td><td class="buf"><code>[ka=0|rakar=0]</code></td></tr><tr><td class="what">start reordering USE</td><td class="buf"><code>[ka=0|rakar=0]</code></td></tr><tr><td class="what">skipped inserting dotted-circles because there is no broken syllables</td><td class="buf"><code>[ka=0|rakar=0]</code></td></tr><tr><td class="what">end reordering USE</td><td class="buf"><code>[ka=0|rakar=0]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;dev3&#x27;</td><td class="buf"><code>[ka=0|rakar=0]</code></td></tr></tbody></table></div>
+<h3 id="old-and-new-indic-tags">Old and new Indic tags</h3>
+<p id="ix-57">Under <code>deva</code>, KA with RA below comes out as KA, RA, virama. The Indic shaper ran, but in its old mode. When the plan is made, the Indic shaper records whether the font uses the old model (<code>data_create_indic</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc#L328"><code>hb-ot-shaper-indic.cc:328</code></a>):</p>
+<pre><code class="language-c++">indic_plan-&gt;is_old_spec = indic_plan-&gt;config-&gt;has_old_spec &amp;&amp;
+                          ((plan-&gt;map.chosen_script[0] &amp; 0x000000FFu) != '2');
+</code></pre>
+<p id="ix-58">All nine Indic scripts have <code>has_old_spec</code> set. In the old mode, the shaper moves the first virama after the base to after the last consonant (<code>:669</code>), the order old fonts’ lookups expect: <code>ra virama</code>, not <code>virama ra</code>. It also merges clusters differently and sets the <code>blwf</code> mask on fewer glyphs; <a href="indic-model.html">The Indic model</a> has the rest. This font’s <code>blwf</code> was written for the new order, so under <code>deva</code> it no longer matches:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape indic-deva.ttf "क्र" --language=hi --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;deva&#x27;</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">start reordering indic initial</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">skipped inserting dotted-circles because there is no broken syllables</td><td class="buf"><code>[ka=0|virama=0|ra=2]</code></td></tr><tr><td class="what">end reordering indic initial</td><td class="buf"><code>[ka=0|ra=0|virama=0]</code></td></tr><tr><td class="what">start lookup 1 feature &#x27;akhn&#x27;</td><td class="buf"><code>[ka=0|ra=0|virama=0]</code></td></tr><tr><td class="what">end lookup 1 feature &#x27;akhn&#x27;</td><td class="buf"><code>[ka=0|ra=0|virama=0]</code></td></tr><tr><td class="what">start lookup 2 feature &#x27;blwf&#x27;</td><td class="buf"><code>[ka=0|ra=0|virama=0]</code></td></tr><tr><td class="what">end lookup 2 feature &#x27;blwf&#x27;</td><td class="buf"><code>[ka=0|ra=0|virama=0]</code></td></tr><tr><td class="what">start reordering indic final</td><td class="buf"><code>[ka=0|ra=0|virama=0]</code></td></tr><tr><td class="what">end reordering indic final</td><td class="buf"><code>[ka=0|ra=0|virama=0]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;deva&#x27;</td><td class="buf"><code>[ka=0|ra=0|virama=0]</code></td></tr></tbody></table></div>
+<p id="ix-59">The test is “doesn’t end in <code>2</code>”, not “is the old tag”. So <code>dflt</code>, which isn’t <code>DFLT</code>, gets the Indic shaper in its old mode, as the results above show. So does a font with no script for the text, or no GSUB at all: its chosen script, <code>HB_TAG_NONE</code>, is neither <code>DFLT</code> nor <code>latn</code>, and doesn’t end in <code>2</code>. <code>indic-none.ttf</code> has no lookups, but its vowel sign is still reordered, by the shaper alone. The 91 USE scripts are the same: with no GSUB they go to the USE. The comment above that case says “for some simple scripts, there may not be <em>any</em> GSUB/GPOS needed, so there may be no scripts found!”, but only <code>DFLT</code> and <code>latn</code> are tested (inferred: no test font here uses a USE script).</p>
+<h3 id="arabic-and-syriac">Arabic and Syriac</h3>
+<p id="ix-60">Arabic gets its shaper whatever the font has, if the text is horizontal, because “we do fallback shaping for Arabic script (and not others)”: from the presentation forms in the <code>cmap</code>, as <a href="joining-scripts.html">Joining scripts</a> describes. Syriac gets the Arabic shaper only if GSUB’s chosen script isn’t <code>DFLT</code>. The test fonts <code>join-*.ttf</code> have <code>init</code>, <code>medi</code> and <code>fina</code> for Arabic BEH and Syriac BETH under <code>arab</code> and <code>syrc</code>, under <code>DFLT</code> only, or under <code>latn</code> only:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">join-arab.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[beh.fina=2+600|beh.medi=1+400|beh.init=0+400]</code></td></tr><tr><td class="font">join-arab.ttf</td><td class="in"><span class="txt">ܒܒܒ</span><span class="cps">U+0712 U+0712 U+0712</span></td><td class="opt">--language=syr</td><td class="out"><code>[beth.fina=2+650|beth.medi=1+450|beth.init=0+450]</code></td></tr><tr><td class="font">join-DFLT.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[beh.fina=2+600|beh.medi=1+400|beh.init=0+400]</code></td></tr><tr><td class="font">join-DFLT.ttf</td><td class="in"><span class="txt">ܒܒܒ</span><span class="cps">U+0712 U+0712 U+0712</span></td><td class="opt">--language=syr</td><td class="out"><code>[beth=2+600|beth=1+600|beth=0+600]</code></td></tr><tr><td class="font">join-latn.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[beh.fina=2+600|beh.medi=1+400|beh.init=0+400]</code></td></tr><tr><td class="font">join-latn.ttf</td><td class="in"><span class="txt">ܒܒܒ</span><span class="cps">U+0712 U+0712 U+0712</span></td><td class="opt">--language=syr</td><td class="out"><code>[beth.fina=2+650|beth.medi=1+450|beth.init=0+450]</code></td></tr><tr><td class="font">join-DFLT.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--language=ar --direction=ttb</td><td class="out"><code>[beh=0@-300,-750+0,-1000|beh=1@-300,-750+0,-1000|beh=2@-300,-750+0,-1000]</code></td></tr></tbody></table></div>
+<p id="ix-61">The Arabic joins in all three fonts. The Syriac joins under <code>syrc</code>, doesn’t under <code>DFLT</code>, and does again under <code>latn</code>. The Indic and USE cases treat a <code>latn</code> fallback like <code>DFLT</code>, but the Syriac case tests only <code>DFLT</code>, so here <code>latn</code> gets the Arabic shaper, which finds the joining features under <code>latn</code> and applies them. So do <code>dflt</code> and a font with no GSUB. Vertical text gets the default shaper, and the behs don’t join.</p>
+<h3 id="myanmar-and-zawgyi">Myanmar and Zawgyi</h3>
+<p id="ix-62">Myanmar treats its old tag differently. <code>mymr</code> is the “tag used from before Myanmar shaping spec was developed. The shaping spec uses ‘mym2’ tag”, says the comment, and a font with only <code>mymr</code> gets the default shaper. There is no old mode. (<code>NEWS</code> for 0.9.34 lists “Add old-spec Myanmar shaper”; 15.1.0 has none.) In the test fonts, a <code>pres</code> ligature expects medial RA (U+103C) moved before its consonant:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">myanmar-mym2.ttf</td><td class="in"><span class="txt">ကြ</span><span class="cps">U+1000 U+103C</span></td><td class="opt">--language=my</td><td class="out"><code>[ra_mka=0+800]</code></td></tr><tr><td class="font">myanmar-mymr.ttf</td><td class="in"><span class="txt">ကြ</span><span class="cps">U+1000 U+103C</span></td><td class="opt">--language=my</td><td class="out"><code>[mka=0+600|medialRa=0+200]</code></td></tr></tbody></table></div>
+<p id="ix-63"><code>Qaag</code> is not a Unicode script. It is a code from ISO 15924’s private-use range that HarfBuzz uses for <strong>Zawgyi</strong>, a font encoding for Burmese that uses the Myanmar block’s code points in its own way (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh#L267"><code>hb-ot-shaper.hh:267</code></a>, and HarfBuzz issue #1162, though the source itself calls it only “Ugly Zawgyi encoding”). No character has that script, so an application must set it. The <code>myanmar_zawgyi</code> shaper has every hook null, uses the lightest normalization, and zeroes no marks: “Disable all auto processing” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-myanmar.cc#L367"><code>hb-ot-shaper-myanmar.cc:367</code></a>). <code>HB_NO_OT_SHAPER_MYANMAR_ZAWGYI</code> leaves it out, and <code>Qaag</code> then gets the default shaper.</p>
+<h3 id="hebrew-and-its-gpos-tag">Hebrew and its GPOS tag</h3>
+<p id="ix-64">Hebrew always gets the Hebrew shaper, which asks something of GPOS. A shaper’s <code>gpos_tag</code>, if set, must be the script GPOS chose, or GPOS isn’t applied and positioning falls back to HarfBuzz’s own (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L135"><code>hb-ot-shape.cc:135</code></a>). Only Hebrew sets it, to <code>hebr</code>, citing issue #347. The Hebrew test fonts have no GSUB and one <code>mark</code> lookup, putting the hiriq at the alef’s right-hand edge, under <code>hebr</code> or <code>DFLT</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hebrew-hebr.ttf</td><td class="in"><span class="txt">אִ</span><span class="cps">U+05D0 U+05B4</span></td><td class="opt">--language=he</td><td class="out"><code>[hiriq=0@500,-150+0|alef=0+600]</code></td></tr><tr><td class="font">hebrew-DFLT.ttf</td><td class="in"><span class="txt">אִ</span><span class="cps">U+05D0 U+05B4</span></td><td class="opt">--language=he</td><td class="out"><code>[hiriq=0@300,-62+0|alef=0+600]</code></td></tr></tbody></table></div>
+<p id="ix-65">Under <code>DFLT</code> the anchor is ignored, and fallback mark positioning centers the hiriq. Under <code>hebr</code> GPOS runs, though its trace line names GSUB’s chosen script, which here is none:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape hebrew-hebr.ttf "אִ" --language=he --trace</code></div><table><tbody><tr><td class="what">start table GPOS script tag &#x27;&#x27;</td><td class="buf"><code>[alef=0+600|hiriq=0+0]</code></td></tr><tr><td class="what">start lookup 0 feature &#x27;mark&#x27;</td><td class="buf"><code>[alef=0+600|hiriq=0+0]</code></td></tr><tr><td class="what">attaching mark glyph at 1 to glyph at 0</td><td class="buf"><code>[alef=0+600|hiriq=0+0]</code></td></tr><tr><td class="what">attached mark glyph at 1 to glyph at 0</td><td class="buf"><code>[alef=0+600|hiriq=0@500,-150+0]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;mark&#x27;</td><td class="buf"><code>[alef=0+600|hiriq=0@500,-150+0]</code></td></tr><tr><td class="what">end table GPOS script tag &#x27;&#x27;</td><td class="buf"><code>[alef=0+600|hiriq=0@500,-150+0]</code></td></tr></tbody></table></div>
+<h3 id="thai-and-lao">Thai and Lao</h3>
+<p id="ix-66">Thai and Lao always get the Thai shaper, but if GSUB didn’t find <code>thai</code> itself (<code>found_script[0]</code> false, so <code>DFLT</code> and <code>latn</code> don’t count), Thai is shaped with the private-use glyphs of old Thai fonts’ <code>cmap</code>s (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-thai.cc#L368"><code>hb-ot-shaper-thai.cc:368</code></a>), as <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a> explains. <code>HB_NO_OT_SHAPER_THAI_FALLBACK</code> leaves that out.</p>
+<h3 id="aat-fonts">AAT fonts</h3>
+<p id="ix-67">The planner’s last step swaps any shaper but the default one for <code>dumber</code> when the font will be shaped with <code>morx</code>: when it has <code>morx</code> (or <code>mort</code>) and the text is horizontal or there is no GSUB (<code>_hb_apply_morx</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L60"><code>hb-ot-shape.cc:60</code></a>). <code>dumber</code> is the default shaper without mark zeroing and fallback positioning (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-default.cc#L55"><code>hb-ot-shaper-default.cc:55</code></a>), “Dumbest shaper ever, basically.” An AAT font reorders in its own state machines, and HarfBuzz mustn’t do it again (issue #1528). This Tamil font from HarfBuzz’s tests has <code>morx</code> and GPOS but no GSUB:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape hb:test/shape/data/in-house/fonts/e6185e88b04432fbf373594d5971686bb7dd698d.ttf "கொ" --language=ta --trace</code></div><table><tbody><tr><td class="what">start table morx</td><td class="buf"><code>[ka-tamil=0|oMatra-tamil=0]</code></td></tr><tr><td class="what">start chainsubtable 0</td><td class="buf"><code>[ka-tamil=0|oMatra-tamil=0]</code></td></tr><tr><td class="what">end chainsubtable 0</td><td class="buf"><code>[ka-tamil=0|oMatra-tamil=0]</code></td></tr><tr><td class="what">start chainsubtable 1</td><td class="buf"><code>[ka-tamil=0|oMatra-tamil=0]</code></td></tr><tr><td class="what">end chainsubtable 1</td><td class="buf"><code>[ka-tamil=0|oMatra-tamil=0]</code></td></tr><tr><td class="what">start chainsubtable 2</td><td class="buf"><code>[ka-tamil=0|oMatra-tamil=0]</code></td></tr><tr><td class="what">end chainsubtable 2</td><td class="buf"><code>[ka-tamil=0|oMatra-tamil=0]</code></td></tr><tr><td class="what">start chainsubtable 3</td><td class="buf"><code>[ka-tamil=0|oMatra-tamil=0]</code></td></tr><tr><td class="what">end chainsubtable 3</td><td class="buf"><code>[ka-tamil=0|oMatra-tamil=0]</code></td></tr><tr><td class="what">start chainsubtable 4</td><td class="buf"><code>[ka-tamil=0|oMatra-tamil=0]</code></td></tr><tr><td class="what">end chainsubtable 4</td><td class="buf"><code>[ka-tamil=0|oMatra-tamil=0|aaMatra-tamil=0]</code></td></tr><tr><td class="what">start chainsubtable 5</td><td class="buf"><code>[ka-tamil=0|oMatra-tamil=0|aaMatra-tamil=0]</code></td></tr><tr><td class="what">end chainsubtable 5</td><td class="buf"><code>[ka-tamil=0|eMatra-tamil=0|aaMatra-tamil=0]</code></td></tr><tr><td class="what">start chainsubtable 6</td><td class="buf"><code>[ka-tamil=0|eMatra-tamil=0|aaMatra-tamil=0]</code></td></tr><tr><td class="what">end chainsubtable 6</td><td class="buf"><code>[eMatra-tamil=0|ka-tamil=0|aaMatra-tamil=0]</code></td></tr><tr><td class="what">end table morx</td><td class="buf"><code>[eMatra-tamil=0|ka-tamil=0|aaMatra-tamil=0]</code></td></tr></tbody></table></div>
+<p id="ix-68">Tamil with no GSUB would get the Indic shaper. Here it gets <code>dumber</code>, and the whole trace has no Indic step: the font’s own chain subtables split the vowel sign O and move its first part before KA. The original shaper’s settings are kept before the swap (<code>script_fallback_position</code>, <code>script_zero_marks</code>), and later decisions, such as whether legacy <code>kern</code> may apply, use them. <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a> covers the rest.</p>
+<h2 id="what-the-choice-decides">What the choice decides</h2>
+<p id="ix-69">A script shaper is an <code>hb_ot_shaper_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh#L67"><code>hb-ot-shaper.hh:67</code></a>): a table of hooks, any of which may be null, and four settings. The choice of shaper is the choice of these:</p>
+<table>
+<thead>
+<tr>
+<th>Member</th>
+<th>What it does</th>
+<th id="ix-70">When it runs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>collect_features</code>, <code>override_features</code></td>
+<td id="ix-71">add the script’s features and the pauses between them, and change the common ones</td>
+<td id="ix-72">while the plan is made</td>
+</tr>
+<tr>
+<td><code>data_create</code>, <code>data_destroy</code></td>
+<td id="ix-73">make and free the shaper’s plan data</td>
+<td id="ix-74">at the end of planning, and when the plan is destroyed</td>
+</tr>
+<tr>
+<td><code>preprocess_text</code></td>
+<td id="ix-75">change the characters before normalization</td>
+<td id="ix-76">each run</td>
+</tr>
+<tr>
+<td><code>decompose</code>, <code>compose</code>, <code>reorder_marks</code></td>
+<td id="ix-77">change how normalization treats the script</td>
+<td id="ix-78">each run, during normalization</td>
+</tr>
+<tr>
+<td><code>setup_masks</code></td>
+<td id="ix-79">set each character’s feature masks, or record categories for later</td>
+<td id="ix-80">each run, before the glyphs are looked up</td>
+</tr>
+<tr>
+<td><code>postprocess_glyphs</code></td>
+<td id="ix-81">change the glyphs after positioning</td>
+<td id="ix-82">each run, at the end</td>
+</tr>
+<tr>
+<td><code>gpos_tag</code></td>
+<td id="ix-83">the script GPOS must have chosen to be used</td>
+<td>at planning</td>
+</tr>
+<tr>
+<td><code>normalization_preference</code></td>
+<td id="ix-84">how far normalization should compose</td>
+<td>at planning</td>
+</tr>
+<tr>
+<td><code>zero_width_marks</code></td>
+<td id="ix-85">whether, and when, marks lose their advance</td>
+<td>at planning</td>
+</tr>
+<tr>
+<td><code>fallback_position</code></td>
+<td id="ix-86">whether fallback mark positioning, and legacy <code>kern</code>, may be used</td>
+<td>at planning</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-87">Much of a shaper’s work is in the pauses that <code>collect_features</code> adds between GSUB stages, such as the Indic reordering passes (<a href="from-features-to-lookups.html">From features to lookups</a>). <a href="pipeline-step-by-step.html">The pipeline, step by step</a> shows where each hook runs. The default shaper’s hooks are all null.</p>
+<h2 id="what-it-means">What it means</h2>
+<h3 id="for-applications">For applications</h3>
+<p id="ix-88">The script HarfBuzz is told decides most of this. <code>hb_buffer_guess_segment_properties</code> takes it from the first character with a real script, which is right for a run already split by script and wrong for one that mixes them.</p>
+<p id="ix-89">The language should be set too, or the locale’s is used. It is given as BCP 47, so an application needn’t know OpenType’s tags, though each distinct BCP 47 tag is a separate plan (<a href="shape-plans-and-their-cache.html#segment-properties">Shape plans and their cache</a>).</p>
+<p id="ix-90">To shape with tags HarfBuzz wouldn’t choose, the <code>-x-hbsc</code> and <code>-x-hbot</code> subtags are the only way through <code>hb_shape</code>. To ask what a font supports before choosing it for a run, <code>hb_ot_tags_from_script_and_language</code> gives the tags HarfBuzz will try, and the return value of <code>hb_ot_layout_table_select_script</code> says whether the font has one of them or only a fallback.</p>
+<blockquote>
+<p id="ix-91">For programmers: nothing in the public API reports which script shaper a plan chose. A trace shows it indirectly: “reordering indic initial”, “reordering USE”, “reordering myanmar”, “preprocess-text” and “postprocess-glyphs” come from shapers’ hooks.</p>
+</blockquote>
+<h3 id="for-type-designers">For type designers</h3>
+<p id="ix-92">The script tag in a font is not a label. It decides which shaper runs, and so which features are applied at all.</p>
+<ul>
+<li id="ix-93">A font for an Indic or USE script needs its lookups under that script’s own tag. Under <code>DFLT</code> or <code>latn</code> alone, the shaper is the default one, and features such as <code>akhn</code>, <code>blwf</code>, <code>half</code> and <code>pref</code> are never applied, however they are registered.</li>
+<li id="ix-94">For the nine Indic scripts, the <code>2</code> tag and the old tag mean different glyph orders in some lookups. A font with both is shaped with the <code>2</code> tag. A font with only the old tag gets the old mode, and so does a font whose only tag is the misspelling <code>dflt</code>.</li>
+<li id="ix-95">A <code>3</code> tag, such as <code>dev3</code>, sends the text to the Universal Shaping Engine, which has its own feature order and categories, and HarfBuzz looks for it before the <code>2</code> tag. The <code>3</code> tags aren’t in the OpenType registry, and DirectWrite doesn’t support them.</li>
+<li id="ix-96">A Myanmar font needs <code>mym2</code>: <code>mymr</code> gets the default shaper.</li>
+<li id="ix-97">A Hebrew font needs <code>hebr</code> in GPOS, not just <code>DFLT</code>, or its GPOS is ignored.</li>
+<li id="ix-98">A Syriac font under <code>DFLT</code> alone gets no joining. Under <code>latn</code> it does.</li>
+<li id="ix-99">GSUB and GPOS are searched separately, and only GSUB’s answer picks the shaper. A font with no GSUB still gets the script’s shaper (for the Indic scripts, in its old mode).</li>
+</ul>
+<h3 id="turkish-i">Turkish i</h3>
+<p id="ix-100">Turkish has a dotted and a dotless i, and its capital of <em>i</em> is <em>İ</em>, with a dot. A font usually gives Turkish its own <em>i</em> through <code>locl</code>, and the language system decides whether that happens. The test font <code>turkish.ttf</code>, from <code>fonts/choosing-a-script-shaper/turkish.fea</code>, has a <code>TRK</code> language system whose <code>locl</code> turns <em>i</em> into <code>i.TRK</code>, a glyph that looks the same. It has <code>liga</code>, with an <em>f i</em> ligature, and <code>smcp</code>, which turns <em>i</em> into <code>i.sc</code> and <code>i.TRK</code> into <code>i.TRK.sc</code>, a small capital that keeps its dot:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">turkish.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--language=en</td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">turkish.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--language=tr</td><td class="out"><code>[f=0+500|i.TRK=1+500]</code></td></tr><tr><td class="font">turkish.ttf</td><td class="in"><span class="txt">i</span><span class="cps">U+0069</span></td><td class="opt">--language=en --features=smcp</td><td class="out"><code>[i.sc=0+500]</code></td></tr><tr><td class="font">turkish.ttf</td><td class="in"><span class="txt">i</span><span class="cps">U+0069</span></td><td class="opt">--language=tr --features=smcp</td><td class="out"><code>[i.TRK.sc=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-101"><code>tr</code> gives <code>TRK</code>. In Turkish, <code>locl</code> has made <code>i.TRK</code> before <code>liga</code> and <code>smcp</code> run, so no ligature forms, since an <em>fi</em> ligature would hide the dot, and the small capital is the dotted one. Nothing in <code>liga</code> or <code>smcp</code> needs to know about Turkish: a different glyph is enough.</p>
+<p id="ix-102">That depends on the order of the lookups. Under the default shaper, <code>locl</code>, <code>liga</code> and <code>smcp</code> are in one stage (<a href="feature-order.html">Feature order</a>), so <code>locl</code> comes first only if its lookup does. <code>turkish-late.ttf</code> is the same font with the <code>locl</code> block moved to the end of the feature file:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">turkish-late.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--language=tr</td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">turkish-late.ttf</td><td class="in"><span class="txt">i</span><span class="cps">U+0069</span></td><td class="opt">--language=tr --features=smcp</td><td class="out"><code>[i.sc=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-103">Now <code>liga</code> and <code>smcp</code> reach the <em>i</em> first, and <code>locl</code> finds nothing to change. Under the Indic, Myanmar and USE shapers, <code>locl</code> runs in an early stage, before any reordering, but under the default shaper its place in the LookupList is all it has.</p>
+<p id="ix-104">For the font file’s side, see Simon Cozens’ <em>Fonts and Layout for Global Scripts</em>. <a href="https://simoncozens.github.io/fonts-and-layout/features.html#scripts-and-languages">“Scripts and languages”</a> explains <code>languagesystem</code> and <code>exclude_dflt</code>, and <a href="https://simoncozens.github.io/fonts-and-layout/localisation.html#language-specific-substitutes">“Language-specific substitutes”</a> and <a href="https://simoncozens.github.io/fonts-and-layout/localisation.html#the-letter-i">“The letter ‘i’”</a> work through language-specific forms with <code>locl</code>, including Turkish i with small capitals and ligatures.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-tag.cc"><code>src/hb-ot-tag.cc</code></a></td>
+<td>script to tags (<code>hb_ot_all_tags_from_script</code>, the new and old tags), language to tags, the private-use subtags, and the reverse mappings</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-tag-table.hh"><code>src/hb-ot-tag-table.hh</code></a></td>
+<td>the generated language tables and <code>hb_ot_tags_from_complex_language</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-tag-table.py"><code>src/gen-tag-table.py</code></a></td>
+<td>the generator, which reads the OpenType language tag page and the IANA subtag registry</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>src/hb-ot-layout.cc</code></a></td>
+<td><code>hb_ot_layout_table_select_script</code> and <code>hb_ot_layout_script_select_language2</code>, with the <code>DFLT</code>, <code>dflt</code> and <code>latn</code> fallbacks</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.cc"><code>src/hb-ot-map.cc</code></a></td>
+<td>the map builder’s constructor, which searches GSUB and GPOS for the tags</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh"><code>src/hb-ot-shaper.hh</code></a></td>
+<td><code>hb_ot_shaper_t</code>, the list of shapers, and <code>hb_ot_shaper_categorize</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>src/hb-ot-shape.cc</code></a></td>
+<td>the planner’s constructor, <code>_hb_apply_morx</code> and the swap to <code>dumber</code>, and the <code>gpos_tag</code> test</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-default.cc"><code>src/hb-ot-shaper-default.cc</code></a></td>
+<td>the default and <code>dumber</code> shapers</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc"><code>src/hb-ot-shaper-indic.cc</code></a></td>
+<td><code>is_old_spec</code>, and what it changes</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A run’s script becomes up to three OpenType script tags, newest first (<code>dev3</code>, <code>dev2</code>, <code>deva</code>), and its BCP 47 language becomes up to three language system tags, from tables generated from the OpenType and IANA registries.</li>
+<li><code>-x-hbsc</code> and <code>-x-hbot</code> private-use subtags force the tags.</li>
+<li>Each of GSUB and GPOS chooses a script: the first tag the font has, else <code>DFLT</code>, <code>dflt</code> or <code>latn</code>, else none. Then a language system: the first tag found, else the default.</li>
+<li>The shaper is chosen from the text’s script and the script GSUB chose. For Indic, Myanmar and USE scripts, <code>DFLT</code> and <code>latn</code> mean the default shaper; for Indic, a <code>3</code> tag means the USE, and any tag not ending in <code>2</code> means the old mode.</li>
+<li>Arabic always gets its shaper in horizontal text; Syriac unless GSUB chose <code>DFLT</code>. Hebrew uses GPOS only under <code>hebr</code>. Fonts shaped with <code>morx</code> get <code>dumber</code>.</li>
+<li>The choice decides which features are applied, how the text is normalized and reordered, and how marks are positioned.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="from-features-to-lookups.html">← From features to lookups</a><a rel="next" href="pipeline-step-by-step.html">The pipeline, step by step →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Legacy kern · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part V · The pipeline</p>
+<h1 id="legacy-kern">21. Legacy kern</h1>
+<p id="ix-1">Before GPOS, a TrueType font kerned with a table of its own, <code>kern</code>: a list of glyph pairs and the amount to move each pair closer or apart. Fonts still carry one. Some are old, and some are new fonts that keep a <code>kern</code> table beside GPOS for software that reads nothing else (HarfBuzz issue #5607 is about such fonts). HarfBuzz reads the table, but it doesn’t always use it: it depends on what else the font has, on which language system GPOS chose, and since 12.2.0, on the script.</p>
+<p id="ix-2">This chapter is about that table: its two incompatible versions, the four subtable formats HarfBuzz reads, the coverage bits, the plan’s decision whether to use it, and the loop that applies it. Kerning that comes from an application’s font functions, when a font has no kerning table of any kind, is in <a href="fallbacks.html">Fallbacks</a>. Apple’s newer <code>kerx</code> table shares most of its code with <code>kern</code>, and has a chapter of its own, <a href="aat-positioning.html">AAT positioning</a>.</p>
+<p id="ix-3">The examples come from one test font, <code>kern.ttf</code>, built by <code>fonts/legacy-kern/build-fonts.py</code>, and eight variants of it. It has box glyphs for a few Latin letters, a combining acute, and two letters each of Thai, Devanagari and Hebrew. It has no GSUB and no GPOS, only a <code>kern</code> table. Every shaping result and trace on this page was produced by running HarfBuzz 15.1.0 on those fonts when the page was built.</p>
+<h2 id="two-tables-called-kern">Two tables called kern</h2>
+<p id="ix-4">There are two <code>kern</code> tables. Microsoft’s, which the OpenType specification describes, starts with a 16-bit version, 0, and a 16-bit count of subtables. Apple’s, in the TrueType Reference Manual, starts with a 32-bit version, 1.0 (<code>0x00010000</code>), and a 32-bit count. Their subtable headers differ too:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>OpenType, version 0</th>
+<th>Apple, version 1.0</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>table header</td>
+<td><code>version</code> (16 bits), <code>tableCount</code> (16)</td>
+<td><code>version</code> (32 bits), <code>tableCount</code> (32)</td>
+</tr>
+<tr>
+<td>subtable header</td>
+<td><code>versionZ</code>, <code>length</code> (16), <code>format</code>, <code>coverage</code></td>
+<td><code>length</code> (32), <code>coverage</code>, <code>format</code>, <code>tupleIndex</code></td>
+</tr>
+<tr>
+<td>header size</td>
+<td>6 bytes</td>
+<td>8 bytes</td>
+</tr>
+<tr>
+<td>HarfBuzz struct</td>
+<td id="ix-5"><code>KernOTSubTableHeader</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-kern-table.hh#L204"><code>hb-ot-kern-table.hh:204</code></a>)</td>
+<td id="ix-6"><code>KernAATSubTableHeader</code> (<code>:259</code>)</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-7">HarfBuzz tells them apart by the first 16 bits. The struct <code>kern</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-kern-table.hh#L313"><code>hb-ot-kern-table.hh:313</code></a>) is a union of the two, and <code>get_type</code> reads its first <code>HBUINT16</code>: 0 is the OpenType table, 1 is the first half of Apple’s <code>0x00010000</code>. Anything else is neither, and nothing in it is read. Each version is then a <code>KerxTable</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-kerx-table.hh#L999"><code>hb-aat-layout-kerx-table.hh:999</code></a>), the template that <code>kerx</code> uses too, given its own header type. So the same code walks the subtables of all three tables; only the header and the sizes of the fields change.</p>
+<p><code>kern.ttf</code> has the OpenType version and <code>apple.ttf</code> the Apple one, with the same pairs. In TTX:</p>
+<figure class="views ttx"><pre><code>&lt;kern&gt;
+  &lt;version value=&quot;0&quot;/&gt;
+  &lt;kernsubtable coverage=&quot;1&quot; format=&quot;0&quot;&gt;
+    &lt;pair l=&quot;A&quot; r=&quot;V&quot; v=&quot;-80&quot;/&gt;
+    &lt;pair l=&quot;T&quot; r=&quot;o&quot; v=&quot;-100&quot;/&gt;
+    &lt;pair l=&quot;bet&quot; r=&quot;gimel&quot; v=&quot;-100&quot;/&gt;
+    &lt;pair l=&quot;ka&quot; r=&quot;ka&quot; v=&quot;-100&quot;/&gt;
+    &lt;pair l=&quot;ko&quot; r=&quot;ko&quot; v=&quot;-100&quot;/&gt;
+  &lt;/kernsubtable&gt;
+&lt;/kern&gt;</code></pre><figcaption>kern.ttf: kern (TTX)</figcaption></figure>
+<figure class="views ttx"><pre><code>&lt;kern&gt;
+  &lt;version value=&quot;1.0&quot;/&gt;
+  &lt;kernsubtable coverage=&quot;0&quot; format=&quot;0&quot; tupleIndex=&quot;0&quot;&gt;
+    &lt;pair l=&quot;A&quot; r=&quot;V&quot; v=&quot;-80&quot;/&gt;
+    &lt;pair l=&quot;T&quot; r=&quot;o&quot; v=&quot;-100&quot;/&gt;
+    &lt;pair l=&quot;bet&quot; r=&quot;gimel&quot; v=&quot;-100&quot;/&gt;
+    &lt;pair l=&quot;ka&quot; r=&quot;ka&quot; v=&quot;-100&quot;/&gt;
+    &lt;pair l=&quot;ko&quot; r=&quot;ko&quot; v=&quot;-100&quot;/&gt;
+  &lt;/kernsubtable&gt;
+&lt;/kern&gt;</code></pre><figcaption>apple.ttf: kern (TTX)</figcaption></figure>
+<p>They kern alike:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">AVTo</span><span class="cps">U+0041 U+0056 U+0054 U+006F</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+560|V=1@-40,0+560|T=2+550|o=3@-50,0+450]</code></td></tr><tr><td class="font">apple.ttf</td><td class="in"><span class="txt">AVTo</span><span class="cps">U+0041 U+0056 U+0054 U+006F</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+560|V=1@-40,0+560|T=2+550|o=3@-50,0+450]</code></td></tr></tbody></table></div>
+<p id="ix-8">Each pair moves by its full value, but not in the way GPOS would move it: A’s advance has lost 40 units and V has lost 40 of advance <em>and</em> 40 of offset. That is the subject of the last section. A table with no subtables counts as no table at all: <code>hb_ot_layout_has_kerning</code> is true only if the first 32 bits aren’t zero (<code>:317</code>), which for the OpenType version means a count of at least one.</p>
+<p id="ix-9">Checking the table is the <a href="trust-nothing-the-sanitizer.html">sanitizer</a>’s work, as for any table. Each subtable is checked inside its own <code>length</code>, except the last, whose length is ignored because an OpenType subtable longer than 64 KB can’t state it; <a href="trust-nothing-the-sanitizer.html#a-smaller-window">A smaller window</a> tells that story. A table that declares more than <code>HB_AAT_MAX_SUBTABLES</code> subtables, 1,024, is rejected whole (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-kerx-table.hh#L1154"><code>hb-aat-layout-kerx-table.hh:1154</code></a>), because HarfBuzz keeps two glyph sets for each.</p>
+<h2 id="four-subtable-formats">Four subtable formats</h2>
+<p id="ix-10"><code>KernSubTable::dispatch</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-kern-table.hh#L141"><code>hb-ot-kern-table.hh:141</code></a>) chooses by the subtable’s <code>format</code>, and reads four:</p>
+<table>
+<thead>
+<tr>
+<th>Format</th>
+<th>What it holds</th>
+<th>Specified for</th>
+<th>HarfBuzz struct</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td id="ix-11">ordered pairs: left glyph, right glyph, value</td>
+<td>both</td>
+<td id="ix-12"><code>KerxSubTableFormat0</code></td>
+</tr>
+<tr>
+<td>1</td>
+<td id="ix-13">a state machine that pushes glyphs and pops values</td>
+<td>Apple</td>
+<td id="ix-14"><code>KerxSubTableFormat1</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td id="ix-15">a left class table, a right class table, and an array of values</td>
+<td>both</td>
+<td id="ix-16"><code>KerxSubTableFormat2</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td id="ix-17">a class for every glyph on each side, and a matrix of indices into a list of values</td>
+<td>Apple</td>
+<td id="ix-18"><code>KernSubTableFormat3</code></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-19">Formats 0, 1 and 2 are <code>kerx</code>’s own structs, made with the <code>kern</code> header and <code>ObsoleteTypes</code>: 16-bit offsets, and class values that are byte offsets rather than indices. Only format 3 has a struct of its own. HarfBuzz doesn’t check which header a format came under, so it would run a format 1 or 3 subtable in a Microsoft table too. A build with <code>HB_NO_AAT_SHAPE</code> leaves out formats 1 and 3 and the Apple header with them (<code>:148</code>), so an Apple <code>kern</code> table is then ignored.</p>
+<p id="ix-20">Format 0 is the common one. Its pairs are a <code>BinSearchArrayOf</code>, with the usual <code>searchRange</code>, <code>entrySelector</code> and <code>rangeShift</code>, and <code>KerxSubTableFormat0::get_kerning</code> finds a pair by binary search (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-kerx-table.hh#L101"><code>hb-aat-layout-kerx-table.hh:101</code></a>). That only works if the pairs are sorted, by left glyph ID and then right, as the specification requires. <code>unsorted.ttf</code> has <code>kern.ttf</code>’s pairs in descending order, and none of them is found:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">unsorted.ttf</td><td class="in"><span class="txt">AVTo</span><span class="cps">U+0041 U+0056 U+0054 U+006F</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+600|V=1+600|T=2+600|o=3+500]</code></td></tr></tbody></table></div>
+<figure class="views ttx"><pre><code>&lt;kern&gt;
+  &lt;version value=&quot;0&quot;/&gt;
+  &lt;kernsubtable coverage=&quot;1&quot; format=&quot;0&quot;&gt;
+    &lt;pair l=&quot;A&quot; r=&quot;V&quot; v=&quot;-80&quot;/&gt;
+    &lt;pair l=&quot;T&quot; r=&quot;o&quot; v=&quot;-100&quot;/&gt;
+    &lt;pair l=&quot;bet&quot; r=&quot;gimel&quot; v=&quot;-100&quot;/&gt;
+    &lt;pair l=&quot;ka&quot; r=&quot;ka&quot; v=&quot;-100&quot;/&gt;
+    &lt;pair l=&quot;ko&quot; r=&quot;ko&quot; v=&quot;-100&quot;/&gt;
+  &lt;/kernsubtable&gt;
+&lt;/kern&gt;</code></pre><figcaption>unsorted.ttf: kern (TTX)</figcaption></figure>
+<blockquote>
+<p id="ix-21">For type designers: TTX doesn’t show the order. It lists pairs by glyph name, whatever order they are in, and fontTools sorts them by glyph ID again when it compiles. A <code>kern</code> table from a tool that writes its own bytes is worth checking another way.</p>
+</blockquote>
+<p id="ix-22">Format 2 sorts glyphs into classes. A left class table and a right class table each cover a range of glyphs, and each glyph’s class value is already a byte offset: the left one to the start of a row, the right one to a column within the row. HarfBuzz counts their sum from the start of the subtable (<code>:464</code>). The OpenType specification’s wording, “adding the class values to the address of the array”, suggests counting from the array instead; a font built that way doesn’t kern in HarfBuzz, because every sum falls before the array, where HarfBuzz finds no value. A glyph outside a class table has class 0, and is not kerned on that side. Format 3 gives every glyph a left class and a right class, one byte each, and a matrix of one-byte indices into a list of at most 255 values (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-kern-table.hh#L48"><code>hb-ot-kern-table.hh:48</code></a>). <code>format2.ttf</code> and <code>format3.ttf</code> are <code>kern.ttf</code> with the Latin pairs written in each format, byte by byte, because fontTools writes only format 0:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">format2.ttf</td><td class="in"><span class="txt">AVTo</span><span class="cps">U+0041 U+0056 U+0054 U+006F</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+560|V=1@-40,0+560|T=2+550|o=3@-50,0+450]</code></td></tr><tr><td class="font">format2-array.ttf</td><td class="in"><span class="txt">AVTo</span><span class="cps">U+0041 U+0056 U+0054 U+006F</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+600|V=1+600|T=2+600|o=3+500]</code></td></tr><tr><td class="font">format3.ttf</td><td class="in"><span class="txt">AVTo</span><span class="cps">U+0041 U+0056 U+0054 U+006F</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+560|V=1@-40,0+560|T=2+550|o=3@-50,0+450]</code></td></tr></tbody></table></div>
+<p><code>format2-array.ttf</code> is <code>format2.ttf</code> with its left class values counted from the array. The specification also says “Format 0 is the only subtable format supported by Windows.”</p>
+<p id="ix-23">Format 1 isn’t a list of pairs at all. It is a state machine of the kind <code>morx</code> uses (<a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a>): an entry can push the current glyph on a stack of up to eight, and an action pops glyphs and adds a value to each. In <code>kern</code>, the last value of an action has its low bit set (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-kerx-table.hh#L345"><code>hb-aat-layout-kerx-table.hh:345</code></a>). A popped glyph gets the whole value, on its advance and its offset alike, not half on each of two glyphs. This font from HarfBuzz’s tests has one format 1 subtable, under the Apple header:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hb:test/shape/data/in-house/fonts/a5baedaf2c0f467d6a08701309a177dbd7e6156d.ttf</td><td class="in"><span class="txt">ab</span><span class="cps">U+0061 U+0062</span></td><td class="opt"></td><td class="out"><code>[gid1=0@-100,0+1014|gid2=1+1149]</code></td></tr></tbody></table></div>
+<p id="ix-24">The first glyph’s advance has dropped by 100 and it has moved 100 left. HarfBuzz 15.1.0’s <code>NEWS</code> lists a fix for <code>kern</code> state machines whose initial state isn’t the first one, which were being ignored.</p>
+<h2 id="coverage-bits">Coverage bits</h2>
+<p>Each subtable has a byte of coverage flags. The two headers define different bits, and put the byte in different places: in the OpenType header it is the low byte of a 16-bit field whose high byte is the format; in the Apple header it is the high byte, and the format the low one. HarfBuzz’s structs read each as two separate bytes, so neither needs masking.</p>
+<table>
+<thead>
+<tr>
+<th>Bit</th>
+<th>OpenType</th>
+<th>Apple</th>
+<th>What HarfBuzz does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-25">direction</td>
+<td><code>Horizontal</code> (0x01): set for horizontal data</td>
+<td><code>Vertical</code> (0x80): set for vertical data</td>
+<td id="ix-26">runs the subtable only in text of that direction (<code>:1078</code>)</td>
+</tr>
+<tr>
+<td id="ix-27"><code>CrossStream</code></td>
+<td>0x04</td>
+<td>0x40</td>
+<td id="ix-28">moves glyphs across the line instead of along it</td>
+</tr>
+<tr>
+<td><code>Minimum</code></td>
+<td>0x02</td>
+<td>none</td>
+<td>ignored</td>
+</tr>
+<tr>
+<td><code>Override</code></td>
+<td>0x08</td>
+<td>none</td>
+<td>ignored</td>
+</tr>
+<tr>
+<td><code>Variation</code></td>
+<td>none</td>
+<td>0x20</td>
+<td>skips the subtable</td>
+</tr>
+<tr>
+<td><code>tupleIndex</code></td>
+<td>none</td>
+<td>header field</td>
+<td id="ix-29">not read: “We don’t implement” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-kern-table.hh#L287"><code>hb-ot-kern-table.hh:287</code></a>)</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-30"><code>KernOTSubTableHeader</code> defines <code>Minimum</code> and <code>Override</code> (<code>:215</code>), and nothing reads them. The specification says that with the override bit “the value in this table should replace the value currently being accumulated”, and that a subtable with the minimum bit holds minimum values, which limit how far kerning and tracking together may move a pair. HarfBuzz runs each subtable in its own pass over the buffer, so values always add up. <code>override.ttf</code> has <code>kern.ttf</code>’s subtable and then one with A V −30 and the override bit:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">AV</span><span class="cps">U+0041 U+0056</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+560|V=1@-40,0+560]</code></td></tr><tr><td class="font">override.ttf</td><td class="in"><span class="txt">AV</span><span class="cps">U+0041 U+0056</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+545|V=1@-55,0+545]</code></td></tr></tbody></table></div>
+<p id="ix-31">The pair has moved by −110, not −30. A comment on the sanitizer (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-kerx-table.hh#L1161"><code>hb-aat-layout-kerx-table.hh:1161</code></a>) says Microsoft’s implementation reads only one subtable, of format 0, and the specification agrees, so a font that relies on more than one is relying on something few readers do. A subtable with <code>Minimum</code> set is kerned like any other, its limits added as kerning values.</p>
+<h3 id="cross-stream">Cross-stream</h3>
+<p id="ix-32">A <strong>cross-stream</strong> subtable moves glyphs across the line: up and down in horizontal text, sideways in vertical. HarfBuzz’s <code>NEWS</code> for 2.1.2, which added it, calls it “cursive positioning, etc”. HarfBuzz gives it the meaning <code>kerx</code> has. The first time it meets a cross-stream subtable, it links every glyph to the one before it as if by a cursive attachment (<code>:1103</code>). The value is then written into the second glyph’s offset across the line, and when the links are resolved after positioning, each glyph carries the offsets of the ones before it. <code>cross.ttf</code> adds a cross-stream subtable to <code>kern.ttf</code>, with A V +100, and T o with the value 0x8000:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">cross.ttf</td><td class="in"><span class="txt">AVAT</span><span class="cps">U+0041 U+0056 U+0041 U+0054</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+560|V=1@-40,100+560|A=2@0,100+600|T=3@0,100+600]</code></td></tr><tr><td class="font">cross.ttf</td><td class="in"><span class="txt">AVAV</span><span class="cps">U+0041 U+0056 U+0041 U+0056</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+560|V=1@-40,100+560|A=2@0,100+560|V=3@-40,200+560]</code></td></tr><tr><td class="font">cross.ttf</td><td class="in"><span class="txt">AVTo</span><span class="cps">U+0041 U+0056 U+0054 U+006F</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+560|V=1@-40,100+560|T=2@0,100+550|o=3@-50,-32668+450]</code></td></tr></tbody></table></div>
+<p id="ix-33">The V is raised by 100, and so is everything after it, until another pair raises it again. The ordinary subtable before it has still kerned A V along the line. The specification says “The value 0x8000 in the kerning data resets the cross-stream kerning back to 0.” Only the format 1 state machine knows that (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-kerx-table.hh#L360"><code>hb-aat-layout-kerx-table.hh:360</code></a>). The kern machine, which runs formats 0, 2 and 3, takes 0x8000 as −32,768, so the <code>o</code> ends up 32,668 units below the line instead of on it. That looks like a HarfBuzz bug. A plan with cross-stream <code>kern</code> doesn’t move marks back by their advance when it zeroes them, nor position them itself (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L198"><code>hb-ot-shape.cc:198</code></a>), and a plan with a format 1 subtable doesn’t zero marks at all (<code>:189</code>). <a href="pipeline-step-by-step.html#gpos-and-what-surrounds-it">The pipeline, step by step</a> shows where those steps are.</p>
+<h3 id="vertical-subtables">Vertical subtables</h3>
+<p id="ix-34">The direction bit means that an OpenType subtable without <code>Horizontal</code> is for vertical text. In practice it is never used. In vertical text the plan’s kerning feature is <code>vkrn</code>, not <code>kern</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L127"><code>hb-ot-shape.cc:127</code></a>), and <code>vkrn</code> is neither turned on by default nor kept, as <code>kern</code> is, when the font lacks it. So the kerning mask is zero, and no format 0, 2 or 3 subtable kerns (read from the code). The test fonts’ subtable is horizontal, and is skipped in vertical text as it should be:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">AV</span><span class="cps">U+0041 U+0056</span></td><td class="opt">--language=en --direction=ttb</td><td class="out"><code>[A=0@-300,-750+0,-1000|V=1@-300,-750+0,-1000]</code></td></tr></tbody></table></div>
+<p><a href="vertical-text.html">Vertical text</a> has the rest.</p>
+<h2 id="when-the-plan-uses-kern">When the plan uses kern</h2>
+<p id="ix-35">Whether <code>kern</code> runs is decided when the shape plan is made, in <code>hb_ot_shape_planner_t::compile</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L127"><code>hb-ot-shape.cc:127</code></a>–<code>187</code>), along with GPOS, <code>kerx</code> and fallback kerning; <a href="fallbacks.html#who-decides">Fallbacks</a> quotes the code. The legacy <code>kern</code> table is used when all of these are true:</p>
+<ol>
+<li id="ix-36">The font has no <code>kerx</code>. Any <code>kerx</code> that the first test passed over is taken up in the second, so a font with both never uses <code>kern</code>.</li>
+<li id="ix-37">GPOS isn’t being used, or it is but has no <code>kern</code> feature in the language system it chose. <code>has_gpos_kern</code> asks the map, so it looks only at GPOS’s choice of script and language, not at the whole table.</li>
+<li id="ix-38">The font has a <code>kern</code> table with at least one subtable.</li>
+<li id="ix-39">The script shaper allows it: its <code>fallback_position</code> setting is true.</li>
+</ol>
+<p id="ix-40">None of the four looks at the outlines. The specification says that “Fonts containing CFF outlines are not supported by the 'kern' table and require use of the GPOS table to provide kerning” (<a href="https://learn.microsoft.com/en-us/typography/opentype/spec/kern">kern</a>), but HarfBuzz applies a <code>kern</code> table in a CFF font just as in a TrueType one (<code>hb_ot_layout_has_kerning</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L88"><code>hb-ot-layout.cc:88</code></a>, checks only that the table has data). A CFF font that relies on that kerns in HarfBuzz, but the specification gives no reason to expect other engines to do the same.</p>
+<p id="ix-41"><code>plan-&gt;position</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L271"><code>hb-ot-shape.cc:271</code></a>) then runs GPOS or <code>kerx</code>, and after it <code>kern</code> or fallback kerning. GPOS and <code>kern</code> aren’t exclusive. When both are applied, each does its own part, and <code>kern</code> comes second.</p>
+<h3 id="alongside-gpos">Alongside GPOS</h3>
+<p id="ix-42"><code>both.ttf</code> is <code>kern.ttf</code> with a GPOS added, from <code>fonts/legacy-kern/both.fea</code>. Latin’s default language system has <code>kern</code> (A V −50) and <code>mark</code>. Its Turkish language system, <code>TRK</code>, has <code>mark</code> only, as it would if a tool had forgotten it. Devanagari has <code>dist</code> (ka ka −30) and no <code>kern</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">both.ttf</td><td class="in"><span class="txt">AVTo</span><span class="cps">U+0041 U+0056 U+0054 U+006F</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+550|V=1+600|T=2+600|o=3+500]</code></td></tr><tr><td class="font">both.ttf</td><td class="in"><span class="txt">AVTo</span><span class="cps">U+0041 U+0056 U+0054 U+006F</span></td><td class="opt">--language=tr</td><td class="out"><code>[A=0+560|V=1@-40,0+560|T=2+550|o=3@-50,0+450]</code></td></tr><tr><td class="font">both.ttf</td><td class="in"><span class="txt">A◌́V</span><span class="cps">U+0041 U+0301 U+0056</span></td><td class="opt">--language=tr</td><td class="out"><code>[A=0+560|acutecomb=0@-260,-100+0|V=2@-40,0+560]</code></td></tr></tbody></table></div>
+<p id="ix-43">In English, GPOS has a <code>kern</code> feature, so the <code>kern</code> table is left alone: A V gets GPOS’s −50, and T o isn’t kerned, because GPOS doesn’t kern it. In Turkish, the same text in the same font gets the <code>kern</code> table’s values. With an acute, GPOS places the mark and the <code>kern</code> table kerns A V across it: the two tables have each done part of the job. The mark stays over the A, though the A’s advance shrank after GPOS had placed it. That’s because <code>kern</code> runs before attachments are resolved, and resolving them adds up the advances as they are then (<a href="gpos.html#resolving-attachments">Resolving attachments</a>).</p>
+<p id="ix-44">This is the behavior since HarfBuzz 2.0.0. Before it, the <code>kern</code> table was used only in a font with no GPOS at all. The commit that changed it says why: it applies to “Arial, Times New Roman, etc in Win7”, which have a GPOS without kerning in it, and were “not kerning before” (commit e655fd38, October 2018).</p>
+<h3 id="the-kern-feature-and-its-mask">The kern feature and its mask</h3>
+<p id="ix-45"><code>kern</code> is one of the default horizontal features, with <code>F_HAS_FALLBACK</code> (<a href="from-features-to-lookups.html#the-flags">From features to lookups</a>): it gets a mask bit even when neither GSUB nor GPOS has it, because the <code>kern</code> table and fallback kerning both read that bit. <code>kern_mask</code> is the bit, and <code>requested_kerning</code> says whether there is one. Turning the feature off for the whole text removes it from the map. Then formats 0, 2 and 3 return at once (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-kerx-table.hh#L109"><code>hb-aat-layout-kerx-table.hh:109</code></a>); format 1 still runs if it is cross-stream (<code>:422</code>).</p>
+<p id="ix-46">Turned off for part of the text, the feature clears the bit on those glyphs, and a pair is kerned only if <em>both</em> its glyphs have it. The second glyph is found by the skipping iterator, which won’t match a glyph without the mask:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">AVAV</span><span class="cps">U+0041 U+0056 U+0041 U+0056</span></td><td class="opt">--language=en --features=-kern</td><td class="out"><code>[A=0+600|V=1+600|A=2+600|V=3+600]</code></td></tr><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">AVAV</span><span class="cps">U+0041 U+0056 U+0041 U+0056</span></td><td class="opt">--language=en --features=kern[0:1]=0</td><td class="out"><code>[A=0+600|V=1+600|A=2+560|V=3@-40,0+560]</code></td></tr><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">AVAV</span><span class="cps">U+0041 U+0056 U+0041 U+0056</span></td><td class="opt">--language=en --features=kern[1:]=0</td><td class="out"><code>[A=0+600|V=1+600|A=2+600|V=3+600]</code></td></tr></tbody></table></div>
+<p id="ix-47">Turning off <code>kern</code> also hides GPOS’s <code>kern</code> feature from <code>has_gpos_kern</code>, so in <code>both.ttf</code> the plan applies the <code>kern</code> table, and then the table does nothing because kerning wasn’t requested. The trace shows the table and its subtable start and end with nothing done. (The empty script tag in GPOS’s message is a slip in the message, which prints GSUB’s choice of script, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L2149"><code>hb-ot-layout.cc:2149</code></a>; this font has no GSUB.)</p>
+<div class="trace"><div class="trace-head"><code>hb-shape both.ttf "AV" --language=en --features=-kern --trace</code></div><table><tbody><tr><td class="what">start table GPOS script tag &#x27;&#x27;</td><td class="buf"><code>[A=0+600|V=1+600]</code></td></tr><tr><td class="what">end table GPOS script tag &#x27;&#x27;</td><td class="buf"><code>[A=0+600|V=1+600]</code></td></tr><tr><td class="what">start table kern</td><td class="buf"><code>[A=0+600|V=1+600]</code></td></tr><tr><td class="what">start subtable 0</td><td class="buf"><code>[A=0+600|V=1+600]</code></td></tr><tr><td class="what">end subtable 0</td><td class="buf"><code>[A=0+600|V=1+600]</code></td></tr><tr><td class="what">end table kern</td><td class="buf"><code>[A=0+600|V=1+600]</code></td></tr></tbody></table></div>
+<h3 id="which-shapers-apply-it">Which shapers apply it</h3>
+<p id="ix-48"><code>fallback_position</code> is one of the four settings of a script shaper (<a href="choosing-a-script-shaper.html#what-the-choice-decides">What the choice decides</a>). It also decides whether marks are positioned by HarfBuzz when there is no GPOS. In 15.1.0 it is:</p>
+<table>
+<thead>
+<tr>
+<th>Shaper</th>
+<th><code>fallback_position</code></th>
+<th id="ix-49">Legacy <code>kern</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>default</td>
+<td>true</td>
+<td>yes</td>
+</tr>
+<tr>
+<td id="ix-50">Arabic (Arabic, and Syriac when GSUB has a Syriac script; horizontal text only)</td>
+<td>true</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>Hebrew</td>
+<td>true</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>Hangul</td>
+<td>true</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>Thai (also Lao)</td>
+<td>false</td>
+<td>no</td>
+</tr>
+<tr>
+<td>Indic</td>
+<td>false</td>
+<td>no</td>
+</tr>
+<tr>
+<td>Khmer</td>
+<td>false</td>
+<td>no</td>
+</tr>
+<tr>
+<td id="ix-51">Myanmar, and Myanmar Zawgyi</td>
+<td>false</td>
+<td>no</td>
+</tr>
+<tr>
+<td id="ix-52">USE</td>
+<td>false</td>
+<td>no</td>
+</tr>
+<tr>
+<td>dumber</td>
+<td>false</td>
+<td>(not consulted)</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-53">The planner reads it from the shaper it first chose, as <code>script_fallback_position</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L94"><code>hb-ot-shape.cc:94</code></a>), before an AAT font’s shaper is replaced by <code>dumber</code> (<a href="choosing-a-script-shaper.html#aat-fonts">AAT fonts</a>). So a <code>morx</code> font with a <code>kern</code> table and no <code>kerx</code> kerns Latin and Hebrew, but not Devanagari or Thai (read from the code; no test font here has <code>morx</code>).</p>
+<p id="ix-54"><code>kern.ttf</code> has a pair in each of four scripts:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">กก</span><span class="cps">U+0E01 U+0E01</span></td><td class="opt">--language=th</td><td class="out"><code>[ko=0+600|ko=1+600]</code></td></tr><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">कक</span><span class="cps">U+0915 U+0915</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|ka=1+600]</code></td></tr><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">גב</span><span class="cps">U+05D2 U+05D1</span></td><td class="opt">--language=he</td><td class="out"><code>[bet=1+550|gimel=0@-50,0+350]</code></td></tr><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">בג</span><span class="cps">U+05D1 U+05D2</span></td><td class="opt">--language=he</td><td class="out"><code>[gimel=1+400|bet=0+600]</code></td></tr><tr><td class="font">both.ttf</td><td class="in"><span class="txt">कक</span><span class="cps">U+0915 U+0915</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+570|ka=1+600]</code></td></tr></tbody></table></div>
+<p id="ix-55">Thai and Devanagari aren’t kerned, though their pairs are in the table. Hebrew is kerned, and only one way round, which the next section explains. In <code>both.ttf</code>, Devanagari gets GPOS’s <code>dist</code>, −30, and nothing from the <code>kern</code> table.</p>
+<h2 id="what-changed-in-122">What changed in 12.2</h2>
+<p id="ix-56">12.2.0’s <code>NEWS</code> says: “Disable legacy <code>kern</code> table for most shapers, enabling it only for default, Arabic, Hangul, and Hebrew shapers.” Until then, the plan’s line was <code>plan.apply_kern = true</code>.</p>
+<p id="ix-57">The reason was double kerning. HarfBuzz issue #5607 reported that the legacy table was being used “in more common scenarios” than the manual said: whenever the chosen language system has no <code>kern</code> feature. Fonts compiled by ufo2ft for scripts such as Devanagari kern with <code>dist</code> instead, so there is no <code>kern</code> feature, and the same pairs, often between characters common to several scripts, were also in the <code>kern</code> table that the font carried for older software. HarfBuzz applied both. Behdad Esfahbod suggested reusing the shaper’s <code>fallback_position</code>, then true only for the default, Hebrew and Arabic shapers, and the change was made in pull request #5609. Jonathan Kew asked in its review whether Hangul should keep the table too, since <code>dist</code> is meant for Indic and other Brahmi-derived scripts, and Hangul’s <code>fallback_position</code> was turned on (commit 63e8c13e), which also gave Hangul fallback mark positioning. A second commit made fallback kerning, through the font functions, follow the same setting (5973479e, <a href="fallbacks.html">Fallbacks</a>).</p>
+<p id="ix-58">So the rule isn’t about <code>dist</code>. A Thai or Indic font with a <code>kern</code> table and no GPOS at all isn’t kerned either, as <code>kern.ttf</code> shows. Apart from Hangul, the shapers that lost the table are the ones that already left mark positioning to the font. The test suite has the case from the issue (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/shape/data/in-house/tests/per-script-kern-fallback.tests"><code>test/shape/data/in-house/tests/per-script-kern-fallback.tests</code></a>).</p>
+<p id="ix-59">HarfBuzz’s manual hasn’t caught up. <code>docs/usermanual-opentype-features.xml</code> still says that HarfBuzz uses the <code>kern</code> table “if neither table is found”, meaning <code>kerx</code> and GPOS, which hasn’t been true since 2018 and says nothing of the shapers.</p>
+<blockquote>
+<p id="ix-60">For type designers: in HarfBuzz, a <code>kern</code> table is a fallback for Latin, Cyrillic, Greek, Arabic, Hebrew, Hangul and the other scripts the default shaper handles, and only where GPOS has no <code>kern</code> feature in the language system it chooses. Every language system needs its <code>kern</code> feature, or that language gets the old table instead, with its own values. For Thai, Lao, Khmer, Myanmar and the Indic and USE scripts, kerning has to be in GPOS.</p>
+</blockquote>
+<h2 id="how-the-kerning-is-applied">How the kerning is applied</h2>
+<p id="ix-61">Every format but 1 ends in the same loop, the <strong>kern machine</strong>, <code>hb_kern_machine_t::kern</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-kern.hh#L46"><code>hb-kern.hh:46</code></a>). It is a template over a <em>driver</em> with a <code>get_kerning (left, right)</code> method: each subtable format is a driver, and so is fallback kerning, whose driver asks the font functions. Trimmed of the vertical case, the cross-stream case and scaling’s on-off switch, and with its <code>goto</code> written as an <code>if</code>:</p>
+<pre><code class="language-c++">buffer-&gt;unsafe_to_concat ();
+OT::hb_ot_apply_context_t c (1, font, buffer, hb_blob_get_empty ());
+c.set_lookup_mask (kern_mask);
+c.set_lookup_props (OT::LookupFlag::IgnoreMarks);
+auto &amp;skippy_iter = c.iter_input;
+
+for (unsigned int idx = 0; idx &lt; count;)
+{
+  if (!(info[idx].mask &amp; kern_mask)) { idx++; continue; }
+
+  skippy_iter.reset_fast (idx);
+  unsigned unsafe_to;
+  if (unlikely (!skippy_iter.next (&amp;unsafe_to))) { idx = unsafe_to; continue; }
+
+  unsigned int i = idx, j = skippy_iter.idx;
+  hb_position_t kern = driver.get_kerning (info[i].codepoint, info[j].codepoint);
+  if (kern)
+  {
+    kern = font-&gt;em_scale_x (kern);
+    hb_position_t kern1 = kern &gt;&gt; 1;
+    hb_position_t kern2 = kern - kern1;
+    pos[i].x_advance = hb_saturate_add (pos[i].x_advance, kern1);
+    pos[j].x_advance = hb_saturate_add (pos[j].x_advance, kern2);
+    pos[j].x_offset  = hb_saturate_add (pos[j].x_offset, kern2);
+    buffer-&gt;unsafe_to_break (i, j + 1);
+  }
+  idx = skippy_iter.idx;
+}
+</code></pre>
+<p>Five things follow from it.</p>
+<p id="ix-62"><strong>It is GPOS’s iterator.</strong> The context is made for table 1, GPOS, with the lookup flag <code>IgnoreMarks</code> and the kerning mask. So the second glyph of a pair is found as a GPOS pair lookup with <code>IgnoreMarks</code> would find it: marks are passed over, and so are ZWJ, ZWNJ and the other default ignorables (<a href="gpos.html#what-a-lookup-passes-over">What a lookup passes over</a>). A <code>kern</code> table has no lookup flags of its own; this is HarfBuzz’s choice for it:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">A◌́V</span><span class="cps">U+0041 U+0301 U+0056</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+560|acutecomb=0@-260,562+0|V=2@-40,0+560]</code></td></tr><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">A⟨ZWNJ⟩V</span><span class="cps">U+0041 U+200C U+0056</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+560|space=1+0|V=2@-40,0+560]</code></td></tr><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">A␣V</span><span class="cps">U+0041 U+0020 U+0056</span></td><td class="opt">--language=en</td><td class="out"><code>[A=0+600|space=1+250|V=2+600]</code></td></tr></tbody></table></div>
+<p id="ix-63">A space is a glyph like any other, so A and V either side of one aren’t a pair.</p>
+<p id="ix-64"><strong>The value is split.</strong> Half goes on the first glyph’s advance, rounded down; the rest goes on the second glyph’s advance and, to put it back where it would have been, on its offset. Every glyph after the pair moves by the whole value, and so does the second glyph’s drawing, so it looks the same as GPOS’s kerning; but the change is shared between the two glyphs’ advances, which moves the boundary between them, where a caret goes, halfway. That was the reason 4.0.0’s <code>NEWS</code> gave for splitting GPOS kerning the same way, “for improved cursor positioning”. GPOS does it now only in a build with <code>HB_SPLIT_KERN</code>, which is off (<a href="gpos.html#safe-to-break">Safe to break</a>); the kern machine always does it. Compare the English and Turkish results for <code>both.ttf</code> above: −50 all on A from GPOS, −80 shared from <code>kern</code>.</p>
+<p id="ix-65"><strong>Every glyph starts a pair.</strong> After a pair, the loop moves to its second glyph, which then starts the next: A V A V is tried as A V, V A and A V. Each subtable runs over the whole buffer in its own pass, from <code>KerxTable::apply</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-kerx-table.hh#L1055"><code>hb-aat-layout-kerx-table.hh:1055</code></a>).</p>
+<p id="ix-66"><strong>Pairs are left and right.</strong> In right-to-left text, <code>KerxTable::apply</code> reverses the buffer into visual order before a subtable runs and back afterward (<code>:1091</code>), so the first glyph of a pair is always the left-hand one, as both specifications define it. GPOS works in logical order instead. In the Hebrew example above, the pair is bet then gimel, left to right, so it kerns “גב”, typed gimel first, and not “בג”. A pair moved from a <code>kern</code> table to GPOS for a right-to-left script has to be turned round.</p>
+<p id="ix-67"><strong>It marks the buffer.</strong> A kerned pair is unsafe to break from its first glyph to its second. And before any subtable runs, the whole buffer is marked unsafe to concatenate, once in <code>KerxTable::apply</code> and again in the kern machine, whether or not anything is kerned:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">AVTo</span><span class="cps">U+0041 U+0056 U+0054 U+006F</span></td><td class="opt">--language=en --show-flags --unsafe-to-concat</td><td class="out"><code>[A=0+560#2|V=1@-40,0+560#3|T=2+550#2|o=3@-50,0+450#3]</code></td></tr><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">oA</span><span class="cps">U+006F U+0041</span></td><td class="opt">--language=en --show-flags --unsafe-to-concat</td><td class="out"><code>[o=0+500#2|A=1+600#2]</code></td></tr><tr><td class="font">both.ttf</td><td class="in"><span class="txt">oA</span><span class="cps">U+006F U+0041</span></td><td class="opt">--language=en --show-flags --unsafe-to-concat</td><td class="out"><code>[o=0+500|A=1+600#2]</code></td></tr></tbody></table></div>
+<p id="ix-68"><code>o A</code> isn’t a pair in either font. With GPOS kerning only A is marked, by the pair lookup that tried it; with the <code>kern</code> table, both glyphs are, and they would be with <code>-kern</code> in <code>both.ttf</code> too, since the plan then still runs the table. Unsafe to concatenate is only a hint that reshaping may be needed, so this costs an application work, not correctness. <a href="buffers.html#glyph-flags">Buffers</a> explains the flags.</p>
+<p>The trace shows the table, its subtable and the machine, each with its own messages:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape kern.ttf "AVTo" --language=en --trace</code></div><table><tbody><tr><td class="what">start table kern</td><td class="buf"><code>[A=0+600|V=1+600|T=2+600|o=3+500]</code></td></tr><tr><td class="what">start subtable 0</td><td class="buf"><code>[A=0+600|V=1+600|T=2+600|o=3+500]</code></td></tr><tr><td class="what">start kern</td><td class="buf"><code>[A=0+600|V=1+600|T=2+600|o=3+500]</code></td></tr><tr><td class="what">end kern</td><td class="buf"><code>[A=0+560|V=1@-40,0+560|T=2+550|o=3@-50,0+450]</code></td></tr><tr><td class="what">end subtable 0</td><td class="buf"><code>[A=0+560|V=1@-40,0+560|T=2+550|o=3@-50,0+450]</code></td></tr><tr><td class="what">end table kern</td><td class="buf"><code>[A=0+560|V=1@-40,0+560|T=2+550|o=3@-50,0+450]</code></td></tr></tbody></table></div>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-kern-table.hh"><code>src/hb-ot-kern-table.hh</code></a></td>
+<td><code>kern</code>: the union of the two versions, <code>KernOTSubTableHeader</code> and <code>KernAATSubTableHeader</code> with their coverage bits, <code>KernSubTable</code> and its dispatch, <code>KernSubTableFormat3</code>, the accelerator</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-kerx-table.hh"><code>src/hb-aat-layout-kerx-table.hh</code></a></td>
+<td><code>KerxTable</code>, shared by <code>kern</code> and <code>kerx</code>: subtable iteration, direction and cross-stream handling, sanitizing; <code>KerxSubTableFormat0</code>, <code>1</code> and <code>2</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-kern.hh"><code>src/hb-kern.hh</code></a></td>
+<td><code>hb_kern_machine_t</code>, the pair loop</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>src/hb-ot-shape.cc</code></a></td>
+<td>the plan’s choice between GPOS, <code>kerx</code>, <code>kern</code> and fallback kerning (<code>:127</code>), and <code>hb_ot_shape_plan_t::position</code> (<code>:271</code>)</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>src/hb-ot-layout.cc</code></a></td>
+<td><code>hb_ot_layout_has_kerning</code>, <code>has_machine_kerning</code>, <code>has_cross_kerning</code>, and <code>hb_ot_layout_kern</code> (<code>:130</code>)</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-ot-shaper-*.cc</code></a></td>
+<td>each shaper’s <code>fallback_position</code></td>
+</tr>
+<tr>
+<td><code>test/shape/data/in-house/tests/</code></td>
+<td><code>per-script-kern-fallback.tests</code>, <code>tt-kern-gpos.tests</code>, <code>kern-format1.tests</code>, <code>kern-format2.tests</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>HB_NO_OT_KERN</code> leaves the <code>kern</code> table out of the build. <code>HB_NO_LEGACY</code> sets it, and <code>HB_MINI</code> sets that (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh#L150"><code>hb-config.hh:150</code></a>).</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>There are two <code>kern</code> tables, Microsoft’s version 0 and Apple’s version 1.0, told apart by their first 16 bits. HarfBuzz reads formats 0, 1, 2 and 3 under either.</li>
+<li>Format 0 is searched by binary search, so its pairs must be sorted. Format 2 class values count from the start of the subtable. Subtables always add up: the override and minimum bits are ignored. Cross-stream values shift every later glyph, and outside format 1 nothing resets them.</li>
+<li>The table is used when the font has no <code>kerx</code>, GPOS has no <code>kern</code> feature in the language system it chose (or isn’t used), and the shaper’s <code>fallback_position</code> is true: the default, Arabic, Hebrew and Hangul shapers.</li>
+<li>Since 12.2.0, Thai, Lao, Indic, Khmer, Myanmar and USE text never uses it, because fonts for those scripts kerned the same pairs twice, in <code>dist</code> and in <code>kern</code>.</li>
+<li>The kern machine passes over marks, needs the <code>kern</code> mask on both glyphs, reads pairs left to right, and splits each value between the two glyphs’ advances.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="fallbacks.html">← Fallbacks</a><a rel="next" href="vertical-text.html">Vertical text →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

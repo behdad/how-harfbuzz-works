@@ -1,0 +1,1188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>GPOS: positioning glyphs · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part V · The pipeline</p>
+<h1 id="gpos-positioning-glyphs">19. GPOS: positioning glyphs</h1>
+<p id="ix-1">When GPOS starts, the glyphs are settled. GSUB has chosen them, and the positions array has been cleared and filled with each glyph’s advance from the font (<a href="pipeline-step-by-step.html#advances">The pipeline, step by step</a>). GPOS never changes which glyphs there are. It changes four numbers per glyph, the advance and the offset in each direction, and it records which glyph is attached to which, so that the attachments can be worked out once all its lookups have run.</p>
+<p id="ix-2">GPOS has the same structure as GSUB, and HarfBuzz runs it with the same machinery, so this chapter covers only what is different: the nine lookup types as HarfBuzz runs them, then the last step, in which a tree of attachments becomes offsets an application can draw with. For how to write each type in a feature file, with Nastaliq cursive attachment and Thai mark-to-ligature among the examples, see “Types of Positioning Rule” in Simon Cozens’ <a href="https://simoncozens.github.io/fonts-and-layout/features-2.html#types-of-positioning-rule"><em>Fonts and Layout for Global Scripts</em></a>.</p>
+<p id="ix-3">The examples come from one test font, <code>gpos.ttf</code>, built from <code>fonts/gpos/gpos.fea</code>, and three variants of it. It has the GSUB chapter’s <code>f</code>, <code>i</code> and their ligatures, a few letters to kern, two combining marks, and letters that join in a cursive chain. Its glyphs are boxes. Every shaping result and trace on this page was produced by running HarfBuzz 15.1.0 on those fonts when the page was built.</p>
+<h2 id="what-changes-from-gsub">What changes from GSUB</h2>
+<p id="ix-4">A GPOS table has a ScriptList, a FeatureList, a LookupList and optional FeatureVariations, exactly as GSUB does (<a href="gsub.html#the-shape-of-the-table">The shape of the table</a>). Its lookups have nine types:</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Name</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Single adjustment</td>
+<td id="ix-5">moves one glyph, or changes its advance</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Pair adjustment</td>
+<td id="ix-6">the same for two glyphs in sequence: kerning</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Cursive attachment</td>
+<td id="ix-7">joins a glyph’s exit point to the next glyph’s entry point</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Mark-to-base attachment</td>
+<td id="ix-8">puts a mark’s anchor on a base glyph’s anchor</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Mark-to-ligature attachment</td>
+<td>the same, on one component of a ligature</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Mark-to-mark attachment</td>
+<td>puts a mark on the mark before it</td>
+</tr>
+<tr>
+<td>7</td>
+<td id="ix-9">Context</td>
+<td id="ix-10">runs other lookups where an input sequence matches</td>
+</tr>
+<tr>
+<td>8</td>
+<td id="ix-11">Chained context</td>
+<td id="ix-12">the same, also checking the glyphs before and after</td>
+</tr>
+<tr>
+<td>9</td>
+<td>Extension</td>
+<td id="ix-13">a wrapper allowing 32-bit offsets</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-14">Types 1 to 6 have beyond-64k formats too: SinglePos and PairPos formats 3 and 4, and format 2 of the others.</p>
+<p id="ix-15">Each lookup runs through GSUB’s <code>apply_forward</code> loop, with its digests, mask test and glyph-property test (<a href="gsub.html#running-one-lookup">Running one lookup</a>). The second-glyph digest holds a pair subtable’s second glyphs and a mark subtable’s bases, so a mark lookup is skipped for a buffer with none of its bases. Planning puts all of GPOS in <strong>one stage</strong>: no script shaper pauses between GPOS lookups, so they all run in LookupList order (<a href="from-features-to-lookups.html#stages-and-pauses">From features to lookups</a>).</p>
+<h3 id="one-array-in-place">One array, in place</h3>
+<p id="ix-16">GSUB reads from the buffer and writes to a second array (<a href="gsub.html#an-input-buffer-and-an-output-buffer">An input buffer and an output buffer</a>). GPOS never needs to, since it never adds or removes a glyph. The proxy through which HarfBuzz applies GPOS says so with one constant (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L1965"><code>hb-ot-layout.cc:1965</code></a>):</p>
+<pre><code class="language-c++">struct GPOSProxy
+{
+  static constexpr unsigned table_index = 1u;
+  static constexpr bool always_inplace = true;
+  typedef OT::PosLookup Lookup;
+  /* … (trimmed) */
+};
+</code></pre>
+<p id="ix-17">With <code>always_inplace</code>, <code>apply_string</code> skips <code>clear_output</code> and <code>sync</code>, and <code>next_glyph</code> just moves <code>idx</code> on. Glyphs before <code>idx</code> and after it are in the same array, so a lookup that looks backwards, as cursive and mark attachment do, reads the glyphs directly. There are no reverse lookups: <code>PosLookup::is_reverse</code> always returns false.</p>
+<h3 id="what-a-lookup-passes-over">What a lookup passes over</h3>
+<p id="ix-18">Lookup flags and GDEF classes work as in GSUB (<a href="gsub.html#which-glyphs-a-lookup-sees">Which glyphs a lookup sees</a>). Default ignorables are treated differently. The matcher sets its rules from the table it is in (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L844"><code>hb-ot-layout-gsubgpos.hh:844</code></a>):</p>
+<pre><code class="language-c++">/* Ignore ZWNJ if we are matching GPOS, or matching GSUB context and asked to. */
+ignore_zwnj = c-&gt;table_index == 1 || (context_match &amp;&amp; c-&gt;auto_zwnj);
+/* Ignore ZWJ if we are matching context, or asked to. */
+ignore_zwj = context_match || c-&gt;auto_zwj;
+/* Ignore hidden glyphs (like CGJ) during GPOS. */
+ignore_hidden = c-&gt;table_index == 1;
+</code></pre>
+<p id="ix-19">So in GPOS, compared with <a href="gsub.html#joiners">the GSUB table</a>:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>ZWJ</th>
+<th id="ix-20">ZWNJ</th>
+<th id="ix-21">Hidden: CGJ, Mongolian FVS1–4, TAG characters</th>
+<th>Other default ignorables</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>input</td>
+<td id="ix-22">passed over, unless the feature has manual ZWJ</td>
+<td>passed over</td>
+<td>passed over</td>
+<td>passed over</td>
+</tr>
+<tr>
+<td id="ix-23">context</td>
+<td>passed over</td>
+<td>passed over</td>
+<td>passed over</td>
+<td>passed over</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-24">A ZWNJ asks for no <em>joining</em>, a matter for GSUB, so it never stops kerning. Hidden characters have been passed over since 10.0.0 (<a href="unicode-inside-harfbuzz.html#in-gpos">Unicode inside HarfBuzz</a> shows kerning across each). For the default shaper only <code>mark</code> and <code>mkmk</code> have manual ZWJ (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L302"><code>hb-ot-shape.cc:302</code></a>), so a ZWJ between a base and its mark keeps them apart. The per-syllable rule of the syllabic shapers applies only to GSUB.</p>
+<h2 id="value-records">Value records</h2>
+<p id="ix-25">Single and pair adjustments say what to change in a <strong>value record</strong>: up to eight fields, of which only those named in a <strong>ValueFormat</strong> are stored. Four are numbers in font units: <code>xPlacement</code> and <code>yPlacement</code>, which move the glyph without moving anything after it, and <code>xAdvance</code> and <code>yAdvance</code>, which change its advance. The other four are offsets to Device tables, one for each of those. To find a record’s length, HarfBuzz counts only the eight defined bits: the specification says every set bit takes two bytes, but a comment (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/ValueFormat.hh#L61"><code>ValueFormat.hh:61</code></a>) cites Microsoft developers saying only the defined fields count.</p>
+<p id="ix-26">Single adjustment, type 1, applies one value record to every glyph in its coverage (format 1) or one record per glyph (format 2). The test font’s first lookup moves <code>a</code> 40 units right and 100 up:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of gpos.ttf, lookup 0"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 0: Single adjustment (type 1)
+  lookupFlag: none
+  subtable 0: SinglePosFormat1
+    coverage: [a]
+    valueFormat: xPlacement yPlacement
+    value: &lt;xPlacement 40, yPlacement 100&gt;</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature ss01 {
+  pos a &lt;40 100 0 0&gt;;
+} ss01;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;0&quot;&gt;
+  &lt;LookupType value=&quot;1&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;SinglePos index=&quot;0&quot; Format=&quot;1&quot;&gt;
+    &lt;Coverage&gt;
+      &lt;Glyph value=&quot;a&quot;/&gt;
+    &lt;/Coverage&gt;
+    &lt;ValueFormat value=&quot;3&quot;/&gt;
+    &lt;Value XPlacement=&quot;40&quot; YPlacement=&quot;100&quot;/&gt;
+  &lt;/SinglePos&gt;
+&lt;/Lookup&gt;</code></pre></div><figcaption>gpos.ttf, lookup 0</figcaption></figure>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">a</span><span class="cps">U+0061</span></td><td class="opt"></td><td class="out"><code>[a=0+500]</code></td></tr><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">a</span><span class="cps">U+0061</span></td><td class="opt">--features=ss01</td><td class="out"><code>[a=0@40,100+500]</code></td></tr></tbody></table></div>
+<p id="ix-27"><code>apply_value</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/ValueFormat.hh#L87"><code>ValueFormat.hh:87</code></a>) scales each number with <code>em_scale_x</code> or <code>em_scale_y</code> and adds it, saturating rather than overflowing. Placements apply in either direction of text. <code>xAdvance</code> applies only in horizontal text and <code>yAdvance</code> only in vertical, negated, because HarfBuzz’s vertical advances grow downwards (<a href="vertical-text.html">Vertical text</a>).</p>
+<h3 id="device-tables">Device tables</h3>
+<p id="ix-28">A Device table is read only if the font has a ppem set or variation coordinates that aren’t all zero (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/ValueFormat.hh#L123"><code>ValueFormat.hh:123</code></a>). Two kinds share the offset. A hinting Device table, formats 1 to 3, gives a correction in pixels for a range of sizes, scaled into the font’s units (<a href="fonts-and-font-functions.html#three-kinds-of-size">Fonts and font functions</a> shows one). A <strong>VariationIndex</strong> table, format 0x8000, holds an index into GDEF’s item variation store (<a href="deltas.html#item-variation-stores">Deltas</a>); its delta is scaled, then rounded.</p>
+<p id="ix-29"><code>var-kern.ttf</code> is the shared variable font <code>variations/var.ttf</code> with one kerning pair added. Its value is −20 at the lightest weight, −60 at the default, −150 at the heaviest, and its spec-like view shows the VariationIndex behind it:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of var-kern.ttf, lookup 0"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="ttx">TTX</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 0: Pair adjustment (type 2)
+  lookupFlag: none
+  subtable 0: PairPosFormat1
+    coverage: [H]
+    valueFormat[0]: xAdvance xAdvDevice
+    valueFormat[1]: none
+    pairSet:
+      (H)
+        V: &lt;xAdvance -60, xAdvDevice VariationIndex 0:0&gt;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;0&quot;&gt;
+  &lt;LookupType value=&quot;2&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;PairPos index=&quot;0&quot; Format=&quot;1&quot;&gt;
+    &lt;Coverage&gt;
+      &lt;Glyph value=&quot;H&quot;/&gt;
+    &lt;/Coverage&gt;
+    &lt;ValueFormat1 value=&quot;68&quot;/&gt;
+    &lt;ValueFormat2 value=&quot;0&quot;/&gt;
+    &lt;!-- PairSetCount=1 --&gt;
+    &lt;PairSet index=&quot;0&quot;&gt;
+      &lt;!-- PairValueCount=1 --&gt;
+      &lt;PairValueRecord index=&quot;0&quot;&gt;
+        &lt;SecondGlyph value=&quot;V&quot;/&gt;
+        &lt;Value1 XAdvance=&quot;-60&quot;&gt;
+          &lt;XAdvDevice&gt;
+            &lt;StartSize value=&quot;0&quot;/&gt;
+            &lt;EndSize value=&quot;0&quot;/&gt;
+            &lt;DeltaFormat value=&quot;32768&quot;/&gt;
+          &lt;/XAdvDevice&gt;
+        &lt;/Value1&gt;
+      &lt;/PairValueRecord&gt;
+    &lt;/PairSet&gt;
+  &lt;/PairPos&gt;
+&lt;/Lookup&gt;</code></pre></div><figcaption>var-kern.ttf, lookup 0</figcaption></figure>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">var-kern.ttf</td><td class="in"><span class="txt">HV</span><span class="cps">U+0048 U+0056</span></td><td class="opt">--variations=wght=100 --features=-kern</td><td class="out"><code>[H=0+560|V=1+200]</code></td></tr><tr><td class="font">var-kern.ttf</td><td class="in"><span class="txt">HV</span><span class="cps">U+0048 U+0056</span></td><td class="opt">--variations=wght=100</td><td class="out"><code>[H=0+540|V=1+200]</code></td></tr><tr><td class="font">var-kern.ttf</td><td class="in"><span class="txt">HV</span><span class="cps">U+0048 U+0056</span></td><td class="opt">--variations=wght=650 --features=-kern</td><td class="out"><code>[H=0+660|V=1+420]</code></td></tr><tr><td class="font">var-kern.ttf</td><td class="in"><span class="txt">HV</span><span class="cps">U+0048 U+0056</span></td><td class="opt">--variations=wght=650</td><td class="out"><code>[H=0+555|V=1+420]</code></td></tr><tr><td class="font">var-kern.ttf</td><td class="in"><span class="txt">HV</span><span class="cps">U+0048 U+0056</span></td><td class="opt">--variations=wght=900 --features=-kern</td><td class="out"><code>[H=0+700|V=1+560]</code></td></tr><tr><td class="font">var-kern.ttf</td><td class="in"><span class="txt">HV</span><span class="cps">U+0048 U+0056</span></td><td class="opt">--variations=wght=900</td><td class="out"><code>[H=0+550|V=1+560]</code></td></tr></tbody></table></div>
+<p id="ix-30">Halfway between the default and the heaviest weight, the kern is halfway between −60 and −150: H’s 660 becomes 555. A value record’s Device offsets count from its nearest parent table: the subtable, or in glyph-pair kerning the PairSet.</p>
+<p id="ix-31">The sanitizer doesn’t follow these offsets when GPOS is loaded. It checks them when they are first used, and treats a bad one as missing (<a href="trust-nothing-the-sanitizer.html#some-of-gpos">Some of GPOS</a>).</p>
+<h2 id="pair-adjustment">Pair adjustment</h2>
+<p id="ix-32">Pair adjustment is how fonts kern. A subtable covers the first glyph of a pair; HarfBuzz finds the second with the skipping iterator, so a lookup with <code>IgnoreMarks</code> kerns across marks. The test font’s kerning lookup has both formats:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of gpos.ttf, lookup 1"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button><button type="button" role="tab" data-view="cpp">HarfBuzz C++</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 1: Pair adjustment (type 2)
+  lookupFlag: none
+  subtable 0: PairPosFormat1
+    coverage: [A T V]
+    valueFormat[0]: xAdvance
+    valueFormat[1]: none
+    pairSet:
+      (A)
+        V: &lt;xAdvance -80&gt;
+      (T)
+        o: &lt;xAdvance -100&gt;
+      (V)
+        e: &lt;xAdvance 0&gt;
+  subtable 1: PairPosFormat2
+    coverage: [T V]
+    valueFormat1: xAdvance
+    valueFormat2: none
+    classDef1 (class 0: the rest of the coverage):
+    classDef2 (class 0: every other glyph):
+      1 = [a e o]
+    values (1 × 2):
+      0 × 0: &lt;xAdvance 0&gt;
+      0 × 1: &lt;xAdvance -60&gt;</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature kern {
+  pos A V -80;
+  pos T o -100;
+  pos V e 0;
+  pos [T V] [a e o] -60;
+} kern;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;1&quot;&gt;
+  &lt;LookupType value=&quot;2&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=2 --&gt;
+  &lt;PairPos index=&quot;0&quot; Format=&quot;1&quot;&gt;
+    &lt;Coverage&gt;
+      &lt;Glyph value=&quot;A&quot;/&gt;
+      &lt;Glyph value=&quot;T&quot;/&gt;
+      &lt;Glyph value=&quot;V&quot;/&gt;
+    &lt;/Coverage&gt;
+    &lt;ValueFormat1 value=&quot;4&quot;/&gt;
+    &lt;ValueFormat2 value=&quot;0&quot;/&gt;
+    &lt;!-- PairSetCount=3 --&gt;
+    &lt;PairSet index=&quot;0&quot;&gt;
+      &lt;!-- PairValueCount=1 --&gt;
+      &lt;PairValueRecord index=&quot;0&quot;&gt;
+        &lt;SecondGlyph value=&quot;V&quot;/&gt;
+        &lt;Value1 XAdvance=&quot;-80&quot;/&gt;
+      &lt;/PairValueRecord&gt;
+    &lt;/PairSet&gt;
+    &lt;PairSet index=&quot;1&quot;&gt;
+      &lt;!-- PairValueCount=1 --&gt;
+      &lt;PairValueRecord index=&quot;0&quot;&gt;
+        &lt;SecondGlyph value=&quot;o&quot;/&gt;
+        &lt;Value1 XAdvance=&quot;-100&quot;/&gt;
+      &lt;/PairValueRecord&gt;
+    &lt;/PairSet&gt;
+    &lt;PairSet index=&quot;2&quot;&gt;
+      &lt;!-- PairValueCount=1 --&gt;
+      &lt;PairValueRecord index=&quot;0&quot;&gt;
+        &lt;SecondGlyph value=&quot;e&quot;/&gt;
+        &lt;Value1 XAdvance=&quot;0&quot;/&gt;
+      &lt;/PairValueRecord&gt;
+    &lt;/PairSet&gt;
+  &lt;/PairPos&gt;
+  &lt;PairPos index=&quot;1&quot; Format=&quot;2&quot;&gt;
+    &lt;Coverage&gt;
+      &lt;Glyph value=&quot;T&quot;/&gt;
+      &lt;Glyph value=&quot;V&quot;/&gt;
+    &lt;/Coverage&gt;
+    &lt;ValueFormat1 value=&quot;4&quot;/&gt;
+    &lt;ValueFormat2 value=&quot;0&quot;/&gt;
+    &lt;ClassDef1&gt;
+    &lt;/ClassDef1&gt;
+    &lt;ClassDef2&gt;
+      &lt;ClassDef glyph=&quot;a&quot; class=&quot;1&quot;/&gt;
+      &lt;ClassDef glyph=&quot;e&quot; class=&quot;1&quot;/&gt;
+      &lt;ClassDef glyph=&quot;o&quot; class=&quot;1&quot;/&gt;
+    &lt;/ClassDef2&gt;
+    &lt;!-- Class1Count=1 --&gt;
+    &lt;!-- Class2Count=2 --&gt;
+    &lt;Class1Record index=&quot;0&quot;&gt;
+      &lt;Class2Record index=&quot;0&quot;&gt;
+        &lt;Value1 XAdvance=&quot;0&quot;/&gt;
+      &lt;/Class2Record&gt;
+      &lt;Class2Record index=&quot;1&quot;&gt;
+        &lt;Value1 XAdvance=&quot;-60&quot;/&gt;
+      &lt;/Class2Record&gt;
+    &lt;/Class1Record&gt;
+  &lt;/PairPos&gt;
+&lt;/Lookup&gt;</code></pre></div><div class="pane" data-view="cpp" data-label="HarfBuzz C++" role="tabpanel"><pre><code>template &lt;typename Types&gt;
+struct PairPosFormat1_3
+{
+  using PairSet = GPOS_impl::PairSet&lt;Types&gt;;
+  using PairValueRecord = GPOS_impl::PairValueRecord&lt;Types&gt;;
+
+  protected:
+  HBUINT16      format;                 /* Format identifier--format = 1 */
+  typename Types::template LOffsetTo&lt;Coverage&gt;
+                coverage;               /* Offset to Coverage table--from
+                                         * beginning of subtable */
+  ValueFormat   valueFormat[2];         /* [0] Defines the types of data in
+                                         * ValueRecord1--for the first glyph
+                                         * in the pair--may be zero (0) */
+                                        /* [1] Defines the types of data in
+                                         * ValueRecord2--for the second glyph
+                                         * in the pair--may be zero (0) */
+  typename Types::template ArrayOf&lt;typename Types::template OffsetTo&lt;PairSet&gt;&gt;
+                pairSet;                /* Array of PairSet tables ordered by
+                                         * Coverage Index */
+  public:
+  DEFINE_SIZE_ARRAY (2 + Types::LOffset::static_size + 2 * ValueFormat::static_size + Types::HBUINT::static_size, pairSet);
+  /* … */
+};</code></pre><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/PairPosFormat1.hh#L11-L32">src/OT/Layout/GPOS/PairPosFormat1.hh:11</a></div><figcaption>gpos.ttf, lookup 1</figcaption></figure>
+<p id="ix-33">Format 1 lists pairs of glyphs. The first glyph’s coverage index chooses a <strong>PairSet</strong>, a list of second glyphs, each with a value record for the first glyph and one for the second, searched by binary search (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/PairSet.hh#L173"><code>PairSet.hh:173</code></a>). Format 2 kerns classes: two class definitions, and a matrix with a pair of value records for each pair of classes. Class 0 is every glyph not given a class.</p>
+<h3 id="glyph-pairs-first-then-classes">Glyph pairs first, then classes</h3>
+<p id="ix-34">The formats differ in when they decline. Format 1 declines when the second glyph isn’t in the pair set, and the next subtable gets a chance. Format 2 has a value for every pair of classes, zero or not, so once its coverage has the first glyph and a second is found, it applies, and no later subtable is tried. That is how kerning exceptions work: <code>pos V e 0</code> is a glyph pair, found first, whose zero stops the class pair <code>[T V] [a e o]</code> from applying. feaLib always puts the glyph pairs first. <code>class-first.ttf</code> is the same font with the two subtables swapped:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">To</span><span class="cps">U+0054 U+006F</span></td><td class="opt"></td><td class="out"><code>[T=0+500|o=1+500]</code></td></tr><tr><td class="font">class-first.ttf</td><td class="in"><span class="txt">To</span><span class="cps">U+0054 U+006F</span></td><td class="opt"></td><td class="out"><code>[T=0+540|o=1+500]</code></td></tr><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">Ve</span><span class="cps">U+0056 U+0065</span></td><td class="opt"></td><td class="out"><code>[V=0+600|e=1+500]</code></td></tr><tr><td class="font">class-first.ttf</td><td class="in"><span class="txt">Ve</span><span class="cps">U+0056 U+0065</span></td><td class="opt"></td><td class="out"><code>[V=0+540|e=1+500]</code></td></tr></tbody></table></div>
+<p>In <code>class-first.ttf</code>, the class subtable claims every pair that starts with <code>T</code> or <code>V</code>, so <code>T o</code> gets the class value, −60, instead of its own −100, and <code>V e</code> is kerned though the font says it shouldn’t be.</p>
+<blockquote>
+<p id="ix-35">For type designers: in a lookup, a class-pair subtable ends the search for every glyph in its coverage, whatever the second glyph is. Exceptions have to come before it.</p>
+</blockquote>
+<h3 id="the-second-glyph">The second glyph</h3>
+<p id="ix-36">If a pair has a value record for the second glyph, its ValueFormat is nonzero, and HarfBuzz moves on past the second glyph after applying the pair (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/PairSet.hh#L210"><code>PairSet.hh:210</code></a>). The second glyph has been positioned already, so it can’t start a pair of its own. If the second ValueFormat is zero, the next pair starts at the second glyph. That depends on the format, not on the values. <code>second-value.ttf</code> is <code>gpos.ttf</code> with its glyph-pair subtable given a second value record, <code>xAdvance</code> 0, for every pair:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">AVa</span><span class="cps">U+0041 U+0056 U+0061</span></td><td class="opt"></td><td class="out"><code>[A=0+520|V=1+540|a=2+500]</code></td></tr><tr><td class="font">second-value.ttf</td><td class="in"><span class="txt">AVa</span><span class="cps">U+0041 U+0056 U+0061</span></td><td class="opt"></td><td class="out"><code>[A=0+520|V=1+600|a=2+500]</code></td></tr></tbody></table></div>
+<p>In <code>gpos.ttf</code>, <code>A V</code> is kerned by −80 and then <code>V a</code> by −60. In <code>second-value.ttf</code> the pair <code>A V</code> takes the <code>V</code> with it, so <code>V a</code> is never tried.</p>
+<h3 id="safe-to-break">Safe to break</h3>
+<p id="ix-37">A pair whose values changed something is unsafe to break. A pair whose values are all zero is only unsafe to concatenate (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/PairSet.hh#L207"><code>PairSet.hh:207</code></a>: “Even a zero-valued pair record is a concat hazard”). When the second glyph had a value record, the glyph after it is marked unsafe to break too (HarfBuzz issues #3824 and #3888):</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">To</span><span class="cps">U+0054 U+006F</span></td><td class="opt">--show-flags --unsafe-to-concat</td><td class="out"><code>[T=0+500|o=1+500#3]</code></td></tr><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">Ve</span><span class="cps">U+0056 U+0065</span></td><td class="opt">--show-flags --unsafe-to-concat</td><td class="out"><code>[V=0+600#2|e=1+500#2]</code></td></tr><tr><td class="font">second-value.ttf</td><td class="in"><span class="txt">AVaa</span><span class="cps">U+0041 U+0056 U+0061 U+0061</span></td><td class="opt">--show-flags</td><td class="out"><code>[A=0+520|V=1+600#1|a=2+500#1|a=3+500]</code></td></tr></tbody></table></div>
+<p id="ix-38"><code>#1</code> is unsafe to break, <code>#2</code> unsafe to concatenate (<a href="buffers.html#glyph-flags">Buffers</a>). HarfBuzz 4.0.0 split a simple kern between the two glyphs of a pair, “for improved cursor positioning”, its <code>NEWS</code> says. The code is still in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/PairPosFormat2.hh#L280"><code>PairPosFormat2.hh:280</code></a>, behind <code>HB_SPLIT_KERN</code>, and off: “Disabled, because causes issues… :-(” (HarfBuzz issue #3408).</p>
+<p id="ix-39">Pair adjustment is also cached. Each of a lookup’s first eight subtables gets a small cache of coverage lookups (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L1570"><code>hb-ot-layout-gsubgpos.hh:1570</code></a>), and either a digest of each pair set’s second glyphs, which rejects most absent pairs without a search, or caches of the two class definitions. <code>HB_NO_OT_LAYOUT_LOOKUP_CACHE</code> leaves them out.</p>
+<h2 id="anchors">Anchors</h2>
+<p id="ix-40">The other four positioning types work with <strong>anchors</strong>: points on a glyph, in font units, where something attaches. There are three formats:</p>
+<ul>
+<li id="ix-41"><strong>Format 1</strong>: x and y.</li>
+<li id="ix-42"><strong>Format 2</strong>: x, y and the index of a point in the glyph’s outline. If the font has a ppem and the font funcs can find the point, its position is used instead (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/AnchorFormat2.hh#L41"><code>AnchorFormat2.hh:41</code></a>). The point differs from x and y only in a hinted outline, and HarfBuzz’s own <code>hb-ot</code> funcs don’t implement <code>get_glyph_contour_point</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L991"><code>hb-ot-font.cc:991</code></a> is commented out), so in practice it is used only with FreeType’s funcs. <code>HB_NO_HINTING</code> makes format 2 read as format 1.</li>
+<li id="ix-43"><strong>Format 3</strong>: x and y, with a Device table for each, followed under the same conditions as a value record’s.</li>
+</ul>
+<p id="ix-44">Anchors are scaled to floats, and kept as floats until two of them are subtracted: the difference is rounded, not each anchor (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L6374"><code>hb-ot-layout-common.hh:6374</code></a>). An anchor offset that is null, in a cursive record or in a mark lookup’s matrix, means there is no anchor, and the subtable declines, so the next subtable gets a chance at the glyph (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/MarkArray.hh#L144"><code>MarkArray.hh:144</code></a>).</p>
+<h2 id="cursive-attachment">Cursive attachment</h2>
+<p id="ix-45">A cursive lookup gives each glyph it covers an <strong>entry anchor</strong> and an <strong>exit anchor</strong>, and joins each glyph’s exit to the entry of the glyph after it. In the test font, <code>n</code> enters at (50, 0) and exits 100 units higher, at (450, 100), so a run of them climbs:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of gpos.ttf, lookup 2"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button><button type="button" role="tab" data-view="cpp">HarfBuzz C++</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 2: Cursive attachment (type 3)
+  lookupFlag: none
+  subtable 0: CursivePosFormat1
+    coverage: [n beh]
+    entryExitRecord:
+      n: entry (50, 0), exit (450, 100)
+      beh: entry (450, 0), exit (50, 100)</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature curs {
+  pos cursive n &lt;anchor 50 0&gt; &lt;anchor 450 100&gt;;
+  pos cursive beh &lt;anchor 450 0&gt; &lt;anchor 50 100&gt;;
+} curs;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;2&quot;&gt;
+  &lt;LookupType value=&quot;3&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;CursivePos index=&quot;0&quot; Format=&quot;1&quot;&gt;
+    &lt;Coverage&gt;
+      &lt;Glyph value=&quot;n&quot;/&gt;
+      &lt;Glyph value=&quot;beh&quot;/&gt;
+    &lt;/Coverage&gt;
+    &lt;!-- EntryExitCount=2 --&gt;
+    &lt;EntryExitRecord index=&quot;0&quot;&gt;
+      &lt;EntryAnchor Format=&quot;1&quot;&gt;
+        &lt;XCoordinate value=&quot;50&quot;/&gt;
+        &lt;YCoordinate value=&quot;0&quot;/&gt;
+      &lt;/EntryAnchor&gt;
+      &lt;ExitAnchor Format=&quot;1&quot;&gt;
+        &lt;XCoordinate value=&quot;450&quot;/&gt;
+        &lt;YCoordinate value=&quot;100&quot;/&gt;
+      &lt;/ExitAnchor&gt;
+    &lt;/EntryExitRecord&gt;
+    &lt;EntryExitRecord index=&quot;1&quot;&gt;
+      &lt;EntryAnchor Format=&quot;1&quot;&gt;
+        &lt;XCoordinate value=&quot;450&quot;/&gt;
+        &lt;YCoordinate value=&quot;0&quot;/&gt;
+      &lt;/EntryAnchor&gt;
+      &lt;ExitAnchor Format=&quot;1&quot;&gt;
+        &lt;XCoordinate value=&quot;50&quot;/&gt;
+        &lt;YCoordinate value=&quot;100&quot;/&gt;
+      &lt;/ExitAnchor&gt;
+    &lt;/EntryExitRecord&gt;
+  &lt;/CursivePos&gt;
+&lt;/Lookup&gt;</code></pre></div><div class="pane" data-view="cpp" data-label="HarfBuzz C++" role="tabpanel"><pre><code>template &lt;typename Types&gt;
+struct CursivePosFormat1_2
+{
+
+  protected:
+  HBUINT16      format;                 /* Format identifier--format = 1 */
+  typename Types::template LOffsetTo&lt;Coverage&gt;
+                coverage;               /* Offset to Coverage table--from beginning of subtable */
+  typename Types::template ArrayOf&lt;EntryExitRecord&lt;Types&gt;&gt;
+                entryExitRecord;        /* Array of EntryExit records--in
+                                         * Coverage Index order */
+  public:
+  DEFINE_SIZE_ARRAY (2 + Types::LOffset::static_size + Types::HBUINT::static_size, entryExitRecord);
+  /* … */
+};</code></pre><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/CursivePosFormat1.hh#L227-L239">src/OT/Layout/GPOS/CursivePosFormat1.hh:227</a></div><figcaption>gpos.ttf, lookup 2</figcaption></figure>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">nnnn</span><span class="cps">U+006E U+006E U+006E U+006E</span></td><td class="opt"></td><td class="out"><code>[n=0+450|n=1@-50,100+400|n=2@-50,200+400|n=3@-50,300+450]</code></td></tr></tbody></table></div>
+<p id="ix-46"><code>CursivePosFormat1::apply</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/CursivePosFormat1.hh#L275"><code>CursivePosFormat1.hh:275</code></a>) takes the current glyph’s entry anchor and looks back, with the skipping iterator, for the previous glyph’s exit, which must be in the same subtable. <code>apply_cursive_attachment</code> then works along the line and across it.</p>
+<p id="ix-47">Along the line, it changes advances so the two anchors meet. In left-to-right text, the first glyph’s advance becomes its exit’s x, 450, and the second glyph is moved back by its entry’s x, 50, its advance shortened to match. Each <code>n</code> in the middle gets both: moved back 50, with an advance of 450 − 50. Right-to-left text mirrors this, and vertical text does it with y.</p>
+<p id="ix-48">Across the line, one glyph has to move so that its anchor is level with the other’s. Which one moves is set by the lookup’s <strong>RightToLeft</strong> flag, the only lookup flag that isn’t about skipping glyphs. HarfBuzz thinks of the moved glyph as a child attached to a parent (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/CursivePosFormat1.hh#L164"><code>CursivePosFormat1.hh:164</code></a>):</p>
+<pre><code class="language-c++">unsigned int child  = i;
+unsigned int parent = j;
+hb_position_t x_offset = (hb_position_t) roundf (entry_x - exit_x);
+hb_position_t y_offset = (hb_position_t) roundf (entry_y - exit_y);
+if  (!(c-&gt;lookup_props &amp; LookupFlag::RightToLeft))
+{
+  unsigned int k = child;
+  child = parent;
+  parent = k;
+  x_offset = -x_offset;
+  y_offset = -y_offset;
+}
+</code></pre>
+<p id="ix-49"><code>i</code> is the earlier glyph, in logical order. Without the flag the later glyph is the child, so a chain’s first glyph stays on the baseline and each later one hangs from the one before. With it, the <em>last</em> glyph stays on the baseline, as a Nastaliq font wants: an Urdu word ends on the baseline and climbs toward its start. Lookup 3 is lookup 2 with the flag set:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[beh=2@0,200+450|beh=1@-50,100+400|beh=0@-50,0+450]</code></td></tr><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--language=ar --features=-curs,ss03</td><td class="out"><code>[beh=2+450|beh=1@-50,-100+400|beh=0@-50,-200+450]</code></td></tr><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">nnnn</span><span class="cps">U+006E U+006E U+006E U+006E</span></td><td class="opt">--features=-curs,ss03</td><td class="out"><code>[n=0@0,-300+450|n=1@-50,-200+400|n=2@-50,-100+400|n=3@-50,0+450]</code></td></tr></tbody></table></div>
+<p>Read the Arabic from the right. Without the flag the first beh, <code>beh=0</code> on the right, is on the baseline. With it the last, on the left, is.</p>
+<p id="ix-50">The child stores the offset across the line, and a link to its parent in two fields that GPOS keeps in the spare <code>var</code> of each position, set to zero by <code>position_start</code> before GPOS starts (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/Common.hh#L17"><code>OT/Layout/GPOS/Common.hh:17</code></a>):</p>
+<ul>
+<li id="ix-51"><strong><code>attach_chain</code></strong>: how far away the parent is, in glyphs, negative for one before it;</li>
+<li><strong><code>attach_type</code></strong>: <code>ATTACH_TYPE_CURSIVE</code> or <code>ATTACH_TYPE_MARK</code>.</li>
+</ul>
+<p id="ix-52">The offset is relative to the parent; chains are added up at the end of GPOS. When a child that already has a parent gets a new one, from a second cursive lookup, <code>reverse_cursive_minor_offset</code> reverses every link of its old chain, so its whole old tree hangs from the new parent. If the new parent was its child, that link is cut (HarfBuzz issue #2469). The join is unsafe to break. Marks may be attached cursively too, since 1.2.0.</p>
+<h2 id="mark-to-base">Mark to base</h2>
+<p>A mark-to-base subtable has two coverages, for marks and for bases. Each mark has a class and an anchor, and each base has one anchor for each class:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of gpos.ttf, lookup 4"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button><button type="button" role="tab" data-view="cpp">HarfBuzz C++</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 4: Mark-to-base attachment (type 4)
+  lookupFlag: none
+  subtable 0: MarkBasePosFormat1
+    markCoverage: [acutecomb gravecomb]
+    baseCoverage: [A T V a e f i n o]
+    classCount: 1
+    markArray:
+      acutecomb: class 0, anchor (0, 0)
+      gravecomb: class 0, anchor (0, 0)
+    baseArray:
+      A: [(250, 700)]
+      T: [(250, 700)]
+      V: [(250, 700)]
+      a: [(250, 500)]
+      e: [(250, 500)]
+      f: [(250, 700)]
+      i: [(250, 700)]
+      n: [(250, 500)]
+      o: [(250, 500)]</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature mark {
+  pos base [a e o n] &lt;anchor 250 500&gt; mark @TOP;
+  pos base [f i A T V] &lt;anchor 250 700&gt; mark @TOP;
+  pos ligature f_i &lt;anchor 225 700&gt; mark @TOP
+    ligComponent &lt;anchor 675 700&gt; mark @TOP;
+  pos ligature f_f_i &lt;anchor 150 700&gt; mark @TOP
+    ligComponent &lt;anchor 450 700&gt; mark @TOP
+    ligComponent &lt;anchor 750 700&gt; mark @TOP;
+} mark;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;4&quot;&gt;
+  &lt;LookupType value=&quot;4&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;MarkBasePos index=&quot;0&quot; Format=&quot;1&quot;&gt;
+    &lt;MarkCoverage&gt;
+      &lt;Glyph value=&quot;acutecomb&quot;/&gt;
+      &lt;Glyph value=&quot;gravecomb&quot;/&gt;
+    &lt;/MarkCoverage&gt;
+    &lt;BaseCoverage&gt;
+      &lt;Glyph value=&quot;A&quot;/&gt;
+      &lt;Glyph value=&quot;T&quot;/&gt;
+      &lt;Glyph value=&quot;V&quot;/&gt;
+      &lt;Glyph value=&quot;a&quot;/&gt;
+      &lt;Glyph value=&quot;e&quot;/&gt;
+      &lt;Glyph value=&quot;f&quot;/&gt;
+      &lt;Glyph value=&quot;i&quot;/&gt;
+      &lt;Glyph value=&quot;n&quot;/&gt;
+      &lt;Glyph value=&quot;o&quot;/&gt;
+    &lt;/BaseCoverage&gt;
+    &lt;!-- ClassCount=1 --&gt;
+    &lt;MarkArray&gt;
+      &lt;!-- MarkCount=2 --&gt;
+      &lt;MarkRecord index=&quot;0&quot;&gt;
+        &lt;Class value=&quot;0&quot;/&gt;
+        &lt;MarkAnchor Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;0&quot;/&gt;
+          &lt;YCoordinate value=&quot;0&quot;/&gt;
+        &lt;/MarkAnchor&gt;
+      &lt;/MarkRecord&gt;
+      &lt;MarkRecord index=&quot;1&quot;&gt;
+        &lt;Class value=&quot;0&quot;/&gt;
+        &lt;MarkAnchor Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;0&quot;/&gt;
+          &lt;YCoordinate value=&quot;0&quot;/&gt;
+        &lt;/MarkAnchor&gt;
+      &lt;/MarkRecord&gt;
+    &lt;/MarkArray&gt;
+    &lt;BaseArray&gt;
+      &lt;!-- BaseCount=9 --&gt;
+      &lt;BaseRecord index=&quot;0&quot;&gt;
+        &lt;BaseAnchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;250&quot;/&gt;
+          &lt;YCoordinate value=&quot;700&quot;/&gt;
+        &lt;/BaseAnchor&gt;
+      &lt;/BaseRecord&gt;
+      &lt;BaseRecord index=&quot;1&quot;&gt;
+        &lt;BaseAnchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;250&quot;/&gt;
+          &lt;YCoordinate value=&quot;700&quot;/&gt;
+        &lt;/BaseAnchor&gt;
+      &lt;/BaseRecord&gt;
+      &lt;BaseRecord index=&quot;2&quot;&gt;
+        &lt;BaseAnchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;250&quot;/&gt;
+          &lt;YCoordinate value=&quot;700&quot;/&gt;
+        &lt;/BaseAnchor&gt;
+      &lt;/BaseRecord&gt;
+      &lt;BaseRecord index=&quot;3&quot;&gt;
+        &lt;BaseAnchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;250&quot;/&gt;
+          &lt;YCoordinate value=&quot;500&quot;/&gt;
+        &lt;/BaseAnchor&gt;
+      &lt;/BaseRecord&gt;
+      &lt;BaseRecord index=&quot;4&quot;&gt;
+        &lt;BaseAnchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;250&quot;/&gt;
+          &lt;YCoordinate value=&quot;500&quot;/&gt;
+        &lt;/BaseAnchor&gt;
+      &lt;/BaseRecord&gt;
+      &lt;BaseRecord index=&quot;5&quot;&gt;
+        &lt;BaseAnchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;250&quot;/&gt;
+          &lt;YCoordinate value=&quot;700&quot;/&gt;
+        &lt;/BaseAnchor&gt;
+      &lt;/BaseRecord&gt;
+      &lt;BaseRecord index=&quot;6&quot;&gt;
+        &lt;BaseAnchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;250&quot;/&gt;
+          &lt;YCoordinate value=&quot;700&quot;/&gt;
+        &lt;/BaseAnchor&gt;
+      &lt;/BaseRecord&gt;
+      &lt;BaseRecord index=&quot;7&quot;&gt;
+        &lt;BaseAnchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;250&quot;/&gt;
+          &lt;YCoordinate value=&quot;500&quot;/&gt;
+        &lt;/BaseAnchor&gt;
+      &lt;/BaseRecord&gt;
+      &lt;BaseRecord index=&quot;8&quot;&gt;
+        &lt;BaseAnchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;250&quot;/&gt;
+          &lt;YCoordinate value=&quot;500&quot;/&gt;
+        &lt;/BaseAnchor&gt;
+      &lt;/BaseRecord&gt;
+    &lt;/BaseArray&gt;
+  &lt;/MarkBasePos&gt;
+&lt;/Lookup&gt;</code></pre></div><div class="pane" data-view="cpp" data-label="HarfBuzz C++" role="tabpanel"><pre><code>template &lt;typename Types&gt;
+struct MarkBasePosFormat1_2
+{
+  protected:
+  HBUINT16      format;                 /* Format identifier--format = 1 */
+  typename Types::template LOffsetTo&lt;Coverage&gt;
+                markCoverage;           /* Offset to MarkCoverage table--from
+                                         * beginning of MarkBasePos subtable */
+  typename Types::template LOffsetTo&lt;Coverage&gt;
+                baseCoverage;           /* Offset to BaseCoverage table--from
+                                         * beginning of MarkBasePos subtable */
+  HBUINT16      classCount;             /* Number of classes defined for marks */
+  typename Types::template LOffsetTo&lt;MarkArray&lt;Types&gt;&gt;
+                markArray;              /* Offset to MarkArray table--from
+                                         * beginning of MarkBasePos subtable */
+  typename Types::template LOffsetTo&lt;AnchorMatrix&lt;Types&gt;&gt;
+                baseArray;              /* Offset to BaseArray table--from
+                                         * beginning of MarkBasePos subtable */
+
+  public:
+  DEFINE_SIZE_STATIC (4 + 4 * Types::LOffset::static_size);
+  /* … */
+};</code></pre><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/MarkBasePosFormat1.hh#L10-L30">src/OT/Layout/GPOS/MarkBasePosFormat1.hh:10</a></div><figcaption>gpos.ttf, lookup 4</figcaption></figure>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">a◌́</span><span class="cps">U+0061 U+0301</span></td><td class="opt"></td><td class="out"><code>[a=0+500|acutecomb=0@-250,500+0]</code></td></tr></tbody></table></div>
+<h3 id="finding-the-base">Finding the base</h3>
+<p id="ix-53">When the current glyph is in the mark coverage, HarfBuzz looks back for the nearest glyph that isn’t a mark, using the skipping iterator’s matcher with its lookup props replaced by <code>IgnoreMarks</code> alone: the lookup’s own flags don’t say what counts as a base. Instead of the iterator’s <code>prev</code>, which the comment says would be O(n²), it has a loop of its own (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/MarkBasePosFormat1.hh#L113"><code>MarkBasePosFormat1.hh:113</code></a>), which remembers what it found in two fields of the apply context, <strong><code>last_base</code></strong> and <code>last_base_until</code>. Each mark in a run after one base then searches only the glyphs not yet searched. The cache is reset for each lookup.</p>
+<p id="ix-54">The glyph found needn’t be a GDEF base (that check “is too strong; disabled”), only in the base coverage. One kind of non-mark is passed over: the second or later glyph of a multiple substitution, so that a mark after <code>x</code> decomposed into <code>f i</code> would attach to the <code>f</code> (HarfBuzz issue #740). The rule, <code>accept</code> (<code>:75</code>), stops at a mark inside the sequence (#1020), and since #4124 doesn’t pass over a glyph that is itself in the base coverage.</p>
+<p id="ix-55">The loop only stops at a glyph that matches. A glyph that doesn’t, because its mask lacks the lookup’s bit, is passed over like a mark, though <code>prev</code> would have stopped there. With <code>mark</code> turned off for the <code>e</code> alone, the acute after it is attached to the <code>a</code> instead:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">ae◌́</span><span class="cps">U+0061 U+0065 U+0301</span></td><td class="opt">--cluster-level=1</td><td class="out"><code>[a=0+500|e=1+500|acutecomb=2@-250,500+0]</code></td></tr><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">ae◌́</span><span class="cps">U+0061 U+0065 U+0301</span></td><td class="opt">--cluster-level=1 --features=mark[1:2]=0</td><td class="out"><code>[a=0+500|e=1+500|acutecomb=2@-750,500+0]</code></td></tr></tbody></table></div>
+<p id="ix-56">(Cluster level 1 keeps the acute in a cluster of its own, so the range covers only the <code>e</code>.) The acute is now 750 units back, over the <code>a</code>. This looks like a bug: elsewhere the matchers treat a glyph without the lookup’s mask bit as one that doesn’t match, and stop.</p>
+<h3 id="attaching">Attaching</h3>
+<p id="ix-57">Once the base is found and in the coverage, the base’s anchor for the mark’s class is fetched, and <code>apply_mark_attachment</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/MarkArray.hh#L41"><code>MarkArray.hh:41</code></a>) sets the mark’s offset to the base anchor minus the mark anchor. It sets it: whatever offset the mark had from earlier lookups is replaced. The mark then points to its base with <code>attach_chain</code> and <code>ATTACH_TYPE_MARK</code>. Here the base anchor of <code>a</code> is (250, 500) and the acute’s anchor (0, 0), so its offset is (250, 500) for now, and becomes (−250, 500) once the base’s advance is taken off, at the end.</p>
+<p id="ix-58">The two directions are treated differently. Across the line, the base’s offset is added now, including all the offsets up its cursive chain (<code>resolve_cross_offset</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/MarkArray.hh#L12"><code>MarkArray.hh:12</code></a>). Along the line, the base’s offset is added only at the end. So a mark follows a base that a later lookup moves along the line, but not one it moves across:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">a◌́</span><span class="cps">U+0061 U+0301</span></td><td class="opt">--features=ss01</td><td class="out"><code>[a=0@40,100+500|acutecomb=0@-210,600+0]</code></td></tr><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">a◌́</span><span class="cps">U+0061 U+0301</span></td><td class="opt">--features=ss02</td><td class="out"><code>[a=0@40,100+500|acutecomb=0@-210,500+0]</code></td></tr><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">nn◌́</span><span class="cps">U+006E U+006E U+0301</span></td><td class="opt"></td><td class="out"><code>[n=0+450|n=1@-50,100+450|acutecomb=1@-250,600+0]</code></td></tr></tbody></table></div>
+<p id="ix-59"><code>ss01</code> (lookup 0) and <code>ss02</code> (lookup 7) both move <code>a</code> by (40, 100). After <code>ss01</code>, which runs before the marks, the acute follows both; after <code>ss02</code>, only the 40. The acute on the second <code>n</code> follows it up the cursive chain, which was made first. This is from 14.3.0, for compatibility with DirectWrite and Core Text, whose <code>NEWS</code> says “marks no longer follow a cross-direction shift that a later lookup applies to the base”.</p>
+<p>The attachment makes the base and mark unsafe to break apart. Joiners behave as the table near the start of this chapter says:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">a⟨ZWJ⟩◌́</span><span class="cps">U+0061 U+200D U+0301</span></td><td class="opt"></td><td class="out"><code>[a=0+500|space=0+0|acutecomb=0+0]</code></td></tr><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">a⟨ZWNJ⟩◌́</span><span class="cps">U+0061 U+200C U+0301</span></td><td class="opt"></td><td class="out"><code>[a=0+500|space=1+0|acutecomb=1@-250,500+0]</code></td></tr><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">a◌͏◌́</span><span class="cps">U+0061 U+034F U+0301</span></td><td class="opt"></td><td class="out"><code>[a=0+500|space=0+0|acutecomb=0@-250,500+0]</code></td></tr></tbody></table></div>
+<p id="ix-60">The ZWJ stops the attachment: with manual ZWJ it isn’t passed over, so it is the glyph the base search finds, and it isn’t in the base coverage. The ZWNJ and the combining grapheme joiner are passed over.</p>
+<h2 id="mark-to-ligature">Mark to ligature</h2>
+<p id="ix-61">A mark-to-ligature subtable is the same, except that each ligature has a row of anchors for each of its components. Which row a mark uses comes from GSUB. When <code>ligate_input</code> made the ligature, it gave the ligature a ligature ID, and gave each mark it passed over the same ID and the number of the component it followed (<a href="gsub.html#matching-and-the-marks-in-between">Matching, and the marks in between</a>). The choice is in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/MarkLigPosFormat1.hh#L156"><code>MarkLigPosFormat1.hh:156</code></a>:</p>
+<pre><code class="language-c++">if (lig_id &amp;&amp; lig_id == mark_id &amp;&amp; mark_comp &gt; 0)
+  comp_index = hb_min (comp_count, _hb_glyph_info_get_lig_comp (&amp;buffer-&gt;cur())) - 1;
+else
+  comp_index = comp_count - 1;
+</code></pre>
+<p id="ix-62">A mark with the ligature’s ID goes on its own component. Any other mark, such as one typed after the whole ligature, goes on the last. The GSUB chapter could show this only with HarfBuzz’s fallback positioning, which divides a ligature into equal parts. <code>gpos.ttf</code> has the same ligatures, with anchors:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of gpos.ttf, lookup 5"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button><button type="button" role="tab" data-view="cpp">HarfBuzz C++</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 5: Mark-to-ligature attachment (type 5)
+  lookupFlag: none
+  subtable 0: MarkLigPosFormat1
+    markCoverage: [acutecomb gravecomb]
+    ligatureCoverage: [f_i f_f_i]
+    classCount: 1
+    markArray:
+      acutecomb: class 0, anchor (0, 0)
+      gravecomb: class 0, anchor (0, 0)
+    ligatureArray:
+      f_i:
+        component 1: [(225, 700)]
+        component 2: [(675, 700)]
+      f_f_i:
+        component 1: [(150, 700)]
+        component 2: [(450, 700)]
+        component 3: [(750, 700)]</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature mark {
+  pos base [a e o n] &lt;anchor 250 500&gt; mark @TOP;
+  pos base [f i A T V] &lt;anchor 250 700&gt; mark @TOP;
+  pos ligature f_i &lt;anchor 225 700&gt; mark @TOP
+    ligComponent &lt;anchor 675 700&gt; mark @TOP;
+  pos ligature f_f_i &lt;anchor 150 700&gt; mark @TOP
+    ligComponent &lt;anchor 450 700&gt; mark @TOP
+    ligComponent &lt;anchor 750 700&gt; mark @TOP;
+} mark;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;5&quot;&gt;
+  &lt;LookupType value=&quot;5&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;MarkLigPos index=&quot;0&quot; Format=&quot;1&quot;&gt;
+    &lt;MarkCoverage&gt;
+      &lt;Glyph value=&quot;acutecomb&quot;/&gt;
+      &lt;Glyph value=&quot;gravecomb&quot;/&gt;
+    &lt;/MarkCoverage&gt;
+    &lt;LigatureCoverage&gt;
+      &lt;Glyph value=&quot;f_i&quot;/&gt;
+      &lt;Glyph value=&quot;f_f_i&quot;/&gt;
+    &lt;/LigatureCoverage&gt;
+    &lt;!-- ClassCount=1 --&gt;
+    &lt;MarkArray&gt;
+      &lt;!-- MarkCount=2 --&gt;
+      &lt;MarkRecord index=&quot;0&quot;&gt;
+        &lt;Class value=&quot;0&quot;/&gt;
+        &lt;MarkAnchor Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;0&quot;/&gt;
+          &lt;YCoordinate value=&quot;0&quot;/&gt;
+        &lt;/MarkAnchor&gt;
+      &lt;/MarkRecord&gt;
+      &lt;MarkRecord index=&quot;1&quot;&gt;
+        &lt;Class value=&quot;0&quot;/&gt;
+        &lt;MarkAnchor Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;0&quot;/&gt;
+          &lt;YCoordinate value=&quot;0&quot;/&gt;
+        &lt;/MarkAnchor&gt;
+      &lt;/MarkRecord&gt;
+    &lt;/MarkArray&gt;
+    &lt;LigatureArray&gt;
+      &lt;!-- LigatureCount=2 --&gt;
+      &lt;LigatureAttach index=&quot;0&quot;&gt;
+        &lt;!-- ComponentCount=2 --&gt;
+        &lt;ComponentRecord index=&quot;0&quot;&gt;
+          &lt;LigatureAnchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+            &lt;XCoordinate value=&quot;225&quot;/&gt;
+            &lt;YCoordinate value=&quot;700&quot;/&gt;
+          &lt;/LigatureAnchor&gt;
+        &lt;/ComponentRecord&gt;
+        &lt;ComponentRecord index=&quot;1&quot;&gt;
+          &lt;LigatureAnchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+            &lt;XCoordinate value=&quot;675&quot;/&gt;
+            &lt;YCoordinate value=&quot;700&quot;/&gt;
+          &lt;/LigatureAnchor&gt;
+        &lt;/ComponentRecord&gt;
+      &lt;/LigatureAttach&gt;
+      &lt;LigatureAttach index=&quot;1&quot;&gt;
+        &lt;!-- ComponentCount=3 --&gt;
+        &lt;ComponentRecord index=&quot;0&quot;&gt;
+          &lt;LigatureAnchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+            &lt;XCoordinate value=&quot;150&quot;/&gt;
+            &lt;YCoordinate value=&quot;700&quot;/&gt;
+          &lt;/LigatureAnchor&gt;
+        &lt;/ComponentRecord&gt;
+        &lt;ComponentRecord index=&quot;1&quot;&gt;
+          &lt;LigatureAnchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+            &lt;XCoordinate value=&quot;450&quot;/&gt;
+            &lt;YCoordinate value=&quot;700&quot;/&gt;
+          &lt;/LigatureAnchor&gt;
+        &lt;/ComponentRecord&gt;
+        &lt;ComponentRecord index=&quot;2&quot;&gt;
+          &lt;LigatureAnchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+            &lt;XCoordinate value=&quot;750&quot;/&gt;
+            &lt;YCoordinate value=&quot;700&quot;/&gt;
+          &lt;/LigatureAnchor&gt;
+        &lt;/ComponentRecord&gt;
+      &lt;/LigatureAttach&gt;
+    &lt;/LigatureArray&gt;
+  &lt;/MarkLigPos&gt;
+&lt;/Lookup&gt;</code></pre></div><div class="pane" data-view="cpp" data-label="HarfBuzz C++" role="tabpanel"><pre><code>template &lt;typename Types&gt;
+struct MarkLigPosFormat1_2
+{
+  protected:
+  HBUINT16      format;                 /* Format identifier--format = 1 */
+  typename Types::template LOffsetTo&lt;Coverage&gt;
+                markCoverage;           /* Offset to Mark Coverage table--from
+                                         * beginning of MarkLigPos subtable */
+  typename Types::template LOffsetTo&lt;Coverage&gt;
+                ligatureCoverage;       /* Offset to Ligature Coverage
+                                         * table--from beginning of MarkLigPos
+                                         * subtable */
+  HBUINT16      classCount;             /* Number of defined mark classes */
+  typename Types::template LOffsetTo&lt;MarkArray&lt;Types&gt;&gt;
+                markArray;              /* Offset to MarkArray table--from
+                                         * beginning of MarkLigPos subtable */
+  typename Types::template LOffsetTo&lt;LigatureArray&lt;Types&gt;&gt;
+                ligatureArray;          /* Offset to LigatureArray table--from
+                                         * beginning of MarkLigPos subtable */
+  public:
+  DEFINE_SIZE_STATIC (4 + 4 * Types::LOffset::static_size);
+  /* … */
+};</code></pre><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/MarkLigPosFormat1.hh#L11-L31">src/OT/Layout/GPOS/MarkLigPosFormat1.hh:11</a></div><figcaption>gpos.ttf, lookup 5</figcaption></figure>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">f◌́i</span><span class="cps">U+0066 U+0301 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900|acutecomb=0@-675,700+0]</code></td></tr><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">fi◌́</span><span class="cps">U+0066 U+0069 U+0301</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900|acutecomb=0@-225,700+0]</code></td></tr><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">f◌́f◌́i</span><span class="cps">U+0066 U+0301 U+0066 U+0301 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_f_i=0+900|acutecomb=0@-750,700+0|acutecomb=0@-450,700+0]</code></td></tr></tbody></table></div>
+<p id="ix-63">The anchors are where the fallback positioner puts marks, a quarter and three quarters along <code>f_i</code>, so the acutes land where the GSUB chapter’s did, −675 and −225; but now they come from the font, and on <code>f_f_i</code> they are at 150 and 450, not at thirds. A trace shows each mark’s offset from its component’s anchor, before anything is added up:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape gpos.ttf "f◌́i◌́"  --trace</code></div><table><tbody><tr><td class="what">start lookup 5 feature &#x27;mark&#x27;</td><td class="buf"><code>[f_i=0+900|acutecomb=0+0|acutecomb=0+0]</code></td></tr><tr><td class="what">attaching mark glyph at 1 to glyph at 0</td><td class="buf"><code>[f_i=0+900|acutecomb=0+0|acutecomb=0+0]</code></td></tr><tr><td class="what">attached mark glyph at 1 to glyph at 0</td><td class="buf"><code>[f_i=0+900|acutecomb=0@225,700+0|acutecomb=0+0]</code></td></tr><tr><td class="what">attaching mark glyph at 2 to glyph at 0</td><td class="buf"><code>[f_i=0+900|acutecomb=0@225,700+0|acutecomb=0+0]</code></td></tr><tr><td class="what">attached mark glyph at 2 to glyph at 0</td><td class="buf"><code>[f_i=0+900|acutecomb=0@225,700+0|acutecomb=0@675,700+0]</code></td></tr><tr><td class="what">end lookup 5 feature &#x27;mark&#x27;</td><td class="buf"><code>[f_i=0+900|acutecomb=0@225,700+0|acutecomb=0@675,700+0]</code></td></tr></tbody></table></div>
+<p>If the chosen component has no anchor for the mark’s class, the subtable declines. The base search, the cache and the multiple-substitution rule are the same as for mark-to-base.</p>
+<h2 id="mark-to-mark">Mark to mark</h2>
+<p>Mark-to-mark attaches a mark to a mark before it, usually to stack accents:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of gpos.ttf, lookup 6"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button><button type="button" role="tab" data-view="cpp">HarfBuzz C++</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 6: Mark-to-mark attachment (type 6)
+  lookupFlag: none
+  subtable 0: MarkMarkPosFormat1
+    mark1Coverage: [acutecomb gravecomb]
+    mark2Coverage: [acutecomb gravecomb]
+    classCount: 1
+    mark1Array:
+      acutecomb: class 0, anchor (0, 0)
+      gravecomb: class 0, anchor (0, 0)
+    mark2Array:
+      acutecomb: [(0, 150)]
+      gravecomb: [(0, 150)]</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature mkmk {
+  pos mark @MARKS &lt;anchor 0 150&gt; mark @TOP;
+} mkmk;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;6&quot;&gt;
+  &lt;LookupType value=&quot;6&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;MarkMarkPos index=&quot;0&quot; Format=&quot;1&quot;&gt;
+    &lt;Mark1Coverage&gt;
+      &lt;Glyph value=&quot;acutecomb&quot;/&gt;
+      &lt;Glyph value=&quot;gravecomb&quot;/&gt;
+    &lt;/Mark1Coverage&gt;
+    &lt;Mark2Coverage&gt;
+      &lt;Glyph value=&quot;acutecomb&quot;/&gt;
+      &lt;Glyph value=&quot;gravecomb&quot;/&gt;
+    &lt;/Mark2Coverage&gt;
+    &lt;!-- ClassCount=1 --&gt;
+    &lt;Mark1Array&gt;
+      &lt;!-- MarkCount=2 --&gt;
+      &lt;MarkRecord index=&quot;0&quot;&gt;
+        &lt;Class value=&quot;0&quot;/&gt;
+        &lt;MarkAnchor Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;0&quot;/&gt;
+          &lt;YCoordinate value=&quot;0&quot;/&gt;
+        &lt;/MarkAnchor&gt;
+      &lt;/MarkRecord&gt;
+      &lt;MarkRecord index=&quot;1&quot;&gt;
+        &lt;Class value=&quot;0&quot;/&gt;
+        &lt;MarkAnchor Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;0&quot;/&gt;
+          &lt;YCoordinate value=&quot;0&quot;/&gt;
+        &lt;/MarkAnchor&gt;
+      &lt;/MarkRecord&gt;
+    &lt;/Mark1Array&gt;
+    &lt;Mark2Array&gt;
+      &lt;!-- Mark2Count=2 --&gt;
+      &lt;Mark2Record index=&quot;0&quot;&gt;
+        &lt;Mark2Anchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;0&quot;/&gt;
+          &lt;YCoordinate value=&quot;150&quot;/&gt;
+        &lt;/Mark2Anchor&gt;
+      &lt;/Mark2Record&gt;
+      &lt;Mark2Record index=&quot;1&quot;&gt;
+        &lt;Mark2Anchor index=&quot;0&quot; Format=&quot;1&quot;&gt;
+          &lt;XCoordinate value=&quot;0&quot;/&gt;
+          &lt;YCoordinate value=&quot;150&quot;/&gt;
+        &lt;/Mark2Anchor&gt;
+      &lt;/Mark2Record&gt;
+    &lt;/Mark2Array&gt;
+  &lt;/MarkMarkPos&gt;
+&lt;/Lookup&gt;</code></pre></div><div class="pane" data-view="cpp" data-label="HarfBuzz C++" role="tabpanel"><pre><code>template &lt;typename Types&gt;
+struct MarkMarkPosFormat1_2
+{
+  protected:
+  HBUINT16      format;                 /* Format identifier--format = 1 */
+  typename Types::template LOffsetTo&lt;Coverage&gt;
+                mark1Coverage;          /* Offset to Combining Mark1 Coverage
+                                         * table--from beginning of MarkMarkPos
+                                         * subtable */
+  typename Types::template LOffsetTo&lt;Coverage&gt;
+                mark2Coverage;          /* Offset to Combining Mark2 Coverage
+                                         * table--from beginning of MarkMarkPos
+                                         * subtable */
+  HBUINT16      classCount;             /* Number of defined mark classes */
+  typename Types::template LOffsetTo&lt;MarkArray&lt;Types&gt;&gt;
+                mark1Array;             /* Offset to Mark1Array table--from
+                                         * beginning of MarkMarkPos subtable */
+  typename Types::template LOffsetTo&lt;AnchorMatrix&lt;Types, HBUINT16&gt;&gt;
+                mark2Array;             /* Offset to Mark2Array table--from
+                                         * beginning of MarkMarkPos subtable */
+  public:
+  DEFINE_SIZE_STATIC (4 + 4 * Types::LOffset::static_size);
+  /* … */
+};</code></pre><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/MarkMarkPosFormat1.hh#L10-L31">src/OT/Layout/GPOS/MarkMarkPosFormat1.hh:10</a></div><figcaption>gpos.ttf, lookup 6</figcaption></figure>
+<p id="ix-64">This search uses the iterator’s <code>prev</code>, with the lookup’s flags minus the three Ignore flags (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/MarkMarkPosFormat1.hh#L87"><code>MarkMarkPosFormat1.hh:87</code></a>), so a mark-filtering set or mark attachment class still decides which marks are passed over, and the glyph found must be a mark: a base ends the search. Then the two marks must belong together (<code>:108</code>): both with ligature ID 0, on the same base; or on the same component of one ligature; or, if their IDs differ, one must be a ligature of marks, with an ID and component number 0.</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">a◌́◌́</span><span class="cps">U+0061 U+0301 U+0301</span></td><td class="opt"></td><td class="out"><code>[a=0+500|acutecomb=0@-250,500+0|acutecomb=0@-250,650+0]</code></td></tr><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">f◌́◌́i</span><span class="cps">U+0066 U+0301 U+0301 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900|acutecomb=0@-675,700+0|acutecomb=0@-675,850+0]</code></td></tr><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">f◌́i◌́</span><span class="cps">U+0066 U+0301 U+0069 U+0301</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900|acutecomb=0@-675,700+0|acutecomb=0@-225,700+0]</code></td></tr></tbody></table></div>
+<p id="ix-65">The first two stack the second acute on the first, 150 units up. In the third, the two acutes end up next to each other after <code>f_i</code>, the first belonging to component 1 and the second to component 2. They have the same ligature ID and different component numbers, so <code>mkmk</code> leaves them alone, and the acute typed over the <code>i</code> stays where mark-to-ligature put it.</p>
+<h2 id="context-chained-context-and-extension">Context, chained context and extension</h2>
+<p id="ix-66">Types 7 to 9 are the same code as GSUB’s types 5 to 7 (<a href="gsub.html#context-and-chained-context">Context and chained context</a>). Nested positioning lookups never change the buffer’s length, so the guessing that <code>apply_lookup</code> does after a nested GSUB lookup never comes up.</p>
+<p id="ix-67">Their commonest use is kerning that depends on a third glyph, a <strong>kerning triplet</strong>. A pair can only say how far apart two glyphs are; a triplet changes that when a particular glyph comes before or after them. The test font <code>context.ttf</code>, from <code>context.fea</code>, kerns <em>T o</em> by −100 as a pair, and gives 40 of it back when <em>n</em> follows:</p>
+<pre><code>feature kern {
+  pos T o -100;
+  pos T' 40 o n;
+} kern;
+</code></pre>
+<p id="ix-68">As with substitutions (<a href="gsub.html#what-a-feature-file-compiles-to">What a feature file compiles to</a>), the second rule becomes two lookups: a chained-context lookup whose rule matches <em>T</em> before <em>o n</em>, and a single adjustment, lookup 2, that it calls:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of context.ttf, lookup 1"><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature kern {
+  pos T o -100;
+  pos T&#x27; 40 o n;
+} kern;</code></pre></div><div class="pane print" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;1&quot;&gt;
+  &lt;LookupType value=&quot;8&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;ChainContextPos index=&quot;0&quot; Format=&quot;1&quot;&gt;
+    &lt;Coverage&gt;
+      &lt;Glyph value=&quot;T&quot;/&gt;
+    &lt;/Coverage&gt;
+    &lt;!-- ChainPosRuleSetCount=1 --&gt;
+    &lt;ChainPosRuleSet index=&quot;0&quot;&gt;
+      &lt;!-- ChainPosRuleCount=1 --&gt;
+      &lt;ChainPosRule index=&quot;0&quot;&gt;
+        &lt;!-- BacktrackGlyphCount=0 --&gt;
+        &lt;!-- InputGlyphCount=1 --&gt;
+        &lt;!-- LookAheadGlyphCount=2 --&gt;
+        &lt;LookAhead index=&quot;0&quot; value=&quot;o&quot;/&gt;
+        &lt;LookAhead index=&quot;1&quot; value=&quot;n&quot;/&gt;
+        &lt;!-- PosCount=1 --&gt;
+        &lt;PosLookupRecord index=&quot;0&quot;&gt;
+          &lt;SequenceIndex value=&quot;0&quot;/&gt;
+          &lt;LookupListIndex value=&quot;2&quot;/&gt;
+        &lt;/PosLookupRecord&gt;
+      &lt;/ChainPosRule&gt;
+    &lt;/ChainPosRuleSet&gt;
+  &lt;/ChainContextPos&gt;
+&lt;/Lookup&gt;</code></pre></div><figcaption>context.ttf, lookup 1</figcaption></figure>
+<p id="ix-69">Both lookups run, the pair first, and their values add up. <em>T</em> before <em>o</em> loses 100 units of advance, and before <em>o n</em> it loses 60:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">context.ttf</td><td class="in"><span class="txt">To</span><span class="cps">U+0054 U+006F</span></td><td class="opt">--language=en</td><td class="out"><code>[T=0+500|o=1+500]</code></td></tr><tr><td class="font">context.ttf</td><td class="in"><span class="txt">Ton</span><span class="cps">U+0054 U+006F U+006E</span></td><td class="opt">--language=en</td><td class="out"><code>[T=0+540|o=1+500|n=2+500]</code></td></tr></tbody></table></div>
+<div class="trace"><div class="trace-head"><code>hb-shape context.ttf "Ton" --language=en --trace</code></div><table><tbody><tr><td class="what">start lookup 0 feature &#x27;kern&#x27;</td><td class="buf"><code>[T=0+600|o=1+500|n=2+500]</code></td></tr><tr><td class="what">try kerning glyphs at 0,1</td><td class="buf"><code>[T=0+600|o=1+500|n=2+500]</code></td></tr><tr><td class="what">kerned glyphs at 0,1</td><td class="buf"><code>[T=0+500|o=1+500|n=2+500]</code></td></tr><tr><td class="what">tried kerning glyphs at 0,1</td><td class="buf"><code>[T=0+500|o=1+500|n=2+500]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;kern&#x27;</td><td class="buf"><code>[T=0+500|o=1+500|n=2+500]</code></td></tr><tr><td class="what">start lookup 1 feature &#x27;kern&#x27;</td><td class="buf"><code>[T=0+500|o=1+500|n=2+500]</code></td></tr><tr><td class="what">start recursing to lookup 2 at 0</td><td class="buf"><code>[T=0+500|o=1+500|n=2+500]</code></td></tr><tr><td class="what">positioning glyph at 0</td><td class="buf"><code>[T=0+500|o=1+500|n=2+500]</code></td></tr><tr><td class="what">positioned glyph at 0</td><td class="buf"><code>[T=0+540|o=1+500|n=2+500]</code></td></tr><tr><td class="what">end recursing to lookup 2</td><td class="buf"><code>[T=0+540|o=1+500|n=2+500]</code></td></tr><tr><td class="what">end lookup 1 feature &#x27;kern&#x27;</td><td class="buf"><code>[T=0+540|o=1+500|n=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-70">So a triplet is usually a correction on top of the pair, written as a later lookup. Written the other way round, before the pair, it would still add, because positioning values accumulate: unlike a substitution, an earlier adjustment doesn’t stop a later one from matching.</p>
+<h2 id="resolving-attachments">Resolving attachments</h2>
+<p id="ix-71">After GPOS, and after the shaper has zeroed the advances of marks (<a href="pipeline-step-by-step.html#gpos-and-what-surrounds-it">The pipeline, step by step</a>), <code>position_finish_offsets</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/GPOS.hh#L164"><code>OT/Layout/GPOS/GPOS.hh:164</code></a>) turns relative offsets into offsets from each glyph’s own pen position, if an attachment set the buffer’s <code>HAS_GPOS_ATTACHMENT</code> scratch flag. For each glyph with an <code>attach_chain</code>, <code>propagate_attachment_offsets</code> (<code>:75</code>) resolves the parent first, recursively, and then:</p>
+<ul>
+<li id="ix-72">for a cursive child, adds the parent’s offset across the line;</li>
+<li id="ix-73">for a mark, adds the base’s offset along the line, and subtracts the advances from the base to the mark: in forward text the base’s and any between; in backward text those after the base up to and including the mark’s own, since the mark will be drawn left of the base.</li>
+</ul>
+<p id="ix-74">Each link is cleared as it is resolved, so nothing is added twice. In the trace above the acutes left GPOS at x 225 and 675; taking off the ligature’s 900 gives −675 and −225. The code also handles a mark whose base comes <em>after</em> it, which <code>kerx</code> can produce (<a href="aat-positioning.html">AAT positioning</a>). Last comes synthetic slant (<a href="fonts-and-font-functions.html#slant">Fonts and font functions</a>).</p>
+<h3 id="a-limit-on-the-depth">A limit on the depth</h3>
+<p id="ix-75">The recursion is bounded by <code>HB_MAX_NESTING_LEVEL</code>, 64, and the glyphs are visited in the buffer’s direction: from the start in left-to-right text, from the end in right-to-left (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/GPOS.hh#L177"><code>GPOS.hh:177</code></a>). That order came from <code>kerx</code>, whose cross-stream kerning links every glyph to its neighbor and was losing a link every 64 glyphs (HarfBuzz issue #5514): visited in order, each parent is resolved before its child, and the recursion stays shallow.</p>
+<p id="ix-76">A cursive chain can point the other way. In left-to-right text with the RightToLeft flag, every glyph’s parent comes after it, so resolving the first glyph recurses down the whole chain, and gives up at depth 64. In right-to-left text it is a chain <em>without</em> the flag, the usual kind in Arabic, that does this. Here are 67 <code>n</code>s with the flag set:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gpos.ttf</td><td class="in"><span class="txt">nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn</span><span class="cps">U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E U+006E</span></td><td class="opt">--features=-curs,ss03</td><td class="out"><code>[n=0@0,-6500+450|n=1@-50,-6400+400|n=2@-50,-6300+400|n=3@-50,-6200+400|n=4@-50,-6100+400|n=5@-50,-6000+400|n=6@-50,-5900+400|n=7@-50,-5800+400|n=8@-50,-5700+400|n=9@-50,-5600+400|n=10@-50,-5500+400|n=11@-50,-5400+400|n=12@-50,-5300+400|n=13@-50,-5200+400|n=14@-50,-5100+400|n=15@-50,-5000+400|n=16@-50,-4900+400|n=17@-50,-4800+400|n=18@-50,-4700+400|n=19@-50,-4600+400|n=20@-50,-4500+400|n=21@-50,-4400+400|n=22@-50,-4300+400|n=23@-50,-4200+400|n=24@-50,-4100+400|n=25@-50,-4000+400|n=26@-50,-3900+400|n=27@-50,-3800+400|n=28@-50,-3700+400|n=29@-50,-3600+400|n=30@-50,-3500+400|n=31@-50,-3400+400|n=32@-50,-3300+400|n=33@-50,-3200+400|n=34@-50,-3100+400|n=35@-50,-3000+400|n=36@-50,-2900+400|n=37@-50,-2800+400|n=38@-50,-2700+400|n=39@-50,-2600+400|n=40@-50,-2500+400|n=41@-50,-2400+400|n=42@-50,-2300+400|n=43@-50,-2200+400|n=44@-50,-2100+400|n=45@-50,-2000+400|n=46@-50,-1900+400|n=47@-50,-1800+400|n=48@-50,-1700+400|n=49@-50,-1600+400|n=50@-50,-1500+400|n=51@-50,-1400+400|n=52@-50,-1300+400|n=53@-50,-1200+400|n=54@-50,-1100+400|n=55@-50,-1000+400|n=56@-50,-900+400|n=57@-50,-800+400|n=58@-50,-700+400|n=59@-50,-600+400|n=60@-50,-500+400|n=61@-50,-400+400|n=62@-50,-300+400|n=63@-50,-200+400|n=64@-50,-100+400|n=65@-50,-100+400|n=66@-50,0+450]</code></td></tr></tbody></table></div>
+<p id="ix-77">Each glyph should be 100 units below the next. Glyphs 64 and 65 are both at −100: the recursion stopped at glyph 64 before adding glyph 65’s offset, so glyphs 0 to 64 are all 100 units too high. Chains that long are rare, but this looks like a bug of the same kind as #5514, left for chains that run against the buffer’s direction.</p>
+<blockquote>
+<p id="ix-78">For programmers: a message callback that reads positions during GPOS sees attachments still relative to their parents, with the links in <code>var</code>, not the offsets the application will get.</p>
+</blockquote>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src/OT/Layout/GPOS"><code>src/OT/Layout/GPOS/*.hh</code></a></td>
+<td>one file per subtable type and format, with its <code>apply</code>; value records, anchors, and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/MarkArray.hh"><code>MarkArray.hh</code></a> (<code>apply_mark_attachment</code>, <code>resolve_cross_offset</code>)</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/CursivePosFormat1.hh"><code>src/OT/Layout/GPOS/CursivePosFormat1.hh</code></a></td>
+<td><code>apply_cursive_attachment</code>, the RightToLeft flag, <code>reverse_cursive_minor_offset</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/GPOS.hh"><code>src/OT/Layout/GPOS/GPOS.hh</code></a></td>
+<td><code>position_start</code>, <code>position_finish_offsets</code>, <code>propagate_attachment_offsets</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/Common.hh"><code>src/OT/Layout/GPOS/Common.hh</code></a></td>
+<td><code>attach_chain</code>, <code>attach_type</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh"><code>src/hb-ot-layout-gsubgpos.hh</code></a></td>
+<td>what GSUB and GPOS share: the matcher’s GPOS rules, the skipping iterator, the subtable caches, <code>last_base</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>src/hb-ot-layout.cc</code></a></td>
+<td><code>GPOSProxy</code>, <code>apply_string</code>, <code>hb_ot_map_t::position</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh"><code>src/hb-ot-layout-common.hh</code></a></td>
+<td><code>Device</code>, <code>HintingDevice</code>, <code>VariationDevice</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>src/hb-ot-shape.cc</code></a></td>
+<td>where GPOS runs in the pipeline; the <code>mark</code>, <code>mkmk</code>, <code>curs</code> and <code>kern</code> features</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>GPOS works in place, in one stage, with GSUB’s loop, digests and flags.</li>
+<li>In GPOS, ZWNJ and hidden characters are always passed over; ZWJ is too, except by <code>mark</code> and <code>mkmk</code>.</li>
+<li>Value records are scaled and added; Device tables are read only with a ppem or variation coordinates.</li>
+<li>A class-pair subtable applies to every pair whose first glyph it covers, so kerning exceptions must come before it. A pair with a value for its second glyph moves past it.</li>
+<li>A cursive chain hangs from its first glyph, or from its last with the RightToLeft flag.</li>
+<li>A mark looks back past marks for its base, and on a ligature uses the component GSUB recorded. Across the line its offset is fixed when it attaches; along the line it follows its base.</li>
+<li>Attachments are stored as links and added up after GPOS, in <code>propagate_attachment_offsets</code>.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="gsub.html">← GSUB: substituting glyphs</a><a rel="next" href="fallbacks.html">Fallbacks →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

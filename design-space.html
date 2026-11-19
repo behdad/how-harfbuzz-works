@@ -1,0 +1,1091 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Design space · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part VIII · Variations</p>
+<h1 id="design-space">31. Design space</h1>
+<p id="ix-1">A variable font is one set of outlines together with instructions for changing them. Where a static font has one weight, a variable font has a <strong>weight axis</strong>, and any position along it, not only the weights the designer drew, is a font. With two axes, weight and width say, every point in a rectangle is a font. That rectangle, or box, or higher-dimensional block, is the font’s <strong>design space</strong>.</p>
+<p id="ix-2">Every other chapter in this part is about what happens at a position in the design space: how deltas are found and added to advances, metrics and outlines. This one is about the position itself: how the numbers an application asks for, like <code>wght=700</code>, become the coordinates that the rest of HarfBuzz reads. That takes three tables and three number formats, and it’s where HarfBuzz departs from the specification more often than almost anywhere else in its variation code.</p>
+<p id="ix-3">The examples use a small family of test fonts, built for this part of the book in <code>fonts/variations/</code> by <code>tools/build-var-test-fonts.py</code>. Like a real variable font, they’re made from static masters combined by fontTools’ varLib. They have a weight axis and a width axis, and three glyphs whose shapes make their coordinates easy to read: <code>I</code> is one stem, as wide as the weight says; <code>H</code> has two stems and a bar, and gets narrower along the width axis; <code>V</code> is a stem whose right edge leans as the weight grows.</p>
+<figure class="draw slider"><div class="frames"><div class="frame print" data-value="100" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=100">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L120,700L120,0L80,0Z" fill="currentColor"/>
+<path d="M280,0L280,700L320,700L320,0L280,0ZM640,0L640,700L680,700L680,0L640,0ZM320,330L320,362L640,362L640,330L320,330Z" fill="currentColor"/>
+<path d="M840,0L840,700L880,700L880,525L880,350L880,175L880,0L840,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=100</div><code class="frame-shape">[I=0+200|H=1+560|V=2+200]</code></div><div class="frame" data-value="125" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=125">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L125,700L125,0L80,0Z" fill="currentColor"/>
+<path d="M285,0L285,700L330,700L330,0L285,0ZM643.33,0L643.33,700L688.33,700L688.33,0L643.33,0ZM330,330L330,366L643.33,366L643.33,330L330,330Z" fill="currentColor"/>
+<path d="M848,0L848,700L893,700L893,525L893,350L893,175L893,0L848,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=125</div><code class="frame-shape">[I=0+205|H=1+563|V=2+205]</code></div><div class="frame" data-value="150" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=150">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L130,700L130,0L80,0Z" fill="currentColor"/>
+<path d="M290,0L290,700L340,700L340,0L290,0ZM646.67,0L646.67,700L696.67,700L696.67,0L646.67,0ZM340,330L340,370L646.67,370L646.67,330L340,330Z" fill="currentColor"/>
+<path d="M857,0L857,700L907,700L907,525L907,350L907,175L907,0L857,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=150</div><code class="frame-shape">[I=0+210|H=1+567|V=2+210]</code></div><div class="frame" data-value="175" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=175">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L135,700L135,0L80,0Z" fill="currentColor"/>
+<path d="M295,0L295,700L350,700L350,0L295,0ZM650,0L650,700L705,700L705,0L650,0ZM350,330L350,374L650,374L650,330L350,330Z" fill="currentColor"/>
+<path d="M865,0L865,700L920,700L920,525L920,350L920,175L920,0L865,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=175</div><code class="frame-shape">[I=0+215|H=1+570|V=2+215]</code></div><div class="frame" data-value="200" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=200">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L140,700L140,0L80,0Z" fill="currentColor"/>
+<path d="M300,0L300,700L360,700L360,0L300,0ZM653.33,0L653.33,700L713.33,700L713.33,0L653.33,0ZM360,330L360,378L653.33,378L653.33,330L360,330Z" fill="currentColor"/>
+<path d="M873,0L873,700L933,700L933,525L933,350L933,175L933,0L873,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=200</div><code class="frame-shape">[I=0+220|H=1+573|V=2+220]</code></div><div class="frame" data-value="225" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=225">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L145,700L145,0L80,0Z" fill="currentColor"/>
+<path d="M305,0L305,700L370,700L370,0L305,0ZM656.67,0L656.67,700L721.67,700L721.67,0L656.67,0ZM370,330L370,382L656.67,382L656.67,330L370,330Z" fill="currentColor"/>
+<path d="M882,0L882,700L947,700L947,525L947,350L947,175L947,0L882,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=225</div><code class="frame-shape">[I=0+225|H=1+577|V=2+225]</code></div><div class="frame" data-value="250" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=250">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L150,700L150,0L80,0Z" fill="currentColor"/>
+<path d="M310,0L310,700L380,700L380,0L310,0ZM660,0L660,700L730,700L730,0L660,0ZM380,330L380,386L660,386L660,330L380,330Z" fill="currentColor"/>
+<path d="M890,0L890,700L960,700L960,525L960,350L960,175L960,0L890,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=250</div><code class="frame-shape">[I=0+230|H=1+580|V=2+230]</code></div><div class="frame" data-value="275" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=275">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L155,700L155,0L80,0Z" fill="currentColor"/>
+<path d="M315,0L315,700L390,700L390,0L315,0ZM663.33,0L663.33,700L738.33,700L738.33,0L663.33,0ZM390,330L390,390L663.33,390L663.33,330L390,330Z" fill="currentColor"/>
+<path d="M898,0L898,700L973,700L973,525L973,350L973,175L973,0L898,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=275</div><code class="frame-shape">[I=0+235|H=1+583|V=2+235]</code></div><div class="frame" data-value="300" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=300">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L160,700L160,0L80,0Z" fill="currentColor"/>
+<path d="M320,0L320,700L400,700L400,0L320,0ZM666.67,0L666.67,700L746.67,700L746.67,0L666.67,0ZM400,330L400,394L666.67,394L666.67,330L400,330Z" fill="currentColor"/>
+<path d="M907,0L907,700L987,700L987,525L987,350L987,175L987,0L907,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=300</div><code class="frame-shape">[I=0+240|H=1+587|V=2+240]</code></div><div class="frame" data-value="325" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=325">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L165,700L165,0L80,0Z" fill="currentColor"/>
+<path d="M325,0L325,700L410,700L410,0L325,0ZM670,0L670,700L755,700L755,0L670,0ZM410,330L410,398L670,398L670,330L410,330Z" fill="currentColor"/>
+<path d="M915,0L915,700L1000,700L1000,525L1000,350L1000,175L1000,0L915,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=325</div><code class="frame-shape">[I=0+245|H=1+590|V=2+245]</code></div><div class="frame" data-value="350" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=350">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L170,700L170,0L80,0Z" fill="currentColor"/>
+<path d="M330,0L330,700L420,700L420,0L330,0ZM673.33,0L673.33,700L763.33,700L763.33,0L673.33,0ZM420,330L420,402L673.33,402L673.33,330L420,330Z" fill="currentColor"/>
+<path d="M923,0L923,700L1013,700L1013,525L1013,350L1013,175L1013,0L923,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=350</div><code class="frame-shape">[I=0+250|H=1+593|V=2+250]</code></div><div class="frame" data-value="375" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=375">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L175,700L175,0L80,0Z" fill="currentColor"/>
+<path d="M335,0L335,700L430,700L430,0L335,0ZM676.67,0L676.67,700L771.67,700L771.67,0L676.67,0ZM430,330L430,406L676.67,406L676.67,330L430,330Z" fill="currentColor"/>
+<path d="M932,0L932,700L1027,700L1027,525L1027,350L1027,175L1027,0L932,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=375</div><code class="frame-shape">[I=0+255|H=1+597|V=2+255]</code></div><div class="frame print" data-value="400"><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=400">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L180,700L180,0L80,0Z" fill="currentColor"/>
+<path d="M340,0L340,700L440,700L440,0L340,0ZM680,0L680,700L780,700L780,0L680,0ZM440,330L440,410L680,410L680,330L440,330Z" fill="currentColor"/>
+<path d="M940,0L940,700L1040,700L1040,525L1040,350L1040,175L1040,0L940,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=400</div><code class="frame-shape">[I=0+260|H=1+600|V=2+260]</code></div><div class="frame" data-value="425" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=425">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L190,700L190,0L80,0Z" fill="currentColor"/>
+<path d="M350,0L350,700L460,700L460,0L350,0ZM686,0L686,700L796,700L796,0L686,0ZM460,330L460,418L686,418L686,330L460,330Z" fill="currentColor"/>
+<path d="M956,0L956,700L1072,700L1070.5,525L1069,350L1067.5,175L1066,0L956,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=425</div><code class="frame-shape">[I=0+270|H=1+606|V=2+276]</code></div><div class="frame" data-value="450" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=450">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L200.01,700L200.01,0L80,0Z" fill="currentColor"/>
+<path d="M360,0L360,700L480.01,700L480.01,0L360,0ZM692,0L692,700L812,700L812,0L692,0ZM480.01,330L480.01,426.01L692,426.01L692,330L480.01,330Z" fill="currentColor"/>
+<path d="M972,0L972,700L1104.01,700L1101.01,525L1098.01,350L1095.01,175L1092.01,0L972,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=450</div><code class="frame-shape">[I=0+280|H=1+612|V=2+292]</code></div><div class="frame" data-value="475" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=475">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L210,700L210,0L80,0Z" fill="currentColor"/>
+<path d="M370,0L370,700L500,700L500,0L370,0ZM698,0L698,700L828,700L828,0L698,0ZM500,330L500,434L698,434L698,330L500,330Z" fill="currentColor"/>
+<path d="M988,0L988,700L1136.01,700L1131.51,525L1127.01,350L1122.51,175L1118,0L988,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=475</div><code class="frame-shape">[I=0+290|H=1+618|V=2+308]</code></div><div class="frame" data-value="500" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=500">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L220,700L220,0L80,0Z" fill="currentColor"/>
+<path d="M380,0L380,700L520,700L520,0L380,0ZM704,0L704,700L844,700L844,0L704,0ZM520,330L520,442L704,442L704,330L520,330Z" fill="currentColor"/>
+<path d="M1004,0L1004,700L1168,700L1162,525L1156,350L1150,175L1144,0L1004,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=500</div><code class="frame-shape">[I=0+300|H=1+624|V=2+324]</code></div><div class="frame" data-value="525" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=525">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L230,700L230,0L80,0Z" fill="currentColor"/>
+<path d="M390,0L390,700L540,700L540,0L390,0ZM710,0L710,700L860,700L860,0L710,0ZM540,330L540,450L710,450L710,330L540,330Z" fill="currentColor"/>
+<path d="M1020,0L1020,700L1200,700L1192.5,525L1185,350L1177.5,175L1170,0L1020,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=525</div><code class="frame-shape">[I=0+310|H=1+630|V=2+340]</code></div><div class="frame" data-value="550" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=550">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L240,700L240,0L80,0Z" fill="currentColor"/>
+<path d="M400,0L400,700L560,700L560,0L400,0ZM716,0L716,700L876,700L876,0L716,0ZM560,330L560,458L716,458L716,330L560,330Z" fill="currentColor"/>
+<path d="M1036,0L1036,700L1232,700L1223,525L1214,350L1205,175L1196,0L1036,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=550</div><code class="frame-shape">[I=0+320|H=1+636|V=2+356]</code></div><div class="frame" data-value="575" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=575">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L250.01,700L250.01,0L80,0Z" fill="currentColor"/>
+<path d="M410,0L410,700L580.01,700L580.01,0L410,0ZM722,0L722,700L892,700L892,0L722,0ZM580.01,330L580.01,466.01L722,466.01L722,330L580.01,330Z" fill="currentColor"/>
+<path d="M1052,0L1052,700L1264.01,700L1253.51,525L1243.01,350L1232.51,175L1222.01,0L1052,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=575</div><code class="frame-shape">[I=0+330|H=1+642|V=2+372]</code></div><div class="frame" data-value="600" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=600">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L260,700L260,0L80,0Z" fill="currentColor"/>
+<path d="M420,0L420,700L600,700L600,0L420,0ZM728,0L728,700L908,700L908,0L728,0ZM600,330L600,474L728,474L728,330L600,330Z" fill="currentColor"/>
+<path d="M1068,0L1068,700L1296.01,700L1284.01,525L1272.01,350L1260.01,175L1248,0L1068,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=600</div><code class="frame-shape">[I=0+340|H=1+648|V=2+388]</code></div><div class="frame" data-value="625" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=625">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L270,700L270,0L80,0Z" fill="currentColor"/>
+<path d="M430,0L430,700L620,700L620,0L430,0ZM734,0L734,700L924,700L924,0L734,0ZM620,330L620,482L734,482L734,330L620,330Z" fill="currentColor"/>
+<path d="M1084,0L1084,700L1328,700L1314.5,525L1301,350L1287.5,175L1274,0L1084,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=625</div><code class="frame-shape">[I=0+350|H=1+654|V=2+404]</code></div><div class="frame" data-value="650" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=650">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L280,700L280,0L80,0Z" fill="currentColor"/>
+<path d="M440,0L440,700L640,700L640,0L440,0ZM740,0L740,700L940,700L940,0L740,0ZM640,330L640,490L740,490L740,330L640,330Z" fill="currentColor"/>
+<path d="M1100,0L1100,700L1360,700L1345,525L1330,350L1315,175L1300,0L1100,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=650</div><code class="frame-shape">[I=0+360|H=1+660|V=2+420]</code></div><div class="frame" data-value="675" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=675">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L285,700L285,0L80,0Z" fill="currentColor"/>
+<path d="M445,0L445,700L650,700L650,0L445,0ZM744,0L744,700L949,700L949,0L744,0ZM650,330L650,494L744,494L744,330L650,330Z" fill="currentColor"/>
+<path d="M1109,0L1109,700L1383,700L1365.7,525L1348.5,350L1331.3,175L1314,0L1109,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=675</div><code class="frame-shape">[I=0+365|H=1+664|V=2+434]</code></div><div class="frame" data-value="700" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=700">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L290,700L290,0L80,0Z" fill="currentColor"/>
+<path d="M450,0L450,700L660,700L660,0L450,0ZM748,0L748,700L958,700L958,0L748,0ZM660,330L660,498L748,498L748,330L660,330Z" fill="currentColor"/>
+<path d="M1118,0L1118,700L1406.01,700L1386.41,525L1367.01,350L1347.61,175L1328,0L1118,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=700</div><code class="frame-shape">[I=0+370|H=1+668|V=2+448]</code></div><div class="frame" data-value="725" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=725">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L295,700L295,0L80,0Z" fill="currentColor"/>
+<path d="M455,0L455,700L670,700L670,0L455,0ZM752,0L752,700L967,700L967,0L752,0ZM670,330L670,502L752,502L752,330L670,330Z" fill="currentColor"/>
+<path d="M1127,0L1127,700L1429.01,700L1407.11,525L1385.5,350L1363.9,175L1342,0L1127,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=725</div><code class="frame-shape">[I=0+375|H=1+672|V=2+462]</code></div><div class="frame" data-value="750" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=750">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L300,700L300,0L80,0Z" fill="currentColor"/>
+<path d="M460,0L460,700L680,700L680,0L460,0ZM756,0L756,700L976,700L976,0L756,0ZM680,330L680,506L756,506L756,330L680,330Z" fill="currentColor"/>
+<path d="M1136,0L1136,700L1452,700L1427.8,525L1404,350L1380.2,175L1356,0L1136,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=750</div><code class="frame-shape">[I=0+380|H=1+676|V=2+476]</code></div><div class="frame" data-value="775" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=775">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L305,700L305,0L80,0Z" fill="currentColor"/>
+<path d="M465,0L465,700L690,700L690,0L465,0ZM760,0L760,700L985,700L985,0L760,0ZM690,330L690,510L760,510L760,330L690,330Z" fill="currentColor"/>
+<path d="M1145,0L1145,700L1475,700L1448.5,525L1422.5,350L1396.5,175L1370,0L1145,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=775</div><code class="frame-shape">[I=0+385|H=1+680|V=2+490]</code></div><div class="frame" data-value="800" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=800">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L310,700L310,0L80,0Z" fill="currentColor"/>
+<path d="M470,0L470,700L700,700L700,0L470,0ZM764,0L764,700L994,700L994,0L764,0ZM700,330L700,514L764,514L764,330L700,330Z" fill="currentColor"/>
+<path d="M1154,0L1154,700L1498,700L1469.2,525L1441,350L1412.8,175L1384,0L1154,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=800</div><code class="frame-shape">[I=0+390|H=1+684|V=2+504]</code></div><div class="frame" data-value="825" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=825">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L315,700L315,0L80,0Z" fill="currentColor"/>
+<path d="M475,0L475,700L710,700L710,0L475,0ZM768,0L768,700L1003,700L1003,0L768,0ZM710,330L710,518L768,518L768,330L710,330Z" fill="currentColor"/>
+<path d="M1163,0L1163,700L1521.01,700L1489.91,525L1459.51,350L1429.11,175L1398,0L1163,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=825</div><code class="frame-shape">[I=0+395|H=1+688|V=2+518]</code></div><div class="frame" data-value="850" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=850">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L320,700L320,0L80,0Z" fill="currentColor"/>
+<path d="M480,0L480,700L720,700L720,0L480,0ZM772,0L772,700L1012,700L1012,0L772,0ZM720,330L720,522L772,522L772,330L720,330Z" fill="currentColor"/>
+<path d="M1172,0L1172,700L1544.01,700L1510.61,525L1478,350L1445.4,175L1412,0L1172,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=850</div><code class="frame-shape">[I=0+400|H=1+692|V=2+532]</code></div><div class="frame" data-value="875" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=875">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L325,700L325,0L80,0Z" fill="currentColor"/>
+<path d="M485,0L485,700L730,700L730,0L485,0ZM776,0L776,700L1021,700L1021,0L776,0ZM730,330L730,526L776,526L776,330L730,330Z" fill="currentColor"/>
+<path d="M1181,0L1181,700L1567,700L1531.3,525L1496.5,350L1461.7,175L1426,0L1181,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=875</div><code class="frame-shape">[I=0+405|H=1+696|V=2+546]</code></div><div class="frame print" data-value="900" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=900">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L330,700L330,0L80,0Z" fill="currentColor"/>
+<path d="M490,0L490,700L740,700L740,0L490,0ZM780,0L780,700L1030,700L1030,0L780,0ZM740,330L740,530L780,530L780,330L740,330Z" fill="currentColor"/>
+<path d="M1190,0L1190,700L1590,700L1552,525L1515,350L1478,175L1440,0L1190,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=900</div><code class="frame-shape">[I=0+410|H=1+700|V=2+560]</code></div></div><label class="control"><span>wght</span><input type="range" min="100" max="900" step="25" value="400"><output>400</output></label><figcaption><code>hb-vector variations/var.ttf "IHV" --variations=wght=…</code>, drawn at every 25 from 100 to 900</figcaption></figure>
+<p id="ix-4">Under each drawing is what <code>hb-shape</code> says about the same text at the same position: glyph names, clusters and advances. The advances are the easiest place to watch a position take effect. <code>I</code>’s advance is its stem plus 160 units of side bearing.</p>
+<h2 id="axes-fvar">Axes: fvar</h2>
+<p id="ix-5">The axes are listed in the <code>fvar</code> table. Each has a tag, a minimum, a default and a maximum, in <strong>user coordinates</strong>: the numbers people use, like 400 for a regular weight, or 75 for a width that is 75% of normal.</p>
+<figure class="views ttx"><pre><code>&lt;fvar&gt;
+
+  &lt;!-- Weight --&gt;
+  &lt;Axis&gt;
+    &lt;AxisTag&gt;wght&lt;/AxisTag&gt;
+    &lt;Flags&gt;0x0&lt;/Flags&gt;
+    &lt;MinValue&gt;100.0&lt;/MinValue&gt;
+    &lt;DefaultValue&gt;400.0&lt;/DefaultValue&gt;
+    &lt;MaxValue&gt;900.0&lt;/MaxValue&gt;
+    &lt;AxisNameID&gt;256&lt;/AxisNameID&gt;
+  &lt;/Axis&gt;
+
+  &lt;!-- Width --&gt;
+  &lt;Axis&gt;
+    &lt;AxisTag&gt;wdth&lt;/AxisTag&gt;
+    &lt;Flags&gt;0x0&lt;/Flags&gt;
+    &lt;MinValue&gt;75.0&lt;/MinValue&gt;
+    &lt;DefaultValue&gt;100.0&lt;/DefaultValue&gt;
+    &lt;MaxValue&gt;100.0&lt;/MaxValue&gt;
+    &lt;AxisNameID&gt;257&lt;/AxisNameID&gt;
+  &lt;/Axis&gt;
+
+  &lt;!-- Light --&gt;
+  &lt;NamedInstance flags=&quot;0x0&quot; subfamilyNameID=&quot;258&quot;&gt;
+    &lt;coord axis=&quot;wght&quot; value=&quot;100.0&quot;/&gt;
+    &lt;coord axis=&quot;wdth&quot; value=&quot;100.0&quot;/&gt;
+  &lt;/NamedInstance&gt;
+
+  &lt;!-- Regular --&gt;
+  &lt;NamedInstance flags=&quot;0x0&quot; subfamilyNameID=&quot;2&quot;&gt;
+    &lt;coord axis=&quot;wght&quot; value=&quot;400.0&quot;/&gt;
+    &lt;coord axis=&quot;wdth&quot; value=&quot;100.0&quot;/&gt;
+  &lt;/NamedInstance&gt;
+
+  &lt;!-- Bold --&gt;
+  &lt;NamedInstance flags=&quot;0x0&quot; subfamilyNameID=&quot;259&quot;&gt;
+    &lt;coord axis=&quot;wght&quot; value=&quot;700.0&quot;/&gt;
+    &lt;coord axis=&quot;wdth&quot; value=&quot;100.0&quot;/&gt;
+  &lt;/NamedInstance&gt;
+
+  &lt;!-- Narrow --&gt;
+  &lt;NamedInstance flags=&quot;0x0&quot; subfamilyNameID=&quot;260&quot;&gt;
+    &lt;coord axis=&quot;wght&quot; value=&quot;400.0&quot;/&gt;
+    &lt;coord axis=&quot;wdth&quot; value=&quot;75.0&quot;/&gt;
+  &lt;/NamedInstance&gt;
+&lt;/fvar&gt;</code></pre><figcaption>variations/var.ttf: fvar (TTX)</figcaption></figure>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="opt">--list-variations</td><td class="out"><pre><code>Variations information:
+
+Varitation axes:
+
+Tag	Minimum	Default	Maximum	Name
+------------------------------------
+wght	100	400	900	Weight
+wdth	75	100	100	Width
+
+
+Named instances:
+
+Index	Name				Position
+------------------------------------------------
+0	Light                           100, 100, 
+1	Regular                         400, 100, 
+2	Bold                            700, 100, 
+3	Narrow                          400, 75,</code></pre></td></tr></tbody></table></div>
+<p id="ix-6">(“Varitation” is a typo in <code>hb-info</code>, at <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-info.cc#L1190"><code>util/hb-info.cc:1190</code></a>.) The table also lists <strong>named instances</strong>, positions the designer has given names to. They come later in this chapter.</p>
+<p id="ix-7">An axis has a flag, too. <code>AXIS_FLAG_HIDDEN</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-fvar-table.hh#L159"><code>hb-ot-var-fvar-table.hh:159</code></a>) says that an application shouldn’t show the axis to users. HarfBuzz reports the flag and otherwise ignores it: a hidden axis can be set like any other.</p>
+<h2 id="from-user-coordinates-to-normalized-ones">From user coordinates to normalized ones</h2>
+<p id="ix-8">User coordinates are convenient for people and awkward for arithmetic, since every axis has its own range. So before any deltas are applied, each coordinate is <strong>normalized</strong>: mapped to −1 at the axis minimum, 0 at the default and +1 at the maximum, in a straight line on each side of the default. Weight 100 becomes −1, 400 becomes 0, 650 becomes 0.5, and 900 becomes 1. Everything else in a variable font, every region and every delta, is written in terms of normalized coordinates.</p>
+<p id="ix-9">The whole conversion is one short function, <code>hb_ot_var_normalize_coords</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var.cc#L323"><code>hb-ot-var.cc:323</code></a>):</p>
+<pre><code class="language-c++">for (unsigned int i = 0; i &lt; coords_length; i++)
+  normalized_coords[i] = roundf (fvar.normalize_axis_value (i, design_coords[i]) * 65536.0f);
+
+face-&gt;table.avar-&gt;map_coords_16_16 (normalized_coords, coords_length);
+
+// Round to 2.14
+for (unsigned i = 0; i &lt; coords_length; i++)
+  normalized_coords[i] = (normalized_coords[i] + 2) &gt;&gt; 2;
+</code></pre>
+<p id="ix-10">There are three steps: normalize each axis with fvar; let the <code>avar</code> table bend the result; round. And three number formats along the way:</p>
+<ul>
+<li id="ix-11">The user’s value is a <code>float</code>, and so is fvar’s arithmetic. <code>normalize_axis_value</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-fvar-table.hh#L185"><code>hb-ot-var-fvar-table.hh:185</code></a>) clamps the value to the axis range and divides by the distance from the default to the minimum or the maximum.</li>
+<li>The result is stored in <strong>16.16</strong> fixed point, a 32-bit integer with 16 bits after the binary point, and avar works in that.</li>
+<li id="ix-12">The final coordinates are <strong>2.14</strong>, a 16-bit integer with 14 bits after the point, the format every variation table uses. Normalized coordinate 0.5 is stored as 8192, and 1 as 16384. <code>(v + 2) &gt;&gt; 2</code> drops two bits, rounding halves upwards.</li>
+</ul>
+<p id="ix-13">The specification describes the same steps, but asks for the normalization itself to be done in 16.16 arithmetic from a 16.16 input. HarfBuzz divides in floating point and rounds the result. The two can differ by one unit of 16.16, which only rarely survives the final rounding to 2.14.</p>
+<p>Clamping means a value outside the axis has no further effect. A weight of 2000 is a weight of 900:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=900</td><td class="out"><code>[I=0+410|H=1+700|V=2+560]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=2000</td><td class="out"><code>[I=0+410|H=1+700|V=2+560]</code></td></tr></tbody></table></div>
+<p id="ix-14">There is one more quiet repair. The specification assumes that an axis’s minimum is no greater than its default, and its default no greater than its maximum, but doesn’t say what to do if they aren’t. HarfBuzz fixes them up when it reads them, in <code>get_coordinates</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-fvar-table.hh#L208"><code>hb-ot-var-fvar-table.hh:208</code></a>): a minimum above the default is treated as the default, and so is a maximum below it. The comment says it’s to “simplify client math”. The repaired values are also what <code>hb_ot_var_get_axis_infos</code> reports, so an application never sees the font’s real minimum and maximum if they’re out of order.</p>
+<h2 id="bending-an-axis-avar">Bending an axis: avar</h2>
+<p id="ix-15">A straight line from the default to each end is rarely what a designer wants. On a weight axis, the step from 400 to 500 might need to be smaller than the step from 800 to 900, or the designer may want the user’s 600 to be the design they drew at 750. The <code>avar</code> table bends each axis. For each axis it gives a <strong>segment map</strong>: pairs of normalized coordinates, from and to, with straight lines between them.</p>
+<p id="ix-16">The test font <code>var-avar.ttf</code> is <code>var.ttf</code> with one segment map added, built from a designspace that says user weight 600 is design weight 750:</p>
+<figure class="views ttx"><pre><code>&lt;avar&gt;
+  &lt;version major=&quot;1&quot; minor=&quot;0&quot;/&gt;
+  &lt;segment axis=&quot;wght&quot;&gt;
+    &lt;mapping from=&quot;-1.0&quot; to=&quot;-1.0&quot;/&gt;
+    &lt;mapping from=&quot;0.0&quot; to=&quot;0.0&quot;/&gt;
+    &lt;mapping from=&quot;0.4&quot; to=&quot;0.7&quot;/&gt;
+    &lt;mapping from=&quot;1.0&quot; to=&quot;1.0&quot;/&gt;
+  &lt;/segment&gt;
+  &lt;segment axis=&quot;wdth&quot;&gt;
+    &lt;mapping from=&quot;-1.0&quot; to=&quot;-1.0&quot;/&gt;
+    &lt;mapping from=&quot;0.0&quot; to=&quot;0.0&quot;/&gt;
+    &lt;mapping from=&quot;1.0&quot; to=&quot;1.0&quot;/&gt;
+  &lt;/segment&gt;
+&lt;/avar&gt;</code></pre><figcaption>variations/var-avar.ttf: avar (TTX)</figcaption></figure>
+<p id="ix-17">In normalized coordinates that’s 0.4 to 0.7: halfway between 0 and 0.4 becomes halfway between 0 and 0.7, and so on. The two fonts agree at the default and at the ends, and disagree in between:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=600</td><td class="out"><code>[I=0+340]</code></td></tr><tr><td class="font">variations/var-avar.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=600</td><td class="out"><code>[I=0+380]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=750</td><td class="out"><code>[I=0+380]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=900</td><td class="out"><code>[I=0+410]</code></td></tr><tr><td class="font">variations/var-avar.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=900</td><td class="out"><code>[I=0+410]</code></td></tr></tbody></table></div>
+<p>At 600, <code>var-avar.ttf</code> gives the stem that <code>var.ttf</code> gives at 750. <span class="screen-only">Drag the slider here and compare it with the one at the top of the chapter:</span><span class="print-only">Compare the frames at 600 here with those at the top of the chapter:</span> this axis gets heavy sooner.</p>
+<figure class="draw slider"><div class="frames"><div class="frame print" data-value="100" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=100">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L120,700L120,0L80,0Z" fill="currentColor"/>
+<path d="M280,0L280,700L320,700L320,0L280,0ZM640,0L640,700L680,700L680,0L640,0ZM320,330L320,362L640,362L640,330L320,330Z" fill="currentColor"/>
+<path d="M840,0L840,700L880,700L880,525L880,350L880,175L880,0L840,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=100</div><code class="frame-shape">[I=0+200|H=1+560|V=2+200]</code></div><div class="frame" data-value="125" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=125">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L125,700L125,0L80,0Z" fill="currentColor"/>
+<path d="M285,0L285,700L330,700L330,0L285,0ZM643.33,0L643.33,700L688.33,700L688.33,0L643.33,0ZM330,330L330,366L643.33,366L643.33,330L330,330Z" fill="currentColor"/>
+<path d="M848,0L848,700L893,700L893,525L893,350L893,175L893,0L848,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=125</div><code class="frame-shape">[I=0+205|H=1+563|V=2+205]</code></div><div class="frame" data-value="150" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=150">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L130,700L130,0L80,0Z" fill="currentColor"/>
+<path d="M290,0L290,700L340,700L340,0L290,0ZM646.67,0L646.67,700L696.67,700L696.67,0L646.67,0ZM340,330L340,370L646.67,370L646.67,330L340,330Z" fill="currentColor"/>
+<path d="M857,0L857,700L907,700L907,525L907,350L907,175L907,0L857,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=150</div><code class="frame-shape">[I=0+210|H=1+567|V=2+210]</code></div><div class="frame" data-value="175" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=175">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L135,700L135,0L80,0Z" fill="currentColor"/>
+<path d="M295,0L295,700L350,700L350,0L295,0ZM650,0L650,700L705,700L705,0L650,0ZM350,330L350,374L650,374L650,330L350,330Z" fill="currentColor"/>
+<path d="M865,0L865,700L920,700L920,525L920,350L920,175L920,0L865,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=175</div><code class="frame-shape">[I=0+215|H=1+570|V=2+215]</code></div><div class="frame" data-value="200" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=200">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L140,700L140,0L80,0Z" fill="currentColor"/>
+<path d="M300,0L300,700L360,700L360,0L300,0ZM653.33,0L653.33,700L713.33,700L713.33,0L653.33,0ZM360,330L360,378L653.33,378L653.33,330L360,330Z" fill="currentColor"/>
+<path d="M873,0L873,700L933,700L933,525L933,350L933,175L933,0L873,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=200</div><code class="frame-shape">[I=0+220|H=1+573|V=2+220]</code></div><div class="frame" data-value="225" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=225">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L145,700L145,0L80,0Z" fill="currentColor"/>
+<path d="M305,0L305,700L370,700L370,0L305,0ZM656.67,0L656.67,700L721.67,700L721.67,0L656.67,0ZM370,330L370,382L656.67,382L656.67,330L370,330Z" fill="currentColor"/>
+<path d="M882,0L882,700L947,700L947,525L947,350L947,175L947,0L882,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=225</div><code class="frame-shape">[I=0+225|H=1+577|V=2+225]</code></div><div class="frame" data-value="250" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=250">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L150,700L150,0L80,0Z" fill="currentColor"/>
+<path d="M310,0L310,700L380,700L380,0L310,0ZM660,0L660,700L730,700L730,0L660,0ZM380,330L380,386L660,386L660,330L380,330Z" fill="currentColor"/>
+<path d="M890,0L890,700L960,700L960,525L960,350L960,175L960,0L890,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=250</div><code class="frame-shape">[I=0+230|H=1+580|V=2+230]</code></div><div class="frame" data-value="275" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=275">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L155,700L155,0L80,0Z" fill="currentColor"/>
+<path d="M315,0L315,700L390,700L390,0L315,0ZM663.33,0L663.33,700L738.33,700L738.33,0L663.33,0ZM390,330L390,390L663.33,390L663.33,330L390,330Z" fill="currentColor"/>
+<path d="M898,0L898,700L973,700L973,525L973,350L973,175L973,0L898,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=275</div><code class="frame-shape">[I=0+235|H=1+583|V=2+235]</code></div><div class="frame" data-value="300" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=300">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L160,700L160,0L80,0Z" fill="currentColor"/>
+<path d="M320,0L320,700L400,700L400,0L320,0ZM666.67,0L666.67,700L746.67,700L746.67,0L666.67,0ZM400,330L400,394L666.67,394L666.67,330L400,330Z" fill="currentColor"/>
+<path d="M907,0L907,700L987,700L987,525L987,350L987,175L987,0L907,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=300</div><code class="frame-shape">[I=0+240|H=1+587|V=2+240]</code></div><div class="frame" data-value="325" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=325">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L165,700L165,0L80,0Z" fill="currentColor"/>
+<path d="M325,0L325,700L410,700L410,0L325,0ZM670,0L670,700L755,700L755,0L670,0ZM410,330L410,398L670,398L670,330L410,330Z" fill="currentColor"/>
+<path d="M915,0L915,700L1000,700L1000,525L1000,350L1000,175L1000,0L915,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=325</div><code class="frame-shape">[I=0+245|H=1+590|V=2+245]</code></div><div class="frame" data-value="350" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=350">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L170,700L170,0L80,0Z" fill="currentColor"/>
+<path d="M330,0L330,700L420,700L420,0L330,0ZM673.33,0L673.33,700L763.33,700L763.33,0L673.33,0ZM420,330L420,402L673.33,402L673.33,330L420,330Z" fill="currentColor"/>
+<path d="M923,0L923,700L1013,700L1013,525L1013,350L1013,175L1013,0L923,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=350</div><code class="frame-shape">[I=0+250|H=1+593|V=2+250]</code></div><div class="frame" data-value="375" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=375">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L175,700L175,0L80,0Z" fill="currentColor"/>
+<path d="M335,0L335,700L430,700L430,0L335,0ZM676.67,0L676.67,700L771.67,700L771.67,0L676.67,0ZM430,330L430,406L676.67,406L676.67,330L430,330Z" fill="currentColor"/>
+<path d="M932,0L932,700L1027,700L1027,525L1027,350L1027,175L1027,0L932,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=375</div><code class="frame-shape">[I=0+255|H=1+597|V=2+255]</code></div><div class="frame print" data-value="400"><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=400">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L180,700L180,0L80,0Z" fill="currentColor"/>
+<path d="M340,0L340,700L440,700L440,0L340,0ZM680,0L680,700L780,700L780,0L680,0ZM440,330L440,410L680,410L680,330L440,330Z" fill="currentColor"/>
+<path d="M940,0L940,700L1040,700L1040,525L1040,350L1040,175L1040,0L940,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=400</div><code class="frame-shape">[I=0+260|H=1+600|V=2+260]</code></div><div class="frame" data-value="425" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=425">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L197.5,700L197.5,0L80,0Z" fill="currentColor"/>
+<path d="M358,0L358,700L475.5,700L475.5,0L358,0ZM691,0L691,700L808.5,700L808.5,0L691,0ZM475.5,330L475.5,424L691,424L691,330L475.5,330Z" fill="currentColor"/>
+<path d="M969,0L969,700L1097.01,700L1094.38,525L1091.76,350L1089.13,175L1086.5,0L969,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=425</div><code class="frame-shape">[I=0+278|H=1+611|V=2+288]</code></div><div class="frame" data-value="450" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=450">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L215,700L215,0L80,0Z" fill="currentColor"/>
+<path d="M375,0L375,700L510,700L510,0L375,0ZM701,0L701,700L836,700L836,0L701,0ZM510,330L510,438L701,438L701,330L510,330Z" fill="currentColor"/>
+<path d="M996,0L996,700L1152,700L1146.75,525L1141.5,350L1136.25,175L1131,0L996,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=450</div><code class="frame-shape">[I=0+295|H=1+621|V=2+316]</code></div><div class="frame" data-value="475" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=475">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L232.5,700L232.5,0L80,0Z" fill="currentColor"/>
+<path d="M393,0L393,700L545.5,700L545.5,0L393,0ZM712,0L712,700L864.5,700L864.5,0L712,0ZM545.5,330L545.5,452L712,452L712,330L545.5,330Z" fill="currentColor"/>
+<path d="M1025,0L1025,700L1209,700L1201.13,525L1193.25,350L1185.38,175L1177.5,0L1025,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=475</div><code class="frame-shape">[I=0+313|H=1+632|V=2+344]</code></div><div class="frame" data-value="500" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=500">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L250,700L250,0L80,0Z" fill="currentColor"/>
+<path d="M410,0L410,700L580,700L580,0L410,0ZM722,0L722,700L892,700L892,0L722,0ZM580,330L580,466L722,466L722,330L580,330Z" fill="currentColor"/>
+<path d="M1052,0L1052,700L1263.99,700L1253.49,525L1242.99,350L1232.49,175L1222,0L1052,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=500</div><code class="frame-shape">[I=0+330|H=1+642|V=2+372]</code></div><div class="frame" data-value="525" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=525">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L267.5,700L267.5,0L80,0Z" fill="currentColor"/>
+<path d="M428,0L428,700L615.5,700L615.5,0L428,0ZM733,0L733,700L920.5,700L920.5,0L733,0ZM615.5,330L615.5,480L733,480L733,330L615.5,330Z" fill="currentColor"/>
+<path d="M1081,0L1081,700L1321,700L1307.88,525L1294.75,350L1281.62,175L1268.5,0L1081,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=525</div><code class="frame-shape">[I=0+348|H=1+653|V=2+400]</code></div><div class="frame" data-value="550" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=550">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L282.5,700L282.5,0L80,0Z" fill="currentColor"/>
+<path d="M442,0L442,700L644.5,700L644.5,0L442,0ZM741.5,0L741.5,700L944,700L944,0L741.5,0ZM644.5,330L644.5,492L741.5,492L741.5,330L644.5,330Z" fill="currentColor"/>
+<path d="M1104,0L1104,700L1370.99,700L1354.84,525L1338.74,350L1322.64,175L1306.5,0L1104,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=550</div><code class="frame-shape">[I=0+362|H=1+662|V=2+427]</code></div><div class="frame" data-value="575" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=575">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L291.25,700L291.25,0L80,0Z" fill="currentColor"/>
+<path d="M451,0L451,700L662.25,700L662.25,0L451,0ZM748.75,0L748.75,700L960,700L960,0L748.75,0ZM662.25,330L662.25,499L748.75,499L748.75,330L662.25,330Z" fill="currentColor"/>
+<path d="M1120,0L1120,700L1411.5,700L1391.32,525L1371.37,350L1351.42,175L1331.25,0L1120,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=575</div><code class="frame-shape">[I=0+371|H=1+669|V=2+451]</code></div><div class="frame print" data-value="600" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=600">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L300,700L300,0L80,0Z" fill="currentColor"/>
+<path d="M460,0L460,700L680,700L680,0L460,0ZM756,0L756,700L976,700L976,0L756,0ZM680,330L680,506L756,506L756,330L680,330Z" fill="currentColor"/>
+<path d="M1136,0L1136,700L1451.99,700L1427.79,525L1403.99,350L1380.19,175L1356,0L1136,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=600</div><code class="frame-shape">[I=0+380|H=1+676|V=2+476]</code></div><div class="frame" data-value="625" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=625">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L302.5,700L302.5,0L80,0Z" fill="currentColor"/>
+<path d="M463,0L463,700L685.5,700L685.5,0L463,0ZM758.5,0L758.5,700L981,700L981,0L758.5,0ZM685.5,330L685.5,508L758.5,508L758.5,330L685.5,330Z" fill="currentColor"/>
+<path d="M1141,0L1141,700L1464.01,700L1438.66,525L1413.76,350L1388.86,175L1363.5,0L1141,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=625</div><code class="frame-shape">[I=0+383|H=1+678|V=2+483]</code></div><div class="frame" data-value="650" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=650">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L305,700L305,0L80,0Z" fill="currentColor"/>
+<path d="M465,0L465,700L690,700L690,0L465,0ZM760,0L760,700L985,700L985,0L760,0ZM690,330L690,510L760,510L760,330L690,330Z" fill="currentColor"/>
+<path d="M1145,0L1145,700L1475,700L1448.5,525L1422.5,350L1396.5,175L1370,0L1145,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=650</div><code class="frame-shape">[I=0+385|H=1+680|V=2+490]</code></div><div class="frame" data-value="675" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=675">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L307.5,700L307.5,0L80,0Z" fill="currentColor"/>
+<path d="M468,0L468,700L695.5,700L695.5,0L468,0ZM762.5,0L762.5,700L990,700L990,0L762.5,0ZM695.5,330L695.5,512L762.5,512L762.5,330L695.5,330Z" fill="currentColor"/>
+<path d="M1150,0L1150,700L1487.01,700L1459.36,525L1432.25,350L1405.15,175L1377.5,0L1150,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=675</div><code class="frame-shape">[I=0+388|H=1+682|V=2+497]</code></div><div class="frame" data-value="700" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=700">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L310,700L310,0L80,0Z" fill="currentColor"/>
+<path d="M470,0L470,700L700,700L700,0L470,0ZM764,0L764,700L994,700L994,0L764,0ZM700,330L700,514L764,514L764,330L700,330Z" fill="currentColor"/>
+<path d="M1154,0L1154,700L1498,700L1469.2,525L1441,350L1412.8,175L1384,0L1154,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=700</div><code class="frame-shape">[I=0+390|H=1+684|V=2+504]</code></div><div class="frame" data-value="725" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=725">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L312.5,700L312.5,0L80,0Z" fill="currentColor"/>
+<path d="M473,0L473,700L705.5,700L705.5,0L473,0ZM766.5,0L766.5,700L999,700L999,0L766.5,0ZM705.5,330L705.5,516L766.5,516L766.5,330L705.5,330Z" fill="currentColor"/>
+<path d="M1159,0L1159,700L1510,700L1480.05,525L1450.75,350L1421.45,175L1391.5,0L1159,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=725</div><code class="frame-shape">[I=0+393|H=1+686|V=2+511]</code></div><div class="frame" data-value="750" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=750">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L315,700L315,0L80,0Z" fill="currentColor"/>
+<path d="M475,0L475,700L710,700L710,0L475,0ZM768,0L768,700L1003,700L1003,0L768,0ZM710,330L710,518L768,518L768,330L710,330Z" fill="currentColor"/>
+<path d="M1163,0L1163,700L1521.01,700L1489.91,525L1459.51,350L1429.11,175L1398,0L1163,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=750</div><code class="frame-shape">[I=0+395|H=1+688|V=2+518]</code></div><div class="frame" data-value="775" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=775">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L317.5,700L317.5,0L80,0Z" fill="currentColor"/>
+<path d="M478,0L478,700L715.5,700L715.5,0L478,0ZM770.5,0L770.5,700L1008,700L1008,0L770.5,0ZM715.5,330L715.5,520L770.5,520L770.5,330L715.5,330Z" fill="currentColor"/>
+<path d="M1168,0L1168,700L1533,700L1500.75,525L1469.25,350L1437.75,175L1405.5,0L1168,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=775</div><code class="frame-shape">[I=0+398|H=1+690|V=2+525]</code></div><div class="frame" data-value="800" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=800">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L320,700L320,0L80,0Z" fill="currentColor"/>
+<path d="M480,0L480,700L720,700L720,0L480,0ZM772,0L772,700L1012,700L1012,0L772,0ZM720,330L720,522L772,522L772,330L720,330Z" fill="currentColor"/>
+<path d="M1172,0L1172,700L1544.01,700L1510.61,525L1478,350L1445.4,175L1412,0L1172,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=800</div><code class="frame-shape">[I=0+400|H=1+692|V=2+532]</code></div><div class="frame" data-value="825" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=825">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L322.5,700L322.5,0L80,0Z" fill="currentColor"/>
+<path d="M482,0L482,700L724.5,700L724.5,0L482,0ZM773.5,0L773.5,700L1016,700L1016,0L773.5,0ZM724.5,330L724.5,524L773.5,524L773.5,330L724.5,330Z" fill="currentColor"/>
+<path d="M1176,0L1176,700L1555,700L1520.45,525L1486.75,350L1453.05,175L1418.5,0L1176,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=825</div><code class="frame-shape">[I=0+402|H=1+694|V=2+539]</code></div><div class="frame" data-value="850" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=850">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L325,700L325,0L80,0Z" fill="currentColor"/>
+<path d="M485,0L485,700L730,700L730,0L485,0ZM776,0L776,700L1021,700L1021,0L776,0ZM730,330L730,526L776,526L776,330L730,330Z" fill="currentColor"/>
+<path d="M1181,0L1181,700L1567,700L1531.3,525L1496.5,350L1461.7,175L1426,0L1181,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=850</div><code class="frame-shape">[I=0+405|H=1+696|V=2+546]</code></div><div class="frame" data-value="875" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=875">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L327.5,700L327.5,0L80,0Z" fill="currentColor"/>
+<path d="M488,0L488,700L735.5,700L735.5,0L488,0ZM778.5,0L778.5,700L1026,700L1026,0L778.5,0ZM735.5,330L735.5,528L778.5,528L778.5,330L735.5,330Z" fill="currentColor"/>
+<path d="M1186,0L1186,700L1579.01,700L1542.16,525L1506.26,350L1470.36,175L1433.5,0L1186,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=875</div><code class="frame-shape">[I=0+408|H=1+698|V=2+553]</code></div><div class="frame print" data-value="900" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wght=900">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L330,700L330,0L80,0Z" fill="currentColor"/>
+<path d="M490,0L490,700L740,700L740,0L490,0ZM780,0L780,700L1030,700L1030,0L780,0ZM740,330L740,530L780,530L780,330L740,330Z" fill="currentColor"/>
+<path d="M1190,0L1190,700L1590,700L1552,525L1515,350L1478,175L1440,0L1190,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=900</div><code class="frame-shape">[I=0+410|H=1+700|V=2+560]</code></div></div><label class="control"><span>wght</span><input type="range" min="100" max="900" step="25" value="400"><output>400</output></label><figcaption><code>hb-vector variations/var-avar.ttf "IHV" --variations=wght=…</code>, drawn at every 25 from 100 to 900</figcaption></figure>
+<h3 id="a-more-forgiving-avar-than-the-specifications">A more forgiving avar than the specification’s</h3>
+<p id="ix-18">The specification is strict about segment maps. Each must map −1 to −1, 0 to 0 and +1 to +1, and a map that doesn’t is to be ignored: “no modification” for that axis. Its from-coordinates must increase. And the result is clamped to the range −1 to +1.</p>
+<p id="ix-19">HarfBuzz does something else, and says so. The comment in <code>SegmentMaps::map_float</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-avar-table.hh#L152"><code>hb-ot-var-avar-table.hh:152</code></a>) reads: “Core Text is wild... PingFangUI avar needs all this special-casing... So we implement an extended version of the spec here, which is more robust and more likely to be compatible with the wild.” What it implements:</p>
+<ul>
+<li id="ix-20">A map with no pairs leaves the axis alone. A map with one pair shifts the whole axis by that pair’s difference.</li>
+<li id="ix-21">If the first pair is −1→−1 and the next pair also starts at −1, the first is skipped. That’s the PingFang case: a font that maps −1 to −1 and then −1 to −0.5 means that −1 goes to −0.5. The same goes for +1 at the other end.</li>
+<li id="ix-22">If several pairs share a from-coordinate, one of them is chosen: the middle of three, the last of a run below 0, the first above 0. At 0 itself, the one whose result is nearer 0, and on a tie the later one. (The comment there says “So we’ll just return the smallest one. lol”, and it is followed by four lines that can never run: the function has already returned.)</li>
+<li>A value before the first pair or after the last is <em>shifted</em> by that pair’s difference, not clamped.</li>
+<li id="ix-23">Otherwise, HarfBuzz interpolates between the two pairs on either side, whether or not the map follows the rules.</li>
+</ul>
+<p id="ix-24">Nothing on this path clamps. With a malformed map, a coordinate can end up beyond ±1, and even the default can be mapped away from 0. In other words, a broken avar is used rather than ignored, and it is used the way Core Text uses it, so that a font looks the same in HarfBuzz as on Apple’s systems. That’s a choice of compatibility over the letter of the specification, and it’s typical of HarfBuzz.</p>
+<h3 id="avar-version-2">avar version 2</h3>
+<p id="ix-25">Version 1 bends each axis on its own. <strong>Version 2</strong> lets an axis’s final position depend on all the others. A width axis can make narrow designs lighter, so that stems don’t clog as letters get narrower; an optical size axis can drive weight and contrast together; and a font can have “parametric” axes, hidden from users, that the visible axes move in combination.</p>
+<p id="ix-26">After its segment maps, a version 2 table has two more things: an <strong>item variation store</strong>, the same structure that holds advance and metric deltas (the subject of <a href="deltas.html">the next chapter</a>), and an index map that says which entry in the store belongs to each axis. The store’s regions are written in normalized coordinates, so the deltas it gives can depend on any axis.</p>
+<p id="ix-27"><code>var-avar2.ttf</code> maps every weight lighter at the narrowest width, in a designspace “mapping” from (wght 400, wdth 75) to (wght 300, wdth 75), and the same for the other weights:</p>
+<figure class="views ttx"><pre><code>&lt;avar&gt;
+  &lt;version major=&quot;2&quot; minor=&quot;0&quot;/&gt;
+  &lt;segment axis=&quot;wght&quot;&gt;
+    &lt;mapping from=&quot;-1.0&quot; to=&quot;-1.0&quot;/&gt;
+    &lt;mapping from=&quot;0.0&quot; to=&quot;0.0&quot;/&gt;
+    &lt;mapping from=&quot;1.0&quot; to=&quot;1.0&quot;/&gt;
+  &lt;/segment&gt;
+  &lt;segment axis=&quot;wdth&quot;&gt;
+    &lt;mapping from=&quot;-1.0&quot; to=&quot;-1.0&quot;/&gt;
+    &lt;mapping from=&quot;0.0&quot; to=&quot;0.0&quot;/&gt;
+    &lt;mapping from=&quot;1.0&quot; to=&quot;1.0&quot;/&gt;
+  &lt;/segment&gt;
+  &lt;VarIdxMap Format=&quot;0&quot;&gt;
+    &lt;!-- Omitted values default to 0xFFFF/0xFFFF (no variations) --&gt;
+    &lt;Map index=&quot;0&quot; outer=&quot;0&quot; inner=&quot;0&quot;/&gt;
+    &lt;Map index=&quot;1&quot;/&gt;
+  &lt;/VarIdxMap&gt;
+  &lt;VarStore Format=&quot;1&quot;&gt;
+    &lt;Format value=&quot;1&quot;/&gt;
+    &lt;VarRegionList&gt;
+      &lt;!-- RegionAxisCount=2 --&gt;
+      &lt;!-- RegionCount=3 --&gt;
+      &lt;Region index=&quot;0&quot;&gt;
+        &lt;VarRegionAxis index=&quot;0&quot;&gt;
+          &lt;StartCoord value=&quot;0.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;0.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+        &lt;VarRegionAxis index=&quot;1&quot;&gt;
+          &lt;StartCoord value=&quot;-1.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;-1.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+      &lt;/Region&gt;
+      &lt;Region index=&quot;1&quot;&gt;
+        &lt;VarRegionAxis index=&quot;0&quot;&gt;
+          &lt;StartCoord value=&quot;-1.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;-1.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+        &lt;VarRegionAxis index=&quot;1&quot;&gt;
+          &lt;StartCoord value=&quot;-1.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;-1.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+      &lt;/Region&gt;
+      &lt;Region index=&quot;2&quot;&gt;
+        &lt;VarRegionAxis index=&quot;0&quot;&gt;
+          &lt;StartCoord value=&quot;0.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;1.0&quot;/&gt;
+          &lt;EndCoord value=&quot;1.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+        &lt;VarRegionAxis index=&quot;1&quot;&gt;
+          &lt;StartCoord value=&quot;-1.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;-1.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+      &lt;/Region&gt;
+    &lt;/VarRegionList&gt;
+    &lt;!-- VarDataCount=1 --&gt;
+    &lt;VarData index=&quot;0&quot;&gt;
+      &lt;!-- ItemCount=1 --&gt;
+      &lt;NumShorts value=&quot;3&quot;/&gt;
+      &lt;!-- VarRegionCount=3 --&gt;
+      &lt;VarRegionIndex index=&quot;0&quot; value=&quot;0&quot;/&gt;
+      &lt;VarRegionIndex index=&quot;1&quot; value=&quot;1&quot;/&gt;
+      &lt;VarRegionIndex index=&quot;2&quot; value=&quot;2&quot;/&gt;
+      &lt;Item index=&quot;0&quot; value=&quot;[-5461, 5461, 546]&quot;/&gt;
+    &lt;/VarData&gt;
+  &lt;/VarStore&gt;
+&lt;/avar&gt;</code></pre><figcaption>variations/var-avar2.ttf: avar (TTX)</figcaption></figure>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wdth=75</td><td class="out"><code>[I=0+250|H=1+450|V=2+250]</code></td></tr><tr><td class="font">variations/var-avar2.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wdth=75</td><td class="out"><code>[I=0+230|H=1+437|V=2+230]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=900,wdth=75</td><td class="out"><code>[I=0+400|H=1+550|V=2+550]</code></td></tr><tr><td class="font">variations/var-avar2.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=900,wdth=75</td><td class="out"><code>[I=0+370|H=1+526|V=2+466]</code></td></tr></tbody></table></div>
+<p>Nothing has changed except the width, but <code>I</code>, whose stem only follows the weight, is thinner. <span class="screen-only">Here the slider moves the width:</span><span class="print-only">Here the width changes, from 75 to 100:</span></p>
+<figure class="draw slider"><div class="frames"><div class="frame print" data-value="75" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wdth=75">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L290,700L290,0L80,0Z" fill="currentColor"/>
+<path d="M450,0L450,700L660,700L660,0L450,0ZM606,0L606,700L816,700L816,0L606,0ZM660,330L660,498L606,498L606,330L660,330Z" fill="currentColor"/>
+<path d="M976,0L976,700L1282,700L1257.8,525L1234,350L1210.2,175L1186,0L976,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wdth=75</div><code class="frame-shape">[I=0+370|H=1+526|V=2+466]</code></div><div class="frame" data-value="80" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wdth=80">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L298,700L298,0L80,0Z" fill="currentColor"/>
+<path d="M458,0L458,700L676,700L676,0L458,0ZM640.8,0L640.8,700L858.8,700L858.8,0L640.8,0ZM676,330L676,504.4L640.8,504.4L640.8,330L676,330Z" fill="currentColor"/>
+<path d="M1019,0L1019,700L1343.8,700L1316.84,525L1290.4,350L1263.96,175L1237,0L1019,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wdth=80</div><code class="frame-shape">[I=0+378|H=1+561|V=2+485]</code></div><div class="frame print" data-value="85" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wdth=85">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L306,700L306,0L80,0Z" fill="currentColor"/>
+<path d="M466,0L466,700L692,700L692,0L466,0ZM675.6,0L675.6,700L901.6,700L901.6,0L675.6,0ZM692,330L692,510.8L675.6,510.8L675.6,330L692,330Z" fill="currentColor"/>
+<path d="M1062,0L1062,700L1405.6,700L1375.88,525L1346.8,350L1317.72,175L1288,0L1062,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wdth=85</div><code class="frame-shape">[I=0+386|H=1+596|V=2+504]</code></div><div class="frame" data-value="90" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wdth=90">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L314,700L314,0L80,0Z" fill="currentColor"/>
+<path d="M474,0L474,700L708,700L708,0L474,0ZM710.41,0L710.41,700L944.41,700L944.41,0L710.41,0ZM708,330L708,517.2L710.41,517.2L710.41,330L708,330Z" fill="currentColor"/>
+<path d="M1104,0L1104,700L1466.4,700L1433.92,525L1402.2,350L1370.48,175L1338,0L1104,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wdth=90</div><code class="frame-shape">[I=0+394|H=1+630|V=2+522]</code></div><div class="frame" data-value="95" hidden><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wdth=95">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L322,700L322,0L80,0Z" fill="currentColor"/>
+<path d="M482,0L482,700L724,700L724,0L482,0ZM745.2,0L745.2,700L987.2,700L987.2,0L745.2,0ZM724,330L724,523.6L745.2,523.6L745.2,330L724,330Z" fill="currentColor"/>
+<path d="M1147,0L1147,700L1528.2,700L1492.96,525L1458.6,350L1424.24,175L1389,0L1147,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wdth=95</div><code class="frame-shape">[I=0+402|H=1+665|V=2+541]</code></div><div class="frame print" data-value="100"><svg viewBox="-40 -840 1750 1080" role="img" aria-label="IHV at wdth=100">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L330,700L330,0L80,0Z" fill="currentColor"/>
+<path d="M490,0L490,700L740,700L740,0L490,0ZM780,0L780,700L1030,700L1030,0L780,0ZM740,330L740,530L780,530L780,330L740,330Z" fill="currentColor"/>
+<path d="M1190,0L1190,700L1590,700L1552,525L1515,350L1478,175L1440,0L1190,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wdth=100</div><code class="frame-shape">[I=0+410|H=1+700|V=2+560]</code></div></div><label class="control"><span>wdth</span><input type="range" min="75" max="100" step="5" value="100"><output>100</output></label><figcaption><code>hb-vector variations/var-avar2.ttf "IHV" --variations=wght=900,wdth=…</code>, drawn at every 5 from 75 to 100</figcaption></figure>
+<p id="ix-28">The order of operations is in the second half of <code>map_coords_16_16</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-avar-table.hh#L545"><code>hb-ot-var-avar-table.hh:545</code></a>):</p>
+<pre><code class="language-c++">hb_vector_t&lt;int&gt; coords_2_14;
+coords_2_14.resize (coords_length);
+for (unsigned i = 0; i &lt; coords_length; i++)
+  coords_2_14[i] = roundf (coords[i] / 4.f); // 16.16 -&gt; 2.14
+
+hb_vector_t&lt;int&gt; out;
+out.alloc (coords_length);
+for (unsigned i = 0; i &lt; coords_length; i++)
+{
+  int v = coords[i];
+  uint32_t varidx = varidx_map.map (i);
+  float delta = var_store.get_delta (varidx, coords_2_14.arrayZ, coords_2_14.length, var_store_cache);
+  float d = hb_clamp (delta * 4, -(float) (1&lt;&lt;17), +(float) (1&lt;&lt;17)); // 2.14 -&gt; 16.16
+  v += (int) roundf (d);
+  v = hb_clamp (v, -(1&lt;&lt;16), +(1&lt;&lt;16));
+  out.push (v);
+}
+</code></pre>
+<p id="ix-29">First every axis goes through its version 1 segment map. Then the store is evaluated once, at those results rounded to 2.14, and each axis’s delta is added to its <em>unrounded</em> 16.16 value. Only the sum is clamped, to ±1, “matching fontTools”, as the comment above the clamp says. The results go into a separate array, so no axis sees another’s version 2 result: there is one pass, not an iteration until things settle.</p>
+<p id="ix-30">For years the only description of avar 2 was a proposal, and HarfBuzz’s comment still points to it: <code>/* &quot;Spec&quot;: https://github.com/be-fonts/boring-expansion-spec/issues/14 */</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-avar-table.hh#L46"><code>hb-ot-var-avar-table.hh:46</code></a>). Microsoft’s OpenType 1.9.1 still has only version 1. The 2026 edition of the ISO standard, ISO/IEC 14496-22, describes version 2 in clause 7.3.1, and HarfBuzz differs from it in three small ways:</p>
+<ul>
+<li>The standard adds each delta to the version 1 result already rounded to 2.14. HarfBuzz adds it to the 16.16 value and rounds once, at the end. The two can differ by one unit of 2.14.</li>
+<li>The standard clamps only when there is a variation store. HarfBuzz’s version 2 path always clamps, store or not.</li>
+<li id="ix-31">The standard requires avar to have as many segment maps as fvar has axes. HarfBuzz doesn’t check, for either version: it maps as many axes as both tables have.</li>
+</ul>
+<p id="ix-32">There is also a second implementation in the same file, <code>map_coords_2_14</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-avar-table.hh#L625"><code>hb-ot-var-avar-table.hh:625</code></a>), which rounds to 2.14 before adding the deltas, and has a comment to deprecate it “once fonttools is updated to use 16.16 normalization”. Only the subsetter uses it, when instancing. So the subsetter and the shaper can put the same user position one 2.14 unit apart.</p>
+<h2 id="named-instances">Named instances</h2>
+<p id="ix-33">A named instance is a position in the design space with a name, like “Bold”, for menus. <code>fvar</code> stores a name ID and a full set of user coordinates for each, and, if its records are long enough, a PostScript name ID (<code>get_instance_postscript_name_id</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-fvar-table.hh"><code>hb-ot-var-fvar-table.hh</code></a>). The test font has four: Light, Regular, Bold and Narrow.</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--named-instance=2</td><td class="out"><code>[I=0+370|H=1+668|V=2+448]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=700</td><td class="out"><code>[I=0+370|H=1+668|V=2+448]</code></td></tr></tbody></table></div>
+<p id="ix-34">Choosing an instance doesn’t only set a position. HarfBuzz <em>remembers</em> the choice, and later settings are made on top of it. Here is <code>hb_font_set_variations</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L3099"><code>hb-font.cc:3099</code></a>), which is what <code>--variations</code> calls:</p>
+<pre><code class="language-c++">/* Initialize design coords. */
+for (unsigned int i = 0; i &lt; coords_length; i++)
+  design_coords[i] = axes[i].get_default ();
+if (font-&gt;instance_index != HB_FONT_NO_VAR_NAMED_INSTANCE)
+{
+  unsigned count = coords_length;
+  /* This may fail if index is out-of-range;
+   * That's why we initialize design_coords from fvar above
+   * unconditionally. */
+  hb_ot_var_named_instance_get_design_coords (font-&gt;face, font-&gt;instance_index,
+                                              &amp;count, design_coords);
+}
+
+for (unsigned int i = 0; i &lt; variations_length; i++)
+{
+  const auto tag = variations[i].tag;
+  const auto v = variations[i].value;
+  for (unsigned axis_index = 0; axis_index &lt; coords_length; axis_index++)
+    if (axes[axis_index].axisTag == tag)
+      design_coords[axis_index] = v;
+}
+</code></pre>
+<p id="ix-35">Axes start at their defaults, then take the named instance’s values if one has been chosen, then the values asked for. So asking the Bold instance for a narrower width keeps its weight:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--named-instance=2 --variations=wdth=75</td><td class="out"><code>[I=0+360|H=1+518|V=2+438]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=700,wdth=75</td><td class="out"><code>[I=0+360|H=1+518|V=2+438]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wdth=75</td><td class="out"><code>[I=0+250|H=1+450|V=2+250]</code></td></tr></tbody></table></div>
+<p id="ix-36">That’s useful, but the documentation above the function says something else: “Axes not included in @variations will be effectively set to their default values.” That’s only true when no instance has been chosen. Two more details of the same kind:</p>
+<ul>
+<li id="ix-37"><code>hb_font_set_var_named_instance</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L3272"><code>hb-font.cc:3272</code></a>) returns at once if the index is the one already chosen, even if the coordinates have been changed since. Choosing Bold, then setting some other weight, then choosing Bold again leaves the other weight in place.</li>
+<li id="ix-38">The loop above sets <em>every</em> axis with a matching tag. The ISO standard now allows a font to have several axes with one tag, to be moved together, and this is what it asks for. But <code>hb_ot_var_normalize_variations</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var.cc#L274"><code>hb-ot-var.cc:274</code></a>), the face-level version, sets only the first.</li>
+</ul>
+<p id="ix-39">The 2026 ISO standard also gives instances a flag, <code>REPRESENTATIVE_INSTANCE</code>, meaning that this instance’s values should stand in for the defaults of axes the user hasn’t set. HarfBuzz doesn’t read it. Its struct still describes the field as “Reserved for future use — set to 0” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-fvar-table.hh#L142"><code>hb-ot-var-fvar-table.hh:142</code></a>).</p>
+<h2 id="five-ways-to-set-a-position">Five ways to set a position</h2>
+<p id="ix-40">The public API has five functions for choosing a position, and they don’t all go through the steps above:</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Starts from</th>
+<th>fvar and avar</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-41"><code>hb_font_set_variations</code></td>
+<td id="ix-42">defaults, then the chosen named instance</td>
+<td>yes</td>
+<td>the usual way; <code>--variations</code> in the tools</td>
+</tr>
+<tr>
+<td id="ix-43"><code>hb_font_set_variation</code></td>
+<td>the font’s current design coordinates</td>
+<td>yes</td>
+<td>changes one axis</td>
+</tr>
+<tr>
+<td id="ix-44"><code>hb_font_set_var_coords_design</code></td>
+<td>defaults</td>
+<td>yes</td>
+<td id="ix-45">a full array of user coordinates; ignores the named instance</td>
+</tr>
+<tr>
+<td id="ix-46"><code>hb_font_set_var_named_instance</code></td>
+<td>defaults</td>
+<td>yes</td>
+<td id="ix-47">then calls <code>hb_font_set_variations</code> with nothing</td>
+</tr>
+<tr>
+<td id="ix-48"><code>hb_font_set_var_coords_normalized</code></td>
+<td>zeros</td>
+<td><strong>no</strong></td>
+<td id="ix-49">final 2.14 values, used as given</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-50">The last one is for callers that have done the normalization themselves. It applies no avar, so a version 2 font loses its cross-axis effects, and no clamping, so out-of-range values pass straight through. It doesn’t know what user coordinates those values came from, so it sets the font’s design coordinates to NaN, “not a number”, as the documentation of <code>hb_font_get_var_coords_design</code> admits. That has a consequence the documentation doesn’t mention: a later <code>hb_font_set_variation</code> starts from those NaN values, and clamping NaN to an axis gives its minimum, since <code>hb_max</code> compares with <code>&gt;=</code>. So setting one axis after setting normalized coordinates sends every other axis to its minimum.</p>
+<h2 id="what-the-rest-of-harfbuzz-sees">What the rest of HarfBuzz sees</h2>
+<p id="ix-51">All five functions end in <code>_hb_font_adopt_var_coords</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2166"><code>hb-font.cc:2166</code></a>):</p>
+<pre><code class="language-c++">font-&gt;coords = coords;
+font-&gt;design_coords = design_coords;
+font-&gt;num_coords = coords_length;
+font-&gt;has_nonzero_coords = hb_any (hb_array (coords, coords_length));
+
+font-&gt;changed ();
+font-&gt;serial_coords = font-&gt;serial;
+</code></pre>
+<p id="ix-52">The normalized 2.14 coordinates are the only thing the variation code reads: gvar for outlines, HVAR and VVAR for advances, MVAR for metrics, GDEF and GPOS device tables, CFF2 blends, COLRv1 paints, VARC, and FeatureVariations, which chooses different GSUB and GPOS lookups at different positions. The design coordinates are kept only to be handed back to the caller, and to FreeType when the FreeType font functions are in use.</p>
+<p id="ix-53"><code>has_nonzero_coords</code> is HarfBuzz’s test for “the default instance”, and it saves work everywhere. A font at its default, whether or not any variations were set, takes the same paths as a static font: advances straight from <code>hmtx</code>, no deltas computed. It is also why shape plans don’t multiply. <code>hb_shape_full</code> passes the coordinates to the shape-plan cache only when they aren’t all zero (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape.cc#L143"><code>hb-shape.cc:143</code></a>), and even then the cache’s key doesn’t hold them: it holds which FeatureVariations records they select, so every position that selects the same records shares a plan (<a href="shape-plans-and-their-cache.html">Shape plans and their cache</a>). (A broken avar that maps the default away from 0 turns all of this off, as well as moving the default.)</p>
+<p id="ix-54">Last, the two serial numbers. Every change to a font bumps <code>serial</code>, and a change of position also sets <code>serial_coords</code>. HarfBuzz’s own font functions keep caches of advances and outlines, and they check <code>serial_coords</code> to know when to throw them away (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L290"><code>hb-ot-font.cc:290</code></a>). A change of size alone keeps the advance cache, because the cached advances are in font units, before scaling.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc"><code>src/hb-font.cc</code></a></td>
+<td>the five setters, from 3099; <code>_hb_font_adopt_var_coords</code>, 2166</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var.cc"><code>src/hb-ot-var.cc</code></a></td>
+<td><code>hb_ot_var_normalize_coords</code>, 323, and the face-level API</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-fvar-table.hh"><code>src/hb-ot-var-fvar-table.hh</code></a></td>
+<td>axes, instances, <code>normalize_axis_value</code>, <code>get_coordinates</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-avar-table.hh"><code>src/hb-ot-var-avar-table.hh</code></a></td>
+<td>segment maps and <code>map_float</code>, 152; version 2 in <code>map_coords_16_16</code>, 545; the instancer’s <code>map_coords_2_14</code>, 625</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>User coordinates are normalized per axis to −1, 0 and +1, bent by avar, and rounded to 2.14. Normalization is done in floating point, avar in 16.16.</li>
+<li>HarfBuzz clamps to the axis range, repairs axes whose minimum or maximum is on the wrong side of the default, and uses malformed avar maps the way Core Text does, without clamping.</li>
+<li>avar version 2 adds deltas from an item variation store, evaluated once at the version 1 results, so any axis can depend on all of them. It’s in the 2026 ISO standard, not in Microsoft’s OpenType 1.9.1.</li>
+<li>A chosen named instance becomes the base for later settings, whatever the documentation says.</li>
+<li>Setting normalized coordinates directly skips avar and clamping.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="aat-positioning.html">← AAT positioning</a><a rel="next" href="deltas.html">Deltas →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

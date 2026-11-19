@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Regenerating the Unicode and shaping tables · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Appendix F</p>
+<h1 id="regenerating-the-unicode-and-shaping-tables">Regenerating the Unicode and shaping tables</h1>
+<p id="ix-1">A good part of HarfBuzz’s source is written by programs. The Unicode properties, the categories of the Indic and USE shapers, the Arabic joining types, the mapping from BCP 47 languages to OpenType language systems and the syllable state machines are all generated, and the generated files are committed to the repository. Building HarfBuzz never downloads anything and never runs a data generator. The generators are run by hand, by a maintainer, when Unicode or one of the registries changes.</p>
+<p id="ix-2">The scripts live in <code>src/</code>, and are of two kinds. The <strong>data generators</strong> read the Unicode Character Database, Microsoft’s data for the Universal Shaping Engine and two registries of language tags, and are run through <code>src/update-unicode-tables.make</code>. The <strong>build helpers</strong> are run by meson as part of an ordinary build: they turn Ragel grammars into C, stamp the version into a header, and write the single-file amalgamations. This appendix lists both: what each reads, what it writes, which corrections it makes by hand, and which chapter explains the result.</p>
+<h2 id="generated-files-and-their-inputs">Generated files and their inputs</h2>
+<table>
+<thead>
+<tr>
+<th>Generated file</th>
+<th>Generator</th>
+<th>Reads</th>
+<th>Explained in</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-3"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd-table.hh"><code>hb-ucd-table.hh</code></a></td>
+<td id="ix-4"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ucd-table.py"><code>gen-ucd-table.py</code></a></td>
+<td id="ix-5"><code>ucd.nounihan.grouped.zip</code> (the UCD in XML, without Unihan); <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-script-list.h"><code>hb-script-list.h</code></a></td>
+<td id="ix-6"><a href="unicode-inside-harfbuzz.html#the-built-in-tables">Unicode inside HarfBuzz</a>, <a href="normalization.html">Normalization</a></td>
+</tr>
+<tr>
+<td id="ix-7"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode-emoji-table.hh"><code>hb-unicode-emoji-table.hh</code></a></td>
+<td id="ix-8"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-emoji-table.py"><code>gen-emoji-table.py</code></a></td>
+<td id="ix-9"><code>emoji-data.txt</code>; <code>emoji-test.txt</code>, for a test file</td>
+<td><a href="unicode-inside-harfbuzz.html#continuations-just-enough-of-graphemes">Unicode inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td id="ix-10"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic-table.hh"><code>hb-ot-shaper-arabic-table.hh</code></a></td>
+<td id="ix-11"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-table.py"><code>gen-arabic-table.py</code></a></td>
+<td id="ix-12"><code>ArabicShaping.txt</code>, <code>UnicodeData.txt</code>, <code>Blocks.txt</code></td>
+<td id="ix-13"><a href="joining-scripts.html#joining-types">Joining scripts</a>, <a href="joining-scripts.html#shaping-without-gsub">and fallback shaping</a></td>
+</tr>
+<tr>
+<td id="ix-14"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic-joining-list.hh"><code>hb-ot-shaper-arabic-joining-list.hh</code></a></td>
+<td id="ix-15"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-joining-list.py"><code>gen-arabic-joining-list.py</code></a></td>
+<td id="ix-16"><code>ArabicShaping.txt</code>, <code>Scripts.txt</code></td>
+<td id="ix-17"><a href="joining-scripts.html#joining-scripts-under-use">Joining scripts</a></td>
+</tr>
+<tr>
+<td id="ix-18"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic-pua.hh"><code>hb-ot-shaper-arabic-pua.hh</code></a></td>
+<td id="ix-19"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-pua.py"><code>gen-arabic-pua.py</code></a></td>
+<td id="ix-20"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/ArabicPUASimplified.txt"><code>ArabicPUASimplified.txt</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/ArabicPUATraditional.txt"><code>ArabicPUATraditional.txt</code></a> (committed)</td>
+<td id="ix-21"><a href="joining-scripts.html#legacy-encodings">Joining scripts</a></td>
+</tr>
+<tr>
+<td id="ix-22"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic-table.cc"><code>hb-ot-shaper-indic-table.cc</code></a></td>
+<td id="ix-23"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py"><code>gen-indic-table.py</code></a></td>
+<td id="ix-24"><code>IndicSyllabicCategory.txt</code>, <code>IndicPositionalCategory.txt</code>, <code>Blocks.txt</code></td>
+<td><a href="indic-model.html#where-the-table-comes-from">The Indic model</a>, <a href="khmer-and-myanmar.html#categories">Khmer and Myanmar</a></td>
+</tr>
+<tr>
+<td id="ix-25"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use-table.hh"><code>hb-ot-shaper-use-table.hh</code></a></td>
+<td id="ix-26"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-use-table.py"><code>gen-use-table.py</code></a></td>
+<td>seven UCD files and two of Microsoft’s (below)</td>
+<td id="ix-27"><a href="universal-shaping-engine.html#where-they-come-from">The Universal Shaping Engine</a></td>
+</tr>
+<tr>
+<td id="ix-28"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-vowel-constraints.cc"><code>hb-ot-shaper-vowel-constraints.cc</code></a></td>
+<td id="ix-29"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-vowel-constraints.py"><code>gen-vowel-constraints.py</code></a></td>
+<td id="ix-30"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/ms-use/IndicShapingInvalidCluster.txt"><code>ms-use/IndicShapingInvalidCluster.txt</code></a> (committed), <code>Scripts.txt</code></td>
+<td id="ix-31"><a href="dotted-circles-and-broken-clusters.html#vowel-constraints">Dotted circles and broken clusters</a></td>
+</tr>
+<tr>
+<td id="ix-32"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-tag-table.hh"><code>hb-ot-tag-table.hh</code></a></td>
+<td id="ix-33"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-tag-table.py"><code>gen-tag-table.py</code></a></td>
+<td id="ix-34">the OpenType language system tag page (HTML), the IANA language subtag registry</td>
+<td id="ix-35"><a href="choosing-a-script-shaper.html#from-a-language-to-language-system-tags">Choosing a script shaper</a></td>
+</tr>
+<tr>
+<td id="ix-36">the array in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-os2-unicode-ranges.hh"><code>hb-ot-os2-unicode-ranges.hh</code></a></td>
+<td id="ix-37"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-os2-unicode-ranges.py"><code>gen-os2-unicode-ranges.py</code></a></td>
+<td id="ix-38">a tab-separated copy of the <code>OS/2</code> Unicode range list, not in the repository</td>
+<td><a href="subsetting.html#table-by-table">Subsetting</a></td>
+</tr>
+<tr>
+<td><code>hb-ot-shaper-*-machine.hh</code>, <code>hb-buffer-deserialize-*.hh</code></td>
+<td id="ix-39"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ragel-artifacts.py"><code>gen-ragel-artifacts.py</code></a>, run by meson</td>
+<td>the <code>.rl</code> grammars</td>
+<td><a href="indic-model.html#ragel">The Indic model</a>, <a href="#the-ragel-machines">below</a></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-40">All the data generators except <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-joining-list.py"><code>gen-arabic-joining-list.py</code></a> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-os2-unicode-ranges.py"><code>gen-os2-unicode-ranges.py</code></a> take a first argument <code>--rust</code>, which writes the same data as Rust for HarfRust, the Rust port. The Rust output goes to standard output like the C, and lives in HarfRust’s repository, not HarfBuzz’s.</p>
+<h2 id="running-the-data-generators">Running the data generators</h2>
+<p id="ix-41"><code>update-unicode-tables.make</code> is a makefile with a <code>#!/usr/bin/env -S make -f</code> line, run from <code>src/</code>. Its default target is <code>packtab</code> and then the nine generated files it knows about (<code>update-unicode-tables.make:3</code>). Every rule has the same shape, the generator first and its inputs after it, run as <code>./$^ &gt; $@</code>, and deletes the output if the generator fails:</p>
+<pre><code class="language-make">hb-ot-shaper-indic-table.cc: gen-indic-table.py IndicSyllabicCategory.txt IndicPositionalCategory.txt Blocks.txt
+	./$^ &gt; $@ || ($(RM) $@; false)
+</code></pre>
+<p id="ix-42">The inputs that aren’t in the repository are downloaded with <code>curl -O</code> when missing (<code>:45</code>–<code>:56</code>): the UCD files from <code>https://unicode.org/Public/UCD/latest/ucd/</code>, <code>emoji-data.txt</code> from the <code>emoji/</code> folder beside them, <code>emoji-test.txt</code> from <code>https://www.unicode.org/Public/emoji/latest/</code>, the XML database from <code>ucdxml/</code>, the language tag page from <code>learn.microsoft.com</code>, and the subtag registry from <code>www.iana.org</code>. Every URL says <code>latest</code>, so what a run produces depends on the day it is run. Four inputs are committed and never downloaded: Microsoft’s three files in <code>src/ms-use/</code>, and the two Arabic PUA files. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-os2-unicode-ranges.py"><code>gen-os2-unicode-ranges.py</code></a> is not in the makefile at all; <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-os2-unicode-ranges.hh"><code>hb-ot-os2-unicode-ranges.hh</code></a> says only that “the contents of this array was generated using gen-os2-unicode-ranges.py” (<code>:44</code>), and its input was pasted from the <code>OS/2</code> page of the OpenType specification.</p>
+<p id="ix-43">The <code>packtab</code> target installs <strong>packTab</strong>, HarfBuzz’s table packer, with <code>pip install git+https://github.com/harfbuzz/packtab</code> if <code>import packTab</code> fails (<code>:43</code>). It is the latest commit, not a pinned version. Six generators use it: given a map from code points to values, it searches for the cheapest split of the code point into bit fields for a multi-level table, and writes the arrays and an inline lookup function. Its <code>compression</code> argument trades size for speed, and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ucd-table.py"><code>gen-ucd-table.py</code></a> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-use-table.py"><code>gen-use-table.py</code></a> run it twice or three times to write the <code>HB_OPTIMIZE_SIZE</code> variants side by side (<a href="unicode-inside-harfbuzz.html#three-sizes">Unicode inside HarfBuzz</a> shows the result).</p>
+<p id="ix-44">Two further targets: <code>clean</code> deletes the generated files, and <code>clean-sources</code> the downloaded ones, so that the next run fetches new copies. <code>SOURCES</code>, the list <code>clean-sources</code> deletes (<code>:16</code>), leaves out <code>DerivedCoreProperties.txt</code> and <code>emoji-test.txt</code>, which other rules download. A stale copy of either survives a clean and is used again. That may be why <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use-table.hh"><code>hb-ot-shaper-use-table.hh</code></a> records <code>DerivedCoreProperties-17.0.0.txt</code> beside version 18.0.0 of every other Unicode file (inferred).</p>
+<blockquote>
+<p id="ix-45">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/b873113f410f0fa0b215f225aec5d76eb55c22e3"><code>b873113</code></a> (17 November 2026), so main’s <code>SOURCES</code> lists both files; the USE table hasn’t been regenerated since, and still records <code>DerivedCoreProperties-17.0.0.txt</code>.</p>
+</blockquote>
+<h3 id="what-the-headers-record">What the headers record</h3>
+<p>Each generated file begins with the command that made it and the first lines of each input file, so the headers are the record of which data a release carries. In 15.1.0:</p>
+<table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Version or date in the generated header</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-46">UCD XML (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd-table.hh"><code>hb-ucd-table.hh</code></a>)</td>
+<td>“Unicode 18.0.0”</td>
+</tr>
+<tr>
+<td id="ix-47"><code>ArabicShaping.txt</code>, <code>Scripts.txt</code>, <code>Blocks.txt</code>, <code>IndicSyllabicCategory.txt</code>, <code>IndicPositionalCategory.txt</code></td>
+<td>18.0.0</td>
+</tr>
+<tr>
+<td id="ix-48"><code>DerivedCoreProperties.txt</code> (USE table only)</td>
+<td>17.0.0</td>
+</tr>
+<tr>
+<td id="ix-49"><code>emoji-data.txt</code></td>
+<td>18.0.0, dated 2026-01-30</td>
+</tr>
+<tr>
+<td><code>ms-use/*-Additional.txt</code></td>
+<td>“Updated for Unicode 18.0 by Andrew Glass 2026-09-04”</td>
+</tr>
+<tr>
+<td id="ix-50"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/ms-use/IndicShapingInvalidCluster.txt"><code>ms-use/IndicShapingInvalidCluster.txt</code></a></td>
+<td>dated 2015-03-12 and 2019-11-08</td>
+</tr>
+<tr>
+<td id="ix-51">OpenType language system tags</td>
+<td><code>updated_at</code> 2024-12-06</td>
+</tr>
+<tr>
+<td id="ix-52">IANA language subtag registry</td>
+<td><code>File-Date: 2026-09-17</code></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-53"><code>UnicodeData.txt</code> has no header, and the generators that read it say so. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic-pua.hh"><code>hb-ot-shaper-arabic-pua.hh</code></a> records nothing about its inputs.</p>
+<h2 id="the-data-generators">The data generators</h2>
+<h3 id="gen-ucd-tablepy">gen-ucd-table.py</h3>
+<p id="ix-54">Reads the XML database through <code>packTab.ucdxml</code> and writes five properties for every code point: general category, canonical combining class, script, the Bidi mirroring glyph (as a difference) and the canonical decomposition. <a href="unicode-inside-harfbuzz.html#the-built-in-tables">Unicode inside HarfBuzz</a> explains the encoding. Its second input is <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-script-list.h"><code>hb-script-list.h</code></a>, a hand-written public header: the generator numbers the scripts in the order of the <code>HB_SCRIPT_*</code> lines there (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ucd-table.py#L147"><code>gen-ucd-table.py:147</code></a>), so a script Unicode adds must be added to that header before the table can be regenerated. Hangul syllables are left out of the decompositions on purpose, since <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ucd.cc"><code>hb-ucd.cc</code></a> computes them (<code>:63</code>). The only change it makes to the data is the “sloppy” variant, which fills unassigned code points from their neighbors (<code>:257</code>).</p>
+<p>The usage line names <code>ucd.nounihan.grouped.xml</code>, and the makefile passes the <code>.zip</code>; <code>packTab.ucdxml</code> reads either (inferred from the makefile working).</p>
+<h3 id="gen-emoji-tablepy">gen-emoji-table.py</h3>
+<p id="ix-55">Reads every property in <code>emoji-data.txt</code>, but writes only <code>Extended_Pictographic</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-emoji-table.py#L78"><code>gen-emoji-table.py:78</code></a>), the one HarfBuzz uses, for keeping emoji ZWJ sequences in one cluster. It also reads <code>emoji-test.txt</code> and, if <code>test/shape/data/in-house/tests/</code> exists, rewrites <code>emoji-clusters.tests</code> there: one line per emoji sequence, shaped with <code>AdobeBlank2.ttf</code>, expecting every glyph in cluster 0 (<code>:112</code>–<code>:134</code>). That is the only generator that writes a test.</p>
+<h3 id="gen-arabic-tablepy">gen-arabic-table.py</h3>
+<p id="ix-56">Writes three things. The <strong>joining table</strong>, from <code>ArabicShaping.txt</code>, with three changes: type C is stored as D, the Syriac joining groups Alaph and Dalath Rish replace their letters’ type, and anything unlisted is X, decided at run time (<a href="joining-scripts.html#joining-types">Joining scripts</a>). The <strong>shaping table</strong>, a row of initial, medial, final and isolated presentation forms for each letter, from the <code>&lt;initial&gt;</code>, <code>&lt;medial&gt;</code>, <code>&lt;final&gt;</code> and <code>&lt;isolated&gt;</code> decompositions in <code>UnicodeData.txt</code>. And the <strong>ligature tables</strong> for fallback shaping, only for the ligatures in its <code>LIGATURES</code> list (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-table.py#L139"><code>gen-arabic-table.py:139</code></a>).</p>
+<p id="ix-57">Its overrides are in the data it adds: three made-up <code>UnicodeData.txt</code> lines for Private Use ligatures (U+F201 LELLAH, U+F211 lam-meem-jeem, U+F2EE shadda with fathatan, <code>:156</code>), which exist only for the legacy PUA fonts. A mark ligature is recognized by a leading U+0020 in its decomposition, which the generator drops before reversing the components (<code>:175</code>). <code>Blocks.txt</code> is read into a dictionary that nothing uses (<code>:45</code>, <code>:379</code>), and U+F2EE is in <code>LIGATURES</code> twice; neither affects the output.</p>
+<h3 id="gen-arabic-joining-listpy">gen-arabic-joining-list.py</h3>
+<p id="ix-58">Writes one function, <code>has_arabic_joining</code>: a <code>switch</code> over every script, other than Common and Inherited, that has a character in <code>ArabicShaping.txt</code> whose type isn’t T or U. The USE shaper calls it to decide whether to run the Arabic joining machine. In 15.1.0 that is thirteen scripts (<a href="joining-scripts.html#joining-scripts-under-use">Joining scripts</a>). No overrides. Its usage string calls it <code>gen-arabic-joining-table.py</code>, an old name.</p>
+<h3 id="gen-arabic-puapy">gen-arabic-pua.py</h3>
+<p id="ix-59">Reads the two committed files, “Legacy Simplified Arabic encoding” and “Legacy Traditional Arabic encoding”, each a list of PUA code, Unicode code point and name, and packs the inverse maps, Unicode to PUA, as <code>_hb_arabic_pua_simp_map</code> and <code>_hb_arabic_pua_trad_map</code>. They are used by <code>cmap</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cmap-table.hh#L2222"><code>hb-ot-cmap-table.hh:2222</code></a>) and by the FreeType font funcs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L451"><code>hb-ft.cc:451</code></a>), not by the shaper. The files don’t say where they came from.</p>
+<h3 id="gen-indic-tablepy">gen-indic-table.py</h3>
+<p id="ix-60">One table serves the Indic, Khmer and Myanmar shapers: a 16-bit value per code point, a category in the low byte and a position in the high byte. Only some blocks are kept (<code>ALLOWED_BLOCKS</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py#L25"><code>gen-indic-table.py:25</code></a>), plus U+00A0 and U+25CC. The steps, from Unicode’s two Indic properties to HarfBuzz’s categories and positions, are described in <a href="indic-model.html#where-the-table-comes-from">The Indic model</a>.</p>
+<p>The hand-written parts are larger than the derivation:</p>
+<ul>
+<li id="ix-61"><strong>The category lists</strong> (<code>:93</code>): the categories each shaper’s machine knows, which must match the <code>export</code> numbers in the three <code>.rl</code> files. The generator <code>#define</code>s each category once, and for a category that a later shaper lists again, emits a <code>static_assert</code> that the two machines agree (<code>:537</code>). In 15.1.0 only Khmer and Myanmar share listed categories, the four <code>V…</code> vowel classes.</li>
+<li id="ix-62"><strong><code>category_map</code></strong> (<code>:147</code>), from Unicode’s syllabic categories, with comments where the choice is a guess (“Don’t care”, “TODO”) or tied to an issue (<code>Gemination_Mark</code>, #552). <code>Consonant_Killer</code> maps to <code>M</code>, with the comment “U+17CD only”, but U+17CD is then overridden to <code>Xgroup</code>, so the entry decides nothing.</li>
+<li id="ix-63"><strong><code>category_overrides</code></strong> (<code>:207</code>), about 140 code points. The variation selectors U+FE00 to U+FE0F become <code>VS</code> and six punctuation and box characters <code>PLACEHOLDER</code>, both “not Myanmar-specific”. Ten RAs become <code>Ra</code>. Some Vedic signs become tone marks or <code>Symbol</code> (with TODOs saying they should be restricted). Grantha marks are included “according to ScriptExtensions.txt”, so that Tamil text can use them. Single characters follow, each with an issue or pull request. Then the Khmer classes (<code>Robatic</code>, <code>Xgroup</code>, <code>Ygroup</code>; U+17D3 is “Just guessing. Uniscribe doesn’t categorize it.”) and the Myanmar ones, from Microsoft’s Myanmar specification. One Myanmar override is commented out: “The spec says D0, but Uniscribe doesn’t seem to do.”</li>
+<li id="ix-64"><strong>The matra positions</strong> (<code>:393</code>–<code>:432</code>), per block, with one marked “Deviate from spec” (Gurmukhi top matras), and <strong><code>position_overrides</code></strong> (<code>:386</code>) for U+0A51 and U+0B01.</li>
+</ul>
+<p id="ix-65">Unicode’s positions are discarded for every category except <code>CM</code>, <code>SM</code>, <code>RS</code>, <code>H</code>, <code>M</code> and <code>MPst</code> (<code>:457</code>), and consonants all get <code>BASE_C</code>. Khmer and Myanmar vowel signs are given a category from their position instead (<code>:473</code>), <a href="khmer-and-myanmar.html#categories">as Khmer and Myanmar explains</a>.</p>
+<h3 id="gen-use-tablepy">gen-use-table.py</h3>
+<p id="ix-66">Reads nine files. The seven UCD files give each code point its Indic syllabic and positional categories, joining type, whether it is default ignorable, general category, block and script. The two <code>ms-use/*-Additional.txt</code> files, Microsoft’s, are read last into the same two slots, so their values replace Unicode’s (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-use-table.py#L92"><code>gen-use-table.py:92</code></a>): DOTTED CIRCLE becomes a <code>Consonant</code>, and scripts outside Unicode’s Indic properties, such as Mongolian and Adlam, get values at all. Each code point is then passed through a list of predicates that follow Microsoft’s derivation of USE categories, and exactly one must say yes.</p>
+<p>HarfBuzz’s own corrections, in the order of the source:</p>
+<ul>
+<li id="ix-67">five scripts are dropped, since other shapers handle them: Arabic, Lao, Samaritan, Syriac and Thai (<code>DISABLED_SCRIPTS</code>, <code>:40</code>);</li>
+<li>Microsoft’s <code>Consonant_Final_Modifier</code> is read as <code>Syllable_Modifier</code> and its positional <code>NA</code> as <code>Not_Applicable</code> (<code>:85</code>, <code>:88</code>);</li>
+<li id="ix-68">joining letters and joiners, the generic bases (the same six characters as the Indic table’s placeholders, <code>:224</code>), three viramas with classes of their own (U+0DCA, U+1A60 and the other invisible stackers), and which default ignorables are <code>WJ</code> (excluding the Hangul fillers and U+1BCA0 to U+1BCA3, <code>:297</code>) are all decided in the predicates;</li>
+<li id="ix-69">in <code>map_to_use</code> (<code>:382</code>), U+1CE2 to U+1CE8, four Tibetan signs and U+1CED get syllabic categories, and U+11302, U+11303 and U+114C1 the position <code>Top</code>; U+0F7F is excused from the check that a positioned category has a position (<code>:411</code>).</li>
+</ul>
+<p id="ix-70"><a href="universal-shaping-engine.html#harfbuzzs-own-changes">The Universal Shaping Engine</a> has the full table, with what each comment says. Two of the TODOs explain themselves as missing values “in Unicode 13.0.0” (<code>:389</code>, <code>:393</code>). Whether Unicode 18.0 has since assigned them can’t be checked without the data files, which aren’t in the repository; if it has, the overrides are now redundant.</p>
+<p id="ix-71">The table is written twice, at packTab compression 5 and, under <code>HB_OPTIMIZE_SIZE</code>, 9. Its category names are macros for <code>USE(…)</code>, the export numbers of <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use-machine.rl"><code>hb-ot-shaper-use-machine.rl</code></a>, so the table and the machine must be regenerated together when a category is added. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/test-use-table.cc"><code>src/test-use-table.cc</code></a> prints the category of every code point, which makes a before-and-after comparison of a regeneration easy (inferred use).</p>
+<h3 id="gen-vowel-constraintspy">gen-vowel-constraints.py</h3>
+<p id="ix-72">Reads Microsoft’s list of 103 sequences that should be shown as broken, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/ms-use/IndicShapingInvalidCluster.txt"><code>ms-use/IndicShapingInvalidCluster.txt</code></a>, and <code>Scripts.txt</code> to find each sequence’s script. It writes <code>_hb_preprocess_text_vowel_constraints</code>, a <code>switch</code> on the buffer’s script with nested <code>switch</code>es on the code points, which inserts a dotted circle inside a matching sequence. The Indic and USE shapers call it (<a href="dotted-circles-and-broken-clusters.html#vowel-constraints">Dotted circles and broken clusters</a>). The function carries its own comment, “UGLY UGLY UGLY business of adding dotted-circle…”, and returns at once under <code>HB_NO_OT_SHAPER_VOWEL_CONSTRAINTS</code> or <code>HB_BUFFER_FLAG_DO_NOT_INSERT_DOTTED_CIRCLE</code>. No overrides; the list itself hasn’t changed since 2019.</p>
+<h3 id="gen-tag-tablepy">gen-tag-table.py</h3>
+<p id="ix-73">At 1,498 lines the largest generator. It parses the OpenType language system tag page as HTML, taking from each row the name, the tag and the ISO 639 codes, and the IANA registry for names, scopes, macrolanguages, deprecations and variants. Tags are matched through the ISO codes (three-letter codes are turned into two-letter ones where those exist, through a table of 185 entries copied from SIL, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-tag-table.py#L112"><code>gen-tag-table.py:112</code></a>); names are used only for the comments in the output. Then it adds each macrolanguage’s individual languages, orders the OpenType tags for each language by rank, and writes:</p>
+<ul>
+<li id="ix-74"><code>ot_languages2</code> and <code>ot_languages3</code>, from two- and three-letter language subtags to OpenType tags, with comments such as “Avaric -&gt; Avar”;</li>
+<li id="ix-75"><code>hb_ot_tags_from_complex_language</code>, generated C for tags with a script, region or variant, such as <code>zh-Hant-HK</code> or <code>und-fonipa</code>;</li>
+<li id="ix-76"><code>hb_ot_ambiguous_tag_to_language</code>, the way back for OpenType tags that several languages share.</li>
+</ul>
+<p id="ix-77">The corrections are an explicit block (<code>:755</code>–<code>:871</code>): 63 <code>add_language</code> calls (Chinese by region and script, the Quechua varieties, phonetic transcription as <code>und-fonipa</code>, Polytonic Greek as <code>el-polyton</code>), ten tags removed and re-added differently, five rank adjustments, names and macrolanguages for three retired codes, and a <code>disambiguation</code> map of 33 OpenType tags to the BCP 47 tag they should turn back into (<code>:893</code>). The comments it copies from the two registries are checked against a list of allowed characters before they are written (<code>sanitize_comment</code>, <code>:57</code>), since they end up in C source.</p>
+<h3 id="gen-os2-unicode-rangespy">gen-os2-unicode-ranges.py</h3>
+<p id="ix-78">Reads lines of bit number, block name and range, and prints <code>_hb_os2_unicode_ranges</code>, sorted by first code point, for the subsetter’s recalculation of the <code>OS/2</code> Unicode range bits. The output has to be pasted into <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-os2-unicode-ranges.hh"><code>hb-ot-os2-unicode-ranges.hh</code></a> by hand.</p>
+<h2 id="the-build-helpers">The build helpers</h2>
+<p id="ix-79">These run in every meson build, from <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build"><code>src/meson.build</code></a>, and read nothing outside the source tree.</p>
+<table>
+<thead>
+<tr>
+<th>Writes</th>
+<th>Helper</th>
+<th>From</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-80">the seven Ragel headers</td>
+<td id="ix-81"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ragel-artifacts.py"><code>gen-ragel-artifacts.py</code></a></td>
+<td><code>*.rl</code></td>
+<td id="ix-82">only if Ragel is found; <a href="#the-ragel-machines">below</a></td>
+</tr>
+<tr>
+<td id="ix-83"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-version.h"><code>hb-version.h</code></a></td>
+<td id="ix-84"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-hb-version.py"><code>gen-hb-version.py</code></a></td>
+<td><code>hb-version.h.in</code> and the project version</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-85"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz.cc"><code>harfbuzz.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz-subset.cc"><code>harfbuzz-subset.cc</code></a></td>
+<td id="ix-86"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-harfbuzzcc.py"><code>gen-harfbuzzcc.py</code></a></td>
+<td id="ix-87">meson’s source lists</td>
+<td id="ix-88">one <code>#include</code> per <code>.cc</code> file; copied into <code>src/</code> if it changed</td>
+</tr>
+<tr>
+<td id="ix-89"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/harfbuzz-world.cc"><code>harfbuzz-world.cc</code></a></td>
+<td id="ix-90"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-harfbuzz-world.py"><code>gen-harfbuzz-world.py</code></a></td>
+<td><code>harfbuzz-world.cc.in</code> and tagged source lists</td>
+<td>every library in one file (<a href="building-harfbuzz.html#single-file-builds">Building HarfBuzz</a>)</td>
+</tr>
+<tr>
+<td><code>harfbuzz*.def</code></td>
+<td id="ix-91"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-def.py"><code>gen-def.py</code></a></td>
+<td>the public headers</td>
+<td>the Windows export list; leaves out eleven experimental functions unless <code>-Dexperimental_api=true</code></td>
+</tr>
+<tr>
+<td><code>hb-gpu-*-{glsl,wgsl,msl,hlsl}.hh</code></td>
+<td id="ix-92"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-gpu-shader-artifacts.py"><code>gen-gpu-shader-artifacts.py</code></a></td>
+<td>the shader sources</td>
+<td id="ix-93">each shader as a C string (<a href="hb-gpu.html#what-the-application-supplies">hb-gpu</a>)</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-94">The helpers that write into <code>src/</code> do it so that the committed copies stay current. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ragel-artifacts.py"><code>gen-ragel-artifacts.py</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-gpu-shader-artifacts.py"><code>gen-gpu-shader-artifacts.py</code></a> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-harfbuzz-world.py"><code>gen-harfbuzz-world.py</code></a> also handle a read-only source tree: they compare instead, and stop with “out of date; regenerate with a writable source tree” if the committed file differs.</p>
+<h2 id="the-ragel-machines">The Ragel machines</h2>
+<p id="ix-95"><strong>Ragel</strong> compiles regular expressions with actions into C. HarfBuzz has seven grammars, and commits the C:</p>
+<table>
+<thead>
+<tr>
+<th>Grammar</th>
+<th>Generated header (lines)</th>
+<th>Used by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-96"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic-machine.rl"><code>hb-ot-shaper-indic-machine.rl</code></a></td>
+<td>1,302</td>
+<td><a href="indic-model.html#ragel">The Indic model</a></td>
+</tr>
+<tr>
+<td id="ix-97"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-khmer-machine.rl"><code>hb-ot-shaper-khmer-machine.rl</code></a></td>
+<td>428</td>
+<td><a href="khmer-and-myanmar.html#syllables">Khmer and Myanmar</a></td>
+</tr>
+<tr>
+<td id="ix-98"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-myanmar-machine.rl"><code>hb-ot-shaper-myanmar-machine.rl</code></a></td>
+<td>683</td>
+<td><a href="khmer-and-myanmar.html">Khmer and Myanmar</a></td>
+</tr>
+<tr>
+<td id="ix-99"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use-machine.rl"><code>hb-ot-shaper-use-machine.rl</code></a></td>
+<td>1,112</td>
+<td id="ix-100"><a href="universal-shaping-engine.html#the-grammar">The Universal Shaping Engine</a></td>
+</tr>
+<tr>
+<td id="ix-101"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer-deserialize-json.rl"><code>hb-buffer-deserialize-json.rl</code></a></td>
+<td>735</td>
+<td id="ix-102"><code>hb_buffer_deserialize_glyphs</code>, JSON (<a href="buffers.html#comparing-and-writing-out">Buffers</a>)</td>
+</tr>
+<tr>
+<td id="ix-103"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer-deserialize-text-glyphs.rl"><code>hb-buffer-deserialize-text-glyphs.rl</code></a></td>
+<td>591</td>
+<td id="ix-104"><code>hb_buffer_deserialize_glyphs</code>, text</td>
+</tr>
+<tr>
+<td id="ix-105"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer-deserialize-text-unicode.rl"><code>hb-buffer-deserialize-text-unicode.rl</code></a></td>
+<td>256</td>
+<td id="ix-106"><code>hb_buffer_deserialize_unicode</code></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-107">Meson looks for Ragel with <code>find_program('ragel', version: '6.10', required: false)</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L455"><code>src/meson.build:455</code></a>). If it isn’t found, the option <code>-Dragel_subproject=true</code> builds Ragel 6.10 from <code>subprojects/ragel.wrap</code>, which downloads <code>ragel-6.10.tar.gz</code> from colm.net; without either, meson warns “You have to install ragel if you are going to develop HarfBuzz itself” and builds from the committed headers. With Ragel, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ragel-artifacts.py"><code>gen-ragel-artifacts.py</code></a> copies the <code>.rl</code> file into the build directory, runs <code>ragel -e -F1 -o &lt;name&gt;.hh</code>, and copies the result into <code>src/</code>. <code>-F1</code> is Ragel’s fast flat table style with expanded actions.</p>
+<p id="ix-108">The generated headers don’t name the Ragel version that made them. They begin with <code>#line 1 &quot;hb-ot-shaper-use-machine.rl&quot;</code> and carry only <code>#line</code> directives after that, so 6.10, from <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson.build"><code>meson.build</code></a> and the wrap file, is the only version the repository states.</p>
+<p id="ix-109">The machines once needed Ragel for every build from git (“Removed generated files from git again. So, one needs ragel to bootstrap from the git tree”, NEWS for 0.9.13); the headers are committed now. Ragel is used less than it was: 15.0.0 rewrote the number parser without it.</p>
+<h2 id="a-new-unicode-version">A new Unicode version</h2>
+<p id="ix-110"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/RELEASING.md"><code>RELEASING.md</code></a>, HarfBuzz’s release checklist, says nothing about Unicode data: it covers NEWS, API documentation, the version bump and tagging. The practice shows in <code>NEWS</code>. Since Unicode 14.0, each version has had a release of its own, every time in September: 3.0.0 (Unicode 14.0, 17 September 2021), 5.2.0 (15.0), 8.2.1 (15.1), 10.0.0 (16.0), 11.5.0 (17.0) and 14.5.0 (“Update Unicode 18.0 data and script support”, 21 September 2026).</p>
+<p>From the generators and the code that 14.5.0 touched, an update has these steps (inferred as a sequence; each step is in the source):</p>
+<ol>
+<li id="ix-111"><strong>New scripts first.</strong> Add each to <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-script-list.h"><code>hb-script-list.h</code></a>, with its four-letter tag, a <code>Since:</code> line and the Unicode version in a comment (<code>HB_SCRIPT_JURCHEN</code>, <code>/*18.0*/</code>). <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ucd-table.py"><code>gen-ucd-table.py</code></a> reads the list from there.</li>
+<li><strong>Microsoft’s data.</strong> Copy in the new <code>ms-use/*-Additional.txt</code> files, which Microsoft updates for each Unicode version.</li>
+<li id="ix-112"><strong>Regenerate.</strong> <code>make -f update-unicode-tables.make clean-sources</code>, then <code>make -f update-unicode-tables.make</code>, remembering that <code>DerivedCoreProperties.txt</code> and <code>emoji-test.txt</code> must be deleted by hand.</li>
+<li id="ix-113"><strong>Fix what fails.</strong> The generators assert rather than guess. A new syllabic category value stops <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py"><code>gen-indic-table.py</code></a> with a <code>KeyError</code> in <code>category_map</code> if it falls in an allowed block; a character that no USE predicate, or two, accepts stops <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-use-table.py"><code>gen-use-table.py</code></a> at its assertion; a new value must also be added to <code>property_names</code> there.</li>
+<li id="ix-114"><strong>The hand-written lists.</strong> New scripts that should go to USE are added to the <code>switch</code> in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh"><code>hb-ot-shaper.hh</code></a> (“Unicode-18.0 additions”, <code>:405</code>), right-to-left ones to <code>hb_script_get_horizontal_direction</code> in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.cc"><code>hb-common.cc</code></a>, and scripts with an ideographic baseline to <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L2336"><code>hb-ot-layout.cc:2336</code></a>.</li>
+<li><strong>Test.</strong> The shaping tests and <code>emoji-clusters.tests</code>, which the emoji generator has just rewritten.</li>
+</ol>
+<p>New data isn’t always the end. 15.1.0, six weeks after 14.5.0, lists “Fix Indic shaping of the Unicode 18 Devanagari and Bengali additions”.</p>
+<h2 id="possible-bugs-in-the-generators">Possible bugs in the generators</h2>
+<p>Read from the code, none affecting the output in 15.1.0:</p>
+<ul>
+<li id="ix-115"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-hb-version.py#L20"><code>gen-hb-version.py:20</code></a> looks for an existing version with <code>(\d.\d.\d)</code>, one digit per part, so for 10.0.0 and later the check that skips rewriting never matches. The header is rewritten every time, which is harmless.</li>
+<li id="ix-116"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ragel-artifacts.py"><code>gen-ragel-artifacts.py</code></a> checks <code>len (sys.argv) &lt; 4</code> but reads <code>sys.argv[4]</code>, so a missing argument gives an <code>IndexError</code> instead of the usage message.</li>
+<li id="ix-117"><code>SOURCES</code> in <code>update-unicode-tables.make</code> omits <code>DerivedCoreProperties.txt</code> and <code>emoji-test.txt</code>, as above.</li>
+<li id="ix-118"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-table.py"><code>gen-arabic-table.py</code></a> reads <code>Blocks.txt</code> for nothing and lists U+F2EE twice; <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-joining-list.py"><code>gen-arabic-joining-list.py</code></a>’s usage string has an old name; <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-emoji-table.py"><code>gen-emoji-table.py</code></a>’s header names only <code>emoji-data.txt</code>, not <code>emoji-test.txt</code>.</li>
+<li id="ix-119"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-tag-table.py"><code>gen-tag-table.py</code></a> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-os2-unicode-ranges.py"><code>gen-os2-unicode-ranges.py</code></a> give <code>docs.microsoft.com</code> URLs, which now redirect to <code>learn.microsoft.com</code>, and the ISO 639 table cites <code>www-01.sil.org</code>.</li>
+</ul>
+<blockquote>
+<p id="ix-120">Since 15.1.0: partly fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/ebfcf19c720f3328754ecdde620eb45c2fa8088c"><code>ebfcf19</code></a>, <a href="https://github.com/harfbuzz/harfbuzz/commit/c66b1a505795d701b27c67702809814ee250d6cd"><code>c66b1a5</code></a> and <a href="https://github.com/harfbuzz/harfbuzz/commit/b873113f410f0fa0b215f225aec5d76eb55c22e3"><code>b873113</code></a> (17 November 2026): the version regex, the Ragel argument check and <code>SOURCES</code> (the first three items); the other items remain.</p>
+</blockquote>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>src/update-unicode-tables.make</code></td>
+<td>which generator reads which files, and where each file is downloaded from</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ucd-table.py"><code>src/gen-ucd-table.py</code></a></td>
+<td>the UCD properties and their encoding</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-emoji-table.py"><code>src/gen-emoji-table.py</code></a></td>
+<td>Extended_Pictographic, and <code>emoji-clusters.tests</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-table.py"><code>src/gen-arabic-table.py</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-joining-list.py"><code>src/gen-arabic-joining-list.py</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-pua.py"><code>src/gen-arabic-pua.py</code></a></td>
+<td>joining types, presentation forms, fallback ligatures, the joining scripts, the PUA maps</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py"><code>src/gen-indic-table.py</code></a></td>
+<td>the Indic, Khmer and Myanmar categories, with their overrides</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-use-table.py"><code>src/gen-use-table.py</code></a></td>
+<td>the USE predicates and HarfBuzz’s corrections</td>
+</tr>
+<tr>
+<td><code>src/ms-use/</code></td>
+<td>Microsoft’s files, under the MIT license</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-vowel-constraints.py"><code>src/gen-vowel-constraints.py</code></a></td>
+<td>the vowel constraint function</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-tag-table.py"><code>src/gen-tag-table.py</code></a></td>
+<td>the language tag mapping and its manual corrections</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-ragel-artifacts.py"><code>src/gen-ragel-artifacts.py</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L455"><code>src/meson.build:455</code></a></td>
+<td>how Ragel is found and run</td>
+</tr>
+<tr>
+<td><code>subprojects/ragel.wrap</code></td>
+<td>Ragel 6.10 as a subproject</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-script-list.h"><code>src/hb-script-list.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh"><code>src/hb-ot-shaper.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.cc"><code>src/hb-common.cc</code></a></td>
+<td>the hand-written script lists an update touches</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/RELEASING.md"><code>RELEASING.md</code></a>, <code>NEWS</code></td>
+<td>the release checklist, and when each Unicode version arrived</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Generated tables are committed; a build never downloads data. <code>update-unicode-tables.make</code>, run by hand from <code>src/</code>, fetches the latest UCD, emoji data and language registries and runs nine generators, most through packTab.</li>
+<li>Every generated header records its command and its inputs’ versions: in 15.1.0, Unicode 18.0.0 throughout, except <code>DerivedCoreProperties.txt</code> at 17.0.0 in the USE table.</li>
+<li>The corrections that shape HarfBuzz’s behavior are in the generators: <code>category_overrides</code> in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py"><code>gen-indic-table.py</code></a>, the predicates and <code>map_to_use</code> in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-use-table.py"><code>gen-use-table.py</code></a>, and the manual block in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-tag-table.py"><code>gen-tag-table.py</code></a>. Microsoft’s <code>ms-use/</code> files correct Unicode for USE before HarfBuzz does.</li>
+<li>Seven Ragel grammars are compiled to committed headers when meson finds Ragel 6.10. The headers name no version.</li>
+<li>A Unicode update has come in a September release since 2021. It also means new scripts in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-script-list.h"><code>hb-script-list.h</code></a> first, and hand-kept script lists afterward.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="compile-time-configuration.html">← Compile-time configuration</a><a rel="next" href="glossary.html">Glossary →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

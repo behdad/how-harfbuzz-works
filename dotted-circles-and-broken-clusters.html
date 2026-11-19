@@ -1,0 +1,683 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Dotted circles and broken clusters · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part VI · Scripts</p>
+<h1 id="dotted-circles-and-broken-clusters">28. Dotted circles and broken clusters</h1>
+<p id="ix-1">A combining mark needs something to combine with. When a vowel sign begins a line, or follows a space in a script whose signs can’t stand alone, or comes in an order the script doesn’t allow, there is nothing for it to sit on, and a renderer that drew it anyway would hang it over whatever came before, or over nothing. The convention, which the Unicode code charts use for every combining mark, is to show such a mark on U+25CC DOTTED CIRCLE, so that the reader sees a mark and sees that it is out of place. HarfBuzz follows the convention. It doesn’t change the text: the circle is only a glyph in the output, given a cluster of the text it stands in.</p>
+<p id="ix-2">There are four places in HarfBuzz that insert one. They were written at different times, for different shapers, and they differ in when they run, in what they test, in what they give the circle, and in whether they check that the font has one at all. The script chapters met each of them in passing. This chapter puts them side by side.</p>
+<p id="ix-3">The examples use three small test fonts, built from <code>fonts/dotted-circles-and-broken-clusters/circles.fea</code>. Their glyphs are boxes: a Latin <em>a</em> and a combining acute, and a few Devanagari, Khmer, Myanmar and Brahmi letters and vowel signs. <code>circle.ttf</code> has a dotted circle, a GDEF table and a <code>mark</code> feature that attaches the acute and Devanagari vowel sign U to a base, the dotted circle among them. <code>no-circle.ttf</code> is the same font with U+25CC left out of its <code>cmap</code> (the glyph is still there, but no character reaches it). <code>bare.ttf</code> is <code>circle.ttf</code> without GDEF and GPOS. A few examples borrow fonts from the script chapters. Every result on this page was produced by HarfBuzz 15.1.0 when the page was built.</p>
+<h2 id="four-paths">Four paths</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Function</th>
+<th>When</th>
+<th>Shapers</th>
+<th>When it inserts</th>
+<th>Checks the font</th>
+<th>What it inserts</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td id="ix-4"><code>hb_insert_dotted_circle</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L552"><code>hb-ot-shape.cc:552</code></a>)</td>
+<td>step 3, before <code>preprocess_text</code></td>
+<td>all</td>
+<td>a mark at the start of a paragraph</td>
+<td>yes</td>
+<td id="ix-5">the character, with U+25CC’s own properties</td>
+</tr>
+<tr>
+<td>2</td>
+<td id="ix-6"><code>_hb_preprocess_text_vowel_constraints</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-vowel-constraints.cc#L37"><code>hb-ot-shaper-vowel-constraints.cc:37</code></a>)</td>
+<td><code>preprocess_text</code></td>
+<td id="ix-7">Indic, USE</td>
+<td id="ix-8">inside a listed sequence of characters</td>
+<td>no</td>
+<td id="ix-9">the character, copying the next character’s properties</td>
+</tr>
+<tr>
+<td>3</td>
+<td id="ix-10"><code>preprocess_text_hangul</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-hangul.cc#L232"><code>hb-ot-shaper-hangul.cc:232</code></a>)</td>
+<td><code>preprocess_text</code></td>
+<td>Hangul</td>
+<td id="ix-11">a tone mark with no syllable</td>
+<td>yes</td>
+<td id="ix-12">the character, copying the tone mark’s properties</td>
+</tr>
+<tr>
+<td>4</td>
+<td id="ix-13"><code>hb_syllabic_insert_dotted_circles</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-syllabic.cc#L33"><code>hb-ot-shaper-syllabic.cc:33</code></a>)</td>
+<td id="ix-14">in GSUB, at the first reordering pause</td>
+<td id="ix-15">Indic, Khmer, Myanmar, USE</td>
+<td id="ix-16">a broken cluster</td>
+<td>yes</td>
+<td id="ix-17">the glyph, with a category of the shaper’s</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/74fc8c86c594ec594904fde28b548f5fc6ef2384"><code>74fc8c8</code></a> and <a href="https://github.com/harfbuzz/harfbuzz/commit/2831a8a45c77c180373987312958d31b3575a72c"><code>2831a8a</code></a> (17 November 2026), so on main paths 2 and 3 also give the circle U+25CC’s own properties (the last column of rows 2 and 3).</p>
+</blockquote>
+<p>So the vowel constraints are not a fifth way, beside four others: they are one of the four. No other code in 15.1.0 inserts U+25CC. <code>NEWS</code> first mentions them in 0.9.4: “Implement dotted-circle insertion.”</p>
+<p id="ix-18">All four obey the buffer flag <code>HB_BUFFER_FLAG_DO_NOT_INSERT_DOTTED_CIRCLE</code>, new in 2.4.0, which turns them all off. <code>hb-shape</code> has no option for it. The order in the table is the order they run in, and an earlier one can settle a case before a later one sees it: a circle inserted at step 3 is a base by the time the syllable grammars run, so it leaves nothing broken.</p>
+<h2 id="at-the-start-of-a-paragraph">At the start of a paragraph</h2>
+<p id="ix-19">The first path is the only one outside the script shapers, and the strictest about when it applies. Here it is whole (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L552"><code>hb-ot-shape.cc:552</code></a>):</p>
+<pre><code class="language-c++">static void
+hb_insert_dotted_circle (hb_buffer_t *buffer, hb_font_t *font)
+{
+  if (unlikely (buffer-&gt;flags &amp; HB_BUFFER_FLAG_DO_NOT_INSERT_DOTTED_CIRCLE))
+    return;
+
+  if (!(buffer-&gt;flags &amp; HB_BUFFER_FLAG_BOT) ||
+      buffer-&gt;context_len[0] ||
+      !_hb_glyph_info_is_unicode_mark (&amp;buffer-&gt;info[0]))
+    return;
+
+  if (!font-&gt;has_glyph (0x25CCu))
+    return;
+
+  hb_glyph_info_t dottedcircle = {0};
+  dottedcircle.codepoint = 0x25CCu;
+  _hb_glyph_info_set_unicode_props (&amp;dottedcircle, buffer);
+
+  buffer-&gt;clear_output ();
+
+  buffer-&gt;idx = 0;
+  hb_glyph_info_t info = dottedcircle;
+  info.cluster = buffer-&gt;cur().cluster;
+  info.mask = buffer-&gt;cur().mask;
+  (void) buffer-&gt;output_info (info);
+
+  buffer-&gt;sync ();
+}
+</code></pre>
+<p id="ix-20">Four conditions: the buffer must be marked as the beginning of a paragraph (<code>BOT</code>), it must have no pre-context, its first character must be a mark (any general category M), and the font must map U+25CC. <a href="buffers.html#buffer-flags">Buffers</a> explains why <code>BOT</code> is needed and why pre-context overrides it. What goes in is the character U+25CC, before normalization has mapped anything to glyphs, with its own Unicode properties, and with the first character’s cluster and mask:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">◌́</span><span class="cps">U+0301</span></td><td class="opt">--bot</td><td class="out"><code>[dottedcircle=0+500|acutecomb=0@-250,0+0]</code></td></tr><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">◌́</span><span class="cps">U+0301</span></td><td class="opt"></td><td class="out"><code>[acutecomb=0+0]</code></td></tr><tr><td class="font">no-circle.ttf</td><td class="in"><span class="txt">◌́</span><span class="cps">U+0301</span></td><td class="opt">--bot</td><td class="out"><code>[acutecomb=0+0]</code></td></tr><tr><td class="font">bare.ttf</td><td class="in"><span class="txt">◌́</span><span class="cps">U+0301</span></td><td class="opt">--bot</td><td class="out"><code>[dottedcircle=0+500|acutecomb=0@-350,562+0]</code></td></tr></tbody></table></div>
+<p id="ix-21">The circle is an ordinary character from here on. In <code>circle.ttf</code>, the font’s GPOS attaches the acute to it. In <code>bare.ttf</code> there is no GPOS, and <a href="fallbacks.html#placing-marks">the fallback positioner</a> places the acute over the circle as over any base, because the circle’s general category, So, makes it one. Only the first character is looked at: a mark later in the text, after a space say, gets nothing from this path.</p>
+<p id="ix-22">“A mark” is read from the general category alone, so it includes the variation selectors and COMBINING GRAPHEME JOINER, which are default ignorables:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">︀</span><span class="cps">U+FE00</span></td><td class="opt">--bot</td><td class="out"><code>[dottedcircle=0+500|space=0+0]</code></td></tr><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">◌͏</span><span class="cps">U+034F</span></td><td class="opt">--bot</td><td class="out"><code>[dottedcircle=0+500|space=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-23">The selector is then hidden, as default ignorables are, and leaves a visible circle with nothing on it. A paragraph rarely starts with one, but an application that sets <code>BOT</code> on every run of a paragraph and gives no pre-context would get it at the start of every run (inferred from the code).</p>
+<p id="ix-24">This path runs for every script and every shaper, including <code>dumber</code>, which a font with <code>morx</code> gets (<a href="choosing-a-script-shaper.html#aat-fonts">Choosing a script shaper</a>), and the default shaper that Devanagari falls back to in a font with only <code>DFLT</code> or <code>latn</code> lookups. In the syllabic shapers it comes first. A vowel sign at the start of a paragraph already has its circle when the Indic shaper looks for broken clusters:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape circle.ttf "ि" --language=hi --bot --trace</code></div><table><tbody><tr><td class="what">start preprocess-text</td><td class="buf"><code>&lt;U+25CC=0|U+093F=0&gt;</code></td></tr><tr><td class="what">end preprocess-text</td><td class="buf"><code>&lt;U+25CC=0|U+093F=0&gt;</code></td></tr><tr><td class="what">start decompose</td><td class="buf"><code>&lt;U+25CC=0|U+093F=0&gt;</code></td></tr><tr><td class="what">end decompose</td><td class="buf"><code>&lt;U+25CC=0|U+093F=0&gt;</code></td></tr><tr><td class="what">start reorder</td><td class="buf"><code>&lt;U+25CC=0|U+093F=0&gt;</code></td></tr><tr><td class="what">end reorder</td><td class="buf"><code>&lt;U+25CC=0|U+093F=0&gt;</code></td></tr><tr><td class="what">start compose</td><td class="buf"><code>&lt;U+25CC=0|U+093F=0&gt;</code></td></tr><tr><td class="what">end compose</td><td class="buf"><code>&lt;U+25CC=0|U+093F=0&gt;</code></td></tr><tr><td class="what">start table GSUB script tag &#x27;dev2&#x27;</td><td class="buf"><code>[dottedcircle=0|iMatra=0]</code></td></tr><tr><td class="what">start reordering indic initial</td><td class="buf"><code>[dottedcircle=0|iMatra=0]</code></td></tr><tr><td class="what">skipped inserting dotted-circles because there is no broken syllables</td><td class="buf"><code>[dottedcircle=0|iMatra=0]</code></td></tr><tr><td class="what">end reordering indic initial</td><td class="buf"><code>[iMatra=0|dottedcircle=0]</code></td></tr></tbody></table></div>
+<p id="ix-25">The circle is there in the first line, before any of the shaper’s steps; the Indic grammar sees a dotted circle and a vowel sign, a standalone cluster, and its own insertion finds “no broken syllables”.</p>
+<h2 id="broken-clusters">Broken clusters</h2>
+<p id="ix-26">The four syllabic shapers each divide the text into syllables with a grammar, as <a href="indic-model.html#finding-syllables">the Indic model</a>, <a href="khmer-and-myanmar.html">Khmer and Myanmar</a> and <a href="universal-shaping-engine.html">the Universal Shaping Engine</a> describe. Each grammar has a catch-all for marks with no base: a <strong>broken cluster</strong>, a syllable made of what may follow a base, with no base before it. Indic’s is <code>reph? n? complex_syllable_tail</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic-machine.rl#L107"><code>hb-ot-shaper-indic-machine.rl:107</code></a>), Khmer’s <code>Robatic? (H.cn)* (H | syllable_tail)</code>, Myanmar’s <code>k? VS? syllable_tail</code>, and USE’s a tail with an optional leading repha. A lone vowel sign is one in all four. When the scanner finds one, it also sets a buffer scratch flag, <code>HB_BUFFER_SCRATCH_FLAG_HAS_BROKEN_SYLLABLE</code>, so a buffer with none can skip the next step at once.</p>
+<p id="ix-27">Which sequences count as broken is the grammars’ business, and it changes with them. <code>NEWS</code> for 10.2.0, for instance, says “Don’t insert U+25CC DOTTED CIRCLE before superscript/subscript digits”.</p>
+<h3 id="where-the-circle-goes">Where the circle goes</h3>
+<p id="ix-28">Each shaper calls the same function at the start of its reordering, in the GSUB pause after its first features: Indic in <code>initial_reordering_indic</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc#L983"><code>hb-ot-shaper-indic.cc:983</code></a>), Khmer in <code>reorder_khmer</code> (<code>:309</code>), Myanmar in <code>reorder_myanmar</code> (<code>:330</code>) and USE in <code>reorder_use</code> (<code>:455</code>). Trimmed, it is (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-syllabic.cc#L33"><code>hb-ot-shaper-syllabic.cc:33</code></a>):</p>
+<pre><code class="language-c++">  if (unlikely (buffer-&gt;flags &amp; HB_BUFFER_FLAG_DO_NOT_INSERT_DOTTED_CIRCLE))
+    return false;
+  if (likely (!(buffer-&gt;scratch_flags &amp; HB_BUFFER_SCRATCH_FLAG_HAS_BROKEN_SYLLABLE)))
+    return false;
+
+  hb_codepoint_t dottedcircle_glyph;
+  if (!font-&gt;get_nominal_glyph (0x25CCu, &amp;dottedcircle_glyph))
+    return false;
+
+  hb_glyph_info_t dottedcircle = {0};
+  dottedcircle.ot_shaper_var_u8_category() = dottedcircle_category;
+  if (dottedcircle_position != -1)
+    dottedcircle.ot_shaper_var_u8_auxiliary() = dottedcircle_position;
+  dottedcircle.codepoint = dottedcircle_glyph;
+
+  buffer-&gt;clear_output ();
+  buffer-&gt;idx = 0;
+  unsigned int last_syllable = 0;
+  while (buffer-&gt;idx &lt; buffer-&gt;len &amp;&amp; buffer-&gt;successful)
+  {
+    unsigned int syllable = buffer-&gt;cur().syllable();
+    if (unlikely (last_syllable != syllable &amp;&amp; (syllable &amp; 0x0F) == broken_syllable_type))
+    {
+      last_syllable = syllable;
+
+      hb_glyph_info_t ginfo = dottedcircle;
+      ginfo.cluster = buffer-&gt;cur().cluster;
+      ginfo.mask = buffer-&gt;cur().mask;
+      ginfo.syllable() = buffer-&gt;cur().syllable();
+
+      /* Insert dottedcircle after possible Repha. */
+      if (repha_category != -1)
+      {
+	while (buffer-&gt;idx &lt; buffer-&gt;len &amp;&amp; buffer-&gt;successful &amp;&amp;
+	       last_syllable == buffer-&gt;cur().syllable() &amp;&amp;
+	       buffer-&gt;cur().ot_shaper_var_u8_category() == (unsigned) repha_category)
+	  (void) buffer-&gt;next_glyph ();
+      }
+
+      (void) buffer-&gt;output_info (ginfo);
+    }
+    else
+      (void) buffer-&gt;next_glyph ();
+  }
+  buffer-&gt;sync ();
+</code></pre>
+<p>It walks the buffer once and puts one circle at the start of each broken syllable, recognized by the low four bits of its <code>syllable</code> byte. The four shapers differ only in the arguments:</p>
+<table>
+<thead>
+<tr>
+<th>Shaper</th>
+<th>Broken type</th>
+<th id="ix-29">Circle’s category</th>
+<th>Skipped first</th>
+<th id="ix-30">Position</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Indic</td>
+<td><code>indic_broken_cluster</code></td>
+<td><code>DOTTEDCIRCLE</code></td>
+<td><code>Repha</code></td>
+<td><code>POS_END</code></td>
+</tr>
+<tr>
+<td>Khmer</td>
+<td><code>khmer_broken_cluster</code></td>
+<td><code>DOTTEDCIRCLE</code></td>
+<td>nothing</td>
+<td>none</td>
+</tr>
+<tr>
+<td>Myanmar</td>
+<td><code>myanmar_broken_cluster</code></td>
+<td><code>DOTTEDCIRCLE</code></td>
+<td>nothing</td>
+<td>none</td>
+</tr>
+<tr>
+<td id="ix-31">USE</td>
+<td><code>use_broken_cluster</code></td>
+<td><code>B</code></td>
+<td><code>R</code></td>
+<td>none</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-32">The category is the one a typed U+25CC gets from the shaper’s table, a base in every case, so once the circle is in, the broken cluster is reordered like any other syllable with a base. In the Indic shaper it goes through the code for standalone clusters (<code>:962</code>, “We already inserted dotted-circles, so just call the standalone_cluster”), and the circle becomes the base. The Indic position <code>POS_END</code> differs from the <code>POS_BASE_C</code> a typed circle has, but the base search sets the base’s position to <code>POS_BASE_C</code> anyway (<code>:635</code>).</p>
+<p id="ix-33">One lone vowel sign in each script, with and without a circle in the font:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">ि</span><span class="cps">U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra=0+250|dottedcircle=0+500]</code></td></tr><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">ា</span><span class="cps">U+17B6</span></td><td class="opt">--language=km</td><td class="out"><code>[dottedcircle=0+500|aa.khmr=0+300]</code></td></tr><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">ိ</span><span class="cps">U+102D</span></td><td class="opt">--language=my</td><td class="out"><code>[dottedcircle=0+500|i.mymr=0+0]</code></td></tr><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">𑀸</span><span class="cps">U+11038</span></td><td class="opt">--language=sa</td><td class="out"><code>[dottedcircle=0+500|aa.brah=0+0]</code></td></tr><tr><td class="font">no-circle.ttf</td><td class="in"><span class="txt">ि</span><span class="cps">U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra=0+250]</code></td></tr><tr><td class="font">no-circle.ttf</td><td class="in"><span class="txt">ា</span><span class="cps">U+17B6</span></td><td class="opt">--language=km</td><td class="out"><code>[aa.khmr=0+300]</code></td></tr><tr><td class="font">no-circle.ttf</td><td class="in"><span class="txt">ိ</span><span class="cps">U+102D</span></td><td class="opt">--language=my</td><td class="out"><code>[i.mymr=0+0]</code></td></tr><tr><td class="font">no-circle.ttf</td><td class="in"><span class="txt">𑀸</span><span class="cps">U+11038</span></td><td class="opt">--language=sa</td><td class="out"><code>[aa.brah=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-34">Devanagari vowel sign I is a pre-base sign, and the reordering moves it before the circle, as it would before a consonant. Without a circle in the font, nothing is inserted, and the broken cluster is reordered without a base. The trace of the first line shows the step:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape circle.ttf "ि" --language=hi --trace</code></div><table><tbody><tr><td class="what">start reordering indic initial</td><td class="buf"><code>[iMatra=0]</code></td></tr><tr><td class="what">start inserting dotted-circles</td><td class="buf"><code>[iMatra=0]</code></td></tr><tr><td class="what">end inserting dotted-circles</td><td class="buf"><code>[dottedcircle=0|iMatra=0]</code></td></tr><tr><td class="what">end reordering indic initial</td><td class="buf"><code>[iMatra=0|dottedcircle=0]</code></td></tr></tbody></table></div>
+<h3 id="after-the-repha">After the repha</h3>
+<p id="ix-35">A circle goes after any glyphs at the start of the syllable that have the shaper’s repha category: <code>Repha</code> in the Indic shaper, <code>R</code> in USE. Both are categories of characters, not of sequences. In the Indic table one character has <code>Repha</code>, U+0D4E MALAYALAM LETTER DOT REPH (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic-table.cc#L96"><code>hb-ot-shaper-indic-table.cc:96</code></a>); in USE, <code>R</code> is given to characters whose Indic syllabic category is <code>Consonant_Preceding_Repha</code> or <code>Consonant_Prefixed</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-use-table.py#L282"><code>gen-use-table.py:282</code></a>). With the Malayalam glyphs of <a href="indic-model.html">the Indic model</a>’s <code>scripts.ttf</code>, the dot reph is passed over, and then moved after its new base:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">indic-model/scripts.ttf</td><td class="in"><span class="txt">ൎാ</span><span class="cps">U+0D4E U+0D3E</span></td><td class="opt">--language=ml</td><td class="out"><code>[dottedcircle=0+500|ml.dotReph=0+0|ml.aaMatra=0+300]</code></td></tr><tr><td class="font">indic-model/scripts.ttf</td><td class="in"><span class="txt">ൎാ</span><span class="cps">U+0D4E U+0D3E</span></td><td class="opt">--language=ml --cluster-level=1</td><td class="out"><code>[dottedcircle=0+500|ml.dotReph=0+0|ml.aaMatra=1+300]</code></td></tr></tbody></table></div>
+<p id="ix-36">The reph that RA and a virama make is not a character, and the insertion doesn’t pass over it, though the Indic grammar puts it in the broken cluster (<code>reph?</code>). So RA, virama and a vowel sign get their circle before the RA. The circle becomes the base, the RA a consonant after it, and the reph is never made: the Indic shaper makes one only of RA + virama at the start of a syllable. A circle typed in the same place gives a reph on the circle:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">र्ु</span><span class="cps">U+0930 U+094D U+0941</span></td><td class="opt">--language=hi</td><td class="out"><code>[dottedcircle=0+500|ra=0+500|virama=0+0|uMatra=0+0]</code></td></tr><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">र्◌ु</span><span class="cps">U+0930 U+094D U+25CC U+0941</span></td><td class="opt">--language=hi</td><td class="out"><code>[dottedcircle=0+500|uMatra=0@-200,-100+0|reph=0+0]</code></td></tr><tr><td class="font">universal-shaping-engine/deva3.ttf</td><td class="in"><span class="txt">र्ु</span><span class="cps">U+0930 U+094D U+0941</span></td><td class="opt">--language=hi</td><td class="out"><code>[reph=0+0|dottedcircle=0+500|uMatra=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-37">The first line shows RA with a visible virama after the circle, where the second has the reph; it looks like a bug (the comment “Insert dottedcircle after possible Repha” suggests the reph was meant to be kept). When the circle comes in before the shaper looks, from the vowel constraints below, the reph does form on it, and HarfBuzz’s own test, <code>indic-vowel-letter-spoofing.tests</code>, expects exactly that for RA, virama and LETTER I. The third line is USE, under <code>dev3</code>, where RA + virama is a syllable of its own, a virama-terminated cluster, so the vowel sign after it is broken by itself and the reph, formed in the first syllable, stays before the circle.</p>
+<h3 id="clusters">Clusters</h3>
+<p id="ix-38">The circle takes the cluster and the mask of the first glyph of the syllable, even when it goes in after a repha, as the second Malayalam line shows: the circle is in cluster 0 with the dot reph, not cluster 1 with the vowel sign. After a space, a vowel sign is a broken cluster in the Indic shaper (USE, as <a href="universal-shaping-engine.html#spaces-as-bases">Spaces as bases</a> shows, lets it sit on the space):</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">क␣ि</span><span class="cps">U+0915 U+0020 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|space=1+250|iMatra=1+250|dottedcircle=1+500]</code></td></tr><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">क␣ि</span><span class="cps">U+0915 U+0020 U+093F</span></td><td class="opt">--language=hi --cluster-level=1</td><td class="out"><code>[ka=0+600|space=1+250|iMatra=2+250|dottedcircle=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-39">At the default cluster level, the vowel sign was already merged into the space’s cluster at step 4 (<a href="pipeline-step-by-step.html#properties-and-clusters">The pipeline, step by step</a>), because a mark continues the grapheme before it, so the circle gets cluster 1. At level 1 nothing was merged, and it gets the vowel sign’s cluster, 2.</p>
+<h3 id="what-the-circle-is-to-gdef">What the circle is to GDEF</h3>
+<p id="ix-40">The circle goes in as a glyph ID, after GSUB has begun, so it misses two things every other glyph got. Its Unicode properties are all zero, which reads as general category Cc, a control character, with combining class 0. And its glyph properties are zero, because GDEF classes, or synthesized classes in a font without GDEF, were given out at the start of GSUB (<code>hb_ot_layout_substitute_start</code>, and <code>hb_synthesize_glyph_classes</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L856"><code>hb-ot-shape.cc:856</code></a>), before the pause. So the inserted circle is neither a base nor a mark to HarfBuzz, whatever the font’s GDEF says about the dotted circle glyph, until a substitution replaces it.</p>
+<p id="ix-41">That mostly doesn’t matter. GPOS mark attachment looks back for the nearest glyph that isn’t a mark (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/MarkBasePosFormat1.hh#L105"><code>MarkBasePosFormat1.hh:105</code></a>), and the circle isn’t one, so a mark attaches to it as to a typed circle. The syllabic shapers have no fallback positioning, so without GPOS a mark is left where it is:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">ु</span><span class="cps">U+0941</span></td><td class="opt">--language=hi</td><td class="out"><code>[dottedcircle=0+500|uMatra=0@-200,-100+0]</code></td></tr><tr><td class="font">bare.ttf</td><td class="in"><span class="txt">ु</span><span class="cps">U+0941</span></td><td class="opt">--language=hi</td><td class="out"><code>[dottedcircle=0+500|uMatra=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-42">Where it would matter is a lookup flag that skips base glyphs: such a lookup skips a typed circle the font classes as a base, but not an inserted one (inferred from the code; not shown).</p>
+<h3 id="the-pre-context-isnt-consulted">The pre-context isn’t consulted</h3>
+<p id="ix-43">The grammars run over the buffer only. A vowel sign at the start of a run is a broken cluster even when the pre-context ends in a consonant it belongs to:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">ि</span><span class="cps">U+093F</span></td><td class="opt">--language=hi --text-before=क</td><td class="out"><code>[iMatra=0+250|dottedcircle=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-44">The first path checks for pre-context, and this one doesn’t. So an application that splits a syllable between two runs, for a change of font or style, gets a dotted circle at the split, whatever context it passes.</p>
+<h2 id="hanguls-tone-marks">Hangul’s tone marks</h2>
+<p id="ix-45">The Hangul shaper does its own composition in <code>preprocess_text</code>, and there it gives a dotted circle to a tone mark that doesn’t follow a syllable, if the flag allows and the font has U+25CC (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-hangul.cc#L232"><code>hb-ot-shaper-hangul.cc:232</code></a>). A tone mark with an advance goes before the circle, a zero-width one after it:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hebrew-thai-lao-and-hangul/hangul.ttf</td><td class="in"><span class="txt">〮</span><span class="cps">U+302E</span></td><td class="opt">--language=ko</td><td class="out"><code>[singledot=0+200|dottedcircle=0+500]</code></td></tr><tr><td class="font">hebrew-thai-lao-and-hangul/hangul.ttf</td><td class="in"><span class="txt">〮</span><span class="cps">U+302E</span></td><td class="opt">--language=ko --text-before=가</td><td class="out"><code>[singledot=0+200|dottedcircle=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-46">It doesn’t look at the pre-context either. <a href="hebrew-thai-lao-and-hangul.html#tone-marks">Tone marks</a> shows the rest: the circle is made with <code>replace_glyphs</code>, which copies the tone mark’s entry, so the circle has the tone mark’s properties, a spacing mark, and after a lone jamo the fallback positioner treats it as one; and with <code>BOT</code>, path 1 has already put a circle before the tone mark, which to this shaper isn’t a syllable, so the text gets two.</p>
+<blockquote>
+<p id="ix-47">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/2831a8a45c77c180373987312958d31b3575a72c"><code>2831a8a</code></a> and <a href="https://github.com/harfbuzz/harfbuzz/commit/59fa8f0c28df047b6786a60febf2c8b53a694e05"><code>59fa8f0</code></a> (17 November 2026), so main gives the circle U+25CC’s own properties, and with <code>BOT</code> uses the circle path 1 inserted as the tone mark’s base, so there is one.</p>
+</blockquote>
+<h2 id="vowel-constraints">Vowel constraints</h2>
+<p id="ix-48">Some scripts can write the same vowel in two ways that look alike. In Devanagari, LETTER A with VOWEL SIGN AA looks like LETTER AA, but it isn’t LETTER AA to a search, a sort or a spelling checker, and HarfBuzz’s tests of it are called “vowel letter spoofing”. Microsoft lists such sequences as invalid clusters, and HarfBuzz shows a dotted circle inside them, since issue #1019, in what the code calls an “UGLY UGLY UGLY business of adding dotted-circle in the middle of vowel-sequences that look like another vowel”.</p>
+<h3 id="the-data">The data</h3>
+<p id="ix-49">The list is Microsoft’s: <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/ms-use/IndicShapingInvalidCluster.txt"><code>src/ms-use/IndicShapingInvalidCluster.txt</code></a>, whose header gives the dates 2015-03-12 and 2019-11-08 and which defines one property, <code>Indic_Shaping_Invalid_Cluster</code>: “sequences of characters that should be treated as invalid clusters”. It has 103 sequences in 16 scripts: Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala, Brahmi, Khojki, Khudawadi, Tirhuta, Modi and Takri. Most are an independent vowel followed by a vowel sign, but not all:</p>
+<table>
+<thead>
+<tr>
+<th>Sequence</th>
+<th>Kind</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>U+0905 U+093E, DEVANAGARI LETTER A + VOWEL SIGN AA</td>
+<td>independent vowel + vowel sign</td>
+</tr>
+<tr>
+<td>U+0930 U+094D U+0907, DEVANAGARI RA + VIRAMA + LETTER I</td>
+<td>a reph on an independent vowel</td>
+</tr>
+<tr>
+<td>U+0AC5 U+0ABE, GUJARATI VOWEL SIGN CANDRA E + VOWEL SIGN AA</td>
+<td>two vowel signs</td>
+</tr>
+<tr>
+<td>U+0C3F U+0C55, TELUGU VOWEL SIGN I + LENGTH MARK</td>
+<td>a vowel sign + a length mark</td>
+</tr>
+<tr>
+<td>U+0D91 U+0DCA, SINHALA LETTER EYANNA + AL-LAKUNA</td>
+<td>independent vowel + virama</td>
+</tr>
+<tr>
+<td>U+114AA U+114B5, TIRHUTA LETTER LA + VOWEL SIGN VOCALIC R</td>
+<td>consonant + vowel sign</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-50"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-vowel-constraints.py"><code>gen-vowel-constraints.py</code></a> turns the list into C++ (and, with <code>--rust</code>, into Rust for HarfRust). It reads <code>Scripts.txt</code> too, to find each sequence’s script from its first character (<code>:189</code>), because the generated function switches on the buffer’s script. It builds a tree of the sequences by their first characters (<code>ConstraintSet.add</code>, <code>:71</code>), and a sequence that begins with a shorter one is absorbed by it: Gujarati A + AA + CANDRA E is dropped, since A + AA already matches. The output, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-vowel-constraints.cc"><code>src/hb-ot-shaper-vowel-constraints.cc</code></a>, records the headers of both files it was made from; in 15.1.0, <code>Scripts-18.0.0.txt</code>.</p>
+<h3 id="the-code">The code</h3>
+<p id="ix-51">The function is the Indic and USE shapers’ <code>preprocess_text</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc#L1465"><code>hb-ot-shaper-indic.cc:1465</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use.cc#L474"><code>hb-ot-shaper-use.cc:474</code></a>), so it runs before normalization, on characters. Its Devanagari case begins (trimmed):</p>
+<pre><code class="language-c++">    case HB_SCRIPT_DEVANAGARI:
+      for (buffer-&gt;idx = 0; buffer-&gt;idx + 1 &lt; count &amp;&amp; buffer-&gt;successful;)
+      {
+	bool matched = false;
+	switch (buffer-&gt;cur ().codepoint)
+	{
+	  case 0x0905u:
+	    switch (buffer-&gt;cur (1).codepoint)
+	    {
+	      case 0x093Au: case 0x093Bu: case 0x093Eu: case 0x0945u:
+	      ...
+		matched = true;
+		break;
+	    }
+	    break;
+	  ...
+	  case 0x0930u:
+	    if (0x094Du == buffer-&gt;cur (1).codepoint &amp;&amp;
+		buffer-&gt;idx + 2 &lt; count &amp;&amp;
+		0x0907u == buffer-&gt;cur (2).codepoint)
+	    {
+	      (void) buffer-&gt;next_glyph ();
+	      matched = true;
+	    }
+	    break;
+	}
+	(void) buffer-&gt;next_glyph ();
+	if (matched) _output_with_dotted_circle (buffer);
+      }
+      break;
+</code></pre>
+<p id="ix-52">The circle goes before the last character of the sequence: between A and AA, and between the virama and I. <code>_output_with_dotted_circle</code> (<code>:31</code>) outputs U+25CC with <code>output_glyph</code>, then copies the next character. It checks the flag (<code>:45</code>), but nothing checks the font:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">अा</span><span class="cps">U+0905 U+093E</span></td><td class="opt">--language=hi</td><td class="out"><code>[a.deva=0+600|dottedcircle=0+500|aaMatra=0+250]</code></td></tr><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">अा</span><span class="cps">U+0905 U+093E</span></td><td class="opt">--language=hi --cluster-level=1</td><td class="out"><code>[a.deva=0+600|dottedcircle=1+500|aaMatra=1+250]</code></td></tr><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">र्इ</span><span class="cps">U+0930 U+094D U+0907</span></td><td class="opt">--language=hi</td><td class="out"><code>[dottedcircle=0+500|reph=0+0|i.deva=0+500]</code></td></tr><tr><td class="font">no-circle.ttf</td><td class="in"><span class="txt">अा</span><span class="cps">U+0905 U+093E</span></td><td class="opt">--language=hi</td><td class="out"><code>[a.deva=0+600|.notdef=0+500|aaMatra=0+250]</code></td></tr></tbody></table></div>
+<p id="ix-53">In a font without a dotted circle, the inserted U+25CC is mapped like any other character, to <code>.notdef</code>. The trace shows the character arriving inside <code>preprocess_text</code>:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape circle.ttf "अा" --language=hi --trace</code></div><table><tbody><tr><td class="what">start preprocess-text</td><td class="buf"><code>&lt;U+0905=0|U+093E=0&gt;</code></td></tr><tr><td class="what">end preprocess-text</td><td class="buf"><code>&lt;U+0905=0|U+25CC=0|U+093E=0&gt;</code></td></tr></tbody></table></div>
+<p id="ix-54">After RA + virama the circle is the base of a standalone cluster that begins with a reph, so the reph forms on it, as the test expects.</p>
+<h3 id="what-the-circle-is-given">What the circle is given</h3>
+<p id="ix-55"><code>output_glyph</code> makes the new entry by copying the current one, which is the character the circle goes before (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.hh#L313"><code>hb-buffer.hh:313</code></a>). So the circle gets that character’s cluster, mask and Unicode properties. <code>_output_dotted_circle</code> clears one of them, the continuation bit, so that the circle starts a grapheme of its own; the rest stay. At the default cluster level, step 4 had already merged the vowel sign into the cluster of the letter before it, so all three glyphs share cluster 0; at level 1 the circle has the vowel sign’s cluster, 1.</p>
+<p id="ix-56">The general category it keeps is the vowel sign’s, a mark. In a font with GDEF that is harmless, since GDEF gives the dotted circle glyph its class. In a font without GDEF, HarfBuzz synthesizes classes from the general category, so the circle becomes a mark, and USE, which zeroes marks by class before GPOS (<a href="fallbacks.html#zeroing-marks">Zeroing marks</a>), takes away its advance. Brahmi is shaped by USE:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">𑀅𑀸</span><span class="cps">U+11005 U+11038</span></td><td class="opt">--language=sa</td><td class="out"><code>[a.brah=0+600|dottedcircle=0+500|aa.brah=0+0]</code></td></tr><tr><td class="font">bare.ttf</td><td class="in"><span class="txt">𑀅𑀸</span><span class="cps">U+11005 U+11038</span></td><td class="opt">--language=sa</td><td class="out"><code>[a.brah=0+600|dottedcircle=0@-500,0+0|aa.brah=0+0]</code></td></tr><tr><td class="font">bare.ttf</td><td class="in"><span class="txt">𑀸</span><span class="cps">U+11038</span></td><td class="opt">--language=sa</td><td class="out"><code>[dottedcircle=0+500|aa.brah=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-57">In <code>bare.ttf</code> the circle has no advance and is moved back over the letter A, as a zeroed mark is; a lone vowel sign, which gets its circle from path 4, keeps the circle’s advance. A circle with the properties of U+25CC, as path 1 gives it, would avoid this; it looks like a bug.</p>
+<blockquote>
+<p id="ix-58">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/74fc8c86c594ec594904fde28b548f5fc6ef2384"><code>74fc8c8</code></a> (17 November 2026), so main gives the circle U+25CC’s own properties, and in <code>bare.ttf</code> it keeps its advance.</p>
+</blockquote>
+<h3 id="only-adjacent-characters">Only adjacent characters</h3>
+<p id="ix-59">The match is on characters next to each other in the buffer, so anything between them breaks it. A ZWJ, which the Indic grammar allows inside a syllable, hides the sequence; CGJ ends the syllable, so the vowel sign after it gets a circle from path 4 instead:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">अ⟨ZWJ⟩ा</span><span class="cps">U+0905 U+200D U+093E</span></td><td class="opt">--language=hi</td><td class="out"><code>[a.deva=0+600|space=0+0|aaMatra=0+250]</code></td></tr><tr><td class="font">circle.ttf</td><td class="in"><span class="txt">अ◌͏ा</span><span class="cps">U+0905 U+034F U+093E</span></td><td class="opt">--language=hi</td><td class="out"><code>[a.deva=0+600|space=0+0|dottedcircle=0+500|aaMatra=0+250]</code></td></tr></tbody></table></div>
+<p id="ix-60">The first line shows LETTER A and VOWEL SIGN AA together with no circle, which is what the constraint exists to prevent. The same goes for a sequence split between runs: the function doesn’t look at the pre-context, though there, path 4 catches the vowel sign as a broken cluster.</p>
+<blockquote>
+<p id="ix-61">For type designers: give the font a dotted circle, mapped to U+25CC and classed as a base in GDEF, with the anchors of a base for every mark class. Three of the four paths do nothing without it, and the fourth puts <code>.notdef</code> in its place. Expect the inserted circle in places a typed one would be, and test the shaping of lone vowel signs as well as complete syllables.</p>
+</blockquote>
+<blockquote>
+<p id="ix-62">For programmers: set <code>BOT</code> on the first run of a paragraph and pass the text before every other run as pre-context: path 1 depends on both. The syllabic and Hangul paths don’t read context, so don’t split a syllable between runs. To show text exactly as typed, with no circles, set <code>HB_BUFFER_FLAG_DO_NOT_INSERT_DOTTED_CIRCLE</code>.</p>
+</blockquote>
+<h2 id="configuration">Configuration</h2>
+<p id="ix-63"><code>HB_NO_OT_SHAPER_VOWEL_CONSTRAINTS</code> empties the vowel constraints: the function returns at once (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-vowel-constraints.cc#L42"><code>hb-ot-shaper-vowel-constraints.cc:42</code></a>). It is implied by <code>HB_NO_OT_SHAPE_FALLBACK</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh#L174"><code>hb-config.hh:174</code></a>), which <code>HB_NO_LEGACY</code> implies (<code>:156</code>). The other three paths have no macro of their own; they go with the <code>ot</code> shaper (<code>HB_NO_OT_SHAPE</code> leaves out <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-syllabic.cc"><code>hb-ot-shaper-syllabic.cc</code></a>).</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>src/hb-ot-shape.cc</code></a></td>
+<td><code>hb_insert_dotted_circle</code>, and where it is called, step 3 of <code>hb_ot_shape_internal</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-syllabic.cc"><code>src/hb-ot-shaper-syllabic.cc</code></a></td>
+<td><code>hb_syllabic_insert_dotted_circles</code>, shared by the four syllabic shapers</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc"><code>src/hb-ot-shaper-indic.cc</code></a>, <code>-khmer.cc</code>, <code>-myanmar.cc</code>, <code>-use.cc</code></td>
+<td>the calls, at the start of each shaper’s reordering, with its arguments</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-ot-shaper-*-machine.rl</code></a></td>
+<td>the grammars, and their <code>broken_cluster</code> rules</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-hangul.cc"><code>src/hb-ot-shaper-hangul.cc</code></a></td>
+<td>the tone-mark circle, in <code>preprocess_text_hangul</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-vowel-constraints.cc"><code>src/hb-ot-shaper-vowel-constraints.cc</code></a></td>
+<td>the vowel constraints (generated)</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-vowel-constraints.py"><code>src/gen-vowel-constraints.py</code></a></td>
+<td>its generator</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/ms-use/IndicShapingInvalidCluster.txt"><code>src/ms-use/IndicShapingInvalidCluster.txt</code></a></td>
+<td>Microsoft’s list of invalid sequences</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.h"><code>src/hb-buffer.h</code></a></td>
+<td><code>HB_BUFFER_FLAG_DO_NOT_INSERT_DOTTED_CIRCLE</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/shape/data/in-house/tests/indic-vowel-letter-spoofing.tests"><code>test/shape/data/in-house/tests/indic-vowel-letter-spoofing.tests</code></a>, <code>use-vowel-letter-spoofing.tests</code></td>
+<td>HarfBuzz’s tests of the vowel constraints</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Four functions insert U+25CC DOTTED CIRCLE: one at the start of a paragraph, for every shaper; the vowel constraints, for Indic and USE; the Hangul shaper’s, for tone marks; and one for broken clusters, shared by Indic, Khmer, Myanmar and USE. One buffer flag turns them all off.</li>
+<li>The first needs <code>BOT</code>, no pre-context and a leading mark, and runs before the others, so its circle leaves nothing broken. It inserts the character, with U+25CC’s own properties.</li>
+<li>A broken cluster is a syllable with no base. Its circle goes in at the syllable’s start, after a repha character but not after RA + virama, as a glyph with the shaper’s base category, the syllable’s first cluster, and no Unicode or GDEF properties.</li>
+<li>The vowel constraints are Microsoft’s 103 sequences in 16 scripts, generated into code. They insert the character without checking the font, so a font without a dotted circle gets <code>.notdef</code>, and the circle copies the properties of the vowel sign after it, so in a font without GDEF, USE zeroes it.</li>
+<li>Only the first path reads the pre-context. A syllable split between runs gets a circle at the split.</li>
+</ul>
+<blockquote>
+<p>Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/74fc8c86c594ec594904fde28b548f5fc6ef2384"><code>74fc8c8</code></a> (17 November 2026), so main gives the vowel constraints’ circle U+25CC’s own properties (the item on the vowel constraints).</p>
+</blockquote>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="universal-shaping-engine.html">← The Universal Shaping Engine</a><a rel="next" href="aat-inside-harfbuzz.html">AAT inside HarfBuzz →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

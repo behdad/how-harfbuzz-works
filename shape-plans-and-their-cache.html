@@ -1,0 +1,817 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Shape plans and their cache · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part IV · Planning</p>
+<h1 id="shape-plans-and-their-cache">13. Shape plans and their cache</h1>
+<p id="ix-1">Before HarfBuzz can shape a run of text, it has to decide a great deal about it: which script shaper handles it, which of the font’s scripts and language systems to use, which features are on, which lookups those features use and in what order, and which bits of each glyph’s mask belong to which feature. None of that depends on the text itself. It depends on the face, the run’s segment properties, the features the application asked for and, for a variable font, where in the design space the font is. So HarfBuzz works it out once, keeps the result as a <strong>shape plan</strong>, and reuses the plan for every run that would come to the same answers.</p>
+<p id="ix-2">This chapter is about the plan as an object and about its cache: what a plan holds, what the cache compares to decide that two runs can share one, and what it deliberately leaves out. The two things it leaves out that matter most are the variation coordinates and the ranges of features. How the features become lookups is the subject of the <a href="from-features-to-lookups.html">next chapter</a>, and how the script shaper is chosen is the one after that, <a href="choosing-a-script-shaper.html">Choosing a script shaper</a>.</p>
+<p id="ix-3">The examples use one small test font, <code>featvar.ttf</code>, built by <code>fonts/shape-plans-and-their-cache/build-fonts.py</code> from the variable font that <a href="design-space.html">Design space</a> introduced. Its only feature is <code>rvrn</code>, and its FeatureVariations table swaps <code>I</code> for another glyph in two ranges of weight. The GSUB test font, <code>gsub/ligatures.ttf</code>, appears too. Every result and trace on this page was produced by running HarfBuzz 15.1.0 when the page was built.</p>
+<h2 id="what-a-plan-is">What a plan is</h2>
+<p id="ix-4">The struct is short (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.hh#L71"><code>hb-shape-plan.hh:71</code></a>):</p>
+<pre><code class="language-c++">struct hb_shape_plan_t
+{
+  hb_object_header_t header;
+  hb_face_t *face_unsafe; /* We don't carry a reference to face. */
+  hb_shape_plan_key_t key;
+#ifndef HB_NO_OT_SHAPE
+  hb_ot_shape_plan_t ot;
+#endif
+#ifdef HAVE_HARFRUST
+  hb_atomic_t&lt;void *&gt; harfrust_data;
+#endif
+};
+</code></pre>
+<p id="ix-5">A plan belongs to a face, not to a font. Every font made from the face can use it, whatever its size, its font functions or its synthetic emboldening. The plan points at its face but doesn’t hold a reference to it, as the comment says. The face holds the plans in its cache, and a reference each way would keep both alive for ever (inferred).</p>
+<p id="ix-6">The <strong>key</strong> is what the plan was made for, and what the cache compares. The rest is what was made. The <code>ot</code> part is the compiled result for the <code>ot</code> backend, and it is built for every plan, whichever backend the key names (<a href="hb_shape-and-its-backends.html#ot">hb_shape and its backends</a> explains why that matters for Graphite). <code>harfrust_data</code> exists only in builds with the HarfRust backend, which keeps HarfRust’s own plan there. Other backends can attach data with <code>hb_shape_plan_set_user_data</code>, as <code>kbts</code> does (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-kbts.cc#L107"><code>hb-kbts.cc:107</code></a>).</p>
+<h3 id="the-ot-part">The <code>ot</code> part</h3>
+<p id="ix-7"><code>hb_ot_shape_plan_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.hh#L107"><code>hb-ot-shape.hh:107</code></a>) is everything the <code>ot</code> pipeline needs to know before it sees any text:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>What it holds</th>
+<th>Explained in</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>props</code></td>
+<td id="ix-8">the segment properties the plan was made for</td>
+<td><a href="buffers.html">Buffers</a></td>
+</tr>
+<tr>
+<td><code>shaper</code></td>
+<td id="ix-9">the script shaper: default, Arabic, Indic, USE and the rest</td>
+<td id="ix-10"><a href="choosing-a-script-shaper.html">Choosing a script shaper</a></td>
+</tr>
+<tr>
+<td><code>map</code></td>
+<td id="ix-11">the chosen script and language tags; each feature’s mask bits and shift; the GSUB and GPOS lookups, in stages, with the mask and flags each runs with</td>
+<td id="ix-12"><a href="from-features-to-lookups.html">From features to lookups</a></td>
+</tr>
+<tr>
+<td><code>aat_map</code></td>
+<td id="ix-13">the same for <code>morx</code>, when it is used instead of GSUB</td>
+<td><a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></td>
+</tr>
+<tr>
+<td id="ix-14"><code>data</code></td>
+<td id="ix-15">the script shaper’s own plan data, if it has any</td>
+<td id="ix-16">the chapters on scripts</td>
+</tr>
+<tr>
+<td><code>frac_mask</code>, <code>numr_mask</code>, <code>dnom_mask</code>, <code>rtlm_mask</code>, <code>kern_mask</code></td>
+<td id="ix-17">the masks of features the pipeline treats specially</td>
+<td><a href="pipeline-step-by-step.html">The pipeline, step by step</a></td>
+</tr>
+<tr>
+<td><code>apply_gpos</code>, <code>apply_kern</code>, <code>apply_morx</code>, <code>zero_marks</code>, <code>fallback_mark_positioning</code> and other flags</td>
+<td id="ix-18">decisions about which tables and fallbacks to use</td>
+<td id="ix-19"><a href="fallbacks.html">Fallbacks</a>, <a href="legacy-kern.html">Legacy kern</a></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-20">Five script shapers keep <code>data</code>: Arabic, Hangul, Indic, Khmer and USE (their <code>data_create</code> functions). The Indic shaper, for instance, records there whether the font uses the old or the new Indic script tags, and prepares the tests it uses to ask whether <code>rphf</code>, <code>pref</code>, <code>blwf</code>, <code>pstf</code> and <code>vatu</code> would apply to a glyph (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc#L315"><code>hb-ot-shaper-indic.cc:315</code></a>), once per plan rather than once per run.</p>
+<p id="ix-21">All of this is worked out from the face and the key alone, except for two things that need a font, which the plan doesn’t have. The Indic shaper looks up its script’s virama glyph the first time it needs it, and keeps it in the plan (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc#L281"><code>hb-ot-shaper-indic.cc:281</code></a>). And Arabic fallback shaping, for Arabic text in fonts whose GSUB lacks the joining features, synthesizes lookups from the font’s glyphs for the Arabic presentation forms. It waits until the plan is first run, builds them with whichever font that is, and keeps them in the plan’s data with a compare-and-swap. The comment there is frank: “This sucks. We need a font to build the fallback plan...” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc#L434"><code>hb-ot-shaper-arabic.cc:434</code></a>). In both cases every later font on the same face gets what the first one found. For fonts that share a face, and so a <code>cmap</code>, that’s only wrong if one of them has font functions that map characters to glyphs differently (inferred). <a href="joining-scripts.html">Joining scripts</a> covers fallback shaping itself.</p>
+<h2 id="the-key">The key</h2>
+<p id="ix-22">The key is four things (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.hh#L34"><code>hb-shape-plan.hh:34</code></a>):</p>
+<pre><code class="language-c++">struct hb_shape_plan_key_t
+{
+  hb_segment_properties_t  props;
+
+  const hb_feature_t      *user_features;
+  unsigned int             num_user_features;
+
+  hb_ot_shape_plan_key_t   ot;
+
+  hb_shape_func_t         *shaper_func;
+  const char              *shaper_name;
+};
+</code></pre>
+<p id="ix-23">and two keys are equal when all four are (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L177"><code>hb-shape-plan.cc:177</code></a>):</p>
+<pre><code class="language-c++">return hb_segment_properties_equal (&amp;this-&gt;props, &amp;other-&gt;props) &amp;&amp;
+       this-&gt;user_features_match (other) &amp;&amp;
+       this-&gt;ot.equal (&amp;other-&gt;ot) &amp;&amp;
+       this-&gt;shaper_func == other-&gt;shaper_func;
+</code></pre>
+<p id="ix-24"><code>hb_shape_plan_key_t::init</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L75"><code>hb-shape-plan.cc:75</code></a>) fills one in. It copies the segment properties and the features, works out the variation state, and then chooses the backend, as <a href="hb_shape-and-its-backends.html#how-the-backend-is-chosen">hb_shape and its backends</a> describes. If no backend will take the face, <code>init</code> fails, and there is no key.</p>
+<h3 id="segment-properties">Segment properties</h3>
+<p id="ix-25">The properties are compared field by field by <code>hb_segment_properties_equal</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L64"><code>hb-buffer.cc:64</code></a>): direction, script, language, and two private fields that are always null. The language is an <code>hb_language_t</code>, which is a pointer to an interned string, so languages are compared as pointers. <code>hb_language_from_string</code> lowercases its input before interning it, so <code>en-US</code> and <code>en-us</code> are one language and share a plan. But <code>en</code>, <code>en-US</code> and <code>en-GB</code> are three languages, and get three plans, even though all three map to the same OpenType language tag, <code>ENG</code>. The key is compared before the tags are chosen, so it can’t know that.</p>
+<p id="ix-26">Everything else about the buffer is left out: its text and context, its flags and its cluster level. They change what happens during shaping, not what the plan holds.</p>
+<h3 id="user-features">User features</h3>
+<p id="ix-27">The features are compared by <code>user_features_match</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L159"><code>hb-shape-plan.cc:159</code></a>), here whole:</p>
+<pre><code class="language-c++">if (this-&gt;num_user_features != other-&gt;num_user_features)
+  return false;
+for (unsigned int i = 0; i &lt; num_user_features; i++)
+{
+  if (this-&gt;user_features[i].tag   != other-&gt;user_features[i].tag   ||
+      this-&gt;user_features[i].value != other-&gt;user_features[i].value ||
+      (this-&gt;user_features[i].start == HB_FEATURE_GLOBAL_START &amp;&amp;
+       this-&gt;user_features[i].end   == HB_FEATURE_GLOBAL_END) !=
+      (other-&gt;user_features[i].start == HB_FEATURE_GLOBAL_START &amp;&amp;
+       other-&gt;user_features[i].end   == HB_FEATURE_GLOBAL_END))
+    return false;
+}
+return true;
+</code></pre>
+<p id="ix-28">Three things count: the tag, the value, and whether the feature is <strong>global</strong>, meaning that its range is the whole of the text (<code>start</code> 0 and <code>end</code> <code>HB_FEATURE_GLOBAL_END</code>, which is <code>(unsigned) -1</code>). The range itself doesn’t count. Two runs that turn <code>liga</code> off over different clusters share one plan.</p>
+<p id="ix-29">That is possible because ranges are never used while the plan is made. The planner only asks whether each feature is global (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L392"><code>hb-ot-shape.cc:392</code></a>). A global feature with value 1 can share the one global mask bit with every other such feature, while a feature that is on in some places and off in others needs bits of its own. The range is applied each time the plan is run, from the features passed to the run, in <code>hb_ot_shape_setup_masks</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L760"><code>hb-ot-shape.cc:760</code></a>):</p>
+<pre><code class="language-c++">for (unsigned int i = 0; i &lt; c-&gt;num_user_features; i++)
+{
+  const hb_feature_t *feature = &amp;c-&gt;user_features[i];
+  if (!(feature-&gt;start == HB_FEATURE_GLOBAL_START &amp;&amp; feature-&gt;end == HB_FEATURE_GLOBAL_END)) {
+    unsigned int shift;
+    hb_mask_t mask = map-&gt;get_mask (feature-&gt;tag, &amp;shift);
+    buffer-&gt;set_masks (feature-&gt;value &lt;&lt; shift, mask, feature-&gt;start, feature-&gt;end);
+  }
+}
+</code></pre>
+<p id="ix-30">So these two runs, with <code>liga</code> off over different clusters, share a plan, and come out differently all the same:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gsub/ligatures.ttf</td><td class="in"><span class="txt">fifi</span><span class="cps">U+0066 U+0069 U+0066 U+0069</span></td><td class="opt">--language=en --features=-liga[0:2]</td><td class="out"><code>[f=0+500|i=1+500|f_i=2+900]</code></td></tr><tr><td class="font">gsub/ligatures.ttf</td><td class="in"><span class="txt">fifi</span><span class="cps">U+0066 U+0069 U+0066 U+0069</span></td><td class="opt">--language=en --features=-liga[2:4]</td><td class="out"><code>[f_i=0+900|f=2+500|i=3+500]</code></td></tr></tbody></table></div>
+<p id="ix-31">(That they share it can’t be seen from <code>hb-shape</code>, which shapes once and exits. A small C program, not part of the book’s build, which asks <code>hb_shape_plan_create_cached2</code> for both and compares the pointers, confirms it.) <a href="buffers.html#the-mask">Buffers</a> shows how <code>set_masks</code> compares ranges with clusters.</p>
+<p id="ix-32">The value counts even for a feature with a range, because it decides how many bits the feature gets: <code>hb_bit_storage (max_value)</code>, at most eight (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.cc#L290"><code>hb-ot-map.cc:290</code></a>). An alternate substitution reads its alternate’s number from those bits, as <a href="gsub.html#the-mask">GSUB: substituting glyphs</a> shows. The comparison is exact, not by the number of bits, so <code>salt=2</code> and <code>salt=3</code> over the same cluster get separate plans, though each needs two bits:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gsub/ligatures.ttf</td><td class="in"><span class="txt">aaa</span><span class="cps">U+0061 U+0061 U+0061</span></td><td class="opt">--language=en --features=salt[1]=2</td><td class="out"><code>[a=0+500|a.alt2=1+500|a=2+500]</code></td></tr><tr><td class="font">gsub/ligatures.ttf</td><td class="in"><span class="txt">aaa</span><span class="cps">U+0061 U+0061 U+0061</span></td><td class="opt">--language=en --features=salt[1]=3</td><td class="out"><code>[a=0+500|a.alt3=1+500|a=2+500]</code></td></tr><tr><td class="font">gsub/ligatures.ttf</td><td class="in"><span class="txt">aaa</span><span class="cps">U+0061 U+0061 U+0061</span></td><td class="opt">--language=en --features=salt[1]=2,salt[2]=3</td><td class="out"><code>[a=0+500|a.alt2=1+500|a.alt3=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-33">The features are compared in order, one by one. <code>kern,liga</code> and <code>liga,kern</code> are different keys, and so are <code>liga</code> and <code>liga,liga</code>, though each pair compiles to the same map. Order can matter. When a tag is listed twice, the planner merges the entries, and a later global entry replaces the value of an earlier one (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.cc#L249"><code>hb-ot-map.cc:249</code></a>), so sorting the list could change what it means.</p>
+<p id="ix-34">Asking for a feature that is on anyway makes a new plan too: an empty list and <code>liga</code> are different keys, with identical results.</p>
+<p id="ix-35">When <code>init</code> copies the features into a new plan, it means to “make start/end uniform to easier catch bugs”, setting every non-global <code>start</code> and <code>end</code> to 1 and 2. The loop it does this in writes <code>features[0]</code> each time round instead of <code>features[i]</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L95"><code>hb-shape-plan.cc:95</code></a>), so only the first feature is changed. Nothing reads the copied ranges, so nothing goes wrong (inferred).</p>
+<blockquote>
+<p>Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/caf12a809a78332fb320bc1375eca31ab838a0f6"><code>caf12a8</code></a> (17 November 2026), so main writes <code>features[i]</code> and makes every copied range uniform.</p>
+</blockquote>
+<h3 id="the-variation-state">The variation state</h3>
+<p id="ix-36">The coordinates aren’t in the key. What is in it is their <em>outcome</em>: which of the font’s feature variations apply. <code>hb_shape_full</code> passes the font’s normalized coordinates only when some are non-zero (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape.cc#L143"><code>hb-shape.cc:143</code></a>), and <code>init</code> hands them to <code>hb_ot_shape_plan_key_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.hh#L52"><code>hb-ot-shape.hh:52</code></a>, trimmed):</p>
+<pre><code class="language-c++">struct hb_ot_shape_plan_key_t
+{
+  unsigned int variations_index[2];
+  /* Sorted offsets of distinct true conditions within FeatureVariations.
+   * Different outcomes may conservatively separate equivalent lookup sets. */
+  hb_vector_t&lt;unsigned&gt; lookup_conditions[2];
+
+  bool equal (const hb_ot_shape_plan_key_t *other)
+  {
+    return variations_index[0] == other-&gt;variations_index[0] &amp;&amp;
+           variations_index[1] == other-&gt;variations_index[1] &amp;&amp;
+           lookup_conditions[0] == other-&gt;lookup_conditions[0] &amp;&amp;
+           lookup_conditions[1] == other-&gt;lookup_conditions[1];
+  }
+};
+</code></pre>
+<p id="ix-37">There are two of each, one for GSUB and one for GPOS. <code>variations_index</code> is the number of the FeatureVariations record that applies. <code>FeatureVariations::find_index</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L5969"><code>hb-ot-layout-common.hh:5969</code></a>) tests the records’ condition sets in order and stops at the first that matches, as the specification says it should. If none matches, or the table has no FeatureVariations, the index is <code>NOT_FOUND_INDEX</code>, <code>0xFFFFFFFF</code>. A build with <code>HB_NO_VAR</code> always gets that (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L6527"><code>hb-ot-layout-gsubgpos.hh:6527</code></a>).</p>
+<p id="ix-38"><code>featvar.ttf</code> has two records, made by fontTools’ <code>addFeatureVariations</code>. Record 0 applies from normalized weight 0.6 to 1 (user weights 700 to 900) and swaps <code>I</code> for <code>V</code>. Record 1 applies from 0.4 to 0.59 (600 to 695) and swaps <code>I</code> for <code>H</code>. Below 600 neither applies:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">featvar.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--language=en --variations=wght=400</td><td class="out"><code>[I=0+260]</code></td></tr><tr><td class="font">featvar.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--language=en --variations=wght=500</td><td class="out"><code>[I=0+300]</code></td></tr><tr><td class="font">featvar.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--language=en --variations=wght=600</td><td class="out"><code>[H=0+648]</code></td></tr><tr><td class="font">featvar.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--language=en --variations=wght=695</td><td class="out"><code>[H=0+667]</code></td></tr><tr><td class="font">featvar.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--language=en --variations=wght=700</td><td class="out"><code>[V=0+448]</code></td></tr><tr><td class="font">featvar.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--language=en --variations=wght=900</td><td class="out"><code>[V=0+560]</code></td></tr></tbody></table></div>
+<p id="ix-39">Those six positions make three keys: <code>NOT_FOUND_INDEX</code> for 400 and 500, 1 for 600 and 695, 0 for 700 and 900. So they make three plans, however many positions in between are shaped (the C program confirms this too). Each plan’s map holds the lookups its record chose, which a trace shows as the lookups that run:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape featvar.ttf "I" --language=en --variations=wght=650 --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;DFLT&#x27;</td><td class="buf"><code>[I=0]</code></td></tr><tr><td class="what">start lookup 0 feature &#x27;rvrn&#x27;</td><td class="buf"><code>[I=0]</code></td></tr><tr><td class="what">replacing glyph at 0 (single substitution)</td><td class="buf"><code>[I=0]</code></td></tr><tr><td class="what">replaced glyph at 0 (single substitution)</td><td class="buf"><code>[H=0]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;rvrn&#x27;</td><td class="buf"><code>[H=0]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;DFLT&#x27;</td><td class="buf"><code>[H=0]</code></td></tr></tbody></table></div>
+<div class="trace"><div class="trace-head"><code>hb-shape featvar.ttf "I" --language=en --variations=wght=800 --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;DFLT&#x27;</td><td class="buf"><code>[I=0]</code></td></tr><tr><td class="what">start lookup 1 feature &#x27;rvrn&#x27;</td><td class="buf"><code>[I=0]</code></td></tr><tr><td class="what">replacing glyph at 0 (single substitution)</td><td class="buf"><code>[I=0]</code></td></tr><tr><td class="what">replaced glyph at 0 (single substitution)</td><td class="buf"><code>[V=0]</code></td></tr><tr><td class="what">end lookup 1 feature &#x27;rvrn&#x27;</td><td class="buf"><code>[V=0]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;DFLT&#x27;</td><td class="buf"><code>[V=0]</code></td></tr></tbody></table></div>
+<p id="ix-40">At weight 650 the plan made for record 1 runs lookup 0. At 800 the plan for record 0 runs lookup 1. At 400 the plan has no lookups at all, since <code>rvrn</code> has none by default, and GSUB starts and ends with nothing in between:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape featvar.ttf "I" --language=en --variations=wght=400 --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;DFLT&#x27;</td><td class="buf"><code>[I=0]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;DFLT&#x27;</td><td class="buf"><code>[I=0]</code></td></tr></tbody></table></div>
+<p id="ix-41"><span class="screen-only">Here the slider moves across all of them.</span><span class="print-only">Here are four of them, at weights 400, 600, 700 and 900.</span> Under each frame, the glyph name says which plan made it:</p>
+<figure class="draw slider"><div class="frames"><div class="frame" data-value="100" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=100">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L120,700L120,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=100</div><code class="frame-shape">[I=0+200]</code></div><div class="frame" data-value="125" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=125">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L125,700L125,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=125</div><code class="frame-shape">[I=0+205]</code></div><div class="frame" data-value="150" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=150">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L130,700L130,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=150</div><code class="frame-shape">[I=0+210]</code></div><div class="frame" data-value="175" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=175">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L135,700L135,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=175</div><code class="frame-shape">[I=0+215]</code></div><div class="frame" data-value="200" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=200">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L140,700L140,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=200</div><code class="frame-shape">[I=0+220]</code></div><div class="frame" data-value="225" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=225">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L145,700L145,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=225</div><code class="frame-shape">[I=0+225]</code></div><div class="frame" data-value="250" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=250">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L150,700L150,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=250</div><code class="frame-shape">[I=0+230]</code></div><div class="frame" data-value="275" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=275">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L155,700L155,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=275</div><code class="frame-shape">[I=0+235]</code></div><div class="frame" data-value="300" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=300">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L160,700L160,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=300</div><code class="frame-shape">[I=0+240]</code></div><div class="frame" data-value="325" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=325">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L165,700L165,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=325</div><code class="frame-shape">[I=0+245]</code></div><div class="frame" data-value="350" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=350">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L170,700L170,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=350</div><code class="frame-shape">[I=0+250]</code></div><div class="frame" data-value="375" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=375">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L175,700L175,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=375</div><code class="frame-shape">[I=0+255]</code></div><div class="frame print" data-value="400"><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=400">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L180,700L180,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=400</div><code class="frame-shape">[I=0+260]</code></div><div class="frame" data-value="425" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=425">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L190,700L190,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=425</div><code class="frame-shape">[I=0+270]</code></div><div class="frame" data-value="450" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=450">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L200.01,700L200.01,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=450</div><code class="frame-shape">[I=0+280]</code></div><div class="frame" data-value="475" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=475">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L210,700L210,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=475</div><code class="frame-shape">[I=0+290]</code></div><div class="frame" data-value="500" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=500">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L220,700L220,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=500</div><code class="frame-shape">[I=0+300]</code></div><div class="frame" data-value="525" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=525">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L230,700L230,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=525</div><code class="frame-shape">[I=0+310]</code></div><div class="frame" data-value="550" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=550">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L240,700L240,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=550</div><code class="frame-shape">[I=0+320]</code></div><div class="frame" data-value="575" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=575">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L250.01,700L250.01,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=575</div><code class="frame-shape">[I=0+330]</code></div><div class="frame print" data-value="600" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=600">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L260,700L260,0L80,0ZM388,0L388,700L568,700L568,0L388,0ZM260,330L260,474L388,474L388,330L260,330Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=600</div><code class="frame-shape">[H=0+648]</code></div><div class="frame" data-value="625" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=625">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L270,700L270,0L80,0ZM384,0L384,700L574,700L574,0L384,0ZM270,330L270,482L384,482L384,330L270,330Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=625</div><code class="frame-shape">[H=0+654]</code></div><div class="frame" data-value="650" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=650">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L280,700L280,0L80,0ZM380,0L380,700L580,700L580,0L380,0ZM280,330L280,490L380,490L380,330L280,330Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=650</div><code class="frame-shape">[H=0+660]</code></div><div class="frame" data-value="675" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=675">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L285,700L285,0L80,0ZM379,0L379,700L584,700L584,0L379,0ZM285,330L285,494L379,494L379,330L285,330Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=675</div><code class="frame-shape">[H=0+664]</code></div><div class="frame print" data-value="700" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=700">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L368.01,700L348.41,525L329.01,350L309.61,175L290,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=700</div><code class="frame-shape">[V=0+448]</code></div><div class="frame" data-value="725" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=725">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L382.01,700L360.11,525L338.5,350L316.9,175L295,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=725</div><code class="frame-shape">[V=0+462]</code></div><div class="frame" data-value="750" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=750">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L396,700L371.8,525L348,350L324.2,175L300,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=750</div><code class="frame-shape">[V=0+476]</code></div><div class="frame" data-value="775" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=775">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L410,700L383.5,525L357.5,350L331.5,175L305,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=775</div><code class="frame-shape">[V=0+490]</code></div><div class="frame" data-value="800" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=800">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L424,700L395.2,525L367,350L338.8,175L310,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=800</div><code class="frame-shape">[V=0+504]</code></div><div class="frame" data-value="825" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=825">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L438.01,700L406.91,525L376.51,350L346.11,175L315,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=825</div><code class="frame-shape">[V=0+518]</code></div><div class="frame" data-value="850" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=850">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L452.01,700L418.61,525L386,350L353.4,175L320,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=850</div><code class="frame-shape">[V=0+532]</code></div><div class="frame" data-value="875" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=875">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L466,700L430.3,525L395.5,350L360.7,175L325,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=875</div><code class="frame-shape">[V=0+546]</code></div><div class="frame print" data-value="900" hidden><svg viewBox="-40 -840 744 1080" role="img" aria-label="I at wght=900">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L480,700L442,525L405,350L368,175L330,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=900</div><code class="frame-shape">[V=0+560]</code></div></div><label class="control"><span>wght</span><input type="range" min="100" max="900" step="25" value="400"><output>400</output></label><figcaption><code>hb-vector shape-plans-and-their-cache/featvar.ttf "I" --variations=wght=…</code>, drawn at every 25 from 100 to 900</figcaption></figure>
+<h4 id="lookup-variations">Lookup variations</h4>
+<p id="ix-42">The second half of the key is newer. <code>NEWS</code> for 14.6.0 says “Support <code>FeatureVariations</code> 1.1 lookup variations”. HarfBuzz reads them from an array of <code>LookupVariationRecord</code>s that follows the ordinary records in a FeatureVariations table of version 1.1 or later (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L5957"><code>hb-ot-layout-common.hh:5957</code></a>). With these, a feature’s lookups aren’t replaced wholesale. Each record gives one feature a list of lookup groups, each with a condition of its own, and the feature gets the groups whose conditions are true, plus its default lookups if a flag says so (<code>:5784</code>). Any number of conditions can be true at once, so one record index can’t describe the result.</p>
+<p id="ix-43">So the key records which conditions are true. <code>collect_lookup_conditions</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L5994"><code>hb-ot-layout-common.hh:5994</code></a>) goes through every lookup variation record in the table, evaluates each distinct condition once, and keeps the offsets of the true ones, sorted, so that two positions with the same true conditions give equal lists. A group with no condition always applies, and isn’t recorded (<code>:5716</code>). The comment in the key admits what this costs: two positions whose true conditions differ get different plans, even if they would end up with the same lookups. And it is every condition in the table, not only those of the features this script and language use.</p>
+<p id="ix-44">None of the book’s test fonts uses lookup variations: the fontTools that builds them, 4.38, can’t write them.</p>
+<blockquote>
+<p id="ix-45">For type designers: every distinct outcome of FeatureVariations is a separate plan, and a plan is the whole compiled map, not just the feature that varied. A font with one <code>rvrn</code> record can have two plans for each script, language and feature set: one inside the record and one outside it. A font that steps a substitution through twenty ranges of an axis has twenty-one, and an application that animates the axis builds each of them once, at the moment the position first crosses into its range. That’s fine for a handful of records. A font that needs many, perhaps generated by a tool that splits the design space into small boxes, makes many plans and makes every shaping call test more conditions, as the next section explains.</p>
+</blockquote>
+<h3 id="the-shaper">The shaper</h3>
+<p id="ix-46">The last part of the key is the backend, compared by its function (<code>shaper_func</code>), not by the list of names that chose it. So <code>--shapers=ot</code> and the default list share plans, and a name the build doesn’t have, at the front of a list, changes nothing. <a href="hb_shape-and-its-backends.html#asking-for-a-backend-by-name">hb_shape and its backends</a> has the details.</p>
+<h3 id="what-the-key-leaves-out">What the key leaves out</h3>
+<table>
+<thead>
+<tr>
+<th>Left out</th>
+<th>Why it can be</th>
+<th>Where it is used instead</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-47">the font: size, scale, ppem, point size, synthetic bold and slant, font functions</td>
+<td id="ix-48">the plan is per face</td>
+<td id="ix-49">when the plan is run</td>
+</tr>
+<tr>
+<td>the variation coordinates themselves</td>
+<td id="ix-50">only the FeatureVariations outcome changes the plan</td>
+<td id="ix-51">font functions, GDEF and GPOS deltas, when the plan is run</td>
+</tr>
+<tr>
+<td id="ix-52">feature ranges</td>
+<td id="ix-53">the plan needs only to know which features are global</td>
+<td id="ix-54"><code>hb_ot_shape_setup_masks</code>, each run</td>
+</tr>
+<tr>
+<td id="ix-55">the text, its context, buffer flags, cluster level</td>
+<td id="ix-56">none of them changes which lookups apply</td>
+<td>the pipeline</td>
+</tr>
+</tbody>
+</table>
+<h2 id="the-cache">The cache</h2>
+<h3 id="where-it-lives">Where it lives</h3>
+<p id="ix-57">The cache is two fields of the face (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.hh#L67"><code>hb-face.hh:67</code></a>):</p>
+<pre><code class="language-c++">struct plan_node_t
+{
+  hb_shape_plan_t *shape_plan;
+  plan_node_t *next;
+};
+hb_atomic_t&lt;plan_node_t *&gt; shape_plans;
+/* One-entry cache of the last plan looked up, so repeated shaping with the
+ * same key hits without walking the list.  Nodes are never freed before the
+ * face, so a cached pointer stays valid. */
+hb_atomic_t&lt;plan_node_t *&gt; last_shape_plan;
+</code></pre>
+<p><code>shape_plans</code> is a singly linked list, newest first. <code>last_shape_plan</code> points at whichever node was found or added most recently.</p>
+<h3 id="looking-up-and-adding">Looking up, and adding</h3>
+<p id="ix-58"><code>hb_shape_plan_create_cached2</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L538"><code>hb-shape-plan.cc:538</code></a>) is the whole cache. Trimmed of its debug messages:</p>
+<pre><code class="language-c++">retry:
+  hb_face_t::plan_node_t *cached_plan_nodes = face-&gt;shape_plans;
+
+  bool dont_cache = !hb_object_is_valid (face);
+
+  if (likely (!dont_cache))
+  {
+    hb_shape_plan_key_t key;
+    if (!key.init (false, face, props, user_features, num_user_features,
+                   coords, num_coords, shaper_list))
+      return hb_shape_plan_get_empty ();
+
+    hb_face_t::plan_node_t *cached = face-&gt;last_shape_plan.get_acquire ();
+    if (cached &amp;&amp; cached-&gt;shape_plan-&gt;key.equal (&amp;key))
+      return hb_shape_plan_reference (cached-&gt;shape_plan);
+
+    for (hb_face_t::plan_node_t *node = cached_plan_nodes; node; node = node-&gt;next)
+      if (node-&gt;shape_plan-&gt;key.equal (&amp;key))
+      {
+        face-&gt;last_shape_plan.set_release (node);
+        return hb_shape_plan_reference (node-&gt;shape_plan);
+      }
+  }
+
+  hb_shape_plan_t *shape_plan = hb_shape_plan_create2 (face, props,
+                                                       user_features, num_user_features,
+                                                       coords, num_coords,
+                                                       shaper_list);
+  if (unlikely (dont_cache))
+    return shape_plan;
+
+  hb_face_t::plan_node_t *node = (hb_face_t::plan_node_t *) hb_calloc (1, sizeof (hb_face_t::plan_node_t));
+  if (unlikely (!node))
+    return shape_plan;
+
+  node-&gt;shape_plan = shape_plan;
+  node-&gt;next = cached_plan_nodes;
+
+  if (unlikely (!face-&gt;shape_plans.cmpexch (cached_plan_nodes, node)))
+  {
+    hb_shape_plan_destroy (shape_plan);
+    hb_free (node);
+    goto retry;
+  }
+  face-&gt;last_shape_plan.set_release (node);
+
+  return hb_shape_plan_reference (shape_plan);
+</code></pre>
+<p id="ix-59">A key is built on every call, cached or not. With <code>copy</code> false, it points at the caller’s features instead of copying them, so a lookup allocates nothing for them. But it does evaluate FeatureVariations, for both tables, every time: <code>find_index</code> until a record matches, and for version 1.1 every distinct lookup condition. For a font without FeatureVariations that is next to nothing. For one with many records or conditions, it is work done on every shaping call, before the cache is even looked at. The backend is chosen again too, though after the first time that is only a test of a stored pointer.</p>
+<p id="ix-60">The lookup itself is two steps. First the last plan, then the list from its head. Each comparison is <code>key.equal</code>, which compares properties first, and so fails fast for a different script or direction.</p>
+<p id="ix-61">On a miss, the new plan is built, and then a node is put at the head of the list with one compare-and-swap: “if the head is still the one I started from, make it my node”. If another thread has added a plan since this one read the head, the swap fails, and the thread throws away the plan it built and starts again from <code>retry</code>. That second time round it walks the new list, and if the other thread’s plan was the one it wanted, it finds it there. So two threads that need the same plan at the same moment both build it, but only one copy ends up in the list. It is the same trade as the lazy table loaders’ in <a href="blobs-faces-and-lazy-tables.html#loading-without-a-lock">Blobs, faces and lazy tables</a>: occasional duplicate work, in exchange for no lock on the path every shaping call takes. A thread that loses the race to a <em>different</em> plan throws its own away too, and builds it again.</p>
+<p>Only the head is ever written, and nodes are never removed, so a thread walking the list can never meet a node that is being changed or freed. That is why the walk needs no lock either.</p>
+<h3 id="the-last-plan">The last plan</h3>
+<p id="ix-62"><code>last_shape_plan</code> arrived in 15.1.0, whose <code>NEWS</code> lists “speed up shaping on faces with many shape plans”. Most programs shape run after run with the same key, and a repeat now costs one comparison instead of a walk of the list. It is one entry for the whole face, shared by every thread. Two threads shaping with different keys on one face, or one program alternating between two kinds of run, replace each other’s entry, and walk the list on most calls, which is what happened before 15.1.0 (inferred). Finding a plan in the list doesn’t move it to the front.</p>
+<h3 id="never-pruned">Never pruned</h3>
+<p id="ix-63">Nothing removes a plan from the cache. The list is freed only in <code>hb_face_destroy</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc#L607"><code>hb-face.cc:607</code></a>), which drops the face’s reference to each plan. There is no limit on its length, no eviction, and no API to empty it.</p>
+<p id="ix-64">The plan an application gets back has its own reference, which it releases with <code>hb_shape_plan_destroy</code>, as <code>hb_shape_full</code> does at once. A plan the application keeps can outlive its face, but its <code>face_unsafe</code> then points at freed memory, so it shouldn’t be used (inferred).</p>
+<h3 id="the-empty-plan">The empty plan</h3>
+<p id="ix-65">When a plan can’t be made, these functions return the <strong>empty plan</strong>, <code>hb_shape_plan_get_empty</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L306"><code>hb-shape-plan.cc:306</code></a>): the shared Null object, all zeros, which <code>hb_object_is_valid</code> rejects. Running it returns false (<code>:425</code>) and leaves the buffer as it was. Its shaper name is null. It is what <code>hb_shape_plan_create2</code> returns for an invalid direction (<code>:255</code>), when no backend will take the face, and when it runs out of memory, and what <code>create_cached2</code> returns when no key can be made.</p>
+<p id="ix-66">The cache has one more case. A face that isn’t a valid object, which means the empty face, <code>hb_face_get_empty</code>, is never cached (<code>dont_cache</code>), and every call goes straight to <code>hb_shape_plan_create2</code>. That doesn’t help much. The empty face’s per-shaper data loaders are inert, so no backend can make data for it, not even <code>ot</code>, and the key can’t be made. Shaping a font made from <code>hb_face_get_empty ()</code> fails: <code>hb_shape_full</code> returns false and the buffer stays Unicode. A face made from an empty blob is a valid face with no tables, and shapes every character to glyph 0. (Both were checked with a C program, since <code>hb-shape</code> can’t open the empty face.)</p>
+<h2 id="making-plans-directly">Making plans directly</h2>
+<p id="ix-67">The public API has four functions that make plans:</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Since</th>
+<th>Coordinates</th>
+<th>Cached</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-68"><code>hb_shape_plan_create</code></td>
+<td>0.9.7</td>
+<td>none</td>
+<td>no</td>
+</tr>
+<tr>
+<td id="ix-69"><code>hb_shape_plan_create2</code></td>
+<td>1.4.0</td>
+<td>yes</td>
+<td>no</td>
+</tr>
+<tr>
+<td id="ix-70"><code>hb_shape_plan_create_cached</code></td>
+<td>0.9.7</td>
+<td>none</td>
+<td>yes</td>
+</tr>
+<tr>
+<td id="ix-71"><code>hb_shape_plan_create_cached2</code></td>
+<td>1.4.0</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-72">The versions without coordinates pass none, so they make the plan for the default position. The uncached ones make a new plan on every call, with its own copy of the features, and put it nowhere: two calls with the same arguments give two plans. <code>hb_shape_plan_create2</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L240"><code>hb-shape-plan.cc:240</code></a>) is the function that actually builds one, cached or not. It makes the face immutable (<code>:267</code>, see <a href="blobs-faces-and-lazy-tables.html#immutability">Blobs, faces and lazy tables</a>), makes the key with a copy of the features, and calls <code>ot.init0</code> (<code>:280</code>), which runs the planner and compiles the map (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L227"><code>hb-ot-shape.cc:227</code></a>).</p>
+<p id="ix-73">A plan is run with <code>hb_shape_plan_execute</code>, and it can be looked at: <code>hb_shape_plan_get_shaper</code> gives the backend’s name, <code>hb_ot_shape_plan_collect_lookups</code> the lookups in its map, and <code>hb_ot_shape_plan_get_feature_tags</code> (since 10.3.0) the features it turned on. <code>hb_ot_shape_glyphs_closure</code> uses the cache too, to find the lookups a text could use (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L1310"><code>hb-ot-shape.cc:1310</code></a>).</p>
+<blockquote>
+<p id="ix-74">For programmers: <code>hb_shape_plan_execute</code> takes the features again, and they should be the ones the plan was made with. The global ones were compiled into the plan and are ignored when it runs, while the ranges and values of the others are read from the features passed to <code>execute</code>. A feature the plan wasn’t made with has no mask bits and does nothing. A value bigger than the plan allowed for loses its high bits. <code>execute</code> also asserts that the font’s face is the plan’s face and that the buffer’s properties are the plan’s (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L428"><code>hb-shape-plan.cc:428</code></a>). <code>hb_shape_full</code> gets all of this right by construction.</p>
+</blockquote>
+<h2 id="what-it-means">What it means</h2>
+<h3 id="for-applications">For applications</h3>
+<p id="ix-75">Plans are shared by every run that shapes the same face with the same direction, script and language object, the same list of features in the same order with the same values and the same global-ness, the same FeatureVariations outcome, and the same backend. In ordinary text that is a handful of plans per face: one per script and language in use, times the feature settings in use.</p>
+<p id="ix-76">The cache grows when those multiply. Each distinct language tag is a distinct plan, so an application that passes BCP 47 tags with regions and variants through to HarfBuzz gets a plan per tag, not per language system. Each distinct feature list is a plan, so an application that builds its list in different orders for the same settings, or adds <code>liga</code> and <code>kern</code> explicitly in some places and not others, gets more plans than it needs. And each FeatureVariations outcome is a plan per everything else. Since plans live as long as the face, a long-lived face, such as one kept in a font cache for a whole session, keeps every plan it ever made (inferred).</p>
+<p id="ix-77">Two things help. Building the feature list the same way each time, without reordering entries that share a tag, keeps the keys equal. For a one-off combination that won’t recur, <code>hb_shape_plan_create2</code> with <code>hb_shape_plan_execute</code> makes a plan that is freed when it is released, instead of one that stays in the cache.</p>
+<p id="ix-78">Feature ranges cost nothing here: an editor that turns features on and off over spans gets one plan per set of tags and values, however the spans move.</p>
+<h3 id="for-type-designers">For type designers</h3>
+<p id="ix-79">What the cache sees of a font is its FeatureVariations. A plan is built the first time each record, or each set of true lookup conditions, is reached, and kept. A few records along an axis are cheap. Many records make many plans, each a full compile of every feature’s lookups, and make every shaping call evaluate the conditions before it can find its plan. Records whose substitutions are identical still count separately, since the key holds the index, not the substitutions.</p>
+<p id="ix-80">Nothing else about a variable font reaches the plan: deltas, metrics and outlines are read from the font while the plan runs.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.hh"><code>src/hb-shape-plan.hh</code></a></td>
+<td><code>hb_shape_plan_key_t</code> and <code>hb_shape_plan_t</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc"><code>src/hb-shape-plan.cc</code></a></td>
+<td>the key (<code>init</code>, <code>user_features_match</code>, <code>equal</code>), the four create functions, the empty plan, <code>execute</code>, and the cache in <code>hb_shape_plan_create_cached2</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.hh"><code>src/hb-face.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc"><code>src/hb-face.cc</code></a></td>
+<td>the cache’s two fields, and freeing it in <code>hb_face_destroy</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.hh"><code>src/hb-ot-shape.hh</code></a></td>
+<td><code>hb_ot_shape_plan_key_t</code> and <code>hb_ot_shape_plan_t</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>src/hb-ot-shape.cc</code></a></td>
+<td><code>hb_ot_shape_plan_t::init0</code>, the user features in the planner, and <code>hb_ot_shape_setup_masks</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh"><code>src/hb-ot-layout-common.hh</code></a></td>
+<td><code>FeatureVariations::find_index</code>, <code>collect_lookup_conditions</code>, and the 1.1 records</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>src/hb-ot-layout.cc</code></a></td>
+<td><code>_hb_ot_layout_table_get_feature_variations_state</code>, which the key calls</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc"><code>src/hb-buffer.cc</code></a></td>
+<td><code>hb_segment_properties_equal</code></td>
+</tr>
+</tbody>
+</table>
+<p>Building HarfBuzz with <code>HB_DEBUG_SHAPE_PLAN</code> defined prints a message from the cache on every lookup: “fulfilled from last-plan cache”, “fulfilled from cache” or “inserted into cache”. The book’s build doesn’t, so those messages can’t be shown here.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A shape plan is made for a face, not a font, and holds everything that can be decided before the text is seen: the script shaper, the feature masks, and the lookups in stages.</li>
+<li>The key is the segment properties, the user features, the FeatureVariations outcome, and the backend.</li>
+<li>Features match on tag, value and whether they are global, in order. Their ranges aren’t in the key: they are applied as masks every time the plan runs.</li>
+<li>The coordinates aren’t in the key either: only the index of the FeatureVariations record that applies and, for version 1.1 lookup variations, which conditions are true.</li>
+<li>The cache is a list on the face, grown with a compare-and-swap and read without a lock, with a one-entry fast path for the last plan. Nothing is ever removed until the face is destroyed.</li>
+<li>The empty plan stands for every failure, and running it returns false. The empty face can’t be shaped at all.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="hb_shape-and-its-backends.html">← hb_shape and its backends</a><a rel="next" href="from-features-to-lookups.html">From features to lookups →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

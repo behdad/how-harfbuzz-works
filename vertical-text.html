@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vertical text · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part V · The pipeline</p>
+<h1 id="vertical-text">22. Vertical text</h1>
+<p id="ix-1">Chinese, Japanese and Korean can be set in columns, read from top to bottom, and so can Mongolian and a few other scripts. HarfBuzz shapes such a column as a run whose direction is <strong>top to bottom</strong> (<code>HB_DIRECTION_TTB</code>) or, more rarely, <strong>bottom to top</strong> (<code>HB_DIRECTION_BTT</code>). Most of the pipeline doesn’t care: the same steps run, in the same order, on the same buffer. What changes is a handful of decisions spread through it. A different list of features is asked for. Some punctuation is swapped for vertical forms before the <code>cmap</code> is read, if the font can’t do it itself. Advances run down the y axis instead of along x, every glyph is hung from a vertical origin, and GPOS reads the other half of each value record.</p>
+<p id="ix-2">This chapter collects those decisions. Where vertical advances and origins come from is in <a href="where-metrics-come-from.html#vertical-advances-and-origins">Where metrics come from</a>.</p>
+<p id="ix-3">The examples use four small test fonts, built by <code>fonts/vertical-text/build-fonts.py</code> from one feature file, <code>vertical.fea</code>. Their glyphs are boxes. They have <code>vhea</code> and <code>vmtx</code>, so every glyph advances 1,000 units down and hangs from a point 880 units above the baseline, half its width across. Every shaping result and trace on this page was produced by HarfBuzz 15.1.0 when the page was built.</p>
+<h2 id="what-harfbuzz-does-and-what-it-leaves-to-the-application">What HarfBuzz does, and what it leaves to the application</h2>
+<p id="ix-4">A vertical run is a run like any other: one font, one script, one language and one direction. HarfBuzz never chooses vertical for itself. When a buffer’s direction is left unset, <code>hb_buffer_guess_segment_properties</code> takes the script’s horizontal direction, and left to right if it has none (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L765"><code>hb-buffer.cc:765</code></a>). An application that wants a column says so with <code>hb_buffer_set_direction</code>, or <code>hb-shape --direction=ttb</code>.</p>
+<p id="ix-5">In a column of Japanese, most characters stand upright, but Latin words and many symbols are usually turned on their side. HarfBuzz has no notion of that choice. Every glyph in a vertical run is set upright, one below another. A sideways run is a horizontal run, shaped left to right and rotated by the application when it draws it. HarfBuzz’s manual says only that HarfBuzz lays text out “on a single horizontal (or vertical) line”, and that if the direction changes within a string, “you will need to shape each run independently” (<code>docs/usermanual-what-is-harfbuzz.xml:346</code>, <code>:395</code>). Nor does HarfBuzz carry the data an application needs to choose. The Unicode functions it consults have no Vertical_Orientation property (the list is at <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh#L44"><code>hb-unicode.hh:44</code></a>), so splitting a column into upright and sideways runs is the application’s work, done before HarfBuzz is called (inferred from what is missing).</p>
+<p>Here is a short Latin word set both ways:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">ab</span><span class="cps">U+0061 U+0062</span></td><td class="opt">--direction=ttb --language=en</td><td class="out"><code>[a=0@-250,-880+0,-1000|b=1@-250,-880+0,-1000]</code></td></tr><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">ab</span><span class="cps">U+0061 U+0062</span></td><td class="opt">--direction=ltr --language=en</td><td class="out"><code>[a_b=0+900]</code></td></tr></tbody></table></div>
+<p id="ix-6">Set vertically, <code>a</code> and <code>b</code> are stacked, upright and centered, with no ligature and no kerning. Set horizontally, the font’s <code>liga</code> turns them into <code>a_b</code>, which an application could then rotate.</p>
+<h2 id="direction">Direction</h2>
+<p id="ix-7">The four directions are numbered so that two bit tests sort them (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.h#L288"><code>hb-common.h:288</code></a>): <code>LTR</code> is 4, <code>RTL</code> 5, <code>TTB</code> 6 and <code>BTT</code> 7. <code>HB_DIRECTION_IS_VERTICAL</code> is true for 6 and 7, and <code>HB_DIRECTION_IS_BACKWARD</code> for 5 and 7. So bottom to top is to vertical text what right to left is to horizontal text: the backward direction.</p>
+<h3 id="bottom-to-top-becomes-top-to-bottom">Bottom to top becomes top to bottom</h3>
+<p id="ix-8">Step 5 of the pipeline, <code>hb_ensure_native_direction</code>, puts the text in the order the font expects. For horizontal text, that depends on the script. For vertical text it doesn’t: everything becomes top to bottom (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L635"><code>hb-ot-shape.cc:635</code></a>, trimmed):</p>
+<pre><code class="language-c++">/* TODO vertical:
+ * The only BTT vertical script is Ogham, but it's not clear to me whether OpenType
+ * Ogham fonts are supposed to be implemented BTT or not.  Need to research that
+ * first. */
+if ((HB_DIRECTION_IS_HORIZONTAL (direction) &amp;&amp;
+     direction != horiz_dir &amp;&amp; HB_DIRECTION_IS_VALID (horiz_dir)) ||
+    (HB_DIRECTION_IS_VERTICAL   (direction) &amp;&amp;
+     direction != HB_DIRECTION_TTB))
+{
+  _hb_ot_layout_reverse_graphemes (buffer);
+  buffer-&gt;props.direction = HB_DIRECTION_REVERSE (buffer-&gt;props.direction);
+}
+</code></pre>
+<p id="ix-9">A bottom-to-top run is reversed, grapheme by grapheme, and from then on it <em>is</em> a top-to-bottom run. Every lookup, every positioning step, sees TTB. The fonts are written for reading order down the column, and this is the one order they get.</p>
+<p id="ix-10">Right-to-left text is reversed back at the end of positioning, so that the glyphs come out in left-to-right visual order. Vertical text isn’t: that reversal tests the buffer’s current direction (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L1102"><code>hb-ot-shape.cc:1102</code></a>), which by then is TTB. The direction is restored to BTT only as <code>hb_ot_shape_internal</code> returns (<code>:1200</code>). So a bottom-to-top run comes out top to bottom, its last character first, which is the visual order of a column drawn downwards:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">「水」</span><span class="cps">U+300C U+6C34 U+300D</span></td><td class="opt">--direction=ttb --language=ja</td><td class="out"><code>[cornerleft.vert=0@-500,-880+0,-1000|ideo=1@-500,-880+0,-1000|cornerright.vert=2@-500,-880+0,-1000]</code></td></tr><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">「水」</span><span class="cps">U+300C U+6C34 U+300D</span></td><td class="opt">--direction=btt --language=ja</td><td class="out"><code>[cornerleft.vert=2@-500,-880+0,-1000|ideo=1@-500,-880+0,-1000|cornerright.vert=0@-500,-880+0,-1000]</code></td></tr></tbody></table></div>
+<p id="ix-11">Read from the top, the glyphs and positions are the same. Only the clusters run the other way: in the bottom-to-top run, the glyph at the top is cluster 2, the closing bracket, drawn as an opening one.</p>
+<h3 id="mirroring-a-column">Mirroring a column</h3>
+<p id="ix-12">The brackets were swapped by step 7, <code>hb_ot_rotate_chars</code>, which mirrors characters when the <em>target</em> direction, the one the application asked for, is backward (<a href="pipeline-step-by-step.html#mirroring">The pipeline, step by step</a>). BTT is backward, so U+300C 「 became its mirror U+300D 」 before the <code>cmap</code> was read, and the other way round. The trace shows it at the first point a trace can see, with the order already reversed:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape vertical.ttf "「水」" --direction=btt --language=ja --trace</code></div><table><tbody><tr><td class="what">start decompose</td><td class="buf"><code>&lt;U+300C=2|U+6C34=1|U+300D=0&gt;</code></td></tr><tr><td class="what">end decompose</td><td class="buf"><code>&lt;U+300C=2|U+6C34=1|U+300D=0&gt;</code></td></tr><tr><td class="what">start table GSUB script tag &#x27;hani&#x27;</td><td class="buf"><code>[cornerleft=2|ideo=1|cornerright=0]</code></td></tr><tr><td class="what">start lookup 1 feature &#x27;vert&#x27;</td><td class="buf"><code>[cornerleft=2|ideo=1|cornerright=0]</code></td></tr><tr><td class="what">replacing glyph at 0 (single substitution)</td><td class="buf"><code>[cornerleft=2|ideo=1|cornerright=0]</code></td></tr><tr><td class="what">replaced glyph at 0 (single substitution)</td><td class="buf"><code>[cornerleft.vert=2|ideo=1|cornerright=0]</code></td></tr><tr><td class="what">replacing glyph at 2 (single substitution)</td><td class="buf"><code>[cornerleft.vert=2|ideo=1|cornerright=0]</code></td></tr><tr><td class="what">replaced glyph at 2 (single substitution)</td><td class="buf"><code>[cornerleft.vert=2|ideo=1|cornerright.vert=0]</code></td></tr><tr><td class="what">end lookup 1 feature &#x27;vert&#x27;</td><td class="buf"><code>[cornerleft.vert=2|ideo=1|cornerright.vert=0]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;hani&#x27;</td><td class="buf"><code>[cornerleft.vert=2|ideo=1|cornerright.vert=0]</code></td></tr></tbody></table></div>
+<p id="ix-13">That is what a column read upwards needs. The opening bracket is at the bottom and must open upwards, which is the shape of the closing bracket in a top-to-bottom column (the writer’s reading; HarfBuzz’s source doesn’t say why). The <code>rtlm</code> mask bit that mirroring sets on other characters does nothing here, because <code>rtlm</code> is only asked for in right-to-left text (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L338"><code>hb-ot-shape.cc:338</code></a>).</p>
+<h2 id="the-features-a-vertical-run-gets">The features a vertical run gets</h2>
+<p id="ix-14">Planning asks for features in a fixed order (<a href="from-features-to-lookups.html">From features to lookups</a>). A vertical run gets the same list as a horizontal one, with two differences. It gets none of the direction features <code>ltra</code>, <code>ltrm</code>, <code>rtla</code> and <code>rtlm</code>. And where a horizontal run gets <code>calt</code>, <code>clig</code>, <code>curs</code>, <code>dist</code>, <code>kern</code>, <code>liga</code> and <code>rclt</code>, a vertical run gets one feature (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L374"><code>hb-ot-shape.cc:374</code></a>, trimmed):</p>
+<pre><code class="language-c++">if (HB_DIRECTION_IS_HORIZONTAL (planner-&gt;props.direction))
+  for (unsigned int i = 0; i &lt; ARRAY_LENGTH (horizontal_features); i++)
+    map-&gt;add_feature (horizontal_features[i]);
+else
+{
+  /* We only apply `vert` feature. See:
+   * https://github.com/harfbuzz/harfbuzz/commit/d71c0df2d17f4590d5611239577a6cb532c26528
+   * https://lists.freedesktop.org/archives/harfbuzz/2013-August/003490.html */
+
+  /* We really want to find a 'vert' feature if there's any in the font, no
+   * matter which script/langsys it is listed (or not) under.
+   * See various bugs referenced from:
+   * https://github.com/harfbuzz/harfbuzz/issues/63 */
+  map-&gt;enable_feature (HB_TAG ('v','e','r','t'), F_GLOBAL_SEARCH);
+}
+</code></pre>
+<p id="ix-15">That is why the test font’s <code>liga</code> didn’t apply to <code>ab</code> above. <code>NEWS</code> for 0.9.34 records the change: “Disable ‘liga’ in vertical text.”</p>
+<p id="ix-16"><strong><code>vert</code></strong> (Vertical Alternates) is the OpenType feature that swaps glyphs for the forms they take upright in a column: punctuation moved to the top right of its em box, brackets and dashes turned. The test font’s <code>vert</code> is one single substitution:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of vertical.ttf, lookup 1"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button><button type="button" role="tab" data-view="cpp">HarfBuzz C++</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 1: Single substitution (type 1)
+  lookupFlag: none
+  subtable 0: SingleSubstFormat1
+    coverage: [ellipsis ideocomma ideoperiod cornerleft cornerright parenleftfw parenrightfw]
+    deltaGlyphID: +17
+    (so: ellipsis → ellipsis.vert, ideocomma → ideocomma.vert, ideoperiod → ideoperiod.vert, cornerleft → cornerleft.vert, cornerright → cornerright.vert, parenleftfw → parenleftfw.vert, parenrightfw → parenrightfw.vert)</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature vert {
+  lookup VERT {
+    sub ideocomma by ideocomma.vert;
+    sub ideoperiod by ideoperiod.vert;
+    sub cornerleft by cornerleft.vert;
+    sub cornerright by cornerright.vert;
+    sub parenleftfw by parenleftfw.vert;
+    sub parenrightfw by parenrightfw.vert;
+    sub ellipsis by ellipsis.vert;
+  } VERT;
+} vert;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;1&quot;&gt;
+  &lt;LookupType value=&quot;1&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;SingleSubst index=&quot;0&quot;&gt;
+    &lt;Substitution in=&quot;cornerleft&quot; out=&quot;cornerleft.vert&quot;/&gt;
+    &lt;Substitution in=&quot;cornerright&quot; out=&quot;cornerright.vert&quot;/&gt;
+    &lt;Substitution in=&quot;ellipsis&quot; out=&quot;ellipsis.vert&quot;/&gt;
+    &lt;Substitution in=&quot;ideocomma&quot; out=&quot;ideocomma.vert&quot;/&gt;
+    &lt;Substitution in=&quot;ideoperiod&quot; out=&quot;ideoperiod.vert&quot;/&gt;
+    &lt;Substitution in=&quot;parenleftfw&quot; out=&quot;parenleftfw.vert&quot;/&gt;
+    &lt;Substitution in=&quot;parenrightfw&quot; out=&quot;parenrightfw.vert&quot;/&gt;
+  &lt;/SingleSubst&gt;
+&lt;/Lookup&gt;</code></pre></div><div class="pane" data-view="cpp" data-label="HarfBuzz C++" role="tabpanel"><pre><code>template &lt;typename Types&gt;
+struct SingleSubstFormat1_3
+{
+  protected:
+  HBUINT16      format;                 /* Format identifier--format = 1 */
+  typename Types::template LOffsetTo&lt;Coverage&gt;
+                coverage;               /* Offset to Coverage table--from
+                                         * beginning of Substitution table */
+  typename Types::HBUINT
+                deltaGlyphID;           /* Add to original GlyphID to get
+                                         * substitute GlyphID, modulo 0x10000 */
+
+  public:
+  DEFINE_SIZE_STATIC (2 + Types::LOffset::static_size + Types::HBUINT::static_size);
+  /* … */
+};</code></pre><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/SingleSubstFormat1.hh#L99-L112">src/OT/Layout/GSUB/SingleSubstFormat1.hh:99</a></div><figcaption>vertical.ttf, lookup 1</figcaption></figure>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">水、水。</span><span class="cps">U+6C34 U+3001 U+6C34 U+3002</span></td><td class="opt">--direction=ttb --language=ja</td><td class="out"><code>[ideo=0@-500,-880+0,-1000|ideocomma.vert=1@-500,-880+0,-1000|ideo=2@-500,-880+0,-1000|ideoperiod.vert=3@-500,-880+0,-1000]</code></td></tr><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">水、水。</span><span class="cps">U+6C34 U+3001 U+6C34 U+3002</span></td><td class="opt">--direction=ltr --language=ja</td><td class="out"><code>[ideo=0+1000|ideocomma=1+1000|ideo=2+1000|ideoperiod=3+1000]</code></td></tr></tbody></table></div>
+<h3 id="features-harfbuzz-doesnt-turn-on">Features HarfBuzz doesn’t turn on</h3>
+<p id="ix-17">Several other registered features are for vertical text, and HarfBuzz turns on none of them:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-18">Feature</th>
+<th>What it does</th>
+<th>The specification’s advice</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-19"><code>vkrn</code></td>
+<td>vertical kerning</td>
+<td>active by default in most vertical layout</td>
+</tr>
+<tr>
+<td id="ix-20"><code>vpal</code></td>
+<td>proportional vertical metrics</td>
+<td>off by default</td>
+</tr>
+<tr>
+<td id="ix-21"><code>vhal</code></td>
+<td>half-height vertical metrics</td>
+<td>off by default</td>
+</tr>
+<tr>
+<td id="ix-22"><code>valt</code></td>
+<td>alternate vertical metrics</td>
+<td id="ix-23">active by default; fonts with <code>vmtx</code> shouldn’t have it</td>
+</tr>
+<tr>
+<td id="ix-24"><code>vrt2</code></td>
+<td>vertical alternates and rotation</td>
+<td id="ix-25">active by default, in place of <code>vert</code></td>
+</tr>
+<tr>
+<td id="ix-26"><code>vrtr</code></td>
+<td id="ix-27">alternates for glyphs to be rotated</td>
+<td id="ix-28">active by default in sideways runs</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-29">An application that wants them asks for them, as with any feature. The test font has a <code>vkrn</code> pair, which brings a closing bracket 300 units closer after a full stop, and a <code>vpal</code> value, which halves the comma’s height:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">水。」</span><span class="cps">U+6C34 U+3002 U+300D</span></td><td class="opt">--direction=ttb --language=ja</td><td class="out"><code>[ideo=0@-500,-880+0,-1000|ideoperiod.vert=1@-500,-880+0,-1000|cornerright.vert=2@-500,-880+0,-1000]</code></td></tr><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">水。」</span><span class="cps">U+6C34 U+3002 U+300D</span></td><td class="opt">--direction=ttb --language=ja --features=vkrn</td><td class="out"><code>[ideo=0@-500,-880+0,-1000|ideoperiod.vert=1@-500,-880+0,-700|cornerright.vert=2@-500,-880+0,-1000]</code></td></tr><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">水、水</span><span class="cps">U+6C34 U+3001 U+6C34</span></td><td class="opt">--direction=ttb --language=ja --features=vpal</td><td class="out"><code>[ideo=0@-500,-880+0,-1000|ideocomma.vert=1@-500,-630+0,-500|ideo=2@-500,-880+0,-1000]</code></td></tr></tbody></table></div>
+<p id="ix-30">The specification wants four of these on by default (<a href="https://learn.microsoft.com/en-us/typography/opentype/spec/features_uz">OpenType features u–z</a>). <code>valt</code> is meant for fonts without <code>vmtx</code>, <code>vrt2</code> would replace the <code>vert</code> that HarfBuzz always applies, and <code>vrtr</code> is for sideways runs, which HarfBuzz never sees. That leaves <code>vkrn</code>, which “should be active by default” in most vertical text, and where HarfBuzz departs from the specification. HarfBuzz’s comment above, “We only apply <code>vert</code> feature”, points to a 2013 mailing-list thread for the reason. <code>vkrn</code> still has a part in the plan: in vertical text the plan’s kerning mask is <code>vkrn</code>’s rather than <code>kern</code>’s (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L127"><code>hb-ot-shape.cc:127</code></a>), so the legacy <code>kern</code> table, if a font uses one, applies only where <code>vkrn</code> is turned on (<a href="legacy-kern.html">Legacy kern</a>).</p>
+<h3 id="finding-vert-anywhere">Finding <code>vert</code> anywhere</h3>
+<p id="ix-31"><code>F_GLOBAL_SEARCH</code> is the only flag of its kind, and <code>vert</code> the only feature that has it (<a href="from-features-to-lookups.html">From features to lookups</a>). Every other feature is looked for in the language system HarfBuzz chose for the run. If <code>vert</code> isn’t there, in GSUB or GPOS, the map takes the first feature tagged <code>vert</code> in the whole FeatureList, whatever script lists it, or none (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.cc#L311"><code>hb-ot-map.cc:311</code></a>). The comment points to HarfBuzz issue #63 for the fonts that needed it.</p>
+<p id="ix-32"><code>vert-kana.ttf</code> is the test font with <code>vert</code> listed only under <code>kana</code>. Its <code>hani</code> language system, the one chosen for this text, lists only <code>liga</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">vert-kana.ttf</td><td class="in"><span class="txt">水、水。</span><span class="cps">U+6C34 U+3001 U+6C34 U+3002</span></td><td class="opt">--direction=ttb --language=ja</td><td class="out"><code>[ideo=0@-500,-880+0,-1000|ideocomma.vert=1@-500,-880+0,-1000|ideo=2@-500,-880+0,-1000|ideoperiod.vert=3@-500,-880+0,-1000]</code></td></tr></tbody></table></div>
+<p id="ix-33">The punctuation is still vertical. A <code>vkrn</code> listed only under <code>kana</code> would not be found from Han text.</p>
+<h3 id="vrt2"><code>vrt2</code></h3>
+<p id="ix-34"><strong><code>vrt2</code></strong> (Vertical Alternates and Rotation) was registered by Adobe, and the specification calls <code>vert</code> its “predecessor”. It does what <code>vert</code> does and also replaces proportional glyphs, mostly Latin and half-width katakana, with copies rotated a quarter turn, so that a font can turn sideways text by itself. The specification says it “overrides” <code>vert</code>, which is a subset of it, and that the two should never be used together.</p>
+<p id="ix-35">HarfBuzz doesn’t look at <code>vrt2</code> unless asked. <code>vrt2.ttf</code> is the test font with <code>vrt2</code> in place of <code>vert</code>, and a second lookup in it that turns <code>a</code> into a rotated <code>a.rot</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">vrt2.ttf</td><td class="in"><span class="txt">ab、</span><span class="cps">U+0061 U+0062 U+3001</span></td><td class="opt">--direction=ttb --language=en</td><td class="out"><code>[a=0@-250,-880+0,-1000|b=1@-250,-880+0,-1000|uniFE11=2@-500,-880+0,-1000]</code></td></tr><tr><td class="font">vrt2.ttf</td><td class="in"><span class="txt">ab、</span><span class="cps">U+0061 U+0062 U+3001</span></td><td class="opt">--direction=ttb --language=en --features=vrt2</td><td class="out"><code>[a.rot=0@-500,-880+0,-1000|b=1@-250,-880+0,-1000|uniFE11=2@-500,-880+0,-1000]</code></td></tr></tbody></table></div>
+<p id="ix-36">The rotated <code>a</code> appears only on request. The comma is vertical either way, but not through <code>vrt2</code>: the font has no <code>vert</code>, so HarfBuzz used the presentation-form fallback of the next section, and the comma arriving at GSUB was already U+FE11, which <code>vrt2</code>’s lookup doesn’t cover. In a font with both features, asking for <code>vrt2</code> doesn’t turn <code>vert</code> off: both run, in lookup order (read from the code). An application that wants <code>vrt2</code> <em>instead</em> of <code>vert</code> has to say <code>vert=0</code> too, and that in turn brings in the fallback, as the next section shows.</p>
+<h2 id="the-fallback-to-presentation-forms">The fallback to presentation forms</h2>
+<p id="ix-37">Unicode encodes vertical forms of some punctuation as characters of their own: U+FE10 to U+FE19 and U+FE30 to U+FE48, the “vertical forms” and the vertical half of the “CJK compatibility forms”. HarfBuzz uses them when a font gives it nothing better. In step 7 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L675"><code>hb-ot-shape.cc:675</code></a>):</p>
+<pre><code class="language-c++">#ifndef HB_NO_VERTICAL
+if (HB_DIRECTION_IS_VERTICAL (c-&gt;target_direction) &amp;&amp; !c-&gt;plan-&gt;has_vert)
+{
+  for (unsigned int i = 0; i &lt; count; i++) {
+    hb_codepoint_t codepoint = hb_unicode_funcs_t::vertical_char_for (info[i].codepoint);
+    if (unlikely (codepoint != info[i].codepoint &amp;&amp; c-&gt;font-&gt;has_glyph (codepoint)))
+      info[i].codepoint = codepoint;
+  }
+}
+#endif
+</code></pre>
+<p id="ix-38">Three conditions. The run is vertical. The plan has no <code>vert</code>: <code>has_vert</code> is set when planning gave <code>vert</code> a mask (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L125"><code>hb-ot-shape.cc:125</code></a>), so it is false when the font has no <code>vert</code> feature anywhere, and also when the application turned <code>vert</code> off. And the font has a glyph for the presentation form. The replacement is made on characters, before normalization reads the <code>cmap</code>, so it works however the font’s glyphs are arranged, and the glyph that comes out is whatever the font maps the presentation form to.</p>
+<p id="ix-39"><code>vertical_char_for</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh#L245"><code>hb-unicode.hh:245</code></a>) is a hand-written switch, not generated from Unicode data. It has 34 entries:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-40">Characters</th>
+<th>Vertical forms</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>en dash, em dash, two-dot leader, horizontal ellipsis</td>
+<td>U+FE32, U+FE31, U+FE30, U+FE19</td>
+</tr>
+<tr>
+<td>ideographic comma and full stop</td>
+<td>U+FE11, U+FE12</td>
+</tr>
+<tr>
+<td>the CJK brackets U+3008 to U+3011, U+3014 to U+3017</td>
+<td>U+FE3F to U+FE44, U+FE3B, U+FE3C, U+FE39, U+FE3A, U+FE17, U+FE18</td>
+</tr>
+<tr>
+<td>wavy low line, fullwidth low line</td>
+<td>U+FE34, U+FE33</td>
+</tr>
+<tr>
+<td>fullwidth ! , : ; ?</td>
+<td>U+FE15, U+FE10, U+FE13, U+FE14, U+FE16</td>
+</tr>
+<tr>
+<td>fullwidth ( ) [ ] { }</td>
+<td>U+FE35 to U+FE38, U+FE47, U+FE48</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-41">Nothing in ASCII is on the list: <code>(</code> stays <code>(</code>, because in vertical CJK layout it is usually set sideways, in a run of its own. <code>novert.ttf</code> is the test font without <code>vert</code>, and like all four fonts it maps the presentation forms:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">novert.ttf</td><td class="in"><span class="txt">水、「水」。</span><span class="cps">U+6C34 U+3001 U+300C U+6C34 U+300D U+3002</span></td><td class="opt">--direction=ttb --language=ja</td><td class="out"><code>[ideo=0@-500,-880+0,-1000|uniFE11=1@-500,-880+0,-1000|uniFE41=2@-500,-880+0,-1000|ideo=3@-500,-880+0,-1000|uniFE42=4@-500,-880+0,-1000|uniFE12=5@-500,-880+0,-1000]</code></td></tr><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">水、「水」。</span><span class="cps">U+6C34 U+3001 U+300C U+6C34 U+300D U+3002</span></td><td class="opt">--direction=ttb --language=ja</td><td class="out"><code>[ideo=0@-500,-880+0,-1000|ideocomma.vert=1@-500,-880+0,-1000|cornerleft.vert=2@-500,-880+0,-1000|ideo=3@-500,-880+0,-1000|cornerright.vert=4@-500,-880+0,-1000|ideoperiod.vert=5@-500,-880+0,-1000]</code></td></tr><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">水、「水」。</span><span class="cps">U+6C34 U+3001 U+300C U+6C34 U+300D U+3002</span></td><td class="opt">--direction=ttb --language=ja --features=-vert</td><td class="out"><code>[ideo=0@-500,-880+0,-1000|uniFE11=1@-500,-880+0,-1000|uniFE41=2@-500,-880+0,-1000|ideo=3@-500,-880+0,-1000|uniFE42=4@-500,-880+0,-1000|uniFE12=5@-500,-880+0,-1000]</code></td></tr><tr><td class="font">novert.ttf</td><td class="in"><span class="txt">(…)</span><span class="cps">U+0028 U+2026 U+0029</span></td><td class="opt">--direction=ttb --language=ja</td><td class="out"><code>[parenleft=0@-150,-880+0,-1000|uniFE19=1@-500,-880+0,-1000|parenright=2@-150,-880+0,-1000]</code></td></tr></tbody></table></div>
+<p id="ix-42">The font with <code>vert</code> uses its own alternates, <code>ideocomma.vert</code> and the rest, even though it maps the presentation forms too: <code>vert</code> wins. Turned off, it gives way to the fallback. The trace of <code>novert.ttf</code> shows the characters already replaced when normalization starts:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape novert.ttf "水、「水」。" --direction=ttb --language=ja --trace</code></div><table><tbody><tr><td class="what">start decompose</td><td class="buf"><code>&lt;U+6C34=0|U+FE11=1|U+FE41=2|U+6C34=3|U+FE42=4|U+FE12=5&gt;</code></td></tr><tr><td class="what">end decompose</td><td class="buf"><code>&lt;U+6C34=0|U+FE11=1|U+FE41=2|U+6C34=3|U+FE42=4|U+FE12=5&gt;</code></td></tr></tbody></table></div>
+<p id="ix-43">The fallback is the only part of the presentation forms HarfBuzz knows. It never maps them back: text that contains U+FE11 itself is shaped as U+FE11, in either direction.</p>
+<blockquote>
+<p id="ix-44">For type designers: a CJK font with a <code>vert</code> feature gets its own vertical alternates and nothing else, whichever script lists <code>vert</code>. A font without one gets the Unicode presentation forms, if it maps them, for these 34 characters only. Glyphs that <code>vert</code> would change but that aren’t on the list, such as small kana, stay as they are.</p>
+</blockquote>
+<h2 id="shaping-the-column">Shaping the column</h2>
+<h3 id="which-shaper">Which shaper</h3>
+<p id="ix-45">The script shaper is chosen with the direction in hand. Arabic and Syriac get the default shaper in vertical text, because “Arabic shaping is applicable only to horizontal layout” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh#L195"><code>hb-ot-shaper.hh:195</code></a>; <a href="choosing-a-script-shaper.html#arabic-and-syriac">Choosing a script shaper</a>). No other script’s choice depends on the direction: Mongolian, which is written in columns, gets the same shaper either way (<a href="universal-shaping-engine.html">The Universal Shaping Engine</a>).</p>
+<p id="ix-46">A font with a <code>morx</code> table is shaped with it in vertical text only if it has no GSUB (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L64"><code>hb-ot-shape.cc:64</code></a>, HarfBuzz issue #2124). In horizontal text <code>morx</code> is preferred whenever it is there (<a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a>).</p>
+<h3 id="advances-and-origins">Advances and origins</h3>
+<p id="ix-47">In step 15 each glyph gets its vertical advance and an offset that is its vertical origin, negated (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L1019"><code>hb-ot-shape.cc:1019</code></a>): <code>0,-1000</code> and −500, −880 for every full-width glyph in the test fonts, −250, −880 for the 500-unit <code>a</code>. From then on, offsets carry the origin with them. GPOS works on top of these offsets, not in place of them. Nothing adds the origins back afterward, so an application draws each glyph at the pen position plus its offset, just as in horizontal text, and moves the pen down by the advance.</p>
+<h3 id="value-records">Value records</h3>
+<p id="ix-48">GPOS value records have an advance for each direction. <code>apply_value</code> uses <code>xAdvance</code> only in horizontal text and <code>yAdvance</code> only in vertical, and negates <code>yAdvance</code>, “y_advance values grow downward but font-space grows upward” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/ValueFormat.hh#L115"><code>ValueFormat.hh:115</code></a>). Placements apply in both. So the <code>vkrn</code> value above, <code>&lt;0 0 0 -300&gt;</code>, made the full stop’s advance −700 instead of −1,000, and the <code>vpal</code> value <code>&lt;0 250 0 -500&gt;</code> moved the comma up 250 and halved its advance. A <code>kern</code> pair written with only an x advance does nothing in a column, even when an application asks for <code>kern</code>, though a <code>liga</code> asked for applies as usual:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">ab</span><span class="cps">U+0061 U+0062</span></td><td class="opt">--direction=ttb --language=en --features=kern</td><td class="out"><code>[a=0@-250,-880+0,-1000|b=1@-250,-880+0,-1000]</code></td></tr><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">ab</span><span class="cps">U+0061 U+0062</span></td><td class="opt">--direction=ttb --language=en --features=kern,liga</td><td class="out"><code>[a_b=0@-450,-880+0,-1000]</code></td></tr></tbody></table></div>
+<h3 id="marks">Marks</h3>
+<p id="ix-49">Anchors are in the glyph’s own coordinates, measured from its horizontal origin, in both directions. The vertical origin doesn’t enter into them. <code>vertical.fea</code> attaches the combining voiced sound mark U+3099 to the top right of か:</p>
+<pre><code class="language-fea">markClass dakuten &lt;anchor 150 800&gt; @TOP_RIGHT;
+feature mark {
+  pos base ka &lt;anchor 950 850&gt; mark @TOP_RIGHT;
+} mark;
+</code></pre>
+<p id="ix-50">The font has no glyph for the precomposed が, so normalization decomposes it, and either spelling gives the same result:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">が</span><span class="cps">U+304B U+3099</span></td><td class="opt">--direction=ttb --language=ja</td><td class="out"><code>[ka=0@-500,-880+0,-1000|dakuten=0@300,170+0]</code></td></tr><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">が</span><span class="cps">U+304C</span></td><td class="opt">--direction=ttb --language=ja</td><td class="out"><code>[ka=0@-500,-880+0,-1000|dakuten=0@300,170+0]</code></td></tr><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">が</span><span class="cps">U+304C</span></td><td class="opt">--direction=ltr --language=ja</td><td class="out"><code>[ka=0+1000|dakuten=0@-200,50+0]</code></td></tr></tbody></table></div>
+<p id="ix-51">When the mark attaches, its offset is set to the distance between the anchors, 800 across and 50 up. Across the column, the base’s offset is added at once: in vertical text that is x, so the mark’s x offset becomes 800 − 500 = 300 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/MarkArray.hh#L76"><code>MarkArray.hh:76</code></a>). Along the column, the base’s y offset, −880, is added when attachments are resolved after GPOS, and the advances from the base to the mark are subtracted: the base’s −1,000 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/GPOS.hh#L113"><code>GPOS.hh:113</code></a>). 50 − 880 + 1,000 = 170. It is the same arithmetic as in horizontal text with x and y exchanged, and it puts the two anchors on the same point.</p>
+<p id="ix-52">The mark’s advance is zero, although <code>vmtx</code> gives it 1,000. The default shaper zeroes the advances of GDEF marks after GPOS, and <code>zero_mark_width</code> clears both advances, whatever the direction (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L978"><code>hb-ot-shape.cc:978</code></a>). When a font has no GPOS, the mark’s offset is moved back by the advance it had, in y as well as x, so that it hangs over the glyph before it (<a href="fallbacks.html">Fallbacks</a>).</p>
+<h3 id="cursive-chains">Cursive chains</h3>
+<p id="ix-53"><code>curs</code> is one of the horizontal features, so a vertical run doesn’t ask for it. An application that has a font with vertical cursive attachment has to turn it on. The test font’s chain links <code>l</code>s from an entry at the top to an exit at the bottom, 200 units to the right:</p>
+<pre><code class="language-fea">feature curs {
+  pos cursive l &lt;anchor 400 830&gt; &lt;anchor 600 -70&gt;;
+} curs;
+</code></pre>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">lll</span><span class="cps">U+006C U+006C U+006C</span></td><td class="opt">--direction=ttb --language=en</td><td class="out"><code>[l=0@-500,-880+0,-1000|l=1@-500,-880+0,-1000|l=2@-500,-880+0,-1000]</code></td></tr><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">lll</span><span class="cps">U+006C U+006C U+006C</span></td><td class="opt">--direction=ttb --language=en --features=curs</td><td class="out"><code>[l=0@-500,-880+0,-950|l=1@-300,-830+0,-900|l=2@-100,-830+0,-950]</code></td></tr></tbody></table></div>
+<p id="ix-54"><code>apply_cursive_attachment</code> works along the column as it does along a line, with y for x (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/CursivePosFormat1.hh#L143"><code>CursivePosFormat1.hh:143</code></a>). The first glyph’s advance becomes the distance from its origin down to its exit: −70 plus its y offset of −880, so −950. The second is moved up by its entry’s distance above the origin, 830 − 880 = −50, and its advance shortened to match. Across the column, each child is moved sideways so its entry meets its parent’s exit: the x offset of each <code>l</code> is 200 more than the one before.</p>
+<p id="ix-55">The function has a branch for each of the four directions, and the bottom-to-top branch is never used: by the time GPOS runs, a bottom-to-top run has become top to bottom. Shaped bottom to top, the chain comes out exactly as the top-to-bottom one, with its clusters numbered from the other end:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">vertical.ttf</td><td class="in"><span class="txt">lll</span><span class="cps">U+006C U+006C U+006C</span></td><td class="opt">--direction=btt --language=en --features=curs</td><td class="out"><code>[l=2@-500,-880+0,-950|l=1@-300,-830+0,-900|l=0@-100,-830+0,-950]</code></td></tr></tbody></table></div>
+<p id="ix-56">The unused branch also differs from the others (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/CursivePosFormat1.hh#L155"><code>CursivePosFormat1.hh:155</code></a>, trimmed):</p>
+<pre><code class="language-c++">case HB_DIRECTION_TTB:
+  pos[i].y_advance = hb_saturate_add ((hb_position_t) roundf (exit_y), pos[i].y_offset);
+  ...
+case HB_DIRECTION_BTT:
+  ...
+  pos[j].y_advance = (hb_position_t) roundf (entry_y);
+</code></pre>
+<p id="ix-57">In the other three directions, the advance set from an anchor includes the glyph’s offset along the line, which in vertical text is its origin. Here it doesn’t. If the branch were ever reached, the advance would be wrong by the glyph’s vertical origin. It can’t be reached through <code>hb_shape</code>, so it changes nothing today.</p>
+<h2 id="compiled-out">Compiled out</h2>
+<p id="ix-58"><code>HB_NO_VERTICAL</code> removes the vertical support from the font side: the <code>vhea</code>, <code>vmtx</code> and <code>VORG</code> slots on the face (<a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a>), hb-ot’s vertical advance, origin and font-extents functions, the vertical phantom points of <code>glyf</code>, and the presentation-form fallback. <code>HB_LEAN</code> sets it. Vertical runs still shape: the planning and positioning above don’t depend on it, and the font object answers for the missing functions with its own defaults (<a href="fonts-and-font-functions.html#the-nil-tier-and-the-default-tier">Fonts and font functions</a>). Inside <code>apply_value</code> it makes every run count as horizontal, so in a column <code>yAdvance</code> is ignored and <code>xAdvance</code> applied (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/ValueFormat.hh#L98"><code>ValueFormat.hh:98</code></a>).</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.h"><code>src/hb-common.h</code></a></td>
+<td><code>hb_direction_t</code> and the <code>HB_DIRECTION_IS_*</code> and <code>HB_DIRECTION_REVERSE</code> macros</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>src/hb-ot-shape.cc</code></a></td>
+<td>the vertical feature list and <code>has_vert</code>; <code>hb_ensure_native_direction</code>; <code>hb_ot_rotate_chars</code>; vertical advances and origins in <code>hb_ot_position_default</code>; mark zeroing; <code>_hb_apply_morx</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.cc"><code>src/hb-ot-map.cc</code></a></td>
+<td><code>F_GLOBAL_SEARCH</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh"><code>src/hb-unicode.hh</code></a></td>
+<td><code>vertical_char_for</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh"><code>src/hb-ot-shaper.hh</code></a></td>
+<td>Arabic and Syriac falling back to the default shaper</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh"><code>src/hb-font.hh</code></a></td>
+<td>adding and subtracting vertical origins, with the font object’s fallbacks</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/ValueFormat.hh"><code>src/OT/Layout/GPOS/ValueFormat.hh</code></a></td>
+<td><code>yAdvance</code> and its sign</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/MarkArray.hh"><code>src/OT/Layout/GPOS/MarkArray.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/GPOS.hh"><code>GPOS.hh</code></a></td>
+<td>marks across and along a vertical line</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/CursivePosFormat1.hh"><code>src/OT/Layout/GPOS/CursivePosFormat1.hh</code></a></td>
+<td>cursive chains in TTB and BTT</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc"><code>src/hb-ot-font.cc</code></a></td>
+<td>hb-ot’s vertical metrics (<a href="where-metrics-come-from.html">Where metrics come from</a>)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>HarfBuzz shapes a vertical run with every glyph upright. Deciding what is set sideways, and shaping it horizontally to be rotated, is the application’s work.</li>
+<li>Bottom-to-top text is reversed and shaped as top to bottom, and comes out in top-to-bottom order. Its brackets are mirrored on the way in.</li>
+<li>A vertical run gets the common features and <code>vert</code>, and none of <code>liga</code>, <code>kern</code>, <code>calt</code>, <code>curs</code> and the rest. <code>vkrn</code>, <code>vpal</code>, <code>vhal</code>, <code>valt</code> and <code>vrt2</code> are off unless asked for.</li>
+<li><code>vert</code> is found under any script if the chosen one lacks it.</li>
+<li>Without <code>vert</code>, 34 punctuation characters are replaced by their Unicode vertical presentation forms, if the font maps them.</li>
+<li>Advances are negative y; offsets start as the negated vertical origin and stay that way through GPOS. <code>yAdvance</code> is negated, <code>xAdvance</code> ignored.</li>
+<li>Marks and cursive chains work as in horizontal text with x and y exchanged.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="legacy-kern.html">← Legacy kern</a><a rel="next" href="joining-scripts.html">Joining scripts →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

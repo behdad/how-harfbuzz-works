@@ -1,0 +1,781 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The command-line tools · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part I · Getting started</p>
+<h1 id="the-command-line-tools">3. The command-line tools</h1>
+<p id="ix-1">HarfBuzz comes with a handful of small programs, in its <code>util/</code> folder. <code>hb-shape</code> shapes a piece of text with a font and prints the glyphs and positions that come back. <code>hb-info</code> says what is in a font. <code>hb-subset</code> cuts a font down. <code>hb-vector</code>, <code>hb-raster</code> and <code>hb-view</code> draw shaped text. They are thin: each parses its options, makes the same HarfBuzz objects an application would, calls the library, and prints what it gets. That makes them the quickest way to ask HarfBuzz a question about a font, and the answer comes from the library itself.</p>
+<p>Every shaping result in this book is <code>hb-shape</code> output. This chapter explains its options, then the other tools, then puts them to work on a few questions about fonts. How to get the tools is the <a href="building-harfbuzz.html">previous chapter</a>; <a href="notation.html">Reading this book</a> explains how the book shows their output.</p>
+<p>As everywhere in the book, the results and pictures below were made by running the tools of HarfBuzz 15.1.0 when the page was built. Commands shown in plain code blocks are hand-written.</p>
+<h2 id="the-tools">The tools</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it does</th>
+<th>Library</th>
+<th>Built</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>hb-shape</code></td>
+<td id="ix-2">shapes text, prints glyphs and positions as text or JSON</td>
+<td><code>libharfbuzz</code></td>
+<td>always, installed</td>
+</tr>
+<tr>
+<td><code>hb-info</code></td>
+<td id="ix-3">lists a font’s names, tables, characters, glyphs, scripts, features, axes, palettes</td>
+<td><code>libharfbuzz</code></td>
+<td>always, installed</td>
+</tr>
+<tr>
+<td><code>hb-subset</code></td>
+<td id="ix-4">writes a smaller font: fewer characters, glyphs, tables or axes</td>
+<td><code>libharfbuzz-subset</code></td>
+<td>option <code>subset</code>, installed</td>
+</tr>
+<tr>
+<td><code>hb-vector</code></td>
+<td>draws shaped text as SVG or PDF</td>
+<td><code>libharfbuzz-vector</code></td>
+<td>option <code>vector</code>, installed</td>
+</tr>
+<tr>
+<td><code>hb-raster</code></td>
+<td>draws shaped text as PNG, PPM or terminal art</td>
+<td><code>libharfbuzz-raster</code></td>
+<td>option <code>raster</code>, installed</td>
+</tr>
+<tr>
+<td><code>hb-view</code></td>
+<td>draws shaped text through cairo (<a href="integrations.html#how-hb-view-uses-it">hb-cairo</a>)</td>
+<td><code>libharfbuzz-cairo</code></td>
+<td>with cairo, installed</td>
+</tr>
+<tr>
+<td><code>hb-gpu</code></td>
+<td>an interactive window that draws text on the GPU</td>
+<td><code>libharfbuzz-gpu</code></td>
+<td>with GLEW and GLFW, installed</td>
+</tr>
+<tr>
+<td><code>hb-subset-depend</code></td>
+<td id="ix-5">prints a font’s glyph dependency graph</td>
+<td><code>libharfbuzz-subset</code></td>
+<td>option <code>experimental_api</code>, not installed</td>
+</tr>
+<tr>
+<td><code>hb-ft-raster</code> and the <code>*-all</code> programs</td>
+<td>test and benchmark tools</td>
+<td>various</td>
+<td>not installed</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-6">Except for <code>hb-gpu-encode-all</code>, they are built only where GLib is found (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/meson.build#L44"><code>util/meson.build:44</code></a>); its option parser is what gives them their common command line. The book’s build has neither cairo nor GLEW, so <code>hb-view</code> and <code>hb-gpu</code> are described here from their source, and nothing on this page comes from them.</p>
+<p id="ix-7">Each tool answers <code>--help</code> with its common options, <code>--help-all</code> with all of them, and <code>--help-</code> followed by a group name (<code>--help-features</code>, say) with one group. <code>--version</code> prints the version, and says so if the library it is linked with is a different one (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/options.hh#L264"><code>util/options.hh:264</code></a>). With the environment variable <code>HB_UTIL_HELP_VERBOSE=1</code>, the help also lists the exit codes and environment variables (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/options.hh#L199"><code>options.hh:199</code></a>). The manual pages are made from that help, when the build finds <code>help2man</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/meson.build#L36"><code>util/meson.build:36</code></a>).</p>
+<h2 id="options-the-tools-share">Options the tools share</h2>
+<p id="ix-8">The tools are put together from the same parts. Each group of options is a C++ struct in a header in <code>util/</code>, and a tool inherits the groups it needs. <code>hb-shape</code>, for example, is one line of <code>main</code> over a template: <code>main_font_text_t&lt;shape_consumer_t&lt;shape_output_t&gt;, font_options_t, shape_text_options_t&gt;</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape.cc#L41"><code>hb-shape.cc:41</code></a>). So an option means the same thing in every tool that has it, and an example worked out with <code>hb-shape</code> can be drawn with <code>hb-vector</code> by changing the program’s name.</p>
+<table>
+<thead>
+<tr>
+<th>Group (<code>--help-…</code>)</th>
+<th>Header</th>
+<th>Options</th>
+<th>Tools</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-9"><code>face</code></td>
+<td id="ix-10"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/face-options.hh"><code>face-options.hh</code></a></td>
+<td><code>--font-file</code>, <code>-y</code>/<code>--face-index</code>, <code>--face-loader</code></td>
+<td>all</td>
+</tr>
+<tr>
+<td id="ix-11"><code>font</code>, <code>variations</code></td>
+<td id="ix-12"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/font-options.hh"><code>font-options.hh</code></a></td>
+<td><code>--font-size</code>, <code>--font-ppem</code>, <code>--font-ptem</code>, <code>--font-bold</code>, <code>--font-grade</code>, <code>--font-slant</code>, <code>--font-funcs</code>, <code>--ft-load-flags</code>, <code>--variations</code>, <code>--named-instance</code></td>
+<td>all but <code>hb-subset</code> and <code>hb-subset-depend</code></td>
+</tr>
+<tr>
+<td id="ix-13"><code>text</code>, <code>text-context</code></td>
+<td id="ix-14"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/text-options.hh"><code>text-options.hh</code></a></td>
+<td><code>--text</code>, <code>--text-file</code>, <code>-u</code>/<code>--unicodes</code>, <code>--single-par</code>, <code>--text-before</code>, <code>--text-after</code>, <code>--unicodes-before</code>, <code>--unicodes-after</code></td>
+<td>the shaping and drawing tools</td>
+</tr>
+<tr>
+<td><code>shape</code>, <code>features</code></td>
+<td id="ix-15"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-options.hh"><code>shape-options.hh</code></a></td>
+<td><code>--direction</code>, <code>--script</code>, <code>--language</code>, <code>--features</code>, <code>--shapers</code>, <code>--cluster-level</code>, <code>--verify</code> and the buffer flags</td>
+<td>the shaping and drawing tools</td>
+</tr>
+<tr>
+<td><code>output</code></td>
+<td id="ix-16"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/output-options.hh"><code>output-options.hh</code></a></td>
+<td><code>-o</code>/<code>--output-file</code>, <code>-O</code>/<code>--output-format</code></td>
+<td><code>hb-shape</code>, <code>hb-subset</code>, <code>hb-vector</code>, <code>hb-raster</code>, <code>hb-view</code>, <code>hb-ft-raster</code></td>
+</tr>
+<tr>
+<td><code>output-syntax</code></td>
+<td id="ix-17"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-format.hh"><code>shape-format.hh</code></a></td>
+<td><code>--no-glyph-names</code>, <code>--show-flags</code>, <code>--trace</code> and the rest</td>
+<td><code>hb-shape</code></td>
+</tr>
+<tr>
+<td id="ix-18"><code>view</code></td>
+<td id="ix-19"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/view-options.hh"><code>view-options.hh</code></a></td>
+<td><code>--foreground</code>, <code>--background</code>, <code>--margin</code>, <code>--font-palette</code>, <code>--show-extents</code> and others</td>
+<td><code>hb-view</code>, <code>hb-vector</code>, <code>hb-raster</code></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-20">“The shaping and drawing tools” are <code>hb-shape</code>, <code>hb-view</code>, <code>hb-vector</code>, <code>hb-raster</code>, <code>hb-ft-raster</code> and <code>hb-gpu</code>. Every one of them shapes before it draws, with the same code (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-consumer.hh#L65"><code>shape-consumer.hh:65</code></a>), so the drawing tools take <code>--features</code>, <code>--language</code> and the rest, and draw exactly the glyphs <code>hb-shape</code> would print.</p>
+<p>A few habits are common to all of them:</p>
+<ul>
+<li id="ix-21"><strong>The font and the text.</strong> The first argument that isn’t an option is the font file and the second is the text (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/main-font-text.hh#L91"><code>main-font-text.hh:91</code></a>). <code>--font-file</code> and <code>--text</code> say the same thing as options. A font file named <code>-</code> is read from standard input (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/face-options.hh#L99"><code>face-options.hh:99</code></a>).</li>
+<li id="ix-22"><strong>Text from a file, line by line.</strong> With no text, the tools read standard input; <code>--text-file</code> reads a file (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/text-options.hh#L53"><code>text-options.hh:53</code></a>). Either way, and for <code>--text</code> too, each line is shaped on its own, unless <code>--single-par</code> makes the whole input one paragraph (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/text-options.hh#L314"><code>text-options.hh:314</code></a>).</li>
+<li id="ix-23"><strong>Size.</strong> The default <code>--font-size</code> is the font’s units per em for <code>hb-shape</code>, <code>hb-info</code> and <code>hb-vector</code>, so their numbers are in font units, and 256 for <code>hb-raster</code> and <code>hb-view</code>, whose output is pixels (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape.cc#L35"><code>hb-shape.cc:35</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-raster.cc#L34"><code>hb-raster.cc:34</code></a>).</li>
+<li id="ix-24"><strong>Output.</strong> <code>-o</code> names a file. Without <code>-O</code>, the format comes from the file’s extension (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/output-options.hh#L77"><code>output-options.hh:77</code></a>), so <code>hb-vector -o text.pdf</code> writes PDF.</li>
+<li id="ix-25"><strong>Exit codes.</strong> 0 for success, 1 if the options couldn’t be parsed, 2 if the font couldn’t be loaded, 3 if the operation failed, 4 if the font functions couldn’t be set (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/options.hh#L59"><code>options.hh:59</code></a>).</li>
+<li id="ix-26"><strong>Environment.</strong> <code>HB_SHAPER_LIST</code>, <code>HB_FONT_FUNCS</code> and <code>HB_FACE_LOADER</code> change the library’s defaults, for these tools and for any other program (<a href="hb_shape-and-its-backends.html">hb_shape and its backends</a>, <a href="fonts-and-font-functions.html#choosing-funcs">Fonts and font functions</a>).</li>
+</ul>
+<h2 id="hb-shape">hb-shape</h2>
+<h3 id="reading-the-output">Reading the output</h3>
+<p id="ix-27"><code>hb-shape</code> prints one line per line of input: the glyphs, in the order they are drawn, between square brackets. <a href="notation.html#shaping-results">Reading this book</a> gives the format: <code>name=cluster@x,y+advance</code>. The cluster is the index of the character a glyph came from; characters and glyphs that belong together share one, as <a href="buffers.html#merging-clusters">Buffers</a> explains. Switches take parts away or add them:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">fiá</span><span class="cps">U+0066 U+0069 U+00E1</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900|aacute=2+500]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">fiá</span><span class="cps">U+0066 U+0069 U+00E1</span></td><td class="opt">--no-glyph-names</td><td class="out"><code>[9=0+900|6=2+500]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">fiá</span><span class="cps">U+0066 U+0069 U+00E1</span></td><td class="opt">--no-clusters</td><td class="out"><code>[f_i+900|aacute+500]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">fiá</span><span class="cps">U+0066 U+0069 U+00E1</span></td><td class="opt">--no-positions</td><td class="out"><code>[f_i=0|aacute=2]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">fiá</span><span class="cps">U+0066 U+0069 U+00E1</span></td><td class="opt">--no-advances</td><td class="out"><code>[f_i=0|aacute=2@900,0]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">fiá</span><span class="cps">U+0066 U+0069 U+00E1</span></td><td class="opt">--ned</td><td class="out"><code>[f_i|aacute@900,0]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">fiá</span><span class="cps">U+0066 U+0069 U+00E1</span></td><td class="opt">--show-extents</td><td class="out"><code>[f_i=0+900&lt;50,500,800,-500&gt;|aacute=2+500&lt;50,500,400,-500&gt;]</code></td></tr></tbody></table></div>
+<p id="ix-28"><code>--no-glyph-names</code> gives glyph IDs; a font without names prints them as <code>gid59</code> anyway. <code>--no-advances</code> does more than leave out the advances: each <code>@x,y</code> becomes the glyph’s absolute position, the sum of the advances before it and its own offset (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer-serialize.cc#L290"><code>hb-buffer-serialize.cc:290</code></a>). That is why the <code>aacute</code> is at <code>@900,0</code>. <code>--ned</code>, “no extra data”, is <code>--no-clusters</code> and <code>--no-advances</code> together (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-format.hh#L95"><code>shape-format.hh:95</code></a>). <code>--show-extents</code> adds each glyph’s ink box, <code>&lt;x_bearing,y_bearing,width,height&gt;</code>, from the font funcs; the height is negative because the box runs down from its top (<a href="where-metrics-come-from.html">Where metrics come from</a>).</p>
+<p id="ix-29"><code>--show-flags</code> adds the glyph flags, <code>#</code> and a hexadecimal number, to the glyphs that have any: 1 is unsafe to break, 2 unsafe to concatenate (only with <code>--unsafe-to-concat</code>), 4 safe to insert a tatweel (only with <code>--safe-to-insert-tatweel</code>). What they promise is in <a href="buffers.html#glyph-flags">Buffers</a> and <a href="for-applications.html#what-the-glyph-flags-promise">For applications</a>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--show-flags</td><td class="out"><code>[beh.fina=2+600#1|beh.medi=1+400#1|beh.init=0+400]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--show-flags --unsafe-to-concat</td><td class="out"><code>[beh.fina=2+600#3|beh.medi=1+400#3|beh.init=0+400#2]</code></td></tr></tbody></table></div>
+<p id="ix-30"><code>--output-format=json</code> (or <code>-O json</code>) writes the same data as JSON, with short keys: <code>g</code>, <code>cl</code>, <code>dx</code>, <code>dy</code>, <code>ax</code>, <code>ay</code>, and <code>xb</code>, <code>yb</code>, <code>w</code>, <code>h</code> for extents and <code>fl</code> for flags.:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">fiá</span><span class="cps">U+0066 U+0069 U+00E1</span></td><td class="opt">--output-format=json --show-extents</td><td class="out"><code>[{&quot;g&quot;:&quot;f_i&quot;,&quot;cl&quot;:0,&quot;dx&quot;:0,&quot;dy&quot;:0,&quot;ax&quot;:900,&quot;ay&quot;:0,&quot;xb&quot;:50,&quot;yb&quot;:500,&quot;w&quot;:800,&quot;h&quot;:-500},{&quot;g&quot;:&quot;aacute&quot;,&quot;cl&quot;:2,&quot;dx&quot;:0,&quot;dy&quot;:0,&quot;ax&quot;:500,&quot;ay&quot;:0,&quot;xb&quot;:50,&quot;yb&quot;:500,&quot;w&quot;:400,&quot;h&quot;:-500}]</code></td></tr></tbody></table></div>
+<p id="ix-31">Three switches put the input before each result: <code>--show-text</code> the text in parentheses, <code>--show-unicode</code> its code points, and <code>--show-line-num</code> the number of the input line. <code>--verbose</code> turns on all three. Its short form, <code>-v</code>, also turns on <code>--ned</code>, because in 15.1.0 <code>--ned</code> was given the same letter (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-format.hh#L187"><code>shape-format.hh:187</code></a>, <code>:199</code>); the help lists <code>-v</code> only for <code>--verbose</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--verbose</td><td class="out"><code>1: (fi)
+1: &lt;U+0066=0|U+0069=1&gt;
+1: [f_i=0+900]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">-v</td><td class="out"><code>1: (fi)
+1: &lt;U+0066=0|U+0069=1&gt;
+1: [f_i]</code></td></tr></tbody></table></div>
+<h3 id="text-and-code-points">Text and code points</h3>
+<p id="ix-32">The text can be given as characters or as code points. <code>-u</code> (<code>--unicodes</code>) takes a list of hexadecimal numbers, and is generous about what separates them: commas, spaces, <code>U+</code>, <code>0x</code>, <code>\u</code>, <code>&amp;#x</code> and <code>;</code>, among others (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/text-options.hh#L150"><code>text-options.hh:150</code></a>). So <code>-u 628,644</code>, <code>-u &quot;U+0628 U+0644&quot;</code> and <code>-u &quot;&amp;#x628;&amp;#x644;&quot;</code> give the same text. For text that is hard to type, or invisible, code points are safer than characters.</p>
+<p id="ix-33"><code>--text-before</code> and <code>--text-after</code> give the text around the run, as an application gives the text around a run it has cut out of a paragraph. <code>--unicodes-before</code> and <code>--unicodes-after</code> do the same with code points. They are added to the buffer as <strong>context</strong>: characters HarfBuzz can look at but doesn’t shape (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-options.hh#L117"><code>shape-options.hh:117</code></a>). Context matters wherever shaping looks at Unicode properties of the neighbors, as Arabic joining does:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">ب</span><span class="cps">U+0628</span></td><td class="opt"></td><td class="out"><code>[beh=0+600]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">ب</span><span class="cps">U+0628</span></td><td class="opt">--unicodes-before=628</td><td class="out"><code>[beh.fina=0+600]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">ب</span><span class="cps">U+0628</span></td><td class="opt">--unicodes-after=628</td><td class="out"><code>[beh.init=0+400]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">ب</span><span class="cps">U+0628</span></td><td class="opt">--unicodes-before=628 --unicodes-after=628</td><td class="out"><code>[beh.medi=0+400]</code></td></tr></tbody></table></div>
+<p id="ix-34">A lone beh is isolated; with a beh before it, it is final, and so on. The context is never in the buffer as glyphs, so GSUB rules can’t match it: the GSUB test font turns <code>e</code> into <code>e.init</code> after a space, but a space given as context doesn’t do it:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gsub/ligatures.ttf</td><td class="in"><span class="txt">␣e</span><span class="cps">U+0020 U+0065</span></td><td class="opt"></td><td class="out"><code>[space=0+250|e.init=1+500]</code></td></tr><tr><td class="font">gsub/ligatures.ttf</td><td class="in"><span class="txt">e</span><span class="cps">U+0065</span></td><td class="opt">--unicodes-before=20</td><td class="out"><code>[e=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-35"><a href="for-applications.html#context-at-the-edges-of-a-run">For applications</a> says what this means for an application. One oddity: in 15.1.0, <code>--text-before</code> also prints its argument to standard error (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/text-options.hh#L225"><code>text-options.hh:225</code></a>), a debugging line left in.</p>
+<h3 id="direction-script-and-language">Direction, script and language</h3>
+<p id="ix-36">A run has a direction, a script and a language (<a href="why-shaping-exists.html#runs-and-the-three-things-harfbuzz-must-be-told">Why shaping exists</a>). <code>hb-shape</code> guesses whatever isn’t given, with <code>hb_buffer_guess_segment_properties</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-options.hh#L64"><code>shape-options.hh:64</code></a>): the script and direction from the text, the language from the locale, through the <code>LANG</code> and <code>LC_*</code> environment variables. The language changes results in fonts with language-specific rules, so a result that depends on it should say <code>--language</code> explicitly, or it will differ from one machine to the next:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--language=en</td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--language=tr</td><td class="out"><code>[f=0+500|i=1+500]</code></td></tr></tbody></table></div>
+<p id="ix-37"><code>--direction</code> takes <code>ltr</code>, <code>rtl</code>, <code>ttb</code> or <code>btt</code>; <code>--script</code> an ISO 15924 code such as <code>Latn</code> or <code>Arab</code> (<a href="choosing-a-script-shaper.html">Choosing a script shaper</a>); <code>--language</code> a BCP 47 tag such as <code>tr</code> or <code>ur-PK</code>.</p>
+<h3 id="features">Features</h3>
+<p id="ix-38"><code>--features</code> takes a list of features separated by commas, each in the syntax of <code>hb_feature_from_string</code>, which the help prints in full:</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-39"><code>kern</code>, <code>+kern</code>, <code>kern=1</code></td>
+<td>on</td>
+</tr>
+<tr>
+<td><code>-kern</code>, <code>kern=0</code></td>
+<td>off</td>
+</tr>
+<tr>
+<td><code>aalt=2</code></td>
+<td>on, with value 2: the second alternate</td>
+</tr>
+<tr>
+<td><code>kern[3:5]</code></td>
+<td id="ix-40">on for characters 3 and 4 only</td>
+</tr>
+<tr>
+<td><code>kern[3]</code></td>
+<td id="ix-41">on for character 3</td>
+</tr>
+<tr>
+<td><code>kern[5:]</code>, <code>kern[:5]</code></td>
+<td id="ix-42">on from character 5, or up to it</td>
+</tr>
+<tr>
+<td><code>aalt[3:5]=2</code></td>
+<td id="ix-43">value 2, for characters 3 and 4</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-44">The numbers in brackets count characters from 0 (bytes with <code>--utf8-clusters</code>), and the end is excluded, as in Python. A feature HarfBuzz turns on by default, such as <code>liga</code>, is already on everywhere, so turning it on for a range changes nothing. To keep a ligature in one place only, turn the feature off, then on again for the range:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">ffi</span><span class="cps">U+0066 U+0066 U+0069</span></td><td class="opt">--language=en</td><td class="out"><code>[f_f=0+900|i=2+500]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">ffi</span><span class="cps">U+0066 U+0066 U+0069</span></td><td class="opt">--language=en --features=-liga</td><td class="out"><code>[f=0+500|f=1+500|i=2+500]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">ffi</span><span class="cps">U+0066 U+0066 U+0069</span></td><td class="opt">--language=en --features=-liga,liga[1:3]</td><td class="out"><code>[f=0+500|f_i=1+900]</code></td></tr><tr><td class="font">gsub/ligatures.ttf</td><td class="in"><span class="txt">aa</span><span class="cps">U+0061 U+0061</span></td><td class="opt">--features=salt[1]=3</td><td class="out"><code>[a=0+500|a.alt3=1+500]</code></td></tr></tbody></table></div>
+<p id="ix-45">Which features are on by default, and how a list of features becomes a list of lookups, is <a href="from-features-to-lookups.html">From features to lookups</a>.</p>
+<p id="ix-46">The help says that any value of CSS <code>font-feature-settings</code> is accepted too, and <code>hb_feature_from_string</code> does accept <code>&quot;liga&quot; 0</code>. But <code>hb-shape</code> splits its argument at spaces as well as commas before it parses anything (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-options.hh#L352"><code>shape-options.hh:352</code></a>), so on the command line the CSS form breaks in two, and its <code>0</code> is lost: use <code>liga=0</code>.</p>
+<h3 id="variations">Variations</h3>
+<p id="ix-47"><code>--variations</code> sets a variable font’s axes, as a list such as <code>wght=700,wdth=80</code>; an axis not mentioned stays at its default, and a value beyond an axis’s range is clamped to it. <code>--named-instance</code> picks one of the font’s named instances by its index, and <code>--variations</code> then applies on top of it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/font-options.hh#L104"><code>font-options.hh:104</code></a>). <a href="design-space.html">Design space</a> explains axes and instances; <code>hb-info --list-variations</code> lists them:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt"></td><td class="out"><code>[I=0+260|H=1+600|V=2+260]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=900</td><td class="out"><code>[I=0+410|H=1+700|V=2+560]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=900,wdth=50</td><td class="out"><code>[I=0+400|H=1+550|V=2+550]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--named-instance=3</td><td class="out"><code>[I=0+250|H=1+450|V=2+250]</code></td></tr></tbody></table></div>
+<p id="ix-48">The same split at spaces applies: <code>wght 900</code>, in the CSS form the help mentions, sets nothing (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/font-options.hh#L192"><code>font-options.hh:192</code></a>).</p>
+<h3 id="size-and-the-font-funcs">Size, and the font funcs</h3>
+<p id="ix-49"><code>--font-size</code> sets the font’s scale, the number that one em comes out as. With <code>--font-size=16</code>, positions are in pixels at 16 pixels per em; since positions are whole numbers, every advance is rounded to a whole pixel:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hb:test/subset/data/fonts/Roboto-Regular.ttf</td><td class="in"><span class="txt">Wave</span><span class="cps">U+0057 U+0061 U+0076 U+0065</span></td><td class="opt"></td><td class="out"><code>[gid59=0+1784|gid69=1+1099|gid90=2+979|gid73=3+1085]</code></td></tr><tr><td class="font">hb:test/subset/data/fonts/Roboto-Regular.ttf</td><td class="in"><span class="txt">Wave</span><span class="cps">U+0057 U+0061 U+0076 U+0065</span></td><td class="opt">--font-size=16</td><td class="out"><code>[gid59=0+14|gid69=1+9|gid90=2+8|gid73=3+8]</code></td></tr><tr><td class="font">hb:test/subset/data/fonts/Roboto-Regular.ttf</td><td class="in"><span class="txt">Wave</span><span class="cps">U+0057 U+0061 U+0076 U+0065</span></td><td class="opt">--font-size=1024</td><td class="out"><code>[gid59=0+893|gid69=1+550|gid90=2+490|gid73=3+543]</code></td></tr></tbody></table></div>
+<p id="ix-50">An application that wants fractions of a pixel scales the font by more, often 64 times, and <code>hb-raster</code>, <code>hb-vector</code> and <code>hb-view</code> do that themselves: they multiply the size by 64 (<code>SUBPIXEL_BITS</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-raster.cc#L35"><code>hb-raster.cc:35</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/font-options.hh#L99"><code>font-options.hh:99</code></a>). <a href="fonts-and-font-functions.html#three-kinds-of-size">Fonts and font functions</a> explains scale, <code>--font-ppem</code> (pixels per em, which only Device tables, hinting and bitmap strikes read) and <code>--font-ptem</code> (the point size, which AAT’s <code>trak</code> reads). <code>--font-bold</code>, <code>--font-grade</code> and <code>--font-slant</code> make a font bold, heavier without wider advances, or slanted, synthetically (<a href="fonts-and-font-functions.html#synthetic-bold-and-slant">Fonts and font functions</a>):</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--font-bold=0.05</td><td class="out"><code>[f_i=0+950]</code></td></tr></tbody></table></div>
+<p id="ix-51"><code>--font-funcs</code> chooses where the metrics come from: <code>ot</code>, HarfBuzz’s own, by default, or <code>ft</code> for FreeType in a build that has it, and <code>--list-font-funcs</code> lists them. <code>--ft-load-flags</code> passes FreeType its load flags; the default, 2, is <code>FT_LOAD_NO_HINTING</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/font-options.hh#L73"><code>font-options.hh:73</code></a>). FreeType reads the scale as a size in 64ths of a pixel, so to see hinted advances in <code>hb-shape</code>, multiply the size by 64; <a href="hb-raster.html#hinting-with-freetype">hb-raster</a> shows the difference.</p>
+<h3 id="buffer-and-cluster-options">Buffer and cluster options</h3>
+<p>Most of the remaining options set a property of the buffer, and are explained where the buffer is (<a href="buffers.html#buffer-flags">Buffers</a>):</p>
+<ul>
+<li id="ix-52"><code>--cluster-level=0</code> to <code>3</code> chooses how much clusters merge. Level 0, the default, keeps a base and its marks together; level 1 doesn’t:</li>
+</ul>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">e◌́</span><span class="cps">U+0065 U+0301</span></td><td class="opt"></td><td class="out"><code>[e=0+500|acutecomb=0@-250,150+0]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">e◌́</span><span class="cps">U+0065 U+0301</span></td><td class="opt">--cluster-level=1</td><td class="out"><code>[e=0+500|acutecomb=1@-250,150+0]</code></td></tr></tbody></table></div>
+<ul>
+<li id="ix-53"><code>--utf8-clusters</code> numbers clusters by byte in the UTF-8 text, as the library does, rather than by character, as <code>hb-shape</code> does unless told (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-options.hh#L126"><code>shape-options.hh:126</code></a>).</li>
+<li><code>--bot</code> and <code>--eot</code> say that the text starts or ends a paragraph.</li>
+<li id="ix-54"><code>--preserve-default-ignorables</code> and <code>--remove-default-ignorables</code> decide what becomes of invisible characters such as ZWJ, which by default are hidden behind a zero-width space glyph; <code>--invisible-glyph=N</code> uses glyph <code>N</code> for them instead.</li>
+<li id="ix-55"><code>--not-found-glyph=N</code> uses glyph <code>N</code>, instead of <code>.notdef</code>, for a character the font doesn’t have.</li>
+<li><code>--unsafe-to-concat</code> and <code>--safe-to-insert-tatweel</code> ask for the flags of those names.</li>
+<li id="ix-56"><code>--normalize-glyphs</code> sorts the glyphs within each cluster into a fixed order, so that two results can be compared.</li>
+<li id="ix-57"><code>--glyphs</code> takes, instead of text, glyphs in <code>hb-shape</code>’s own output format, and prints them without shaping, scaled to <code>--font-size</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-options.hh#L73"><code>shape-options.hh:73</code></a>).</li>
+<li id="ix-58"><code>--shapers</code> lists the shaping backends to try, in order, and <code>--list-shapers</code> prints them (<a href="hb_shape-and-its-backends.html">hb_shape and its backends</a>).</li>
+</ul>
+<h3 id="traces">Traces</h3>
+<p id="ix-59"><code>--trace</code> (<code>-V</code>) prints, on standard error, a line for every step of shaping: its name, a tab, and the buffer after it, in the same format as the result (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-output.hh#L142"><code>shape-output.hh:142</code></a>). So <code>--no-glyph-names</code> and the other switches apply to traces too. Here is the GSUB part of the trace for the <code>fi</code> above:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape why-shaping-exists/shaping.ttf "fi" --language=en --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;latn&#x27;</td><td class="buf"><code>[f=0|i=1]</code></td></tr><tr><td class="what">start lookup 0 feature &#x27;liga&#x27;</td><td class="buf"><code>[f=0|i=1]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;liga&#x27;</td><td class="buf"><code>[f=0|i=1]</code></td></tr><tr><td class="what">start lookup 1 feature &#x27;liga&#x27;</td><td class="buf"><code>[f=0|i=1]</code></td></tr><tr><td class="what">ligating glyphs at 0,1</td><td class="buf"><code>[f=0|i=1]</code></td></tr><tr><td class="what">ligated glyph at 0</td><td class="buf"><code>[f_i=0]</code></td></tr><tr><td class="what">end lookup 1 feature &#x27;liga&#x27;</td><td class="buf"><code>[f_i=0]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;latn&#x27;</td><td class="buf"><code>[f_i=0]</code></td></tr></tbody></table></div>
+<p id="ix-60"><code>liga</code> has two lookups in this font, <code>ff</code> then <code>fi</code>, and the trace shows the second one making the ligature. The book’s traces come from a build with <code>HB_BUFFER_MESSAGE_MORE</code>, which adds the lines inside lookups, such as “ligating glyphs at 0,1”; an ordinary build prints only the starts and ends. <a href="pipeline-step-by-step.html">The pipeline, step by step</a> reads a whole trace, and <a href="testing-harfbuzz.html#buffer-messages">Testing HarfBuzz</a> explains the messages.</p>
+<h3 id="verifying">Verifying</h3>
+<p id="ix-61"><code>--verify</code> makes HarfBuzz check its own result: it cuts the text wherever the glyph flags say a line could break, shapes the pieces, and compares (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-options.hh#L54"><code>shape-options.hh:54</code></a>, <a href="buffers.html#verification">Buffers</a>). If the result passes, the output is unchanged. If it fails, HarfBuzz prints the reason and the text to standard error, <code>hb-shape</code> prints <code>error: Shaping failed.</code>, and exits with 3. <a href="for-applications.html#checking-the-flags">For applications</a> shows fonts that fail.</p>
+<h3 id="many-runs">Many runs</h3>
+<p id="ix-62"><code>--batch</code>, as the only argument, makes a tool read standard input for whole command lines, one per line, with the arguments separated by semicolons (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/batch.hh#L36"><code>batch.hh:36</code></a>):</p>
+<pre><code>$ printf 'shaping.ttf;fi\nshaping.ttf;fi;--features=-liga\n' | hb-shape --batch
+</code></pre>
+<p id="ix-63">Each line runs as if it were a command of its own, and prints what it would. The font of the last line is kept loaded while the next line names the same file (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/face-options.hh#L109"><code>face-options.hh:109</code></a>), and one process serves every line. HarfBuzz’s own test runners drive <code>hb-shape</code> and <code>hb-subset</code> this way (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/shape/run-tests.py#L25"><code>test/shape/run-tests.py:25</code></a>). The drawing tools and <code>hb-subset</code> also print <code>success</code> or <code>failure</code> after each line. A line with a bad option or font still ends the whole batch (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/options.hh#L114"><code>options.hh:114</code></a>).</p>
+<p id="ix-64"><code>-n</code> (<code>--num-iterations</code>) repeats the shaping, for timing, and an empty <code>--output-format=</code> skips writing the result at all (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-output.hh#L56"><code>shape-output.hh:56</code></a>), so that the time measured is HarfBuzz’s.</p>
+<h2 id="hb-info">hb-info</h2>
+<p><code>hb-info</code> reads a font and says what is in it. With no query it prints a summary, here of Roboto, from HarfBuzz’s tests:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">hb:test/subset/data/fonts/Roboto-Regular.ttf</td><td class="opt"></td><td class="out"><pre><code>Face count: 1
+Family: Roboto
+Subfamily: Regular
+Unique name: Roboto
+Full name: Roboto
+Postscript name: Roboto-Regular
+Version: Version 2.137; 2017
+Has TrueType outlines
+Has TrueType hinting
+Has OpenType layout
+Unicode count: 896
+Glyph count: 1294
+Units-Per-EM: 2048
+Ascender: 1900
+Descender: -500
+Line gap: 0</code></pre></td></tr></tbody></table></div>
+<p id="ix-65">Its queries come in three kinds. <code>--show-…</code> prints one line of the summary (<code>--show-upem</code>, <code>--show-glyph-count</code> and so on). <code>--get-…</code> fetches one thing by its tag or number: <code>--get-name=13</code>, <code>--get-metric=hasc</code>, <code>--get-style=wght</code>, <code>--get-baseline=romn</code>. <code>--get-table=GSUB</code> writes the table’s raw bytes to standard output (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-info.cc#L617"><code>hb-info.cc:617</code></a>), ready to pipe to another program. <code>--list-…</code> lists: names, tables (<code>-l</code>), characters (<code>--list-unicodes</code>), glyphs, scripts, features, variations, palettes, metrics, style values, baselines and <code>meta</code> entries. <code>-a</code> (<code>--all</code>) prints everything. <code>-q</code> drops the headings, for scripts.</p>
+<p id="ix-66">Because <code>hb-info</code> has the font options, its answers are for the font as configured: <code>--get-style=wght</code>, for example, answers for the instance <code>--variations</code> asks for:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="opt">-q --get-style=wght --variations=wght=650</td><td class="out"><pre><code>650</code></pre></td></tr></tbody></table></div>
+<p id="ix-67"><code>--list-features</code> alone lists every feature of GSUB and GPOS once. With <code>--script</code>, and optionally <code>--language</code>, it lists only those of that script and language, as HarfBuzz would choose them when shaping (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-info.cc#L1047"><code>hb-info.cc:1047</code></a>); <code>--ot-script</code> and <code>--ot-language</code> give OpenType tags directly. <a href="other-tables.html">Other tables</a> uses <code>hb-info</code>’s queries of <code>name</code>, <code>STAT</code>, <code>BASE</code> and <code>meta</code>.</p>
+<h2 id="hb-subset">hb-subset</h2>
+<p id="ix-68"><code>hb-subset</code> writes a font cut down to what some text, or some glyphs, needs. It must be told where to write: it refuses standard output unless asked for it with <code>-o -</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/output-options.hh#L91"><code>output-options.hh:91</code></a>). A typical command keeps the characters of a string:</p>
+<pre><code>$ hb-subset Roboto-Regular.ttf --text=&quot;Hello&quot; -o hello.ttf
+</code></pre>
+<p id="ix-69">The text can also come as the second argument, as for <code>hb-shape</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.cc#L868"><code>hb-subset.cc:868</code></a>). What to keep is given by <code>--text</code>, <code>--unicodes</code> (hex, with ranges and <code>*</code> for all), <code>--gids</code> and <code>--glyphs</code>, each with a <code>-file</code> form. Every set has a <code>+=</code> and a <code>-=</code> form that adds or takes away, so <code>--unicodes=* --unicodes-=41</code> keeps every character but <code>A</code>, and <code>--layout-features+=dlig</code> keeps one more feature than the default list. <code>--drop-tables</code>, <code>--name-IDs</code> and <code>--layout-scripts</code> work the same way.</p>
+<p id="ix-70">Among the flags, <code>--retain-gids</code> keeps glyph IDs unchanged, <code>--no-hinting</code> drops hinting, <code>--desubroutinize</code> flattens CFF, <code>--glyph-names</code> keeps the <code>post</code> table’s names (without it, a TrueType subset’s glyphs print as <code>gid0</code>, <code>gid1</code>), and <code>--no-layout-closure</code> drops the glyphs that only substitutions reach. <code>--variations</code> instances a variable font: <code>wght=700</code> pins an axis, <code>wght=300:700</code> limits it, <code>wght=drop</code> pins it at its default (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/helper-subset.hh#L37"><code>helper-subset.hh:37</code></a>). <a href="subsetting.html">Subsetting</a> and <a href="instancing.html">Instancing</a> explain what happens inside.</p>
+<h2 id="drawing-hb-vector-hb-raster-and-hb-view">Drawing: hb-vector, hb-raster and hb-view</h2>
+<p id="ix-71">The three drawing tools shape the text, lay out its lines, and draw the glyphs. They share the view options (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/view-options.hh#L363"><code>view-options.hh:363</code></a>): <code>--foreground</code> and <code>--background</code> colors (<code>none</code> for a transparent background), <code>--margin</code>, <code>--line-space</code>, <code>--font-extents</code> to override ascent and descent, <code>--logical</code> and <code>--ink</code> to frame the picture by the line’s logical box or by the ink alone, <code>--font-palette</code> and <code>--custom-palette</code> for color fonts, <code>--rainbow</code> to color each glyph differently, and <code>--show-extents</code> to draw each glyph’s ink box and origin. <code>hb-vector</code> and <code>hb-raster</code> find out whether a font has color glyphs (COLR, or PNG bitmaps) and paint them in color; <code>--draw</code> forces plain outlines and <code>--paint</code> the color path (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/raster-output.hh#L79"><code>raster-output.hh:79</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/vector-output.hh#L225"><code>vector-output.hh:225</code></a>).</p>
+<p id="ix-72"><code>hb-vector</code> writes SVG, or PDF with <code>-O pdf</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/vector-output.hh#L40"><code>vector-output.hh:40</code></a>); <code>--precision</code> sets the number of decimals in its coordinates. Its default size is the font’s units per em, so an SVG is in font units. The commands in this section are run from the top of a HarfBuzz checkout, where these test fonts are. This one draws a word as SVG:</p>
+<figure class="command-run"><pre class="command"><code>$ hb-vector test/subset/data/fonts/Roboto-Variable.ttf Wave -o wave.svg</code></pre><img class="vector" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9Ii0xNiAtMTkxNiA0OTgwIDI0MzIiIHdpZHRoPSI0OTgwIiBoZWlnaHQ9IjI0MzIiPgo8cmVjdCB4PSItMTYiIHk9Ii0xOTE2IiB3aWR0aD0iNDk4MCIgaGVpZ2h0PSIyNDMyIiBmaWxsPSJyZ2IoMjU1LDI1NSwyNTUpIi8+CjxnIHRyYW5zZm9ybT0ic2NhbGUoMSwtMSkiPgo8cGF0aCBkPSJNNTUyLDQ0MEw4NDEsMTQ1Nkw5ODEsMTQ1Nkw5MDAsMTA2MUw1ODksMEw0NTAsMEw1NTIsNDQwWk0yNTMsMTQ1Nkw0ODMsNDYwTDU1MiwwTDQxNCwwTDYxLDE0NTZMMjUzLDE0NTZaTTEzNTUsNDYxTDE1ODAsMTQ1NkwxNzczLDE0NTZMMTQyMSwwTDEyODMsMEwxMzU1LDQ2MVpNMTAwMiwxNDU2TDEyODMsNDQwTDEzODUsMEwxMjQ2LDBMOTQ2LDEwNjFMODY0LDE0NTZMMTAwMiwxNDU2WiIgZmlsbD0iIzAwMCIvPgo8cGF0aCBkPSJNMjU2MywxODVMMjU2Myw3NDJRMjU2Myw4MDYgMjUzNy41LDg1My41UTI1MTIsOTAxIDI0NjEsOTI3UTI0MTAsOTUzIDIzMzUsOTUzUTIyNjUsOTUzIDIyMTIuNSw5MjlRMjE2MCw5MDUgMjEzMC41LDg2NlEyMTAxLDgyNyAyMTAxLDc4MkwxOTE2LDc4MlExOTE2LDg0MCAxOTQ2LDg5N1ExOTc2LDk1NCAyMDMyLjUsMTAwMC41UTIwODksMTA0NyAyMTY4LjUsMTA3NC41UTIyNDgsMTEwMiAyMzQ2LDExMDJRMjQ2NCwxMTAyIDI1NTQuNSwxMDYyUTI2NDUsMTAyMiAyNjk2LjUsOTQxLjVRMjc0OCw4NjEgMjc0OCw3NDBMMjc0OCwyMzZRMjc0OCwxODIgMjc1Ny41LDEyMVEyNzY3LDYwIDI3ODYsMTZMMjc4NiwwTDI1OTMsMFEyNTc5LDMyIDI1NzEsODUuNVEyNTYzLDEzOSAyNTYzLDE4NVpNMjU5NSw2NTZMMjU5Nyw1MjZMMjQxMCw1MjZRMjMzMSw1MjYgMjI2OSw1MTMuNVEyMjA3LDUwMSAyMTY1LDQ3NlEyMTIzLDQ1MSAyMTAxLDQxMy41UTIwNzksMzc2IDIwNzksMzI2UTIwNzksMjc1IDIxMDIsMjMzUTIxMjUsMTkxIDIxNzEuNSwxNjYuNVEyMjE4LDE0MiAyMjg2LDE0MlEyMzcxLDE0MiAyNDM2LDE3OFEyNTAxLDIxNCAyNTM5LjUsMjY2UTI1NzgsMzE4IDI1ODEsMzY3TDI2NjAsMjc4UTI2NTMsMjM2IDI2MjIsMTg1UTI1OTEsMTM0IDI1MzkuNSw4Ny41UTI0ODgsNDEgMjQxNy41LDEwLjVRMjM0NywtMjAgMjI1OSwtMjBRMjE0OSwtMjAgMjA2Ni41LDIzUTE5ODQsNjYgMTkzOC41LDEzOC41UTE4OTMsMjExIDE4OTMsMzAxUTE4OTMsMzg4IDE5MjcsNDU0LjVRMTk2MSw1MjEgMjAyNSw1NjUuNVEyMDg5LDYxMCAyMTc5LDYzM1EyMjY5LDY1NiAyMzgwLDY1NkwyNTk1LDY1NloiIGZpbGw9IiMwMDAiLz4KPHBhdGggZD0iTTMzNTMsMTY3TDM2NDksMTA4MkwzODM4LDEwODJMMzQ0OSwwTDMzMjUsMEwzMzUzLDE2N1pNMzEwNiwxMDgyTDM0MTEsMTYyTDM0MzIsMEwzMzA4LDBMMjkxNiwxMDgyTDMxMDYsMTA4MloiIGZpbGw9IiMwMDAiLz4KPHBhdGggZD0iTTQ0NTIsLTIwUTQzMzksLTIwIDQyNDcuNSwxOC41UTQxNTYsNTcgNDA5MC41LDEyN1E0MDI1LDE5NyAzOTkwLDI5M1EzOTU1LDM4OSAzOTU1LDUwM0wzOTU1LDU0NVEzOTU1LDY3NyAzOTk0LDc4MC41UTQwMzMsODg0IDQxMDAsOTU2UTQxNjcsMTAyOCA0MjUyLDEwNjVRNDMzNywxMTAyIDQ0MjgsMTEwMlE0NTQ0LDExMDIgNDYyOC41LDEwNjJRNDcxMywxMDIyIDQ3NjcsOTUwLjVRNDgyMSw4NzkgNDg0Nyw3ODIuNVE0ODczLDY4NiA0ODczLDU3Mkw0ODczLDQ4OUw0MDY1LDQ4OUw0MDY1LDY0MEw0Njg4LDY0MEw0Njg4LDY1NFE0Njg0LDcyNiA0NjU4LjUsNzk0UTQ2MzMsODYyIDQ1NzgsOTA2UTQ1MjMsOTUwIDQ0MjgsOTUwUTQzNjUsOTUwIDQzMTIsOTIzLjVRNDI1OSw4OTcgNDIyMSw4NDVRNDE4Myw3OTMgNDE2Miw3MThRNDE0MSw2NDMgNDE0MSw1NDVMNDE0MSw1MDNRNDE0MSw0MjYgNDE2Mi41LDM1OC41UTQxODQsMjkxIDQyMjUuNSwyNDBRNDI2NywxODkgNDMyNi41LDE2MFE0Mzg2LDEzMSA0NDYyLDEzMVE0NTYwLDEzMSA0NjI4LDE3MVE0Njk2LDIxMSA0NzQ3LDI3OEw0ODU5LDE4OVE0ODI0LDEzNiA0NzcwLDg4UTQ3MTYsNDAgNDYzNy41LDEwUTQ1NTksLTIwIDQ0NTIsLTIwWiIgZmlsbD0iIzAwMCIvPgo8L2c+Cjwvc3ZnPgo=" alt="wave.svg"><figcaption><code>wave.svg</code></figcaption></figure>
+
+<p><code>--variations</code> chooses a weight in a variable font, as it does for <code>hb-shape</code>:</p>
+<figure class="command-run"><pre class="command"><code>$ hb-vector test/subset/data/fonts/Roboto-Variable.ttf Wave --variations=wght=900 -o wave-900.svg</code></pre><img class="vector" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9Ii0xNiAtMTkxNiA1MDEzIDI0MzIiIHdpZHRoPSI1MDEzIiBoZWlnaHQ9IjI0MzIiPgo8cmVjdCB4PSItMTYiIHk9Ii0xOTE2IiB3aWR0aD0iNTAxMyIgaGVpZ2h0PSIyNDMyIiBmaWxsPSJyZ2IoMjU1LDI1NSwyNTUpIi8+CjxnIHRyYW5zZm9ybT0ic2NhbGUoMSwtMSkiPgo8cGF0aCBkPSJNNDQ3LDEzMkw3MzcsMTQ1Nkw5MTAsMTQ1NkwxMDA0LDEzNDNMNjk1LDBMNTA0LDBMNDQ3LDEzMlpNMzcwLDE0NTZMNjE1LDEyMkw1NTIsMEwzMzEsMEwyMiwxNDU2TDM3MCwxNDU2Wk0xMTYzLDEyOUwxNDA2LDE0NTZMMTc1MywxNDU2TDE0NDQsMEwxMjI0LDBMMTE2MywxMjlaTTEwMzUsMTQ1NkwxMzMyLDEyNEwxMjcyLDBMMTA4MSwwTDc2NSwxMzQ1TDg2MywxNDU2TDEwMzUsMTQ1NloiIGZpbGw9IiMwMDAiLz4KPHBhdGggZD0iTTI0MDQsMjcyTDI0MDQsNzE4UTI0MDQsNzY0IDIzOTEsNzk3UTIzNzgsODMwIDIzNTAsODQ4LjVRMjMyMiw4NjcgMjI3NSw4NjdRMjIzNyw4NjcgMjIxMCw4NTRRMjE4Myw4NDEgMjE2OSw4MTVRMjE1NSw3ODkgMjE1NSw3NDlMMTgxOCw3NDlRMTgxOCw4MjQgMTg1MS41LDg4OC41UTE4ODUsOTUzIDE5NDcuNSwxMDAxUTIwMTAsMTA0OSAyMDk3LjUsMTA3NS41UTIxODUsMTEwMiAyMjkzLDExMDJRMjQyMiwxMTAyIDI1MjMuNSwxMDU5UTI2MjUsMTAxNiAyNjg0LDkzMC41UTI3NDMsODQ1IDI3NDMsNzE2TDI3NDMsMjczUTI3NDMsMTY3IDI3NTUsMTEyLjVRMjc2Nyw1OCAyNzg5LDE3TDI3ODksMEwyNDUxLDBRMjQyNyw1MCAyNDE1LjUsMTIyLjVRMjQwNCwxOTUgMjQwNCwyNzJaTTI0NDUsNjYxTDI0NDcsNDgxTDIyOTgsNDgxUTIyNTEsNDgxIDIyMTguNSw0NjhRMjE4Niw0NTUgMjE2Ni41LDQzMi41UTIxNDcsNDEwIDIxMzguNSwzODJRMjEzMCwzNTQgMjEzMCwzMjNRMjEzMCwyOTMgMjE0NC41LDI2OS41UTIxNTksMjQ2IDIxODQsMjMzUTIyMDksMjIwIDIyNDAsMjIwUTIyOTYsMjIwIDIzMzUuNSwyNDEuNVEyMzc1LDI2MyAyMzk2LDI5NFEyNDE3LDMyNSAyNDE3LDM1MkwyNDkxLDIxNFEyNDcxLDE3NCAyNDQ1LjUsMTMzUTI0MjAsOTIgMjM4Mi41LDU3LjVRMjM0NSwyMyAyMjkxLDEuNVEyMjM3LC0yMCAyMTYwLC0yMFEyMDYwLC0yMCAxOTc2LjUsMjFRMTg5Myw2MiAxODQzLDEzNS41UTE3OTMsMjA5IDE3OTMsMzA1UTE3OTMsMzg5IDE4MjMuNSw0NTVRMTg1NCw1MjEgMTkxNiw1NjdRMTk3OCw2MTMgMjA3NCw2MzdRMjE3MCw2NjEgMjMwMCw2NjFMMjQ0NSw2NjFaIiBmaWxsPSIjMDAwIi8+CjxwYXRoIGQ9Ik0zMzA1LDIzMUwzNTE4LDEwODJMMzg3MywxMDgyTDM1MTksMEwzMzA5LDBMMzMwNSwyMzFaTTMxNzksMTA4MkwzMzg5LDIzMUwzMzg3LDBMMzE3NiwwTDI4MjMsMTA4MkwzMTc5LDEwODJaIiBmaWxsPSIjMDAwIi8+CjxwYXRoIGQ9Ik00NDg0LC0yMFE0MzUyLC0yMCA0MjQ4LDIxLjVRNDE0NCw2MyA0MDcyLjUsMTM2UTQwMDEsMjA5IDM5NjMuNSwzMDRRMzkyNiwzOTkgMzkyNiw1MDVMMzkyNiw1NDNRMzkyNiw2NjIgMzk1OSw3NjMuNVEzOTkyLDg2NSA0MDU3LDk0MVE0MTIyLDEwMTcgNDIyMCwxMDU5LjVRNDMxOCwxMTAyIDQ0NDgsMTEwMlE0NTYzLDExMDIgNDY1NCwxMDY1UTQ3NDUsMTAyOCA0ODA4LjUsOTU5UTQ4NzIsODkwIDQ5MDUuNSw3OTJRNDkzOSw2OTQgNDkzOSw1NzJMNDkzOSw0MzVMNDA1NSw0MzVMNDA1NSw2NDZMNDYxMCw2NDZMNDYxMCw2NzJRNDYxMSw3MjYgNDU5MS41LDc2NFE0NTcyLDgwMiA0NTM1LDgyMlE0NDk4LDg0MiA0NDQ1LDg0MlE0MzkwLDg0MiA0MzU0LjUsODE4UTQzMTksNzk0IDQyOTkuNSw3NTIuNVE0MjgwLDcxMSA0MjcyLDY1N1E0MjY0LDYwMyA0MjY0LDU0M0w0MjY0LDUwNVE0MjY0LDQ0NSA0MjgwLjUsMzk2UTQyOTcsMzQ3IDQzMjguNSwzMTIuNVE0MzYwLDI3OCA0NDA0LjUsMjU5UTQ0NDksMjQwIDQ1MDYsMjQwUTQ1NzUsMjQwIDQ2NDIsMjY2UTQ3MDksMjkyIDQ3NTcsMzUyTDQ5MTAsMTcwUTQ4NzcsMTIzIDQ4MTYuNSw3OVE0NzU2LDM1IDQ2NzIsNy41UTQ1ODgsLTIwIDQ0ODQsLTIwWiIgZmlsbD0iIzAwMCIvPgo8L2c+Cjwvc3ZnPgo=" alt="wave-900.svg"><figcaption><code>wave-900.svg</code></figcaption></figure>
+
+<p>and <code>-O pdf</code> writes PDF instead:</p>
+<figure class="command-run"><pre class="command"><code>$ hb-vector test/subset/data/fonts/Roboto-Variable.ttf Wave -O pdf -o wave.pdf</code></pre><figcaption><code>wave.pdf</code></figcaption></figure>
+
+<p id="ix-73"><code>hb-raster</code> writes PNG, PPM, or <code>ansi</code>, a picture in the characters and colors of a terminal (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/raster-output.hh#L41"><code>raster-output.hh:41</code></a>). Its default size is 256 pixels per em. This command writes a PNG at 32 pixels to the em:</p>
+<figure class="command-run"><pre class="command"><code>$ hb-raster test/subset/data/fonts/Roboto-Regular.ttf Wave --font-size=32 -o wave.png</code></pre><img class="pixels" src="data:image/png;base64,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" width="330" height="210" alt="wave.png"><figcaption><code>wave.png</code>: 110 × 70 pixels, shown 3 times larger</figcaption></figure>
+
+<p id="ix-74">Without <code>-o</code>, the picture goes to the terminal, as described below; <code>-O ansi</code> asks for it in characters, whatever the terminal:</p>
+<figure class="command-run"><pre class="command"><code>$ hb-raster test/subset/data/fonts/Roboto-Regular.ttf Wave --font-size=32 -O ansi</code></pre></figure>
+
+<p id="ix-75"><code>--show-extents</code> should add each glyph’s ink box and origin to the picture, but in 15.1.0 it puts most of them in the wrong place (<a href="#a-bug-in-show-extents">below</a>).</p>
+<p id="ix-76"><code>hb-view</code> came first: <code>hb-vector</code> and <code>hb-raster</code> arrived in 13.0.0 with their libraries, and “share many of the same options as <code>hb-view</code>” (<code>NEWS</code>). It draws through cairo, using <code>libharfbuzz-cairo</code>, and so writes whatever cairo can: PNG, SVG, PDF, PostScript, EPS, cairo script and <code>ansi</code>, depending on how cairo was built (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/helper-cairo.hh#L374"><code>helper-cairo.hh:374</code></a>). Its default size is 256. <code>hb-vector</code> and <code>hb-raster</code> do the same work with HarfBuzz’s own renderers and no cairo, and are described with their libraries, in <a href="hb-vector.html">hb-vector</a> and <a href="hb-raster.html">hb-raster</a>. <code>hb-view</code> takes the format from the output file’s name:</p>
+<pre><code>$ hb-view test/subset/data/fonts/Roboto-Regular.ttf Wave -o wave.png
+</code></pre>
+<p>or from <code>-O</code>:</p>
+<pre><code>$ hb-view test/subset/data/fonts/Roboto-Regular.ttf Wave -O svg -o wave.svg
+</code></pre>
+<p id="ix-77">It is built only if both GLib and cairo are found (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/meson.build#L44"><code>util/meson.build:44</code></a>–<code>:45</code>, <a href="building-harfbuzz.html#optional-dependencies-and-backends">Building HarfBuzz</a>); this book’s build leaves cairo out, so its pictures come from <code>hb-vector</code> and <code>hb-raster</code>.</p>
+<p id="ix-78">Written to a terminal without <code>-O</code>, <code>hb-raster</code> and <code>hb-view</code> show the picture there. In iTerm2, WezTerm and kitty, which can show images, they send a PNG in the terminal’s own protocol; elsewhere they print it as <code>ansi</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/helper-image-output.hh#L76"><code>helper-image-output.hh:76</code></a>), with the chafa library’s help if they were built with it.</p>
+<h3 id="a-bug-in-show-extents">A bug in <code>--show-extents</code></h3>
+<p id="ix-79">In 15.1.0, <code>hb-raster</code> and <code>hb-vector</code> draw the box of every glyph but the first in the wrong place. Here is the picture above with <code>--show-extents</code>:</p>
+<figure class="command-run"><pre class="command"><code>$ hb-raster test/subset/data/fonts/Roboto-Regular.ttf Wave --font-size=32 --show-extents -o wave-extents.png</code></pre><img class="pixels" src="data:image/png;base64,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" width="330" height="210" alt="wave-extents.png"><figcaption><code>wave-extents.png</code>: 110 × 70 pixels, shown 3 times larger</figcaption></figure>
+
+<p id="ix-80">Only the <em>W</em>’s box is where it should be. The box around the <em>v</em> and the <em>e</em> is the <em>a</em>’s, at twice the <em>a</em>’s pen position, and the boxes of the <em>v</em> and the <em>e</em> are further on still, outside the picture. Each glyph’s overlay is drawn with its transform already set to the pen position, and then moved by the pen position again (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/raster-output.hh#L251"><code>raster-output.hh:251</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/vector-output.hh#L292"><code>vector-output.hh:292</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/helper-extents-overlay.hh#L66"><code>helper-extents-overlay.hh:66</code></a>). The first glyph’s pen position is 0, so its box alone is right. <code>hb-shape --show-extents</code> gives the correct numbers. This is draft 75 in <a href="testing-harfbuzz.html#the-bugs-this-book-found">Testing HarfBuzz</a>.</p>
+<h2 id="hb-gpu">hb-gpu</h2>
+<p id="ix-81"><code>hb-gpu</code> opens a window and draws shaped text with the shaders of <a href="hb-gpu.html">hb-gpu</a>, through OpenGL, or Metal or Direct3D where those are offered (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/gpu-output.hh#L87"><code>gpu-output.hh:87</code></a>). It is a demonstration more than a tool: the text can be zoomed, rotated and moved (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/gpu/demo-view.cc"><code>util/gpu/demo-view.cc</code></a>), and keys toggle a dark background, stem darkening and a debug heat map. It takes the font and text options of <code>hb-shape</code>; with no text, it builds some from the scripts the font supports (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L166"><code>hb-gpu.cc:166</code></a>), and <code>--demo</code> uses a font and text built into it. <code>-o</code> renders one frame to a PPM file instead of opening a window.</p>
+<h2 id="the-tools-that-arent-installed">The tools that aren’t installed</h2>
+<p id="ix-82">The build makes a few more programs, for HarfBuzz’s own developers, and doesn’t install them (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/meson.build#L105"><code>util/meson.build:105</code></a>–<code>254</code>):</p>
+<ul>
+<li id="ix-83"><code>hb-subset-depend</code> prints the glyph dependency graph of <a href="hb-depend.html">hb-depend</a>: for each glyph, the glyphs it can produce or depend on through GSUB, composites, COLR and MATH (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-subset-depend.cc#L49"><code>hb-subset-depend.cc:49</code></a>). <code>--gids</code> limits it to some glyphs, <code>--flagged</code> to the edges marked as approximate. It needs the experimental API (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/meson.build#L192"><code>util/meson.build:192</code></a>).</li>
+<li id="ix-84"><code>hb-ft-raster</code> draws like <code>hb-raster</code>, but with FreeType’s rasterizer, to compare the two pixel by pixel (<a href="hb-raster.html#checking-against-freetype">hb-raster</a>). It writes PPM only, and has no view options.</li>
+<li id="ix-85"><code>hb-draw-all</code>, <code>hb-paint-all</code>, <code>hb-vector-svg-all</code>, <code>hb-raster-all</code> and <code>hb-ft-raster-all</code> draw or paint every glyph of a font, as benchmarks; the two raster ones can also write each glyph as a PPM file. <code>hb-gpu-encode-all</code> encodes every glyph for hb-gpu and reports sizes and times.</li>
+<li><code>hb-fc-list</code>, in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-fc-list.c"><code>util/hb-fc-list.c</code></a>, lists the fontconfig fonts that can draw a piece of text. Nothing in the build compiles it.</li>
+</ul>
+<h2 id="recipes">Recipes</h2>
+<h3 id="what-does-this-text-look-like-in-this-font">What does this text look like in this font?</h3>
+<p id="ix-86"><code>hb-vector</code> and <code>hb-raster</code> draw it, one command each. The font here is Libre Baskerville, from Google Fonts under the SIL Open Font License, whose standard ligatures turn the <em>ffi</em> of “office” and the <em>ff</em> of “coffee” into one glyph each. First, download it:</p>
+<pre><code>$ curl -L -o LibreBaskerville.ttf &quot;https://github.com/google/fonts/raw/main/ofl/librebaskerville/LibreBaskerville%5Bwght%5D.ttf&quot;
+</code></pre>
+<p id="ix-87"><code>hb-shape</code> shows what the font does with the text. The thirteen characters become ten glyphs:</p>
+<figure class="command-run"><pre class="command"><code>$ hb-shape LibreBaskerville.ttf &quot;office coffee&quot;</code></pre><pre class="command-output"><code>[o=0+654|f_f_i=1+973|c=4+536|e=5+573|space=6+287|c=7+536|o=8+654|f_f=9+718|e=11+573|e=12+573]</code></pre></figure>
+
+<p><code>hb-vector</code> draws the result as SVG, in font units unless <code>--font-size</code> is given:</p>
+<figure class="command-run"><pre class="command"><code>$ hb-vector LibreBaskerville.ttf &quot;office coffee&quot; -o office.svg</code></pre><img class="vector" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9Ii0xNiAtOTg2IDYxMDkgMTI3MiIgd2lkdGg9IjYxMDkiIGhlaWdodD0iMTI3MiI+CjxyZWN0IHg9Ii0xNiIgeT0iLTk4NiIgd2lkdGg9IjYxMDkiIGhlaWdodD0iMTI3MiIgZmlsbD0icmdiKDI1NSwyNTUsMjU1KSIvPgo8ZyB0cmFuc2Zvcm09InNjYWxlKDEsLTEpIj4KPHBhdGggZD0iTTMyNSw1NDBRMzgyLDU0MCA0MzMsNTIwUTQ4NCw1MDAgNTIyLjUsNDYzLjVRNTYxLDQyNyA1ODMuNSwzNzcuNVE2MDYsMzI4IDYwNiwyNjlRNjA2LDIwOCA1ODMuNSwxNTdRNTYxLDEwNiA1MjIuNSw2OC41UTQ4NCwzMSA0MzMsMTAuNVEzODIsLTEwIDMyNSwtMTBRMjY5LC0xMCAyMTksMTAuNVExNjksMzEgMTMwLjUsNjguNVE5MiwxMDYgNzAsMTU3UTQ4LDIwOCA0OCwyNjlRNDgsMzQ4IDg2LDQwOVExMjQsNDcwIDE4Nyw1MDVRMjUwLDU0MCAzMjUsNTQwWk0zMjUsNDkyUTI3Niw0OTIgMjM5LDQ2NFEyMDIsNDM2IDE4MS41LDM4NS41UTE2MSwzMzUgMTYxLDI2OFExNjEsMTY1IDIwNS41LDEwM1EyNTAsNDEgMzI1LDQxUTQwMiw0MSA0NDcuNSwxMDNRNDkzLDE2NSA0OTMsMjY4UTQ5MywzMzUgNDcyLDM4NVE0NTEsNDM1IDQxMy41LDQ2My41UTM3Niw0OTIgMzI1LDQ5MloiIGZpbGw9IiMwMDAiLz4KPHBhdGggZD0iTTE1MjMsNTQwTDE1MjMsMTYyUTE1MjMsMTEwIDE1MjguNSw4M1ExNTM0LDU2IDE1NTAsNDYuNVExNTY2LDM3IDE1OTYsMzdMMTU5NiwwTDEzMzksMEwxMzM5LDM3UTEzNzYsMzcgMTM5NCw0Ni41UTE0MTIsNTYgMTQxOC41LDgxLjVRMTQyNSwxMDcgMTQyNSwxNTRMMTQyNSwyODBRMTQyNSwzMzggMTQyMywzNzUuNVExNDIxLDQxMyAxNDE4LDQyNlExNDEzLDQ1MCAxMzk1LDQ1OC41UTEzNzcsNDY3IDEzMjcsNDY3TDEyMDIsNDY3TDEyMDIsMTQ2UTEyMDIsMTAzIDEyMTAuNSw3OC41UTEyMTksNTQgMTIzOS41LDQ0LjVRMTI2MCwzNSAxMjk2LDM1TDEyOTYsMEwxMDMyLDBMMTAzMiwzNVExMDYzLDM1IDEwNzkuNSw0NFExMDk2LDUzIDExMDIsNzguNVExMTA4LDEwNCAxMTA4LDE1M0wxMTA4LDQ2N0w4ODAsNDY3TDg4MCwxNjFRODgwLDExMiA4ODcuNSw4NC41UTg5NSw1NyA5MTUuNSw0NlE5MzYsMzUgOTc0LDM1TDk3NCwwTDcxMCwwTDcxMCwzNVE3NDUsMzUgNzYxLDQzLjVRNzc3LDUyIDc4MS41LDc3LjVRNzg2LDEwMyA3ODYsMTUzTDc4Niw0NjdMNjczLDQ2N0w2NzMsNTE0TDc4Niw1MTRMNzg2LDU0NlE3ODYsNjIzIDgxMy41LDY3Ny41UTg0MSw3MzIgODkzLDc2MVE5NDUsNzkwIDEwMTksNzkwUTEwNjAsNzkwIDEwOTEsNzc3UTExMjIsNzY0IDExNTAsNzM4UTExODIsNzgwIDEyMzQsODA1UTEyODYsODMwIDEzNjEsODMwUTE0MzIsODMwIDE0NzYuNSw4MTIuNVExNTIxLDc5NSAxNTIxLDc2N1ExNTIxLDc0NyAxNTA4LjUsNzMzLjVRMTQ5Niw3MjAgMTQ3Nyw3MjBRMTQ2NSw3MjAgMTQ1MCw3MjdRMTQzNSw3MzQgMTQxMiw3NTBRMTM4MSw3NzEgMTM2NS41LDc3Ni41UTEzNTAsNzgyIDEzMjQsNzgyUTEyODMsNzgyIDEyNTUuNSw3NjdRMTIyOCw3NTIgMTIxNSw3MTFRMTIwMiw2NzAgMTIwMiw1OTJMMTIwMiw1MTRMMTM2Miw1MTRMMTUyMyw1NDBaTTg4MCw1MTRMMTEwOCw1MTRMMTEwOCw2NzBRMTA4Myw2OTYgMTA1MS41LDcxOVExMDIwLDc0MiA5ODIsNzQyUTk1MCw3NDIgOTI3LDcyNlE5MDQsNzEwIDg5Miw2NjlRODgwLDYyOCA4ODAsNTUyTDg4MCw1MTRaIiBmaWxsPSIjMDAwIi8+CjxwYXRoIGQ9Ik0yMTAzLDExMkwyMTMzLDgzUTIwOTcsNDAgMjA0MCwxNVExOTgzLC0xMCAxOTE3LC0xMFExODQ2LC0xMCAxNzkxLjUsMjRRMTczNyw1OCAxNzA2LjUsMTE5UTE2NzYsMTgwIDE2NzYsMjYxUTE2NzYsMzQ2IDE3MTEsNDA4LjVRMTc0Niw0NzEgMTgwOC41LDUwNS41UTE4NzEsNTQwIDE5NTQsNTQwUTIwMDYsNTQwIDIwNDUuNSw1MjlRMjA4NSw1MTggMjEwNy41LDQ5OFEyMTMwLDQ3OCAyMTMwLDQ1MlEyMTMwLDQzMyAyMTE3LDQyMS41UTIxMDQsNDEwIDIwODEsNDEwUTIwNjMsNDEwIDIwNTEsNDE4UTIwMzksNDI2IDIwMjAsNDUxUTIwMDcsNDY3IDE5OTQuNSw0NzZRMTk4Miw0ODUgMTk2OCw0ODlRMTk1NCw0OTMgMTkzNCw0OTNRMTg2NCw0OTMgMTgyNyw0MzhRMTc5MCwzODMgMTc5MCwyNzZRMTc5MCwxNjIgMTgzMSwxMDJRMTg3Miw0MiAxOTQ5LDQyUTE5OTAsNDIgMjAyOCw1OC41UTIwNjYsNzUgMjEwMywxMTJaIiBmaWxsPSIjMDAwIi8+CjxwYXRoIGQ9Ik0yNjU0LDEyMUwyNjg1LDkzUTI2MDAsLTEwIDI0NzQsLTEwUTIzOTYsLTEwIDIzMzcsMjRRMjI3OCw1OCAyMjQ1LDExOC41UTIyMTIsMTc5IDIyMTIsMjU5UTIyMTIsMzQxIDIyNDcsNDA0LjVRMjI4Miw0NjggMjM0My41LDUwNFEyNDA1LDU0MCAyNDg2LDU0MFEyNTgyLDU0MCAyNjM1LjUsNDg3LjVRMjY4OSw0MzUgMjY4OSwzMzdRMjY4OSwzMjQgMjY4My41LDMyMC41UTI2NzgsMzE3IDI2NTgsMzE3TDIzMjksMzE3UTIzMjcsMzA5IDIzMjYsMjk3LjVRMjMyNSwyODYgMjMyNSwyNzJRMjMyNSwyMDMgMjM0NywxNTFRMjM2OSw5OSAyNDA5LDcwLjVRMjQ0OSw0MiAyNTAyLDQyUTI1NDMsNDIgMjU4MCw2MVEyNjE3LDgwIDI2NTQsMTIxWk0yMzM2LDM2M0wyNTIwLDM2M1EyNTYxLDM2MyAyNTcwLjUsMzY4UTI1ODAsMzczIDI1ODAsMzkxUTI1ODAsNDM3IDI1NTAsNDY0LjVRMjUyMCw0OTIgMjQ3MCw0OTJRMjQxNyw0OTIgMjM4Myw0NTkuNVEyMzQ5LDQyNyAyMzM2LDM2M1oiIGZpbGw9IiMwMDAiLz4KPHBhdGggZD0iTTM0OTksMTEyTDM1MjksODNRMzQ5Myw0MCAzNDM2LDE1UTMzNzksLTEwIDMzMTMsLTEwUTMyNDIsLTEwIDMxODcuNSwyNFEzMTMzLDU4IDMxMDIuNSwxMTlRMzA3MiwxODAgMzA3MiwyNjFRMzA3MiwzNDYgMzEwNyw0MDguNVEzMTQyLDQ3MSAzMjA0LjUsNTA1LjVRMzI2Nyw1NDAgMzM1MCw1NDBRMzQwMiw1NDAgMzQ0MS41LDUyOVEzNDgxLDUxOCAzNTAzLjUsNDk4UTM1MjYsNDc4IDM1MjYsNDUyUTM1MjYsNDMzIDM1MTMsNDIxLjVRMzUwMCw0MTAgMzQ3Nyw0MTBRMzQ1OSw0MTAgMzQ0Nyw0MThRMzQzNSw0MjYgMzQxNiw0NTFRMzQwMyw0NjcgMzM5MC41LDQ3NlEzMzc4LDQ4NSAzMzY0LDQ4OVEzMzUwLDQ5MyAzMzMwLDQ5M1EzMjYwLDQ5MyAzMjIzLDQzOFEzMTg2LDM4MyAzMTg2LDI3NlEzMTg2LDE2MiAzMjI3LDEwMlEzMjY4LDQyIDMzNDUsNDJRMzM4Niw0MiAzNDI0LDU4LjVRMzQ2Miw3NSAzNDk5LDExMloiIGZpbGw9IiMwMDAiLz4KPHBhdGggZD0iTTM4ODQsNTQwUTM5NDEsNTQwIDM5OTIsNTIwUTQwNDMsNTAwIDQwODEuNSw0NjMuNVE0MTIwLDQyNyA0MTQyLjUsMzc3LjVRNDE2NSwzMjggNDE2NSwyNjlRNDE2NSwyMDggNDE0Mi41LDE1N1E0MTIwLDEwNiA0MDgxLjUsNjguNVE0MDQzLDMxIDM5OTIsMTAuNVEzOTQxLC0xMCAzODg0LC0xMFEzODI4LC0xMCAzNzc4LDEwLjVRMzcyOCwzMSAzNjg5LjUsNjguNVEzNjUxLDEwNiAzNjI5LDE1N1EzNjA3LDIwOCAzNjA3LDI2OVEzNjA3LDM0OCAzNjQ1LDQwOVEzNjgzLDQ3MCAzNzQ2LDUwNVEzODA5LDU0MCAzODg0LDU0MFpNMzg4NCw0OTJRMzgzNSw0OTIgMzc5OCw0NjRRMzc2MSw0MzYgMzc0MC41LDM4NS41UTM3MjAsMzM1IDM3MjAsMjY4UTM3MjAsMTY1IDM3NjQuNSwxMDNRMzgwOSw0MSAzODg0LDQxUTM5NjEsNDEgNDAwNi41LDEwM1E0MDUyLDE2NSA0MDUyLDI2OFE0MDUyLDMzNSA0MDMxLDM4NVE0MDEwLDQzNSAzOTcyLjUsNDYzLjVRMzkzNSw0OTIgMzg4NCw0OTJaIiBmaWxsPSIjMDAwIi8+CjxwYXRoIGQ9Ik00MjY5LDBMNDI2OSwzNVE0MzAzLDM3IDQzMTksNDUuNVE0MzM1LDU0IDQzNDAsNzguNVE0MzQ1LDEwMyA0MzQ1LDE1M0w0MzQ1LDQ2N0w0MjMyLDQ2N0w0MjMyLDUxNEw0MzQ1LDUxNEw0MzQ1LDU0NlE0MzQ2LDYyMyA0MzczLDY3Ny41UTQ0MDAsNzMyIDQ0NTIsNzYxUTQ1MDQsNzkwIDQ1NzgsNzkwUTQ2MjAsNzkwIDQ2NTIsNzc2LjVRNDY4NCw3NjMgNDcwMSw3NDdRNDczMCw3ODAgNDc4MC41LDgwNVE0ODMxLDgzMCA0OTAwLDgzMFE0OTYyLDgzMCA1MDAxLDgxMVE1MDQwLDc5MiA1MDQwLDc2MlE1MDQwLDc0MiA1MDI3LjUsNzI4LjVRNTAxNSw3MTUgNDk5Niw3MTVRNDk4NCw3MTUgNDk3MC41LDcyMi41UTQ5NTcsNzMwIDQ5MzUsNzQ4UTQ5MTAsNzY5IDQ4OTYsNzc1LjVRNDg4Miw3ODIgNDg2Myw3ODJRNDgxNyw3ODIgNDc5NS41LDc1My41UTQ3NzQsNzI1IDQ3NjcuNSw2ODEuNVE0NzYxLDYzOCA0NzYxLDU5Mkw0NzYxLDUxNEw0OTIyLDUxNEw0OTIyLDQ2N0w0NzYxLDQ2N0w0NzYxLDE2MVE0NzYxLDExMiA0NzY4LjUsODVRNDc3Niw1OCA0Nzk2LjUsNDdRNDgxNywzNiA0ODU1LDM1TDQ4NTUsMEw0NTkxLDBMNDU5MSwzNVE0NjI1LDM3IDQ2NDEsNDUuNVE0NjU3LDU0IDQ2NjIsNzguNVE0NjY3LDEwMyA0NjY3LDE1M0w0NjY3LDQ2N0w0NDM5LDQ2N0w0NDM5LDE2MVE0NDM5LDExMiA0NDQ2LjUsODVRNDQ1NCw1OCA0NDc0LjUsNDdRNDQ5NSwzNiA0NTMzLDM1TDQ1MzMsMEw0MjY5LDBaTTQ0MzksNTE0TDQ2NjcsNTE0TDQ2NjcsNjcwUTQ2NDEsNzAyIDQ2MTIuNSw3MjJRNDU4NCw3NDIgNDU0Niw3NDJRNDQ5OCw3NDIgNDQ3NSw3MTQuNVE0NDUyLDY4NyA0NDQ1LjUsNjQ0UTQ0MzksNjAxIDQ0MzksNTUyTDQ0MzksNTE0WiIgZmlsbD0iIzAwMCIvPgo8cGF0aCBkPSJNNTQyMiwxMjFMNTQ1Myw5M1E1MzY4LC0xMCA1MjQyLC0xMFE1MTY0LC0xMCA1MTA1LDI0UTUwNDYsNTggNTAxMywxMTguNVE0OTgwLDE3OSA0OTgwLDI1OVE0OTgwLDM0MSA1MDE1LDQwNC41UTUwNTAsNDY4IDUxMTEuNSw1MDRRNTE3Myw1NDAgNTI1NCw1NDBRNTM1MCw1NDAgNTQwMy41LDQ4Ny41UTU0NTcsNDM1IDU0NTcsMzM3UTU0NTcsMzI0IDU0NTEuNSwzMjAuNVE1NDQ2LDMxNyA1NDI2LDMxN0w1MDk3LDMxN1E1MDk1LDMwOSA1MDk0LDI5Ny41UTUwOTMsMjg2IDUwOTMsMjcyUTUwOTMsMjAzIDUxMTUsMTUxUTUxMzcsOTkgNTE3Nyw3MC41UTUyMTcsNDIgNTI3MCw0MlE1MzExLDQyIDUzNDgsNjFRNTM4NSw4MCA1NDIyLDEyMVpNNTEwNCwzNjNMNTI4OCwzNjNRNTMyOSwzNjMgNTMzOC41LDM2OFE1MzQ4LDM3MyA1MzQ4LDM5MVE1MzQ4LDQzNyA1MzE4LDQ2NC41UTUyODgsNDkyIDUyMzgsNDkyUTUxODUsNDkyIDUxNTEsNDU5LjVRNTExNyw0MjcgNTEwNCwzNjNaIiBmaWxsPSIjMDAwIi8+CjxwYXRoIGQ9Ik01OTk1LDEyMUw2MDI2LDkzUTU5NDEsLTEwIDU4MTUsLTEwUTU3MzcsLTEwIDU2NzgsMjRRNTYxOSw1OCA1NTg2LDExOC41UTU1NTMsMTc5IDU1NTMsMjU5UTU1NTMsMzQxIDU1ODgsNDA0LjVRNTYyMyw0NjggNTY4NC41LDUwNFE1NzQ2LDU0MCA1ODI3LDU0MFE1OTIzLDU0MCA1OTc2LjUsNDg3LjVRNjAzMCw0MzUgNjAzMCwzMzdRNjAzMCwzMjQgNjAyNC41LDMyMC41UTYwMTksMzE3IDU5OTksMzE3TDU2NzAsMzE3UTU2NjgsMzA5IDU2NjcsMjk3LjVRNTY2NiwyODYgNTY2NiwyNzJRNTY2NiwyMDMgNTY4OCwxNTFRNTcxMCw5OSA1NzUwLDcwLjVRNTc5MCw0MiA1ODQzLDQyUTU4ODQsNDIgNTkyMSw2MVE1OTU4LDgwIDU5OTUsMTIxWk01Njc3LDM2M0w1ODYxLDM2M1E1OTAyLDM2MyA1OTExLjUsMzY4UTU5MjEsMzczIDU5MjEsMzkxUTU5MjEsNDM3IDU4OTEsNDY0LjVRNTg2MSw0OTIgNTgxMSw0OTJRNTc1OCw0OTIgNTcyNCw0NTkuNVE1NjkwLDQyNyA1Njc3LDM2M1oiIGZpbGw9IiMwMDAiLz4KPC9nPgo8L3N2Zz4K" alt="office.svg"><figcaption><code>office.svg</code></figcaption></figure>
+
+<p>and <code>hb-raster</code> as PNG, here at 32 pixels to the em:</p>
+<figure class="command-run"><pre class="command"><code>$ hb-raster LibreBaskerville.ttf &quot;office coffee&quot; --font-size=32 -o office.png</code></pre><img class="pixels" src="data:image/png;base64,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" width="454" height="146" alt="office.png"><figcaption><code>office.png</code>: 227 × 73 pixels, shown 2 times larger</figcaption></figure>
+
+<p id="ix-88">Features work as in <code>hb-shape</code>. The font’s discretionary ligatures are off unless asked for, with <code>--features=dlig</code>:</p>
+<figure class="command-run"><pre class="command"><code>$ hb-shape LibreBaskerville.ttf &quot;act first&quot; --features=dlig</code></pre><pre class="command-output"><code>[a=0+554|c_t=1+929|space=3+287|fi=4+651|r=6+477|s_t=7+849]</code></pre></figure>
+
+<p>The drawing tools take the same option:</p>
+<figure class="command-run"><pre class="command"><code>$ hb-vector LibreBaskerville.ttf &quot;act first&quot; --features=dlig -o act.svg</code></pre><img class="vector" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9Ii0xNiAtOTg2IDM3NzkgMTI3MiIgd2lkdGg9IjM3NzkiIGhlaWdodD0iMTI3MiI+CjxyZWN0IHg9Ii0xNiIgeT0iLTk4NiIgd2lkdGg9IjM3NzkiIGhlaWdodD0iMTI3MiIgZmlsbD0icmdiKDI1NSwyNTUsMjU1KSIvPgo8ZyB0cmFuc2Zvcm09InNjYWxlKDEsLTEpIj4KPHBhdGggZD0iTTQ0NCwtMTBRNDAxLC0xMCAzNzksMThRMzU3LDQ2IDM1Nyw5N0wzNTIsOTdRMzI1LDQ4IDI3OSwxOS41UTIzMywtOSAxNzcsLTlRMTM2LC05IDEwNiw2UTc2LDIxIDU5LjUsNDcuNVE0Myw3NCA0MywxMTBRNDMsMTU3IDc4LDE5Ni41UTExMywyMzYgMjA1LDI3NkwzNDksMzM5TDM0OSwzODBRMzQ5LDQ0MyAzMjMuNSw0NzIuNVEyOTgsNTAyIDI0Myw1MDJRMjExLDUwMiAxOTYuNSw0ODlRMTgyLDQ3NiAxNjksNDM3UTE1OCw0MDkgMTQ3LjUsMzk5UTEzNywzODkgMTE3LDM4OVE5MywzODkgODAsNDAyUTY3LDQxNSA2Nyw0MzlRNjcsNDg3IDExOCw1MTMuNVExNjksNTQwIDI2Myw1NDBRMzY0LDU0MCA0MDUuNSw1MDVRNDQ3LDQ3MCA0NDcsMzg0TDQ0NywxNjBRNDQ3LDk4IDQ1OSw3MlE0NzEsNDYgNDk3LDQ2UTUwNyw0NiA1MjAuNSw1MC41UTUzNCw1NSA1NDEsNjhMNTU1LDQ0UTU0MywyMSA1MTEsNS41UTQ3OSwtMTAgNDQ0LC0xMFpNMjIyLDUxUTI1OCw1MSAyODcsNzMuNVEzMTYsOTYgMzMyLjUsMTM0UTM0OSwxNzIgMzQ5LDIxN0wzNDksMjk2UTI3MywyNjcgMjI4LDIzOVExODMsMjExIDE2My41LDE4My41UTE0NCwxNTYgMTQ0LDEyN1ExNDQsOTMgMTY2LDcyUTE4OCw1MSAyMjIsNTFaIiBmaWxsPSIjMDAwIi8+CjxwYXRoIGQ9Ik04NDcsLTEwUTc3NCwtMTAgNzE5LDI0UTY2NCw1OCA2MzMuNSwxMTlRNjAzLDE4MCA2MDMsMjYwUTYwMywzNDYgNjM3LjUsNDA4LjVRNjcyLDQ3MSA3MzUuNSw1MDUuNVE3OTksNTQwIDg4NCw1NDBROTIwLDU0MCA5NTAsNTM0UTkzNCw1NzAgOTM0LDYxNlE5MzQsNzA1IDk4Ni41LDc1NC41UTEwMzksODA0IDExMzQsODA0UTEyMjYsODA0IDEyNzEuNSw3NTUuNVExMzE3LDcwNyAxMzE3LDYwOUwxMzE3LDUxNEwxNDM3LDUxNEwxNDM3LDQ2N0wxMzAzLDQ2N0wxMzAzLDE2M1ExMzAzLDkzIDEzMTcuNSw2NlExMzMyLDM5IDEzNzEsMzlRMTM5NywzOSAxNDE1LDQ5LjVRMTQzMyw2MCAxNDQ5LDg1TDE0NzQsNjZRMTQ0NSwtMTAgMTMzOSwtMTBRMTI3NSwtMTAgMTI0MCwyMS41UTEyMDUsNTMgMTIwNSwxMTJMMTIwNSw0NjdMMTE0NSw0NjdMMTE0NSw1MDRRMTIwMCw1MDQgMTIzMi41LDUzOFExMjY1LDU3MiAxMjY1LDYyN1ExMjY1LDY4NiAxMjI5LDcyMFExMTkzLDc1NCAxMTMxLDc1NFExMDY1LDc1NCAxMDI1LjUsNzE2UTk4Niw2NzggOTg2LDYxM1E5ODYsNTQ1IDEwNDAsNDkyUTEwNTcsNDczIDEwNTcsNDUyUTEwNTcsNDMzIDEwNDMuNSw0MjEuNVExMDMwLDQxMCAxMDA2LDQxMFE5ODgsNDEwIDk3Ni41LDQxOVE5NjUsNDI4IDk0Nyw0NTFROTM0LDQ2NyA5MjEuNSw0NzZROTA5LDQ4NSA4OTQuNSw0ODlRODgwLDQ5MyA4NjIsNDkzUTc5MCw0OTMgNzUzLjUsNDM4UTcxNywzODMgNzE3LDI3NVE3MTcsMTYxIDc1OCwxMDEuNVE3OTksNDIgODc3LDQyUTkxOCw0MiA5NTUuNSw1OVE5OTMsNzYgMTAzMCwxMTJMMTA2MCw4M1ExMDIzLDQwIDk2NiwxNVE5MDksLTEwIDg0NywtMTBaIiBmaWxsPSIjMDAwIi8+CjxwYXRoIGQ9Ik0yMzE3LDU0MEwyMzE3LDE2MlEyMzE3LDExMCAyMzIyLjUsODNRMjMyOCw1NiAyMzQ0LDQ2LjVRMjM2MCwzNyAyMzkwLDM3TDIzOTAsMEwyMTMzLDBMMjEzMywzN1EyMTcwLDM3IDIxODguNSw0Ni41UTIyMDcsNTYgMjIxMyw4MS41UTIyMTksMTA3IDIyMTksMTU0TDIyMTksMjgwUTIyMTksMzM4IDIyMTcsMzc1LjVRMjIxNSw0MTMgMjIxMiw0MjZRMjIwNyw0NTAgMjE4OSw0NTguNVEyMTcxLDQ2NyAyMTIxLDQ2N0wxOTk2LDQ2N0wxOTk2LDE2MVExOTk2LDExMiAyMDAzLDg0LjVRMjAxMCw1NyAyMDI4LDQ2UTIwNDYsMzUgMjA4MCwzNUwyMDgwLDBMMTgyNiwwTDE4MjYsMzVRMTg2MCwzNSAxODc2LDQzLjVRMTg5Miw1MiAxODk3LDc3LjVRMTkwMiwxMDMgMTkwMiwxNTNMMTkwMiw0NjdMMTc4OSw0NjdMMTc4OSw1MTRMMTkwMiw1MTRMMTkwMiw1ODZRMTkwMiw3MDEgMTk2OC41LDc2NS41UTIwMzUsODMwIDIxNTUsODMwUTIyMjYsODMwIDIyNzAuNSw4MTIuNVEyMzE1LDc5NSAyMzE1LDc2N1EyMzE1LDc0NyAyMzAyLjUsNzMzLjVRMjI5MCw3MjAgMjI3MSw3MjBRMjI1MCw3MjAgMjIwNiw3NTBRMjE3NSw3NzEgMjE1OS41LDc3Ni41UTIxNDQsNzgyIDIxMTgsNzgyUTIwODcsNzgyIDIwNjQsNzc0UTIwNDEsNzY2IDIwMjYsNzQ1UTIwMTEsNzI0IDIwMDMuNSw2ODdRMTk5Niw2NTAgMTk5Niw1OTJMMTk5Niw1MTRMMjE1Niw1MTRMMjMxNyw1NDBaIiBmaWxsPSIjMDAwIi8+CjxwYXRoIGQ9Ik0yNjQzLDE5M0wyNjQzLDE1OVEyNjQzLDEwNCAyNjQ3LjUsNzguNVEyNjUyLDUzIDI2NjkuNSw0NS41UTI2ODcsMzggMjcyNSwzNUwyNzI1LDBMMjQ1OSwwTDI0NTksMzVRMjQ5OCwzNyAyNTE2LDQ1UTI1MzQsNTMgMjUzOS41LDc3LjVRMjU0NSwxMDIgMjU0NSwxNTJMMjU0NSwyNjlRMjU0NSwzMzcgMjU0MywzNzUuNVEyNTQxLDQxNCAyNTMzLDQzMVEyNTI1LDQ0OCAyNTA3LDQ1MlEyNDg5LDQ1NiAyNDU3LDQ1NkwyNDU3LDQ5MUwyNjMyLDUyOUwyNjQ2LDQwNUwyNjUwLDQwNVEyNjc3LDQ2NSAyNzI1LDUwMi41UTI3NzMsNTQwIDI4MjQsNTQwUTI4NTYsNTQwIDI4NzQuNSw1MjQuNVEyODkzLDUwOSAyODkzLDQ4M1EyODkzLDQ1OSAyODc4LDQ0NS41UTI4NjMsNDMyIDI4MzUsNDMyUTI4MTQsNDMyIDI4MDEsNDM4LjVRMjc4OCw0NDUgMjc3OCw0NTFRMjc2OCw0NTcgMjc1Niw0NTdRMjcyOSw0NTcgMjcwMiw0MjIuNVEyNjc1LDM4OCAyNjYwLDMzNVEyNjUyLDMwNyAyNjQ3LjUsMjcwUTI2NDMsMjMzIDI2NDMsMTkzWiIgZmlsbD0iIzAwMCIvPgo8cGF0aCBkPSJNMzEzOCwtMTBRMzA5OSwtMTAgMzA2NSwxLjVRMzAzMSwxMyAzMDA0LDM1TDI5ODQsMEwyOTYyLDBMMjk2MiwxNzJMMjk4NywxNzJRMzAwNywxMDEgMzA0Miw2NlEzMDc3LDMxIDMxMjksMzFRMzE2OSwzMSAzMTkyLjUsNTEuNVEzMjE2LDcyIDMyMTYsMTA3UTMyMTYsMTI2IDMyMDguNSwxNDBRMzIwMSwxNTQgMzE3Ni41LDE3Mi41UTMxNTIsMTkxIDMxMDAsMjIyUTMwNDcsMjU1IDMwMTcuNSwyODAuNVEyOTg4LDMwNiAyOTc2LjUsMzMyUTI5NjUsMzU4IDI5NjUsMzkwUTI5NjUsNDMzIDI5ODYsNDY4UTMwMDcsNTAzIDMwNDYuNSw1MjQuNVEzMDg2LDU0NiAzMTQxLDU0NlEzMTYwLDU0NiAzMTc3LjUsNTQ0LjVRMzE5NSw1NDMgMzIxMSw1MzlRMzIwNCw1NTcgMzIwMSw1NzZRMzE5OCw1OTUgMzE5OCw2MTZRMzE5OCw3MDUgMzI1MC41LDc1NC41UTMzMDMsODA0IDMzOTgsODA0UTM1ODEsODA0IDM1ODEsNjA5TDM1ODEsNTE0TDM3MDEsNTE0TDM3MDEsNDY3TDM1NjcsNDY3TDM1NjcsMTYzUTM1NjcsOTMgMzU4MS41LDY2UTM1OTYsMzkgMzYzNSwzOVEzNjYxLDM5IDM2NzksNDkuNVEzNjk3LDYwIDM3MTMsODVMMzczOCw2NlEzNzA5LC0xMCAzNjAzLC0xMFEzNTM5LC0xMCAzNTA0LDIxLjVRMzQ2OSw1MyAzNDY5LDExMkwzNDY5LDQ2N0wzNDA5LDQ2N0wzNDA5LDUwNFEzNDY0LDUwNCAzNDk2LjUsNTM4UTM1MjksNTcyIDM1MjksNjI3UTM1MjksNjg2IDM0OTMsNzIwUTM0NTcsNzU0IDMzOTUsNzU0UTMzMjksNzU0IDMyODkuNSw3MTZRMzI1MCw2NzggMzI1MCw2MTNRMzI1MCw1NzkgMzI1OS41LDU1Mi41UTMyNjksNTI2IDMyOTUsNTAwUTMzMTcsNDgwIDMzMTcsNDUzUTMzMTcsNDM0IDMzMDQsNDIyLjVRMzI5MSw0MTEgMzI2OCw0MTFRMzI1MCw0MTEgMzIzOCw0MTlRMzIyNiw0MjcgMzIwNyw0NTJRMzE4OCw0NzggMzE2OSw0ODguNVEzMTUwLDQ5OSAzMTIxLDQ5OVEzMDg4LDQ5OSAzMDY3LjUsNDgxLjVRMzA0Nyw0NjQgMzA0Nyw0MzdRMzA0Nyw0MTYgMzA1NSwzOTkuNVEzMDYzLDM4MyAzMDg0LjUsMzY1LjVRMzEwNiwzNDggMzE0NSwzMjRRMzIwOSwyODYgMzI0My41LDI1N1EzMjc4LDIyOCAzMjkxLjUsMjAwLjVRMzMwNSwxNzMgMzMwNSwxMzlRMzMwNSw3MiAzMjU4LjUsMzFRMzIxMiwtMTAgMzEzOCwtMTBaIiBmaWxsPSIjMDAwIi8+CjwvZz4KPC9zdmc+Cg==" alt="act.svg"><figcaption><code>act.svg</code></figcaption></figure>
+
+<p id="ix-89">Both tools arrived in HarfBuzz 13.0.0, and this book describes 15: if your package manager’s HarfBuzz is older, build 15.1.0 (<a href="building-harfbuzz.html">Building HarfBuzz</a>). <code>hb-raster</code> writes PNG only if HarfBuzz was built with libpng. The <a href="quick-start.html">next chapter</a> writes programs that do the same, in C, JavaScript and Rust.</p>
+<h3 id="does-this-font-have-these-characters">Does this font have these characters?</h3>
+<p id="ix-90"><code>hb-info --list-unicodes</code> lists the characters the font’s <code>cmap</code> maps, with the glyph each goes to:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="opt">--list-unicodes</td><td class="out"><pre><code>Character-set information:
+
+Unicode	Glyph name
+------------------
+U+0020	space
+U+0061	a
+U+0065	e
+U+0066	f
+U+0069	i
+U+00E1	aacute
+U+0301	acutecomb
+U+0627	alef
+U+0628	beh
+U+0644	lam
+U+0915	ka
+U+0937	ssa
+U+093F	iMatra
+U+094D	virama</code></pre></td></tr></tbody></table></div>
+<p id="ix-91">That answers the question for the <code>cmap</code>, but not always for shaping. <code>é</code> (U+00E9) isn’t in the list, yet the font can draw it: HarfBuzz decomposes it into <code>e</code> and a combining acute, which are (<a href="normalization.html">Normalization</a>). Shaping tells the whole story. A character the font can’t draw comes out as glyph 0, <code>.notdef</code>, and <code>--no-glyph-names</code> makes that easy to spot:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">é</span><span class="cps">U+00E9</span></td><td class="opt"></td><td class="out"><code>[e=0+500|acutecomb=0@-250,150+0]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">éb</span><span class="cps">U+00E9 U+0062</span></td><td class="opt">--no-glyph-names</td><td class="out"><code>[3=0+500|7=0@-250,150+0|0=1+500]</code></td></tr></tbody></table></div>
+<h3 id="which-features-apply-in-this-language">Which features apply in this language?</h3>
+<p id="ix-92"><code>--list-scripts</code> shows which scripts and languages the font’s GSUB and GPOS know, and <code>--list-features</code> with <code>--script</code> and <code>--language</code> shows which features HarfBuzz will look at for that combination:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="opt">--list-scripts</td><td class="out"><pre><code>Layout script information:
+
+Table: GSUB
+	Script: Arab (arab)
+	Script: Deva (dev2)
+	Script: Latn (latn)
+		Language: tr (TRK )
+Table: GPOS
+	Script: Latn (latn)</code></pre></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="opt">--list-features --script=Latn --language=tr</td><td class="out"><pre><code>Layout features information:
+
+Table: GSUB
+	Script: latn
+	Language: TRK 
+	Feature: liga
+Table: GPOS
+	Script: latn
+	Language: Default
+	Feature: mark</code></pre></td></tr></tbody></table></div>
+<p id="ix-93">This font has a Turkish language system, <code>TRK</code>. <code>liga</code> is on its list, but it is a different <code>liga</code> from the default one, as the shaping of <code>fi</code> with <code>--language=tr</code> above showed: in Turkish it leaves out the <code>fi</code> ligature, which would hide the dot that tells <code>i</code> from <code>ı</code>.</p>
+<h3 id="why-didnt-this-ligature-form">Why didn’t this ligature form?</h3>
+<p id="ix-94">The test font has a lam-alef ligature, made by <code>rlig</code> from <code>lam.init</code> and <code>alef.fina</code>. It forms on its own, but not after a beh:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">لا</span><span class="cps">U+0644 U+0627</span></td><td class="opt"></td><td class="out"><code>[lam_alef=0+700]</code></td></tr><tr><td class="font">why-shaping-exists/shaping.ttf</td><td class="in"><span class="txt">بلا</span><span class="cps">U+0628 U+0644 U+0627</span></td><td class="opt"></td><td class="out"><code>[alef.fina=2+300|lam=1+500|beh.init=0+400]</code></td></tr></tbody></table></div>
+<p id="ix-95">A trace of the second, from the first joining lookup to <code>rlig</code>, shows why:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape why-shaping-exists/shaping.ttf "بلا"  --trace</code></div><table><tbody><tr><td class="what">start lookup 4 feature &#x27;fina&#x27;</td><td class="buf"><code>[beh=0|lam=1|alef=2]</code></td></tr><tr><td class="what">replacing glyph at 2 (single substitution)</td><td class="buf"><code>[beh=0|lam=1|alef=2]</code></td></tr><tr><td class="what">replaced glyph at 2 (single substitution)</td><td class="buf"><code>[beh=0|lam=1|alef.fina=2]</code></td></tr><tr><td class="what">end lookup 4 feature &#x27;fina&#x27;</td><td class="buf"><code>[beh=0|lam=1|alef.fina=2]</code></td></tr><tr><td class="what">start lookup 3 feature &#x27;medi&#x27;</td><td class="buf"><code>[beh=0|lam=1|alef.fina=2]</code></td></tr><tr><td class="what">end lookup 3 feature &#x27;medi&#x27;</td><td class="buf"><code>[beh=0|lam=1|alef.fina=2]</code></td></tr><tr><td class="what">start lookup 2 feature &#x27;init&#x27;</td><td class="buf"><code>[beh=0|lam=1|alef.fina=2]</code></td></tr><tr><td class="what">replacing glyph at 0 (single substitution)</td><td class="buf"><code>[beh=0|lam=1|alef.fina=2]</code></td></tr><tr><td class="what">replaced glyph at 0 (single substitution)</td><td class="buf"><code>[beh.init=0|lam=1|alef.fina=2]</code></td></tr><tr><td class="what">end lookup 2 feature &#x27;init&#x27;</td><td class="buf"><code>[beh.init=0|lam=1|alef.fina=2]</code></td></tr><tr><td class="what">start lookup 5 feature &#x27;rlig&#x27;</td><td class="buf"><code>[beh.init=0|lam=1|alef.fina=2]</code></td></tr><tr><td class="what">skipped lookup 5 feature &#x27;rlig&#x27; because no glyph matches</td><td class="buf"><code>[beh.init=0|lam=1|alef.fina=2]</code></td></tr><tr><td class="what">end lookup 5 feature &#x27;rlig&#x27;</td><td class="buf"><code>[beh.init=0|lam=1|alef.fina=2]</code></td></tr></tbody></table></div>
+<p id="ix-96">After a beh, the lam is medial. <code>medi</code> runs and changes nothing, because the font has no medial lam, so when <code>rlig</code>’s turn comes the lam is still <code>lam</code>, not <code>lam.init</code>. HarfBuzz skips the lookup without trying it, since no glyph in the buffer is one it could start from (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L2116"><code>hb-ot-layout.cc:2116</code></a>). A trace shows the buffer each lookup saw, which is usually enough; here it points at the font. The same steps work for any ligature: shape with and without the feature, check the features for the script and language with <code>hb-info</code>, then trace.</p>
+<h3 id="what-glyphs-does-a-subset-keep">What glyphs does a subset keep?</h3>
+<p id="ix-97">Subset the font, then list the glyphs. This page’s fonts were cut from the test font by <code>fonts/command-line-tools/build.sh</code>, with <code>--text=fi --glyph-names</code>, the second also with <code>--layout-features-=liga</code>:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">command-line-tools/fi.ttf</td><td class="opt">--list-glyphs</td><td class="out"><pre><code>Glyph-set information:
+
+GlyphID	Glyph name
+------------------
+0	.notdef
+1	f
+2	i
+3	f_f
+4	f_i</code></pre></td></tr><tr><td class="font">command-line-tools/fi-noliga.ttf</td><td class="opt">--list-glyphs</td><td class="out"><pre><code>Glyph-set information:
+
+GlyphID	Glyph name
+------------------
+0	.notdef
+1	f
+2	i</code></pre></td></tr></tbody></table></div>
+<p id="ix-98">The first keeps <code>f_f</code> as well as <code>f_i</code>, though the text has only one <code>f</code>. The subsetter keeps every glyph that the features it keeps could make from the glyphs it already has, and it doesn’t ask whether the text could ever produce them (<a href="subsetting.html#the-glyph-closure-stage-by-stage">Subsetting</a>). Without <code>liga</code>, neither ligature is kept, and the subset can no longer make <code>fi</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">command-line-tools/fi.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">command-line-tools/fi-noliga.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f=0+500|i=1+500]</code></td></tr></tbody></table></div>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/meson.build"><code>util/meson.build</code></a></td>
+<td>which tools are built, and when; which are installed</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/options.hh"><code>util/options.hh</code></a></td>
+<td>the option parser, exit codes, <code>--version</code>, the verbose help</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/batch.hh"><code>util/batch.hh</code></a></td>
+<td><code>--batch</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/main-font-text.hh"><code>util/main-font-text.hh</code></a></td>
+<td>the <code>main</code> shared by the shaping and drawing tools; the font and text arguments</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/face-options.hh"><code>util/face-options.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/font-options.hh"><code>util/font-options.hh</code></a></td>
+<td>the face, font and variations options</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/text-options.hh"><code>util/text-options.hh</code></a></td>
+<td><code>--text</code>, <code>--unicodes</code>, reading lines, the context options</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-options.hh"><code>util/shape-options.hh</code></a></td>
+<td>the shape options, <code>--features</code>, filling the buffer</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-consumer.hh"><code>util/shape-consumer.hh</code></a></td>
+<td>shaping each line, for every tool that shapes</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-format.hh"><code>util/shape-format.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/shape-output.hh"><code>util/shape-output.hh</code></a></td>
+<td><code>hb-shape</code>’s output switches and <code>--trace</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer-serialize.cc"><code>src/hb-buffer-serialize.cc</code></a></td>
+<td>the text and JSON formats themselves</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/view-options.hh"><code>util/view-options.hh</code></a></td>
+<td>the drawing tools’ view options</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-info.cc"><code>util/hb-info.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-subset.cc"><code>util/hb-subset.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/helper-subset.hh"><code>util/helper-subset.hh</code></a></td>
+<td><code>hb-info</code> and <code>hb-subset</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/vector-output.hh"><code>util/vector-output.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/raster-output.hh"><code>util/raster-output.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/view-cairo.hh"><code>util/view-cairo.hh</code></a></td>
+<td><code>hb-vector</code>, <code>hb-raster</code>, <code>hb-view</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/gpu-output.hh"><code>util/gpu-output.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-gpu.cc"><code>util/hb-gpu.cc</code></a>, <code>util/gpu/</code></td>
+<td><code>hb-gpu</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>The tools are thin layers over the library. Their options come from shared groups in <a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/util"><code>util/*.hh</code></a>, so an option works the same in every tool that has it, and the drawing tools shape exactly as <code>hb-shape</code> does.</li>
+<li><code>hb-shape</code> prints <code>name=cluster@x,y+advance</code>. Switches remove parts (<code>--no-glyph-names</code>, <code>--no-clusters</code>, <code>--no-advances</code>, <code>--ned</code>) or add them (<code>--show-extents</code>, <code>--show-flags</code>), and <code>-O json</code> writes JSON.</li>
+<li><code>--features</code> takes <code>tag</code>, <code>-tag</code>, <code>tag=N</code> and ranges in brackets; <code>--variations</code> takes <code>tag=value</code>. Both split at spaces as well as commas.</li>
+<li>Pass <code>--language</code> whenever a result could depend on it. <code>--text-before</code> and <code>--text-after</code> give context for Unicode properties such as joining, but not for GSUB rules.</li>
+<li><code>--trace</code> shows each step; <code>--verify</code> checks the glyph flags by reshaping; <code>--batch</code> runs many command lines in one process.</li>
+<li><code>hb-info</code> answers questions about a font as configured, variations included. <code>hb-subset</code> writes subsets and instances, and needs <code>-o</code>.</li>
+<li><code>hb-vector</code>, <code>hb-raster</code> and <code>hb-view</code> draw shaped text as SVG or PDF, as pixels, and through cairo; <code>hb-gpu</code> draws it in a window on the GPU.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="building-harfbuzz.html">← Building HarfBuzz</a><a rel="next" href="quick-start.html">Quick start: shaping text, then drawing it →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

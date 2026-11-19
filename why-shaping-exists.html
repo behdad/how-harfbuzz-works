@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Why shaping exists · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part I · Getting started</p>
+<h1 id="why-shaping-exists">1. Why shaping exists</h1>
+<p id="ix-1">Text is stored as characters, and it is drawn as glyphs. If every character had exactly one glyph, drawing text would be a table lookup: find each character in the font’s <code>cmap</code>, draw the glyph it names, move along by the glyph’s width, repeat. For a large part of the world’s writing that model fails at once, and even in English it fails as soon as a font has an <em>fi</em> ligature. Shaping is the work that replaces that table lookup.</p>
+<p id="ix-2">This chapter sets up the words the rest of the book uses for the two sides of that work, and for what connects them: characters and code points, glyphs and glyph IDs, clusters, runs, advances and offsets, script, direction, language and features. Then it shows, one by one, the ways in which characters and glyphs fail to line up. It ends with where the rules for shaping live, and with the history of the engines that run them, from Uniscribe and Apple’s ATSUI to the program this book is about.</p>
+<p id="ix-3">The examples come from one small test font, <code>shaping.ttf</code>, built from <code>fonts/why-shaping-exists/shaping.fea</code>. It has a few Latin glyphs (with an <em>fi</em> ligature and a combining acute), the Arabic letters beh, lam and alef in their joining forms, and the Devanagari consonants KA and SSA with the vowel sign I and a conjunct. Its glyphs are boxes: what matters is their names, their widths, the <code>cmap</code> and the layout tables. Every shaping result on this page was produced by running HarfBuzz 15.1.0 on that font when the page was built.</p>
+<h2 id="characters-and-code-points">Characters and code points</h2>
+<p id="ix-4">A <strong>character</strong> is the smallest unit of text that Unicode encodes: a letter, a digit, a punctuation mark, an accent, a space, a joiner. Each has a number, its <strong>code point</strong>, from U+0000 to U+10FFFF. The number after “U+” is hexadecimal: U+0066 is <em>f</em>, 102 in decimal, and U+0628, 1576 in decimal, is the Arabic letter beh.</p>
+<p id="ix-5">In memory, a string is stored in one of three <a href="https://www.unicode.org/faq/utf_bom.html">encodings</a>: UTF-8 uses one to four bytes per code point, UTF-16 one or two 16-bit units, and UTF-32 one 32-bit unit. In UTF-8, <em>f</em> is the byte 66 (hex) and beh the two bytes D8 A8 (hex). HarfBuzz <a href="buffers.html#adding-text">accepts all three</a>, as well as plain arrays of code points, and decodes the text into code points as soon as it arrives. Inside HarfBuzz, a code point is an <code>hb_codepoint_t</code>, a 32-bit integer.</p>
+<p id="ix-6">In strings, characters are stored in <strong>logical order</strong>: the order in which they are read, and normally typed. That is true whichever way the script runs on the page. The first character of an Arabic word is its rightmost letter, and it comes first in the string.</p>
+<p id="ix-7">Unicode encodes characters, not their appearance. There is one code point for beh, though it has four shapes, and one for <em>a</em>, whatever the font. Unicode does say a great deal about each character: its general category (letter, mark, number…), its script, whether it is a combining mark and how strongly it binds, how it joins its neighbors, and how it decomposes into other characters. Shaping needs all of that, and HarfBuzz carries its own tables of it, covered in <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a>.</p>
+<p id="ix-8">Unicode does also contain characters that look like glyphs: the <em>fi</em> ligature U+FB01, and hundreds of Arabic “presentation forms”, one code point for each joining form of each letter. They exist for compatibility with older character sets. Text isn’t normally written with them, and a shaping engine never needs them to produce those shapes. (HarfBuzz’s Arabic shaper does use them for something: as a fallback, when a font has no <code>GSUB</code> but does map the presentation forms in its <code>cmap</code>. That is in <a href="joining-scripts.html">Joining scripts</a>.)</p>
+<h2 id="glyphs-and-glyph-ids">Glyphs and glyph IDs</h2>
+<p id="ix-9">A <strong>glyph</strong> is a shape in a font. Fonts don’t name their glyphs by character, or by anything else that shaping uses: a glyph is known by its position in the font, its <strong>glyph ID</strong>, a number from 0 up to the number of glyphs in the font, less one. In OpenType that is a 16-bit number, so a font has at most 65,535 glyphs, unless it uses the “beyond 64k” extensions mentioned in the <a href="gsub.html">GSUB chapter</a>. Glyph 0 is always <code>.notdef</code>, the glyph drawn for a character the font doesn’t have.</p>
+<p id="ix-10">Glyphs can also have names, such as <code>f_i</code> or <code>beh.init</code>. Names are for people: HarfBuzz doesn’t need them to shape, and a font can leave them out. <code>hb-shape</code> (<a href="command-line-tools.html#hb-shape">The command-line tools</a>) prints them when the font has them, and prints glyph IDs if asked:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">a</span><span class="cps">U+0061</span></td><td class="opt"></td><td class="out"><code>[a=0+500]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">a</span><span class="cps">U+0061</span></td><td class="opt">--no-glyph-names</td><td class="out"><code>[2=0+500]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--no-glyph-names</td><td class="out"><code>[9=0+900]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">ab</span><span class="cps">U+0061 U+0062</span></td><td class="opt"></td><td class="out"><code>[a=0+500|.notdef=1+500]</code></td></tr></tbody></table></div>
+<p id="ix-11">The <em>a</em> is glyph 2 in this font. The <em>fi</em> ligature is glyph 9. The font has no <em>b</em>, so the second character becomes glyph 0.</p>
+<p id="ix-12">The font’s <code>cmap</code> table maps code points to glyph IDs. The glyph it gives for a character is that character’s <strong>nominal glyph</strong>, and a font function, <code>get_nominal_glyph</code>, asks for it (font functions are the subject of <a href="fonts-and-font-functions.html">Fonts and font functions</a>). The nominal glyph is where shaping starts, not where it ends.</p>
+<h2 id="what-harfbuzz-hands-back">What HarfBuzz hands back</h2>
+<p id="ix-13">A shaped buffer is two arrays of the same length, one entry per glyph. Here are the two structs, from <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.h#L62"><code>hb-buffer.h:62</code></a> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.h#L191"><code>hb-buffer.h:191</code></a>, with comments left out:</p>
+<pre><code class="language-c++">typedef struct hb_glyph_info_t {
+  hb_codepoint_t codepoint;
+  hb_mask_t      mask;      /* private */
+  uint32_t       cluster;
+  hb_var_int_t   var1;      /* private */
+  hb_var_int_t   var2;      /* private */
+} hb_glyph_info_t;
+
+typedef struct hb_glyph_position_t {
+  hb_position_t  x_advance;
+  hb_position_t  y_advance;
+  hb_position_t  x_offset;
+  hb_position_t  y_offset;
+  hb_var_int_t   var;       /* private */
+} hb_glyph_position_t;
+</code></pre>
+<p id="ix-14">The same <code>hb_glyph_info_t</code> is used on the way in and on the way out. When text is added to a buffer, <code>codepoint</code> holds a Unicode code point. Partway through shaping, HarfBuzz overwrites it with the glyph ID (<code>hb_ot_map_glyphs_fast</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L844"><code>hb-ot-shape.cc:844</code></a>), and the buffer’s content type changes from Unicode to glyphs. The name of the field stays the same. <code>cluster</code> is set when the text is added and is the subject of a section of its own below. The private fields are HarfBuzz’s scratch space during shaping. <code>mask</code> holds the bits that say which features are on for the glyph, as the <a href="gsub.html#the-mask">GSUB chapter</a> explains.</p>
+<p id="ix-15">The positions are in two parts. The <strong>advance</strong> is how far to move the pen after drawing the glyph: along <em>x</em> for horizontal text, along <em>y</em> for vertical text. The <strong>offset</strong> moves the glyph from where the pen is, without moving the pen. A glyph with an advance of zero and an offset is drawn somewhere other than the pen position, and doesn’t move the next glyph along. That is how marks are placed:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">e◌́</span><span class="cps">U+0065 U+0301</span></td><td class="opt"></td><td class="out"><code>[e=0+500|acutecomb=0@-250,150+0]</code></td></tr></tbody></table></div>
+<p id="ix-16">The <em>e</em> is 500 units wide. The acute has an advance of 0, and an offset of −250 across and 150 up. By the time it is drawn the pen has already moved past the <em>e</em>, so the offset brings it back to the <em>e</em>’s anchor at (250, 650), where the font says marks attach. The acute’s own anchor is at (0, 500), so it is moved by 250 − 500 = −250 across and 650 − 500 = 150 up. Positions are in the font’s units here, because <code>hb-shape</code> sets the font’s scale to its units per em unless told otherwise. In an application they are in whatever units the font object was given, as <a href="fonts-and-font-functions.html">Fonts and font functions</a> explains.</p>
+<blockquote>
+<p id="ix-17">For programmers: the advances and offsets are relative, not absolute. To place glyph <em>n</em>, add up the advances of glyphs 0 to <em>n</em> − 1, then add glyph <em>n</em>’s offset. Nothing in the output gives a glyph’s absolute position directly.</p>
+</blockquote>
+<h2 id="runs-and-the-three-things-harfbuzz-must-be-told">Runs, and the three things HarfBuzz must be told</h2>
+<p id="ix-18">As the <a href="introduction.html">introduction</a> says, HarfBuzz shapes a <strong>run</strong>: text in one font, with one script, one direction and one language. Those three are the buffer’s <strong>segment properties</strong> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.h#L211"><code>hb-buffer.h:211</code></a>):</p>
+<pre><code class="language-c++">typedef struct hb_segment_properties_t {
+  hb_direction_t  direction;
+  hb_script_t     script;
+  hb_language_t   language;
+  /* two private fields left out */
+} hb_segment_properties_t;
+</code></pre>
+<p id="ix-19">The <strong>script</strong> is the writing system: Latin, Arabic, Devanagari. HarfBuzz’s <code>hb_script_t</code> values are the four-letter ISO 15924 codes (<code>Latn</code>, <code>Arab</code>, <code>Deva</code>) packed into an integer. OpenType names scripts with tags of its own, which are not always the same: the newer Devanagari tag is <code>dev2</code>, for example, and HarfBuzz translates between the two in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-tag.cc"><code>hb-ot-tag.cc</code></a>. The script decides which <strong>script shaper</strong> HarfBuzz uses, the part of HarfBuzz that knows the script’s rules, and which part of the font’s tables apply.</p>
+<p id="ix-20">The <strong>direction</strong> is left to right, right to left, top to bottom or bottom to top. It is the direction the glyphs go on the page, and HarfBuzz returns glyphs in that order: for a right-to-left run, the first glyph in the output is the rightmost, which comes from the <em>last</em> character.</p>
+<p id="ix-21">The <strong>language</strong> is a BCP 47 tag, such as <code>en</code>, <code>tr</code> or <code>ur</code>, built from the codes in <a href="https://www.iana.org/assignments/language-subtag-registry">IANA’s language subtag registry</a>. HarfBuzz maps it to an OpenType language system tag, from <a href="https://learn.microsoft.com/en-us/typography/opentype/spec/languagetags">OpenType’s own list</a> (<code>tr</code> becomes <code>TRK</code>), and the font can then use different rules for it.</p>
+<p id="ix-22">HarfBuzz can’t tell the language from the text: Turkish and English are written with the same letters. The application has to say, and it usually knows from the document. In HTML, the <a href="https://html.spec.whatwg.org/multipage/dom.html#the-lang-and-xml:lang-attributes"><code>lang</code> attribute</a> says what language an element’s text is in, and everything inside the element inherits it, so <code>&lt;html lang=&quot;tr&quot;&gt;</code> covers a whole page and <code>&lt;span lang=&quot;en&quot;&gt;</code> one phrase in it. Word processors and layout programs keep a language with each run of text, which they need for spelling and hyphenation as well. Failing those, there are the user’s own language settings. CSS can also name the OpenType language system itself, with <a href="https://www.w3.org/TR/css-fonts-4/#font-language-override-prop"><code>font-language-override</code></a>, for when the font’s tag isn’t the one the language would map to; HarfBuzz has its own way of doing the same (<a href="choosing-a-script-shaper.html#naming-the-tags-directly">Choosing a script shaper</a>).</p>
+<p id="ix-23">If an application doesn’t set them, <code>hb_buffer_guess_segment_properties</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L746"><code>hb-buffer.cc:746</code></a>) fills them in: the script from the first character that has a real script (not Common or Inherited), the direction from the script, and the language from the process’s locale, which has nothing to do with the text: on a computer set up for Turkish, English text is shaped as Turkish. <code>hb-shape</code> calls it, which is why the examples on this page don’t have to say what script they are in. Guessing is no substitute for knowing. Here the same Arabic text is shaped first as Arabic and then as if it were Latin:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt"></td><td class="out"><code>[beh.fina=2+600|beh.medi=1+400|beh.init=0+400]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--script=latn</td><td class="out"><code>[beh=0+600|beh=1+600|beh=2+600]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--script=latn --direction=rtl</td><td class="out"><code>[beh=2+600|beh=1+600|beh=0+600]</code></td></tr></tbody></table></div>
+<p id="ix-24">As Arabic, the three behs take their initial, medial and final forms, and come out right to left. Called Latin, they get the default shaper, which knows nothing about joining, and are drawn left to right as three isolated letters. Setting the direction puts them in the right order, but they still don’t join: that needs the Arabic shaper, and only the script chooses it.</p>
+<p id="ix-25">The language works on a smaller scale. In Turkish, the dot on the <em>i</em> tells it apart from the dotless <em>ı</em>, and an <em>fi</em> ligature that swallows the dot would turn one letter into the other. So the test font, as many real fonts do, has no <em>fi</em> ligature for Turkish:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--language=tr</td><td class="out"><code>[f=0+500|i=1+500]</code></td></tr></tbody></table></div>
+<p id="ix-26">Finding the runs is not HarfBuzz’s job. An application splits a paragraph where the script changes, where the bidirectional algorithm says the direction changes, and where the font changes, because a style changes or because the font lacks a character and another has to be used. What HarfBuzz can be given is a little of the text on either side of a run, its <strong>context</strong>, so that rules looking across the edge of the run still work. The Arabic shaper uses it to decide whether the first and last letters of a run join their neighbors (<code>arabic_joining</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc#L302"><code>hb-ot-shaper-arabic.cc:302</code></a>).</p>
+<h2 id="features">Features</h2>
+<p id="ix-27">A font’s layout tables are organized into <strong>features</strong>, each named by a four-letter tag: <code>liga</code> for standard ligatures, <code>kern</code> for kerning, <code>init</code> for initial forms, <code>smcp</code> for small capitals. A feature is a list of lookups, the actual rules. The font decides what each feature does. The shaping engine decides which features to apply, to which glyphs, and in what order.</p>
+<p id="ix-28">Some features are on by default for every script, like <code>liga</code>, <code>kern</code> and <code>mark</code>. Some are part of a script’s shaping and are applied by its shaper to particular glyphs only, like Arabic’s <code>init</code>, <code>medi</code> and <code>fina</code>. Others are off unless an application asks for them, like <code>smcp</code>, or the stylistic alternates the GSUB chapter showed. An application asks with an <code>hb_feature_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.h#L437"><code>hb-common.h:437</code></a>):</p>
+<pre><code class="language-c++">typedef struct hb_feature_t {
+  hb_tag_t      tag;
+  uint32_t      value;
+  unsigned int  start;
+  unsigned int  end;
+} hb_feature_t;
+</code></pre>
+<p id="ix-29">The value is usually 1 (on) or 0 (off). <code>start</code> and <code>end</code> limit the feature to part of the buffer. <code>hb-shape</code> takes the same thing as a string:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--features=-liga</td><td class="out"><code>[f=0+500|i=1+500]</code></td></tr></tbody></table></div>
+<p id="ix-30">How a list of features turns into a list of lookups, and in what order those run, is the subject of <a href="from-features-to-lookups.html">From features to lookups</a>.</p>
+<h2 id="where-one-to-one-breaks">Where one-to-one breaks</h2>
+<p id="ix-31">With those words in hand, here are the ways in which characters and glyphs fail to correspond. Each is shown in the test font.</p>
+<h3 id="many-characters-one-glyph-ligatures">Many characters, one glyph: ligatures</h3>
+<p id="ix-32">The plainest case. Two characters, <em>f</em> and <em>i</em>, become one glyph:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900]</code></td></tr></tbody></table></div>
+<p id="ix-33">The ligature has cluster 0: it came from the text starting at character 0. Nothing in the output has cluster 1, because the <em>i</em> no longer has a glyph of its own. In Latin text this is a refinement, and the text reads the same with <code>liga</code> off. In other scripts some ligatures are compulsory. Arabic lam followed by alef must become the lam-alef ligature, and fonts put it in the <code>rlig</code> (“required ligatures”) feature:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">لا</span><span class="cps">U+0644 U+0627</span></td><td class="opt"></td><td class="out"><code>[lam_alef=0+700]</code></td></tr></tbody></table></div>
+<h3 id="one-character-many-shapes-joining-and-contextual-forms">One character, many shapes: joining and contextual forms</h3>
+<p>The shape of an Arabic letter depends on whether it joins the letter before it, the letter after it, both or neither. Beh joins on both sides, and has four forms:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">ب</span><span class="cps">U+0628</span></td><td class="opt"></td><td class="out"><code>[beh=0+600]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">بب</span><span class="cps">U+0628 U+0628</span></td><td class="opt"></td><td class="out"><code>[beh.fina=1+600|beh.init=0+400]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt"></td><td class="out"><code>[beh.fina=2+600|beh.medi=1+400|beh.init=0+400]</code></td></tr></tbody></table></div>
+<p id="ix-34">Each character still has one glyph and one cluster, but which glyph depends on its neighbors. Read the clusters to see the right-to-left order: the first glyph printed has the highest cluster number, so it is the last letter of the word.</p>
+<p id="ix-35">The font can’t work this out alone. Its <code>fina</code> lookup in this font says only “replace beh with beh.fina”, which would change every beh in the text. What makes it change only the last one is the Arabic shaper. Before any lookup runs, <code>arabic_joining</code> walks through the text with a state machine driven by each character’s Unicode joining type (dual-joining, right-joining, transparent, non-joining), and records for each letter which of the forms it takes. <code>setup_masks_arabic_plan</code> (<code>:391</code>) then sets that form’s feature bit in the letter’s mask. Each of the features then runs as its own stage, and touches only the glyphs whose masks have its bit (<code>collect_features_arabic</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc#L186"><code>hb-ot-shaper-arabic.cc:186</code></a>). The trace shows each lookup changing one glyph:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape shaping.ttf "ببب"  --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;arab&#x27;</td><td class="buf"><code>[beh=0|beh=1|beh=2]</code></td></tr><tr><td class="what">start lookup 4 feature &#x27;fina&#x27;</td><td class="buf"><code>[beh=0|beh=1|beh=2]</code></td></tr><tr><td class="what">replacing glyph at 2 (single substitution)</td><td class="buf"><code>[beh=0|beh=1|beh=2]</code></td></tr><tr><td class="what">replaced glyph at 2 (single substitution)</td><td class="buf"><code>[beh=0|beh=1|beh.fina=2]</code></td></tr><tr><td class="what">end lookup 4 feature &#x27;fina&#x27;</td><td class="buf"><code>[beh=0|beh=1|beh.fina=2]</code></td></tr><tr><td class="what">start lookup 3 feature &#x27;medi&#x27;</td><td class="buf"><code>[beh=0|beh=1|beh.fina=2]</code></td></tr><tr><td class="what">replacing glyph at 1 (single substitution)</td><td class="buf"><code>[beh=0|beh=1|beh.fina=2]</code></td></tr><tr><td class="what">replaced glyph at 1 (single substitution)</td><td class="buf"><code>[beh=0|beh.medi=1|beh.fina=2]</code></td></tr><tr><td class="what">end lookup 3 feature &#x27;medi&#x27;</td><td class="buf"><code>[beh=0|beh.medi=1|beh.fina=2]</code></td></tr><tr><td class="what">start lookup 2 feature &#x27;init&#x27;</td><td class="buf"><code>[beh=0|beh.medi=1|beh.fina=2]</code></td></tr><tr><td class="what">replacing glyph at 0 (single substitution)</td><td class="buf"><code>[beh=0|beh.medi=1|beh.fina=2]</code></td></tr><tr><td class="what">replaced glyph at 0 (single substitution)</td><td class="buf"><code>[beh.init=0|beh.medi=1|beh.fina=2]</code></td></tr><tr><td class="what">end lookup 2 feature &#x27;init&#x27;</td><td class="buf"><code>[beh.init=0|beh.medi=1|beh.fina=2]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;arab&#x27;</td><td class="buf"><code>[beh.init=0|beh.medi=1|beh.fina=2]</code></td></tr></tbody></table></div>
+<p id="ix-36">The buffer is still in logical order during GSUB. HarfBuzz reverses it into visual order only near the end of shaping, which is why the trace and the result above run in opposite directions.</p>
+<p id="ix-37">Arabic is the clearest case, but not the only one. Syriac, N’Ko, Mongolian and many other scripts join, and a Latin font can use contextual alternates (<code>calt</code>) for the same kind of effect, as the <a href="gsub.html#an-input-buffer-and-an-output-buffer">GSUB chapter</a> showed.</p>
+<h3 id="order-on-the-page-order-in-the-text-reordering">Order on the page, order in the text: reordering</h3>
+<p>In Devanagari, the vowel sign I (U+093F) is written <em>after</em> the consonant it follows in speech, and drawn <em>before</em> it:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt"></td><td class="out"><code>[iMatra=0+250|ka=0+600]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">क्षि</span><span class="cps">U+0915 U+094D U+0937 U+093F</span></td><td class="opt"></td><td class="out"><code>[iMatra=0+250|k_ssa=0+800]</code></td></tr></tbody></table></div>
+<p id="ix-38">In the first line, KA then I becomes the glyph for I then the glyph for KA. In the second, KA, virama and SSA form the conjunct K.SSA, and the I goes before the whole conjunct. Both glyphs in each line have cluster 0: once glyphs have been reordered, the only honest thing to say is that they all came from the whole syllable.</p>
+<p id="ix-39">Again the font doesn’t do the moving. The Indic shaper finds the syllables, works out which consonant is the base, and moves the vowel sign before it, all before the font’s lookups run, then adjusts its position again after the basic features have formed conjuncts and half forms (<code>initial_reordering_consonant_syllable</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc#L463"><code>hb-ot-shaper-indic.cc:463</code></a>, and <code>final_reordering_syllable_indic</code>, <code>:999</code>):</p>
+<div class="trace"><div class="trace-head"><code>hb-shape shaping.ttf "कि"  --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;dev2&#x27;</td><td class="buf"><code>[ka=0|iMatra=0]</code></td></tr><tr><td class="what">start reordering indic initial</td><td class="buf"><code>[ka=0|iMatra=0]</code></td></tr><tr><td class="what">skipped inserting dotted-circles because there is no broken syllables</td><td class="buf"><code>[ka=0|iMatra=0]</code></td></tr><tr><td class="what">end reordering indic initial</td><td class="buf"><code>[iMatra=0|ka=0]</code></td></tr><tr><td class="what">start reordering indic final</td><td class="buf"><code>[iMatra=0|ka=0]</code></td></tr><tr><td class="what">end reordering indic final</td><td class="buf"><code>[iMatra=0|ka=0]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;dev2&#x27;</td><td class="buf"><code>[iMatra=0|ka=0]</code></td></tr></tbody></table></div>
+<p id="ix-40">The reordering appears in the trace as two steps of its own, “reordering indic initial” and “reordering indic final”, which run between stages of lookups (this font’s one Devanagari lookup, <code>akhn</code>, has nothing to do here, so the trace leaves it out). How the shaper decides what is a base, and how the font’s own lookups steer that, is in <a href="indic-model.html">The Indic model</a>. The shaper is chosen by the script tag the font has as well as by the text: a Devanagari font with only <code>DFLT</code> or <code>latn</code> scripts in its <code>GSUB</code> gets the default shaper and no reordering at all, as <a href="choosing-a-script-shaper.html">Choosing a script shaper</a> explains.</p>
+<h3 id="glyphs-placed-on-other-glyphs-marks">Glyphs placed on other glyphs: marks</h3>
+<p id="ix-41">A combining mark, such as U+0301 COMBINING ACUTE ACCENT, is a character of its own that belongs on the character before it. It gets a glyph of its own, and the font’s <code>GPOS</code> table says where that glyph goes, as shown above. A font may have the accented letter as a single glyph instead, and that brings in one more mismatch.</p>
+<h3 id="one-character-several-glyphs-or-the-other-way-round-decomposition">One character, several glyphs, or the other way round: decomposition</h3>
+<p id="ix-42">Unicode has two ways of writing <em>é</em>: the single character U+00E9, or <em>e</em> followed by the combining acute. They are <strong>canonically equivalent</strong>: they mean the same thing, and text may contain either. The test font has a glyph for <em>á</em> but none for <em>é</em>. Here are both letters, written both ways:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">é</span><span class="cps">U+00E9</span></td><td class="opt"></td><td class="out"><code>[e=0+500|acutecomb=0@-250,150+0]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">e◌́</span><span class="cps">U+0065 U+0301</span></td><td class="opt"></td><td class="out"><code>[e=0+500|acutecomb=0@-250,150+0]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">á</span><span class="cps">U+00E1</span></td><td class="opt"></td><td class="out"><code>[aacute=0+500]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">a◌́</span><span class="cps">U+0061 U+0301</span></td><td class="opt"></td><td class="out"><code>[aacute=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-43">Each pair comes out the same, whichever way the text was written, and what it comes out as is decided by the font. With no <em>é</em> glyph, HarfBuzz decomposes U+00E9 into <em>e</em> and the acute, and positions the acute with <code>GPOS</code>: one character has become two glyphs, both in cluster 0. With an <em>á</em> glyph, it composes <em>a</em> and the acute into U+00E1 and uses that glyph: two characters have become one. This is HarfBuzz’s <strong>normalization</strong>, done against the font’s <code>cmap</code> rather than for its own sake (<code>_hb_ot_shape_normalize</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc#L280"><code>hb-ot-shape-normalize.cc:280</code></a>), and it is where the <code>cmap</code> lookup actually happens. It is covered in <a href="normalization.html">Normalization</a>.</p>
+<p id="ix-44">A font can also turn one glyph into several itself, with a multiple substitution in <code>GSUB</code>. That and the other substitution types are in the <a href="gsub.html#multiple-substitution">GSUB chapter</a>.</p>
+<blockquote>
+<p id="ix-45">For type designers: a font doesn’t need precomposed glyphs for every accented letter, as long as its <code>GPOS</code> can position the marks on the base letters. HarfBuzz finds whichever form the font supports. But where the font does have a precomposed glyph, that is the one used, even for text typed as base and mark.</p>
+</blockquote>
+<h2 id="clusters">Clusters</h2>
+<p id="ix-46">Every one of those mismatches leaves a question behind: which glyphs came from which characters? An application needs the answer to put a cursor between letters, to select text, to find which character was clicked, to color part of a word, or to copy text back out of a PDF. HarfBuzz’s answer is the <strong>cluster</strong>.</p>
+<p id="ix-47">When text is added to a buffer, each character’s cluster is set to its position in the caller’s string, counted in the string’s own code units (bytes, for UTF-8). <code>hb-shape</code> counts characters instead, unless it is given <code>--utf8-clusters</code>. Whenever shaping combines or reorders glyphs, it <strong>merges</strong> their clusters: every glyph in the group is given the smallest cluster value among them (<code>merge_clusters_impl</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L569"><code>hb-buffer.cc:569</code></a>). A cluster is therefore a group of characters and the glyphs made from them that can’t be split any further. The examples so far show each kind:</p>
+<table>
+<thead>
+<tr>
+<th>Text</th>
+<th id="ix-48">Glyphs</th>
+<th>What happened</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><em>f i</em></td>
+<td><code>f_i=0</code></td>
+<td id="ix-49">two characters, one glyph</td>
+</tr>
+<tr>
+<td><em>é</em> (U+00E9)</td>
+<td><code>e=0</code>, <code>acutecomb=0</code></td>
+<td id="ix-50">one character, two glyphs</td>
+</tr>
+<tr>
+<td><em>a</em> + acute</td>
+<td><code>aacute=0</code></td>
+<td id="ix-51">two characters, one glyph, by composition</td>
+</tr>
+<tr>
+<td>KA + I</td>
+<td><code>iMatra=0</code>, <code>ka=0</code></td>
+<td id="ix-52">two characters, two glyphs, in the other order</td>
+</tr>
+<tr>
+<td>beh beh beh</td>
+<td><code>beh.fina=2</code>, <code>beh.medi=1</code>, <code>beh.init=0</code></td>
+<td id="ix-53">one glyph each, in right-to-left order</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-54">The rule that ties them together is that a cluster holds the <em>whole</em> of what it is made of: within a cluster there is no saying which glyph came from which character. A cursor can go between clusters, and only an application that does its own work can go inside one, for example between the two letters of the <em>fi</em> ligature.</p>
+<p id="ix-55">How eagerly HarfBuzz merges is set by the buffer’s <strong>cluster level</strong> (<code>hb_buffer_cluster_level_t</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.h#L461"><code>hb-buffer.h:461</code></a>). There are four. At the default, level 0, a mark is merged into the cluster of the base it follows before shaping begins (<code>hb_form_clusters</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L581"><code>hb-ot-shape.cc:581</code></a>), and clusters are kept in order: they rise along the buffer in left-to-right text and fall in right-to-left text, with no going back. Level 1 keeps marks in clusters of their own, and still keeps the order. Level 2 does neither:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">e◌́</span><span class="cps">U+0065 U+0301</span></td><td class="opt"></td><td class="out"><code>[e=0+500|acutecomb=0@-250,150+0]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">e◌́</span><span class="cps">U+0065 U+0301</span></td><td class="opt">--cluster-level=1</td><td class="out"><code>[e=0+500|acutecomb=1@-250,150+0]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--cluster-level=1</td><td class="out"><code>[iMatra=0+250|ka=0+600]</code></td></tr><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--cluster-level=2</td><td class="out"><code>[iMatra=1+250|ka=0+600]</code></td></tr></tbody></table></div>
+<p id="ix-56">At level 1 the acute has its own cluster, 1. The reordered vowel sign doesn’t: putting it first with cluster 1 would break the order, so its cluster is merged with the consonant’s. At level 2, nothing is merged just to keep the order, and the vowel sign keeps its cluster, 1, though it comes first. Level 3, which merges marks as level 0 does but doesn’t keep the order, is the newest: it arrived in 11.0.0. The header comment says level 0 is the default only for backward compatibility and recommends level 1 for new programs. The user manual adds where level 0 came from: it is how the Windows shaping engine behaves, and the old HarfBuzz copied it. All four levels are covered in <a href="buffers.html">Buffers</a>.</p>
+<p id="ix-57">Merging is one of two things HarfBuzz records about the boundaries in its output. The other is whether a boundary is safe to break at: whether the text on each side could be shaped separately and give the same glyphs. Between joined Arabic letters it is not, since each one’s form depends on the next. HarfBuzz marks a glyph with <code>UNSAFE_TO_BREAK</code> when the run can’t safely be broken at the start of its cluster, and <code>hb-shape</code> shows the flag as <code>#1</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">shaping.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--show-flags</td><td class="out"><code>[beh.fina=2+600#1|beh.medi=1+400#1|beh.init=0+400]</code></td></tr></tbody></table></div>
+<p id="ix-58">What applications do with clusters and with these flags, for line breaking and for reshaping after an edit, is in <a href="for-applications.html">For applications</a>.</p>
+<h2 id="where-the-rules-live">Where the rules live</h2>
+<p id="ix-59">Everything above needed two kinds of knowledge. Some of it is about the font: which glyphs it has, which ligatures, where its anchors are. Some of it is about the script: which letters join, which vowel signs go before the consonant, what a syllable is, which features apply to which letters and in what order. The font’s designer knows the first kind. The second kind is the same for every font of the script.</p>
+<p>There have been three answers to the question of where the second kind should live.</p>
+<p id="ix-60"><strong>In the engine.</strong> OpenType keeps the font’s knowledge in the font and leaves the script’s knowledge to the shaping engine. A font says what <code>init</code> does to a beh. The engine decides which behs get <code>init</code>. Microsoft documents what its engine does for each script, in its specifications for developing OpenType fonts for Arabic, Devanagari and the rest, and font developers write their fonts to match. The cost is that every engine has to know every script, and has to know it the same way.</p>
+<p id="ix-61"><strong>In the font.</strong> Apple’s layout tables, now called AAT, put everything in the font. The <code>morx</code> table holds state machines that walk along the glyphs and change, insert, ligate or rearrange them. A font for Devanagari carries its own reordering rules. The engine needs no knowledge of any script, but every font has to contain all of it.</p>
+<p id="ix-62"><strong>In the font, as a program.</strong> SIL’s Graphite also puts the rules in the font, written in a language of its own and compiled into tables that the Graphite engine runs.</p>
+<p id="ix-63">HarfBuzz implements all three. Its OpenType shaping has a script shaper for each family of scripts that needs one, which is what Part VI covers. Apple’s tables run inside the same pipeline, in place of <code>GSUB</code> and <code>GPOS</code>, when a font has them (<a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a>). Graphite runs through a separate backend that uses SIL’s own library, as <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a> explains.</p>
+<h2 id="a-short-history">A short history</h2>
+<p>HarfBuzz comes out of a particular history, and it still shows in the code. What follows is only an outline, kept to what the HarfBuzz source and its documents bear out, or what is well known.</p>
+<h3 id="apple-gx-aat-and-atsui">Apple: GX, AAT and ATSUI</h3>
+<p id="ix-64">TrueType began at Apple. Apple’s QuickDraw GX added layout tables to it, in which the font carries its own rules as state machines: the <code>mort</code> table, later extended as <code>morx</code>, with <code>kern</code> and later <code>kerx</code> for positioning. When GX was retired, its font technology lived on as Apple Advanced Typography. On Mac OS the system API for laying out Unicode text with those fonts was ATSUI, Apple Type Services for Unicode Imaging, later replaced by Core Text. AAT fonts are still found mostly on Apple’s systems, as the HarfBuzz user manual notes.</p>
+<h3 id="microsoft-and-adobe-opentype-and-uniscribe">Microsoft and Adobe: OpenType and Uniscribe</h3>
+<p id="ix-65">Microsoft took the other road. Its TrueType Open, developed further with Adobe as OpenType, added the <code>GSUB</code>, <code>GPOS</code> and <code>GDEF</code> tables, which describe <em>what</em> a font can do but leave <em>when</em> to the engine. On Windows, that engine was Uniscribe, the system’s script processor, with a shaping engine for each family of complex scripts, and later DirectWrite.</p>
+<p id="ix-66">Because the script knowledge lived in Uniscribe, Uniscribe’s behavior became, in practice, part of the specification. Fonts were made and tested on Windows, so they worked with what Uniscribe did, including where it differed from what the documents said. Any other engine that wanted those fonts to work had to find out what Uniscribe did, often by testing it. HarfBuzz’s source is full of the results. The Indic shaper corrects a sentence of Microsoft’s Devanagari specification with “Testing, with Windows 7 Uniscribe and Devanagari shows that the behavior is best described as…” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc#L1111"><code>hb-ot-shaper-indic.cc:1111</code></a>). The Khmer shaper applies its basic features without pauses because “testing suggests that Uniscribe does NOT pause between basic features” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-khmer.cc#L110"><code>hb-ot-shaper-khmer.cc:110</code></a>). The Hangul shaper leaves <code>calt</code> off for jamo because Uniscribe does (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-hangul.cc#L69"><code>hb-ot-shaper-hangul.cc:69</code></a>). The <a href="gsub.html#multiple-substitution">GSUB chapter</a> showed another: a multiple substitution may delete a glyph, though the specification says it can’t, because Uniscribe allows it.</p>
+<p id="ix-67">Microsoft later added a single engine for many of the scripts its other engines didn’t cover, the Universal Shaping Engine, driven by Unicode character properties instead of rules written for each script. HarfBuzz implemented it in its 1.0.0 release, in July 2015, and its <code>NEWS</code> file for that release links to Microsoft’s announcement. It has its own chapter, <a href="universal-shaping-engine.html">The Universal Shaping Engine</a>.</p>
+<h3 id="icus-layoutengine">ICU’s LayoutEngine</h3>
+<p id="ix-68">IBM’s International Components for Unicode (ICU), the portable library of Unicode algorithms, had an OpenType layout engine of its own, the LayoutEngine. It offered shaping outside Windows and the Mac in a library anyone could use, and OpenJDK, among others, used it. ICU later deprecated it and pointed its users to HarfBuzz. HarfBuzz still connects to ICU in another way: <code>libharfbuzz-icu</code> lets it take Unicode properties from ICU instead of from its own tables.</p>
+<h3 id="freetype-pango-and-qt-the-first-harfbuzz">FreeType, Pango and Qt: the first HarfBuzz</h3>
+<p id="ix-69">The free software desktop needed shaping too. FreeType, the free font rasterizer, had code for reading OpenType layout tables, written by David Turner and Werner Lemberg. Their copyright, 1998 to 2004, is still at the top of <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc"><code>hb-buffer.cc</code></a> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>hb-ot-layout.cc</code></a>, and the user manual says that HarfBuzz “began its life as text-shaping code within the FreeType project”. Pango, GNOME’s text layout library, used that code for its OpenType support, with shaping modules of its own for each script. The Red Hat authors named in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc"><code>hb-buffer.cc</code></a> are Owen Taylor and Behdad Esfahbod. Qt, the toolkit then developed by Trolltech and later Nokia, used the same code; two of its developers, Lars Knoll and Simon Hausmann, are in HarfBuzz’s <code>AUTHORS</code> file, and Nokia’s copyright is in <code>COPYING</code>.</p>
+<p id="ix-70">The shared code was extracted into a project of its own, and Behdad Esfahbod named it HarfBuzz: in the README’s words, a “transliteration of the Persian calque for <em>OpenType</em>”, from <em>harf</em>, letter, and <em>bâz</em>, open. The README calls the second meaning, “insincerely talkative; glib”, “a nod to the GNOME project where HarfBuzz originates from”. HarfBuzz dates itself from 2006: the README lists talks called “Ten Years of HarfBuzz” in 2016 and “HarfBuzz at 20!” in 2026, and Behdad Esfahbod’s copyright on <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>hb-ot-layout.cc</code></a> starts in 2006. The 2006 date is the rewrite’s: he had put together a first library in 2005, “thanks to a code donation from Qt”, and “at the end of 2006 I started a rewrite of the entire codebase, codenamed harfbuzz-ng, which is what we simply call HarfBuzz today” (<a href="https://docs.google.com/document/d/1aH_waagdEM5UhslQxCeFEb82ECBhPlZjy5_MwLNLBYo/preview">“Introducing HarfRust”</a>, 2025).</p>
+<h3 id="the-rewrite">The rewrite</h3>
+<p id="ix-71">That first HarfBuzz is now called “old HarfBuzz”. Behdad Esfahbod then rewrote it as a new library, known during its development as harfbuzz-ng, “next generation”. The copyright lines show the work moving from Red Hat to Google, whose copyright starts in 2010. Its <code>NEWS</code> file calls 0.9.2, released on 10 August 2012, “the first major release of HarfBuzz”, and says HarfBuzz “should be in par, or better, than both Pango’s shapers and old HarfBuzz / Qt shapers”. The same release added an Indic shaper, a new Arabic shaper with fallback shaping, a Thai and Lao shaper, synthetic <code>GDEF</code> classes, fallback mark positioning, and backends that call Uniscribe and Core Text, “primarily for testing”: a way of comparing HarfBuzz with the engines it had to match.</p>
+<p id="ix-72">Some things were kept for compatibility with what came before. The default cluster level, 0, is one of them. The README promises that the API and ABI are compatible back to the 0.9 series, and that if they ever have to break, “that would be called a new library”.</p>
+<p id="ix-73">From there, HarfBuzz grew in both directions. Version 2.0.0, in October 2018, added shaping with Apple’s <code>morx</code>, <code>kerx</code> and <code>trak</code> tables, so the engine that started as an implementation of OpenType now runs Apple’s model too. Since then it has added variable fonts, subsetting, drawing and painting glyphs, and rasterizing them, which is why the README now calls it “a full font platform”. Its list of users includes Android, Chrome, Firefox, GNOME, KDE, Qt, LibreOffice, OpenJDK and Adobe’s applications, among many others, and in its own words, “HarfBuzz shapes the majority of text on modern screens”.</p>
+<h2 id="what-happens-to-a-run">What happens to a run</h2>
+<p id="ix-74">This chapter has looked at HarfBuzz from outside: text in, glyphs out, and the ways the two differ. The next two chapters are practical: <a href="building-harfbuzz.html">building HarfBuzz</a> and <a href="command-line-tools.html">the command-line tools</a> that come with it, which the rest of the book uses to show what HarfBuzz does. After them the book looks inside. It follows one run through the library: from the bytes of the font, which <a href="fonts-as-bytes.html">Fonts as bytes</a> starts with, through the buffer and the shape plan, to the pipeline that maps characters to glyphs, substitutes and positions them, and hands them back with their clusters.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.h"><code>src/hb-buffer.h</code></a></td>
+<td><code>hb_glyph_info_t</code>, <code>hb_glyph_position_t</code>, <code>hb_segment_properties_t</code>, the cluster levels and glyph flags</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc"><code>src/hb-buffer.cc</code></a></td>
+<td>adding text (<code>hb_buffer_add_utf8</code> and the others), guessing segment properties, merging clusters</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.h"><code>src/hb-common.h</code></a></td>
+<td><code>hb_feature_t</code>, <code>hb_script_t</code>, <code>hb_direction_t</code>, <code>hb_language_t</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-tag.cc"><code>src/hb-ot-tag.cc</code></a></td>
+<td>translating scripts and languages into OpenType tags</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>src/hb-ot-shape.cc</code></a></td>
+<td><code>hb_ot_shape_internal</code>, the pipeline: forming clusters, mapping to glyphs, substituting, positioning</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc"><code>src/hb-ot-shape-normalize.cc</code></a></td>
+<td>decomposition and composition against the font’s <code>cmap</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc"><code>src/hb-ot-shaper-arabic.cc</code></a></td>
+<td>the joining state machine and the order of the joining features</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc"><code>src/hb-ot-shaper-indic.cc</code></a></td>
+<td>syllables and reordering</td>
+</tr>
+<tr>
+<td><code>NEWS</code>, <code>AUTHORS</code>, <code>COPYING</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.md"><code>README.md</code></a></td>
+<td>the project’s own record of its history</td>
+</tr>
+<tr>
+<td><code>docs/usermanual-what-is-harfbuzz.xml</code></td>
+<td>the user manual’s account of what shaping is and what HarfBuzz doesn’t do</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Text is characters in logical order. A font draws glyphs, known by glyph ID. The <code>cmap</code> gives each character a nominal glyph, and shaping starts there.</li>
+<li>HarfBuzz shapes a run with one script, one direction and one language, and returns, for each glyph, its ID, its cluster, an advance and an offset.</li>
+<li>Characters and glyphs fail to correspond because of ligatures, joining and contextual forms, reordering, marks, and decomposition and composition. Much of the knowledge needed is about the script, not the font, and in OpenType it lives in the engine.</li>
+<li>A cluster groups characters with the glyphs made from them. Merged clusters take the smallest value. The cluster level sets how much is merged.</li>
+<li>HarfBuzz grew out of FreeType’s OpenType code as shared by Pango and Qt, was rewritten as harfbuzz-ng, and had to match Uniscribe’s behavior to work with the fonts made for it. It now runs OpenType, AAT and Graphite.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="notation.html">← Reading this book</a><a rel="next" href="building-harfbuzz.html">Building HarfBuzz →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

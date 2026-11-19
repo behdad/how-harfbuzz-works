@@ -1,0 +1,744 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Reading HarfBuzz’s C++ · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Appendix C</p>
+<h1 id="reading-harfbuzzs-c">Reading HarfBuzz’s C++</h1>
+<p id="ix-1">HarfBuzz has a C API, but it is written in C++, and in a dialect of its own. It doesn’t use the standard library’s containers. It has its own vector, set and hash map, a small library of iterators that are chained together with <code>|</code>, and a set of macros and function objects that turn up on almost every page of the source. A programmer who knows C++ well can still stall on a line like <code>+ hb_iter (intersection) | hb_filter (glyphset, hb_second)</code>.</p>
+<p id="ix-2">This appendix is the key to that dialect, so that chapters quoting the source can link here instead of explaining. Idioms that belong to one subject, such as the structs laid over a font’s bytes, are explained in that subject’s chapter, and <a href="#covered-elsewhere">listed</a> at the end. Everything here lives in headers that <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh"><code>hb.hh</code></a> includes for every file (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L572"><code>hb.hh:572</code></a>).</p>
+<h2 id="the-rules-the-dialect-follows">The rules the dialect follows</h2>
+<p>Three rules explain most of what is unusual.</p>
+<p id="ix-3"><strong>No STL containers.</strong> HarfBuzz’s own <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/AGENTS.md"><code>AGENTS.md</code></a> says so: “Do not introduce STL containers in library code.” The code still uses type traits, <code>std::forward</code>, <code>std::move</code> and <code>std::initializer_list</code>, but not <code>std::vector</code>, <code>std::map</code> and the rest.</p>
+<p id="ix-4"><strong>No exceptions.</strong> The library is compiled with <code>-fno-exceptions</code> and <code>-fno-rtti</code> (in the top-level Meson build file). Nothing throws. Instead a container that fails to allocate remembers it, and <code>in_error ()</code> becomes true. Objects that own several containers, such as buffers, keep a flag called <strong><code>successful</code></strong> that goes false on the first failure and stays false.</p>
+<p id="ix-5"><strong>All memory through <code>hb_malloc</code>.</strong> Every allocation goes through <code>hb_malloc</code>, <code>hb_calloc</code>, <code>hb_realloc</code> and <code>hb_free</code>. They are the C library’s functions unless HarfBuzz is built with <code>HB_CUSTOM_MALLOC</code> and the four <code>hb_*_impl</code> functions are supplied (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L547"><code>hb.hh:547</code></a>). The fuzzers use exactly that: <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/failing-alloc.c"><code>failing-alloc.c</code></a> fails one allocation in sixteen at random, so the out-of-memory paths are run all the time. (The four are public API since 11.0.0, “Not of much use to clients”, says <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.h"><code>hb-common.h</code></a>.)</p>
+<p id="ix-6">Together these give the pattern that most container code follows: <strong>carry on, check once</strong>. Operations on a container that has failed do nothing and return quietly, so a long run of them needs only one check at the end. Here is the subsetter building the map from old glyph IDs to new ones, trimmed (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan.cc#L548"><code>hb-subset-plan.cc:548</code></a>):</p>
+<pre><code class="language-c++">static bool
+_create_glyph_map_gsub (const hb_set_t* glyph_set_gsub,
+                        const hb_map_t* glyph_map,
+                        hb_map_t* out,
+                        hb_vector_t&lt;hb_codepoint_t&gt;* out_flat)
+{
+  if (unlikely (glyph_set_gsub-&gt;in_error ()))
+    return false;
+  ...
+  if (unlikely (!out_flat-&gt;resize_dirty (flat_size)))
+    return false;
+  ...
+  out-&gt;alloc (glyph_set_gsub-&gt;get_population ());
+  for (auto gid : *glyph_set_gsub)
+  {
+    hb_codepoint_t new_gid = glyph_map-&gt;get (gid);
+    out-&gt;set (gid, new_gid);
+    out_flat-&gt;arrayZ[gid] = new_gid;
+  }
+  return !out-&gt;in_error ();
+}
+</code></pre>
+<p id="ix-7">All three containers are here. The set is checked before it is used, the vector’s resize is checked because the loop writes to its memory directly, and the map’s many <code>set</code> calls are checked once, at the end.</p>
+<h2 id="hb_vector_t">hb_vector_t</h2>
+<p id="ix-8"><strong><code>hb_vector_t&lt;Type&gt;</code></strong> is HarfBuzz’s growable array (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector.hh#L44"><code>hb-vector.hh:44</code></a>), and <strong><code>hb_sorted_vector_t&lt;Type&gt;</code></strong> is the same with a flag set: <code>hb_vector_t&lt;Type, true&gt;</code> (<code>:796</code>). It has three fields, all public: <code>arrayZ</code>, the storage; <code>length</code>; and <code>allocated</code>, the capacity, which is signed: a negative value means an allocation failed (<code>:161</code>). It grows by half as much again plus eight (<code>:588</code>).</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>push (v)</code></td>
+<td>appends; returns a pointer to the new element</td>
+</tr>
+<tr>
+<td><code>push_or_fail (v)</code></td>
+<td>the same, returning <code>false</code> on failure</td>
+</tr>
+<tr>
+<td><code>alloc (n)</code>, <code>alloc_exact (n)</code></td>
+<td>reserves room without changing <code>length</code></td>
+</tr>
+<tr>
+<td><code>resize (n)</code>, <code>resize_exact (n)</code>, <code>resize_dirty (n)</code></td>
+<td>changes <code>length</code>; the dirty form leaves new elements uninitialized</td>
+</tr>
+<tr>
+<td><code>pop ()</code>, <code>shrink (n)</code>, <code>remove_ordered (i)</code>, <code>remove_unordered (i)</code>, <code>clear ()</code></td>
+<td>removes</td>
+</tr>
+<tr>
+<td id="ix-9"><code>tail ()</code></td>
+<td>the last element</td>
+</tr>
+<tr>
+<td id="ix-10"><code>as_array ()</code>, <code>iter ()</code></td>
+<td id="ix-11">an <code>hb_array_t</code> view, which is also an iterator</td>
+</tr>
+<tr>
+<td><code>qsort ()</code>, <code>lsearch (x)</code>, <code>lfind (x)</code></td>
+<td>sorting and linear search</td>
+</tr>
+<tr>
+<td><code>in_error ()</code>, <code>reset ()</code></td>
+<td>the error state, and the way out of it</td>
+</tr>
+</tbody>
+</table>
+<p>Three behaviors catch readers out.</p>
+<p id="ix-12"><strong>Indexing never crashes.</strong> <code>v[i]</code> with <code>i</code> past the end returns <code>Crap (Type)</code>, a writable scratch object, or <code>Null (Type)</code> from a <code>const</code> vector (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector.hh#L263"><code>hb-vector.hh:263</code></a>). No assertion fires. <a href="fonts-as-bytes.html#null-objects">Fonts as bytes</a> explains both objects.</p>
+<p id="ix-13"><strong>A failed <code>push</code> still returns a pointer.</strong> It points at <code>Crap</code>, so code can fill in the new element without checking. The shape-plan builder does just that (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.cc#L156"><code>hb-ot-map.cc:156</code></a>, trimmed):</p>
+<pre><code class="language-c++">hb_ot_map_t::lookup_map_t *lookup = m.lookups[table_index].push ();
+lookup-&gt;mask = mask;
+lookup-&gt;index = lookup_index;
+lookup-&gt;auto_zwnj = auto_zwnj;
+</code></pre>
+<p id="ix-14">If the allocation failed, these writes land in the scratch object, and the vector is in error for a later check to see.</p>
+<p id="ix-15"><strong><code>hb_sorted_vector_t</code> doesn’t sort itself.</strong> All the flag does is enable <code>bsearch</code> and <code>bfind</code>, and make <code>as_array ()</code> return a sorted array. Keeping the elements in order is the caller’s job: either fill the vector and then call <code>qsort ()</code>, or insert each element where <code>bfind</code> says it belongs, as the set’s page map does (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-bit-set.hh#L1187"><code>hb-bit-set.hh:1187</code></a>). Sorting and searching use two different comparison functions, and a type that is both sorted and searched has both: a static <code>cmp (const void *, const void *)</code> for <code>qsort</code>, in the C library’s style, and a member <code>cmp (key)</code> for <code>bsearch</code>, which compares a key with this element. The plan’s feature map has both (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.hh#L61"><code>hb-ot-map.hh:61</code></a> and <code>:64</code>), and is searched by tag (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.hh#L123"><code>hb-ot-map.hh:123</code></a>).</p>
+<blockquote>
+<p id="ix-16">For programmers: <code>static constexpr bool realloc_move = true;</code> near the top of a struct (the containers all have it) says that the type can be moved by copying its bytes. A vector of such things grows with <code>realloc</code>, without calling move constructors (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector.hh#L455"><code>hb-vector.hh:455</code></a>).</p>
+</blockquote>
+<h2 id="hb_array_t-and-hb_sorted_array_t">hb_array_t and hb_sorted_array_t</h2>
+<p id="ix-17"><strong><code>hb_array_t&lt;Type&gt;</code></strong> is a view: a pointer and a length, owning nothing (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-array.hh#L48"><code>hb-array.hh:48</code></a>). <code>hb_array (ptr, len)</code> makes one, <code>as_array ()</code> gets one from a vector or a font table’s array, and <code>hb_bytes_t</code> is <code>hb_array_t&lt;const char&gt;</code> (<code>:527</code>). It is also a random-access iterator, which is how plain memory enters the pipes described below. Like the vector, it returns <code>Crap</code> or <code>Null</code> for an index past the end (<code>:86</code>).</p>
+<p id="ix-18"><code>sub_array (start, count)</code> takes a slice, and clamps it to what is there (<code>:279</code>). Its second form takes <code>count</code> by pointer, and writes back how many elements the slice really has. That is the shape of HarfBuzz’s public functions that fill a caller’s array (a start offset, a pointer to the count, the array), and such a function is often little more than a <code>sub_array</code>. Here is <code>hb_ot_map_t::get_feature_tags</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.cc#L417"><code>hb-ot-map.cc:417</code></a>, trimmed):</p>
+<pre><code class="language-c++">if (tag_count)
+{
+  auto sub_features = features.as_array ().sub_array (start_offset, tag_count);
+  if (tags)
+  {
+    for (unsigned int i = 0; i &lt; sub_features.length; i++)
+      tags[i] = sub_features[i].tag;
+  }
+}
+return features.length;
+</code></pre>
+<p id="ix-19"><strong><code>hb_sorted_array_t&lt;Type&gt;</code></strong> adds binary search (<code>:374</code>). <code>bsearch (key)</code> returns a pointer to the match, or <code>nullptr</code>. <code>bfind (key, &amp;i)</code> returns whether it found the key, and stores its index; with <code>HB_NOT_FOUND_STORE_CLOSEST</code> it stores, on a miss, where the key would go, which is how the set below finds where to insert a page. Both search with the element’s <code>cmp (key)</code>. All of HarfBuzz’s binary searches come down to one function, <code>hb_bsearch_impl</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-algs.hh#L1407"><code>hb-algs.hh:1407</code></a>: “This is our <em>only</em> bsearch implementation.”). Calling <code>qsort ()</code> on an <code>hb_array_t</code> sorts it in place and returns it as an <code>hb_sorted_array_t</code>.</p>
+<p id="ix-20">The arrays in a font’s tables, <code>ArrayOf</code> and <code>SortedArrayOf</code>, are a different thing: structs laid over bytes, described in <a href="fonts-as-bytes.html#arrays">Fonts as bytes</a>. Their <code>as_array ()</code> turns them into these views.</p>
+<h2 id="hb_set_t">hb_set_t</h2>
+<p id="ix-21"><strong><code>hb_set_t</code></strong> is a set of 32-bit unsigned integers (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-set.hh#L176"><code>hb-set.hh:176</code></a>). It is the same type as the public <code>hb_set_t</code> that <code>hb_set_create</code> returns, which is why it carries an object header, but inside the library it is mostly made on the stack. Its values are glyph IDs more than anything else, but also code points, lookup and feature indices, name IDs and table tags.</p>
+<p id="ix-22">It is built in layers. <code>hb_set_t</code> wraps <code>hb_sparseset_t</code>, which wraps <code>hb_bit_set_invertible_t</code>, which wraps <strong><code>hb_bit_set_t</code></strong>, the real data structure (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-bit-set.hh#L34"><code>hb-bit-set.hh:34</code></a>). That is a list of <strong>pages</strong>. A page (<code>hb_bit_page_t</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-bit-page.hh#L115"><code>hb-bit-page.hh:115</code></a>) is 512 bits, eight 64-bit words, holding 512 consecutive values, with a cached count of how many are set. The set keeps its pages in the order it made them, and beside them a <code>page_map</code>: a sorted vector of (major, index) pairs, where a value’s <strong>major</strong> is the value divided by 512 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-bit-set.hh#L80"><code>hb-bit-set.hh:80</code></a>). Finding a value’s page is a binary search of the page map, after a check of the page found last time (<code>page_for</code>, <code>:1171</code>).</p>
+<p id="ix-23">This suits glyph IDs well. The glyphs a lookup or a subset touches tend to come in runs, so a few pages hold them: every glyph of a 1,000-glyph font fits in two. Once the page is found, membership is a shift and a mask, and union, intersection and the rest work 64 bits at a time. Code points are much the same, since text in one script uses a few blocks.</p>
+<p id="ix-24">Sets are everywhere because much of what HarfBuzz computes is a set of glyphs: the glyphs a lookup’s coverage holds, the glyphs a substitution can reach (the <strong>closure</strong>), the lookups a set of features uses. The subsetter is built on them. Of the 69 members of a subset plan, 30 are sets or maps (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan-member-list.hh"><code>hb-subset-plan-member-list.hh</code></a>). The shaping loop itself doesn’t use them: when it needs to ask “might this lookup touch this glyph?” fast, it uses the much smaller set digest, which is not a set (see <a href="gsub.html#three-filters-before-any-real-work">GSUB</a>).</p>
+<p id="ix-25"><strong>The invertible set.</strong> <code>hb_bit_set_invertible_t</code> adds one flag, <code>inverted</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-bit-set-invertible.hh#L35"><code>hb-bit-set-invertible.hh:35</code></a>). When it is set, the bits record what is <em>not</em> in the set: <code>add</code> clears a bit, and <code>get</code> returns the bit XOR the flag (<code>:115</code>, <code>:139</code>). A set can then mean “everything except these”, in no memory. The subsetter uses this for its defaults: a new subset input’s set of scripts is inverted, “Default to all scripts” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-input.cc#L190"><code>hb-subset-input.cc:190</code></a>), and <code>hb_subset_input_keep_everything</code> clears and inverts each of its sets (<code>:394</code>). <code>hb_set_invert</code> was deprecated in 1.6.1, and undeprecated in 2.9.1 along with the new subsetting API (<code>NEWS</code>).</p>
+<p>What to watch for:</p>
+<ul>
+<li>Iterating a set gives its values in increasing order, inverted or not. Its iterator is marked as sorted.</li>
+<li id="ix-26"><code>HB_SET_VALUE_INVALID</code>, which is <code>(hb_codepoint_t) -1</code>, can’t be a member: <code>add</code> ignores it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-bit-set.hh#L158"><code>hb-bit-set.hh:158</code></a>). The C-style <code>next (&amp;v)</code> and <code>previous (&amp;v)</code> use it as the start and end marker.</li>
+<li>The population of an inverted set is about four billion.</li>
+<li id="ix-27">A set is a <strong>predicate</strong> and a <strong>sink</strong> as well as a container: <code>set (g)</code> and <code>set.has (g)</code> test membership, and <code>set &lt;&lt; g</code> adds (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-set.hh#L118"><code>hb-set.hh:118</code></a>, <code>:121</code>). That is what lets it appear in the pipes below as <code>hb_filter (glyphset)</code> or <code>hb_sink (c-&gt;output)</code>.</li>
+</ul>
+<h2 id="hb_map_t-and-hb_hashmap_t">hb_map_t and hb_hashmap_t</h2>
+<p id="ix-28"><strong><code>hb_hashmap_t&lt;K, V&gt;</code></strong> is a hash table with open addressing (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-map.hh#L43"><code>hb-map.hh:43</code></a>). The items live in one array whose size is a power of two. A search starts at the key’s hash modulo a prime just below that size, and steps on by 1, 2, 3 slots and so on (<code>fetch_item</code>, <code>:390</code>). A deleted item stays behind, marked as no longer live, so that searches still pass over it. The table grows when two-thirds of its slots have been used.</p>
+<p id="ix-29"><strong><code>hb_map_t</code></strong> is <code>hb_hashmap_t&lt;hb_codepoint_t, hb_codepoint_t, true&gt;</code> (<code>:605</code>), and, like the set, it is also the public type that <code>hb_map_create</code> returns. The subsetter’s glyph map, from old glyph IDs to new ones, is one; so are its maps of lookup and feature indices. Larger values use <code>hb_hashmap_t</code> directly: the subset plan maps each script’s index to a set of language systems with <code>hb_hashmap_t&lt;unsigned, hb::unique_ptr&lt;hb_set_t&gt;&gt;</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>set (k, v)</code></td>
+<td>adds or replaces</td>
+</tr>
+<tr>
+<td><code>get (k)</code>, <code>m[k]</code>, <code>m (k)</code></td>
+<td>the value, or a default if there is none</td>
+</tr>
+<tr>
+<td><code>has (k)</code>, <code>has (k, &amp;vp)</code></td>
+<td id="ix-30">whether the key is there, and a pointer to its value</td>
+</tr>
+<tr>
+<td><code>del (k)</code></td>
+<td>removes</td>
+</tr>
+<tr>
+<td id="ix-31"><code>iter ()</code>, <code>keys ()</code>, <code>values ()</code></td>
+<td id="ix-32">iterators over pairs, keys or values</td>
+</tr>
+</tbody>
+</table>
+<p>What to watch for:</p>
+<ul>
+<li id="ix-33"><strong>A missing key returns a default, not an error.</strong> For <code>hb_map_t</code> the default is <code>HB_MAP_VALUE_INVALID</code>, which is <code>-1</code>; for other maps it is <code>Null (V)</code>, a zero-filled value (<code>:129</code>). Where the default could be a real value, use <code>has (k, &amp;vp)</code>.</li>
+<li><strong><code>m[k]</code> doesn’t insert.</strong> Unlike <code>std::map</code>, it is only another way of writing <code>get</code>.</li>
+<li id="ix-34"><strong>Iteration is in hash order.</strong> Code that writes a map out in a particular order sorts first.</li>
+<li id="ix-35">A map is a <strong>projection</strong> (<code>m (k)</code>, <code>:410</code>) and a predicate (<code>has</code>), so <code>hb_map (glyph_map)</code> and <code>hb_filter (map)</code> both work in pipes.</li>
+</ul>
+<h2 id="iterators-and-pipes">Iterators and pipes</h2>
+<p id="ix-36">HarfBuzz’s iterators are not the standard library’s. An STL loop needs two iterators, a begin and an end. A HarfBuzz iterator is one small object that knows when it has run out: <code>*it</code> is the current item, <code>++it</code> moves on, and <code>bool (it)</code> says whether there is anything left. Many have <code>it.len ()</code> and <code>it[i]</code> as well. Iterators are values, cheap to copy, and copying one makes an independent cursor.</p>
+<p id="ix-37">The base class is <strong><code>hb_iter_t</code></strong> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-iter.hh#L59"><code>hb-iter.hh:59</code></a>), which each iterator derives from, passing itself as the template argument. An iterator implements a few methods with double-underscore names (<code>__item__</code>, <code>__next__</code>, <code>__more__</code>, <code>__len__</code>…), and the base class turns them into operators. <code>hb_iter_with_fallback_t</code> fills in what an iterator leaves out, slowly if it must: without <code>__len__</code>, <code>len ()</code> counts by walking a copy (<code>:206</code>). Each iterator also says whether it is random-access, and whether it is sorted.</p>
+<p id="ix-38"><code>hb_iter (x)</code> gets an iterator from anything: it calls <code>x.iter ()</code> on a container, and it makes an <code>hb_array_t</code> from a pointer and a length, or from a C array (<code>:156</code>). Every iterator also works in a range-based <code>for</code> loop.</p>
+<h3 id="pipes">Pipes</h3>
+<p id="ix-39">The <code>|</code> operator is defined for any iterator on its left, and what it does is short: <code>lhs | rhs</code> is <code>rhs (lhs)</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-iter.hh#L369"><code>hb-iter.hh:369</code></a>). The functions written on the right return small objects that take an iterator and wrap it in another. So a pipe is a chain of iterators, each pulling from the one before. Nothing happens until something pulls at the end. Here is the whole of <code>get_feature_types</code> in the <code>feat</code> table (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-feat-table.hh#L166"><code>hb-aat-layout-feat-table.hh:166</code></a>), which fills a caller’s array:</p>
+<pre><code class="language-c++">if (count &amp;&amp; features)
+{
+  + namesZ.as_array (featureNameCount).sub_array (start_offset, count)
+  | hb_map (&amp;FeatureName::get_feature_type)
+  | hb_sink (hb_array (features, *count))
+  ;
+}
+return featureNameCount;
+</code></pre>
+<p id="ix-40">It takes a slice of the table’s array, maps each record to its type by calling a member function, and writes each result into the caller’s array. The <code>+</code> at the front is the iterator’s unary plus, which returns a copy of the iterator and nothing more (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-iter.hh#L76"><code>hb-iter.hh:76</code></a>). It lets every line of the pipe begin with an operator, which seems to be all it is for at the head of a pipe (inferred). The lone <code>;</code> on the last line is the same habit: lines can be added and removed without touching their neighbors.</p>
+<p>The vocabulary:</p>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Kind</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>hb_map (f)</code></td>
+<td id="ix-41">stage</td>
+<td id="ix-42">each item becomes <code>f (item)</code></td>
+</tr>
+<tr>
+<td><code>hb_map_retains_sorting (f)</code>, <code>hb_map_sorted (f)</code></td>
+<td id="ix-43">stage</td>
+<td>the same, and promises that the order is kept, or that the result is sorted</td>
+</tr>
+<tr>
+<td><code>hb_filter (p, f)</code></td>
+<td id="ix-44">stage</td>
+<td id="ix-45">keeps items for which <code>p (f (item))</code> is true; <code>f</code> defaults to the identity</td>
+</tr>
+<tr>
+<td><code>hb_zip (a, b)</code></td>
+<td id="ix-46">source or stage</td>
+<td id="ix-47">pairs of items from two iterators, stopping at the shorter</td>
+</tr>
+<tr>
+<td><code>hb_enumerate (it)</code></td>
+<td id="ix-48">source or stage</td>
+<td id="ix-49">pairs of (index, item)</td>
+</tr>
+<tr>
+<td><code>hb_range (end)</code>, <code>hb_range (start, end, step)</code></td>
+<td>source</td>
+<td>numbers, as an iterator</td>
+</tr>
+<tr>
+<td><code>hb_iota (start, step)</code></td>
+<td>source</td>
+<td>numbers without end</td>
+</tr>
+<tr>
+<td><code>hb_take (n)</code>, <code>hb_concat (a, b)</code></td>
+<td id="ix-50">stage, source</td>
+<td id="ix-51">the first n items; one iterator after another</td>
+</tr>
+<tr>
+<td><code>hb_sink (s)</code></td>
+<td>end</td>
+<td id="ix-52">writes each item with <code>s &lt;&lt; item</code>, into a vector, set, map or array</td>
+</tr>
+<tr>
+<td><code>hb_apply (f)</code></td>
+<td>end</td>
+<td id="ix-53">calls <code>f (item)</code> for each item</td>
+</tr>
+<tr>
+<td><code>hb_reduce (f, init)</code></td>
+<td>end</td>
+<td id="ix-54">folds the items into one value</td>
+</tr>
+<tr>
+<td id="ix-55"><code>hb_all</code>, <code>hb_any</code>, <code>hb_none</code></td>
+<td>function</td>
+<td id="ix-56">whether every, some or no item matches</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-57"><code>hb_pair_t</code> is the pair the zips make, with <code>.first</code> and <code>.second</code>; <code>hb_codepoint_pair_t</code> is a pair of <code>hb_codepoint_t</code>s. <code>hb_first</code> and <code>hb_second</code> take the halves of a pair, and <code>hb_identity</code> returns what it is given.</p>
+<h3 id="function-objects">Function objects</h3>
+<p id="ix-58">Each of those names is an object, not a function. <code>HB_FUNCOBJ (hb_second)</code> declares a <code>static const</code> object of an unnamed struct whose <code>operator ()</code> does the work (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-meta.hh#L83"><code>hb-meta.hh:83</code></a>). An object, unlike a function template, can be passed as an argument without naming its types, which is how <code>hb_filter (glyphset, hb_second)</code> can pass <code>hb_second</code> along to be called later.</p>
+<p id="ix-59">The pipe stages call what they are given through three helpers, which accept more than functions (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-algs.hh#L681"><code>hb-algs.hh:681</code></a> and <code>:744</code>):</p>
+<ul>
+<li id="ix-60"><code>hb_has (p, v)</code> calls <code>p.has (v)</code> if <code>p</code> has one, and <code>p (v)</code> otherwise. So a set or a map can be a filter.</li>
+<li id="ix-61"><code>hb_get (f, v)</code> calls <code>f.get (v)</code> if there is one, then <code>f (v)</code>, then <code>f[v]</code>. So a map can be a mapping.</li>
+<li id="ix-62"><code>hb_invoke</code> calls lambdas, function objects, pointers to member functions (<code>&amp;FeatureName::get_feature_type</code>) and pointers to data members alike.</li>
+</ul>
+<p id="ix-63">Some function objects can also be given only their last argument, to make a function of the rest. <code>hb_add (this)</code> is “add <code>this</code> to whatever comes”, and <code>hb_zip (b)</code> on the right of a pipe zips what comes from the left with <code>b</code>. Here is the closure of an alternate substitution, finding the glyphs it can produce (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/AlternateSubstFormat1.hh#L50"><code>OT/Layout/GSUB/AlternateSubstFormat1.hh:50</code></a>):</p>
+<pre><code class="language-c++">+ hb_zip (this+coverage, alternateSet)
+| hb_filter (c-&gt;parent_active_glyphs (), hb_first)
+| hb_map (hb_second)
+| hb_map (hb_add (this))
+| hb_apply ([c] (const AlternateSet&lt;Types&gt; &amp;_) { _.closure (c); })
+;
+</code></pre>
+<p id="ix-64">A Coverage table iterates over its glyphs in coverage-index order, so zipping it with the subtable’s array of offsets pairs each glyph with its own entry, which is exactly what a coverage index is for. The filter keeps the pairs whose glyph is in the set of glyphs reached so far; <code>hb_second</code> takes the offset; <code>hb_add (this)</code> resolves it, as <code>this+offset</code> would; and <code>hb_apply</code> visits each alternate set.</p>
+<h3 id="one-pipe-read-step-by-step">One pipe, read step by step</h3>
+<p id="ix-65">The subsetter’s code for SingleSubst format 1 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/SingleSubstFormat1.hh#L11"><code>OT/Layout/GSUB/SingleSubstFormat1.hh:11</code></a>) uses most of the pieces at once. Format 1 maps every covered glyph <code>g</code> to <code>g + d</code>, modulo 65536. Subsetting it means keeping the mappings whose glyphs both survive, and renumbering them:</p>
+<pre><code class="language-c++">const hb_set_t &amp;glyphset = *c-&gt;plan-&gt;glyphset_gsub ();
+const hb_map_t &amp;glyph_map = *c-&gt;plan-&gt;glyph_map;
+
+hb_set_t intersection;
+coverage.intersect_set (glyphset, intersection);
+
+auto it =
++ hb_iter (intersection)
+| hb_map_retains_sorting ([d, mask] (hb_codepoint_t g) {
+                            return hb_codepoint_pair_t (g,
+                                                        (g + d) &amp; mask); })
+| hb_filter (glyphset, hb_second)
+| hb_map_retains_sorting ([&amp;] (hb_codepoint_pair_t p) -&gt; hb_codepoint_pair_t
+                          { return hb_pair (glyph_map[p.first], glyph_map[p.second]); })
+;
+
+bool ret = bool (it);
+SingleSubst_serialize (c-&gt;serializer, it);
+return ret;
+</code></pre>
+<ol>
+<li id="ix-66"><code>glyphset</code> is the set of glyphs the subset keeps, and <code>glyph_map</code> maps their old IDs to new ones. Both are references to the plan’s own containers: nothing is copied.</li>
+<li id="ix-67"><code>intersection</code> is a set on the stack: the covered glyphs that survive.</li>
+<li><code>hb_iter (intersection)</code> walks it, in increasing order.</li>
+<li id="ix-68">The first <code>hb_map_retains_sorting</code> turns each glyph into the pair (glyph, its substitute). The lambda captures <code>d</code> and <code>mask</code> by value. The name promises that the pairs stay in order, which they do, since their first halves are the glyphs in order.</li>
+<li id="ix-69"><code>hb_filter (glyphset, hb_second)</code> drops a pair unless its <em>second</em> half, the substitute, is kept too. The set is the predicate, through <code>hb_has</code>, and <code>hb_second</code> is the projection that picks what it tests.</li>
+<li id="ix-70">The second map renumbers both halves through <code>glyph_map</code>. It promises to keep the order again. That holds when the subsetter numbers the glyphs itself, since it numbers them in their old order (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan.cc#L651"><code>hb-subset-plan.cc:651</code></a>), but not necessarily when a caller has supplied its own glyph mapping.</li>
+<li>The semicolon ends the expression, and <code>it</code> holds the whole pipe. Nothing has been computed yet, except that a filter, when it is made, moves to its first match. So <code>bool (it)</code> asks whether any mapping survives at all.</li>
+<li id="ix-71"><code>SingleSubst_serialize</code> pulls the pairs and writes the new subtable.</li>
+</ol>
+<p id="ix-72">The other end shows what the promises are for. <code>SingleSubst::serialize</code> accepts only a sorted iterator of pairs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/SingleSubst.hh#L43"><code>OT/Layout/GSUB/SingleSubst.hh:43</code></a>, trimmed):</p>
+<pre><code class="language-c++">template&lt;typename Iterator,
+         hb_requires (hb_is_sorted_source_of (Iterator,
+                                              const hb_codepoint_pair_t))&gt;
+bool serialize (hb_serialize_context_t *c,
+                Iterator glyphs)
+{
+  ...
+  auto get_delta = [=] (hb_codepoint_pair_t _)
+                   { return (unsigned) (_.second - _.first) &amp; mask; };
+  delta = get_delta (*glyphs);
+  if (!hb_all (++(+glyphs), delta, get_delta)) format += 1;
+</code></pre>
+<p id="ix-73"><code>hb_requires</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-meta.hh#L67"><code>hb-meta.hh:67</code></a>) removes the function from consideration unless its condition holds, so passing an unsorted iterator doesn’t compile. Then <code>+glyphs</code> copies the iterator, <code>++</code> moves the copy past the first pair, and <code>hb_all</code> checks that every later pair has the same delta as the first: if they all do, the subset can stay format 1, and if not it moves to the format that lists every substitute (2, or 4 beyond 64K). Here the predicate passed to <code>hb_all</code> is a plain value, <code>delta</code>, which matches by equality.</p>
+<p>What to watch for:</p>
+<ul>
+<li id="ix-74"><strong>A pipe runs each time it is walked.</strong> <code>serialize</code> walks <code>glyphs</code> several times, and every walk calls every lambda again. That is cheap here, but a pipe that does real work in a stage is better sunk into a vector once.</li>
+<li id="ix-75"><strong>“Sorted” is a promise, not a check.</strong> As the comment in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-iter.hh#L570"><code>hb-iter.hh:570</code></a> puts it: “Our ‘sorted’ comes with no guarantees. It’s just a contract, put in place to help you remember, and think about, whether an iterator you receive is expected to be sorted or not.” Where it matters most, the code checks anyway: Coverage’s serializer looks at the order itself, and doesn’t choose the format that needs sorted glyphs if it finds them out of order (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/Common/Coverage.hh#L153"><code>OT/Layout/Common/Coverage.hh:153</code></a>).</li>
+<li><strong><code>len ()</code> may walk.</strong> A filtered iterator doesn’t know its length without counting.</li>
+<li><strong>Lambdas that capture by reference tie the pipe to what they capture.</strong> A pipe kept in <code>auto it</code> that holds a <code>[&amp;]</code> lambda must not outlive the variables the lambda refers to.</li>
+</ul>
+<p id="ix-76">A good pipe to read next is in <a href="universal-shaping-engine.html#what-the-machine-doesnt-see">the Universal Shaping Engine</a>, where <code>hb_enumerate</code> numbers the glyphs before the filters drop some, so that results can be written back to the right positions.</p>
+<h2 id="small-idioms">Small idioms</h2>
+<p id="ix-77"><strong><code>likely (x)</code> and <code>unlikely (x)</code></strong> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L267"><code>hb.hh:267</code></a>) tell the compiler which way a test usually goes, with <code>__builtin_expect</code>, when optimizing. They don’t change what the test means. When reading, <code>unlikely</code> marks an error path, and a function can usually be understood first by skipping every branch that starts with it.</p>
+<p id="ix-78"><strong><code>HB_INTERNAL</code></strong> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh#L296"><code>hb.hh:296</code></a>) gives a declaration hidden visibility, so it isn’t exported from the shared library. It marks functions and data that cross files inside HarfBuzz but are not API.</p>
+<p id="ix-79"><strong><code>hb_min</code>, <code>hb_max</code> and <code>hb_clamp</code></strong> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-algs.hh#L877"><code>hb-algs.hh:877</code></a>) are function objects, like the pipe stages. They take arguments of two different types on purpose, so that the compiler can warn when signed and unsigned integers are compared, as the comment above them explains. <code>hb_clamp (x, lo, hi)</code> is <code>hb_min (hb_max (x, lo), hi)</code>.</p>
+<p id="ix-80"><strong><code>hb_memcpy</code>, <code>hb_memset</code> and <code>hb_memcmp</code></strong> wrap the C functions and return at once for a length of zero, because the C functions mustn’t be given a null pointer even then (“It’s illegal to pass NULL to memset(), even if n is zero”, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-algs.hh#L1255"><code>hb-algs.hh:1255</code></a>). HarfBuzz’s <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/AGENTS.md"><code>AGENTS.md</code></a> asks for them in place of the C functions. <code>hb_swap</code> swaps.</p>
+<p id="ix-81"><strong><code>hb_codepoint_t</code></strong> is a <code>uint32_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.h#L123"><code>hb-common.h:123</code></a>). It holds a Unicode code point or a glyph ID, depending on where it is: in a buffer, the <a href="buffers.html#content-types">content type</a> says which. <strong><code>HB_CODEPOINT_INVALID</code></strong> is <code>(hb_codepoint_t) -1</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.h#L132"><code>hb-common.h:132</code></a>), and <code>HB_SET_VALUE_INVALID</code> and <code>HB_MAP_VALUE_INVALID</code> are other names for it.</p>
+<p id="ix-82"><strong><code>hb_tag_t</code></strong> is a <code>uint32_t</code> too, holding four characters, first character in the top byte. <code>HB_TAG ('l','i','g','a')</code> makes one (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-common.h#L196"><code>hb-common.h:196</code></a>), and <code>HB_UNTAG</code> takes one apart. Tables have their own: <code>HB_OT_TAG_GSUB</code> and so on. Tags compare as integers, so sorting by tag sorts printable ASCII tags alphabetically.</p>
+<p id="ix-83"><strong><code>FLAG (x)</code></strong> is <code>1u &lt;&lt; x</code>, with a compile-time check that <code>x</code> is below 32 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-algs.hh#L86"><code>hb-algs.hh:86</code></a>). Sets of small enum values are written as masks of flags: <code>FLAG_UNSAFE (gen_cat) &amp; (FLAG (…SPACING_MARK) | FLAG (…ENCLOSING_MARK) | FLAG (…NON_SPACING_MARK))</code> asks whether a general category is a mark (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh#L406"><code>hb-unicode.hh:406</code></a>). <code>FLAG_UNSAFE</code> skips the check, for values not known at compile time, and <code>HB_MARK_AS_FLAG_T</code> gives an enum the bitwise operators.</p>
+<p id="ix-84"><strong><code>ARRAY_LENGTH (a)</code></strong> is the number of elements in a C array. <strong><code>HB_SCOPE_GUARD (stmt)</code></strong> runs <code>stmt</code> when the scope ends, however it ends: <code>HB_SCOPE_GUARD (fclose (fp));</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.cc#L741"><code>hb-blob.cc:741</code></a>). <strong><code>hb::unique_ptr</code></strong> and <strong><code>hb::shared_ptr</code></strong> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cplusplus.hh"><code>hb-cplusplus.hh</code></a>) hold a HarfBuzz object and destroy it, or release a reference, when they go out of scope.</p>
+<p id="ix-85"><strong><code>_or_fail</code></strong> at the end of a name means the function says when it fails. In the API, <code>hb_blob_create</code> returns the empty blob when it can’t make one, but <code>hb_blob_create_or_fail</code> returns <code>NULL</code>; <code>hb_font_draw_glyph_or_fail</code> returns <code>false</code> when there is nothing to draw. <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a> covers the empty objects that the plain versions return. Inside the library, <code>push_or_fail</code> is the same idea.</p>
+<p id="ix-86"><code>#ifndef HB_NO_…</code> blocks are compile-time switches. A build that defines <code>HB_NO_BEYOND_64K</code>, for instance, leaves out the wider subtable formats, and with them the code in <code>SingleSubst::serialize</code> that chooses them. The <a href="compile-time-configuration.html">Compile-time configuration</a> appendix lists the switches. <code>HB_EXPERIMENTAL_API</code> guards API that isn’t stable yet.</p>
+<p id="ix-87"><strong>Templates.</strong> <code>hb_enable_if (cond)</code> and <code>hb_requires (cond)</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-meta.hh#L65"><code>hb-meta.hh:65</code></a>) remove a template from overload resolution unless <code>cond</code> holds. <code>HB_AUTO_RETURN (expr)</code> (<code>:76</code>) writes a function whose body and return type are both <code>expr</code>. <code>hb_priority</code> and <code>hb_prioritize</code> choose between overloads in order of preference; <a href="fonts-as-bytes.html#choosing-the-method-to-call">Fonts as bytes</a> explains them.</p>
+<h3 id="covered-elsewhere">Covered elsewhere</h3>
+<table>
+<thead>
+<tr>
+<th>Idiom</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-88">structs over bytes, <code>HBUINT16</code>, <code>OffsetTo</code>, <code>this+offset</code>, <code>ArrayOf</code>, <code>DEFINE_SIZE_*</code></td>
+<td><a href="fonts-as-bytes.html">Fonts as bytes</a></td>
+</tr>
+<tr>
+<td id="ix-89"><code>Null</code>, <code>Crap</code></td>
+<td><a href="fonts-as-bytes.html#null-objects">Fonts as bytes</a></td>
+</tr>
+<tr>
+<td id="ix-90">dispatch and contexts</td>
+<td><a href="fonts-as-bytes.html#dispatch-contexts">Fonts as bytes</a></td>
+</tr>
+<tr>
+<td id="ix-91"><code>hb_barrier</code>, <code>TRACE_SANITIZE</code>, <code>return_trace</code>, the <code>HB_DEBUG_*</code> macros</td>
+<td id="ix-92"><a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></td>
+</tr>
+<tr>
+<td id="ix-93">lazy loaders, <code>hb_atomic_t</code>, <code>hb_object_header_t</code>, reference counting</td>
+<td><a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></td>
+</tr>
+<tr>
+<td id="ix-94">the X-macro lists (<code>HB_FONT_FUNC_IMPLEMENT</code>, <code>HB_SHAPER_IMPLEMENT</code>)</td>
+<td id="ix-95"><a href="fonts-and-font-functions.html#one-list-of-callbacks">Fonts and font functions</a>, <a href="hb_shape-and-its-backends.html#the-shaper-list">hb_shape and its backends</a></td>
+</tr>
+<tr>
+<td id="ix-96"><code>HB_BUFFER_ALLOCATE_VAR</code> and the buffer’s scratch bytes</td>
+<td><a href="buffers.html#eight-bytes-of-scratch-space">Buffers</a></td>
+</tr>
+<tr>
+<td id="ix-97">the set digest</td>
+<td id="ix-98"><a href="gsub.html#three-filters-before-any-real-work">GSUB</a></td>
+</tr>
+</tbody>
+</table>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb.hh"><code>src/hb.hh</code></a></td>
+<td><code>likely</code>, <code>HB_INTERNAL</code>, the allocator hooks, and the list of headers every file gets</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector.hh"><code>src/hb-vector.hh</code></a></td>
+<td><code>hb_vector_t</code> and <code>hb_sorted_vector_t</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-array.hh"><code>src/hb-array.hh</code></a></td>
+<td><code>hb_array_t</code>, <code>hb_sorted_array_t</code>, <code>hb_bytes_t</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-set.hh"><code>src/hb-set.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-bit-set-invertible.hh"><code>src/hb-bit-set-invertible.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-bit-set.hh"><code>src/hb-bit-set.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-bit-page.hh"><code>src/hb-bit-page.hh</code></a></td>
+<td><code>hb_set_t</code>, layer by layer</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-map.hh"><code>src/hb-map.hh</code></a></td>
+<td><code>hb_hashmap_t</code> and <code>hb_map_t</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-iter.hh"><code>src/hb-iter.hh</code></a></td>
+<td>the iterator base classes, the pipe operator, and the pipe stages</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-algs.hh"><code>src/hb-algs.hh</code></a></td>
+<td>the function objects (<code>hb_has</code>, <code>hb_get</code>, <code>hb_invoke</code>, <code>hb_min</code>, <code>hb_add</code>…), <code>hb_pair_t</code>, <code>FLAG</code>, <code>hb_memcpy</code>, <code>hb_bsearch_impl</code>, <code>HB_SCOPE_GUARD</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-meta.hh"><code>src/hb-meta.hh</code></a></td>
+<td><code>HB_FUNCOBJ</code>, <code>hb_enable_if</code>, <code>hb_requires</code>, <code>HB_AUTO_RETURN</code>, <code>hb_priority</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cplusplus.hh"><code>src/hb-cplusplus.hh</code></a></td>
+<td><code>hb::shared_ptr</code>, <code>hb::unique_ptr</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-debug.hh"><code>src/hb-debug.hh</code></a></td>
+<td><code>DEBUG_MSG</code>, the <code>TRACE_*</code> macros</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-null.hh"><code>src/hb-null.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-machinery.hh"><code>src/hb-machinery.hh</code></a></td>
+<td><code>Null</code> and <code>Crap</code>; the lazy loaders</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/failing-alloc.c"><code>src/failing-alloc.c</code></a></td>
+<td>the allocator the fuzzers use, which fails at random</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>No STL containers and no exceptions: containers record failure, <code>in_error ()</code> reports it, and code checks once, at the end.</li>
+<li><code>hb_vector_t</code> returns <code>Crap</code> for a bad index and for a failed <code>push</code>. <code>hb_sorted_vector_t</code> is sorted only if the caller sorts it.</li>
+<li><code>hb_array_t</code> is a view and an iterator; <code>sub_array</code> with a count pointer matches the shape of HarfBuzz’s array-filling API.</li>
+<li><code>hb_set_t</code> is a bit set in 512-bit pages, made for runs of glyph IDs, and it can be inverted to mean “everything except”.</li>
+<li><code>hb_map_t</code> returns <code>-1</code> for a missing key; iteration is in hash order.</li>
+<li>A pipe is a chain of lazy iterators: <code>a | f</code> is <code>f (a)</code>, and nothing runs until a sink, an <code>apply</code> or a loop pulls. Sets and maps can stand in for functions.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="reading-feature-files.html">← Reading feature files</a><a rel="next" href="limits.html">Limits →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

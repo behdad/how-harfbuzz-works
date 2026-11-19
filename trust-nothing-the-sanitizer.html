@@ -1,0 +1,710 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Trust nothing: the sanitizer · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part II · Foundations</p>
+<h1 id="trust-nothing-the-sanitizer">6. Trust nothing: the sanitizer</h1>
+<p id="ix-1">HarfBuzz reads a font where it lies. As <a href="fonts-as-bytes.html">Fonts as bytes</a> showed, a table is not parsed into objects: a struct is laid over its bytes, and an offset is followed by adding it to an address. That is fast, and it is only safe if every offset and every count in the table can be believed. A font is a file that came from somewhere: a web page, a PDF, an email attachment. Its numbers were chosen by whoever made it, and some of the people who make fonts are trying to break the software that reads them.</p>
+<p id="ix-2">The <strong>sanitizer</strong> is what lets the rest of HarfBuzz believe the numbers. Before a table is used for the first time, it walks the table once and answers one question: is it safe to call this table’s methods? If the answer is yes, the table is used from then on with no further checks. If it is no, the table is thrown away, and HarfBuzz carries on as though the font didn’t have it. Since HarfBuzz 12.3 there is nothing in between: the sanitizer no longer tries to repair a broken table, so one bad offset anywhere in <code>GSUB</code> costs the whole of <code>GSUB</code>. A few checks are not made up front at all, but left until the data is used: in <code>glyf</code>, in the AAT tables, and in some parts of <code>GPOS</code>.</p>
+<p id="ix-3">This chapter is about how those checks are written, what limits the work they do, what happens when one fails, and why HarfBuzz stopped repairing fonts. <em>When</em> a table is loaded, and how a failed load is remembered, is the subject of the <a href="blobs-faces-and-lazy-tables.html">next chapter</a>. The examples use one small test font, <code>good.ttf</code>, built from <code>fonts/trust-nothing-the-sanitizer/sanitizer.fea</code>, and three copies of it, each with one offset deliberately broken after it was compiled. Every shaping result and trace on this page was produced by running HarfBuzz 15.1.0 on those fonts when the page was built.</p>
+<h2 id="why-fonts-are-hostile-input">Why fonts are hostile input</h2>
+<p id="ix-4">Every number in a table is a claim about the rest of the file. An offset says “there is a Coverage table here”. A count says “there are this many records after me”. A length says “this subtable ends here”. A struct laid over the bytes takes all of them at their word. If an offset points past the end of the table, following it reads whatever memory comes next: at best a crash, at worst other data from the program’s memory, read back out through the shaping result. If a count is multiplied by a record size and the product overflows 32 bits, a check on the product passes while the records themselves run off the end.</p>
+<p id="ix-5">Not every attack needs to read out of bounds. OpenType lets many offsets point at the same subtable, which is how a font shares one Coverage table between several lookups. Nothing stops a font from sharing on purpose, at every level, so that a table of a few kilobytes describes a graph with an enormous number of paths through it. Some structures nest without limit: a COLR paint can contain a paint that contains a paint. A checker that follows every path, or recurses as deep as the data asks, can be made to run for a very long time on a tiny file. So the sanitizer has to bound its own work, as well as the shaper’s.</p>
+<p id="ix-6">None of this is hypothetical. HarfBuzz is fuzzed continuously: programs feed it endless mutated fonts, and when one finds a crash, a hang or a runaway allocation, the font is kept as a test. The repository holds 532 fonts in <code>test/fuzzing/fonts</code>, and 471 of them are named after the fuzzer report they came from (the <a href="testing-harfbuzz.html">testing chapter</a> has more).</p>
+<h2 id="the-contract">The contract</h2>
+<p id="ix-7">The long comment at the top of <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh"><code>hb-sanitize.hh</code></a> (lines 37–104) is the best description of the sanitizer there is, and this chapter follows it closely. Its central paragraph, lightly trimmed:</p>
+<pre><code class="language-c++">/*
+ * The sanitize() method of each object type shall return `true` if it's safe to
+ * call other methods of the object, and `false` otherwise.
+ *
+ * Note that what sanitize() checks for might align with what the specification
+ * describes as valid table data, but does not have to be.  In particular, we
+ * do NOT want to be pedantic and concern ourselves with validity checks that
+ * are irrelevant to our use of the table.  On the contrary, we want to be
+ * lenient with error handling and accept invalid data to the extent that it
+ * does not impose extra burden on us.
+ */
+</code></pre>
+<p id="ix-8">This is a definition of <em>safe</em>, not of <em>valid</em>. The sanitizer isn’t a font validator, and a font that passes it may still be wrong in many ways the OpenType specification cares about. What it guarantees is narrower and more useful: that the code which reads this table, written as it is, won’t read outside the table.</p>
+<p id="ix-9">So what the sanitizer checks depends on what that code assumes. The comment goes on to describe two ways of dividing the work. In <code>GSUB</code>, <code>GPOS</code> and <code>GDEF</code>, the reading code assumes that every offset points inside the table, so the sanitizer must check every offset before any of it is used. In <code>glyf</code> and <code>loca</code>, the reading code checks each glyph’s offsets itself, when it loads the glyph, so the sanitizer checks nothing. The choice is made table by table, for speed and for simplicity. Checking every glyph’s offsets at load would cost time in proportion to the number of glyphs, which is a lot for a CJK font of which a document uses a few hundred glyphs. Leaving them until use makes loading cost nothing and the total cost proportional to the glyphs actually used. For the layout tables the argument goes the other way: their structure is so deeply nested that checking everything once is far simpler than checking at each of the many places that follow an offset.</p>
+<p>Being lenient shows up all over the table code. A few examples:</p>
+<ul>
+<li id="ix-10"><strong>Unknown formats pass.</strong> A Coverage table of format 7, which doesn’t exist, is accepted (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/Common/Coverage.hh#L76"><code>OT/Layout/Common/Coverage.hh:76</code></a>), and so is an unknown subtable format of any lookup type. The code that reads them treats them as empty: such a Coverage covers nothing, and such a subtable never applies. A font made for a future version of OpenType loses only the parts that HarfBuzz doesn’t understand.</li>
+<li id="ix-11"><strong>Order isn’t checked.</strong> The ranges in a Coverage table of format 2 should be sorted, and the sanitizer only checks that they are all inside the table (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/Common/CoverageFormat2.hh#L55"><code>CoverageFormat2.hh:55</code></a>). If they aren’t sorted, the binary search that reads them may miss a glyph. That is a wrong answer, not an unsafe one.</li>
+<li id="ix-12"><strong>Unneeded fields are ignored.</strong> A <code>cmap</code> format 4 subtable has a <code>length</code> field, which fonts have been known to get wrong. The sanitizer doesn’t look at it: it checks that the four segment arrays fit in the table, using only the segment count (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cmap-table.hh#L733"><code>hb-ot-cmap-table.hh:733</code></a>). The glyph ID array after them has no count of its own, and the code that reads it bounds it by the real end of the <code>cmap</code> table (<code>:1866</code>).</li>
+<li id="ix-13"><strong>Some tables check nothing.</strong> <code>hmtx</code> accepts anything (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-hmtx-table.hh#L66"><code>hb-ot-hmtx-table.hh:66</code></a>), with a comment explaining that “the users of the struct do all the hard work”: when its accelerator is built, it cuts the number of metrics down to what the table’s real length can hold (<code>:285–294</code>).</li>
+</ul>
+<h2 id="writing-a-sanitize-method">Writing a <code>sanitize()</code> method</h2>
+<p id="ix-14">Nearly every struct that can be reached in a table has a <code>sanitize()</code> method, and the methods call each other, in the same shape as the structs. Here are the three for a ligature substitution, the lookup from the <a href="gsub.html">GSUB chapter</a>, whole:</p>
+<pre><code class="language-c++">/* LigatureSubstFormat1_2 */
+bool sanitize (hb_sanitize_context_t *c) const
+{
+  TRACE_SANITIZE (this);
+  return_trace (coverage.sanitize (c, this) &amp;&amp; ligatureSet.sanitize (c, this));
+}
+
+/* LigatureSet */
+bool sanitize (hb_sanitize_context_t *c) const
+{
+  TRACE_SANITIZE (this);
+  return_trace (ligature.sanitize (c, this));
+}
+
+/* Ligature */
+bool sanitize (hb_sanitize_context_t *c) const
+{
+  TRACE_SANITIZE (this);
+  return_trace (ligGlyph.sanitize (c) &amp;&amp; component.sanitize (c));
+}
+</code></pre>
+<p id="ix-15"><code>TRACE_SANITIZE</code> and <code>return_trace</code> are for debugging, and compile to nothing in a normal build. What’s left is a chain of <code>&amp;&amp;</code>: the first check that fails makes the whole table fail, and nothing after it is looked at. Most methods are this short, because the work is done by the field types. <code>coverage</code> is an <code>OffsetTo&lt;Coverage&gt;</code>, and <code>ligatureSet</code> is an array of offsets to <code>LigatureSet</code>, and each of those knows how to check itself and then what it points at.</p>
+<p id="ix-16">The offset’s method is the heart of it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L515"><code>hb-open-type.hh:515</code></a> and <code>:529</code>, trimmed, with comments added):</p>
+<pre><code class="language-c++">bool sanitize_shallow (hb_sanitize_context_t *c, const BaseType *base) const
+{
+  if (unlikely (!c-&gt;check_struct (this))) return false;   /* the offset's own 2 bytes */
+  hb_barrier ();
+  if (unlikely ((const char *) base + (unsigned) *this &lt; (const char *) base))
+    return false;                                         /* the address wrapped round */
+  return true;
+}
+
+bool sanitize (hb_sanitize_context_t *c, const BaseType *base, Ts&amp;&amp;... ds) const
+{
+  return sanitize_shallow (c, base) &amp;&amp;
+         hb_barrier () &amp;&amp;
+         (this-&gt;is_null () ||
+          c-&gt;dispatch (StructAtOffset&lt;Type&gt; (base, *this), std::forward&lt;Ts&gt; (ds)...));
+}
+</code></pre>
+<p id="ix-17">It checks that its own two bytes are in the table, then, unless it is zero (a null offset, which reads as the Null object), it hands the struct at <code>base + offset</code> to the context to be checked in turn. The offset doesn’t check whether its target is in range. The target does that itself, as the first thing its own <code>sanitize()</code> does. An array works the same way (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L817"><code>hb-open-type.hh:817</code></a>): it checks that its count and its whole run of elements fit, and then, unless the elements are plain data with nothing to follow, it dispatches each element.</p>
+<h3 id="the-primitives">The primitives</h3>
+<p id="ix-18">Underneath, everything comes down to a few checks on the context, <code>hb_sanitize_context_t</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Check</th>
+<th>What it asks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>check_struct (obj)</code></td>
+<td>do the struct’s fixed fields, <code>min_size</code> bytes, fit in the table?</td>
+</tr>
+<tr>
+<td><code>check_range (p, len)</code></td>
+<td>do <code>len</code> bytes from <code>p</code> fit? Charges <code>len</code> to the budget</td>
+</tr>
+<tr>
+<td><code>check_range (p, a, b)</code>, <code>check_array (p, count)</code></td>
+<td>the same for <code>a × b</code> bytes, or <code>count</code> elements, failing if the multiplication overflows</td>
+</tr>
+<tr>
+<td><code>check_range_fast</code>, <code>check_point</code></td>
+<td>the bounds alone, with no charge to the budget</td>
+</tr>
+<tr>
+<td><code>check_ops (n)</code></td>
+<td>charge <code>n</code> to the budget without checking any bytes</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-19"><code>check_struct</code> is used on every struct with a fixed part (the <code>min_size</code> comes from the <code>DEFINE_SIZE_*</code> macros described in <a href="fonts-as-bytes.html">Fonts as bytes</a>), so it is made as cheap as possible. On a 64-bit machine it only checks that the struct’s <em>end</em> is in the table (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L396"><code>hb-sanitize.hh:396</code></a>). Every multiplication of a count by a size goes through <code>hb_unsigned_mul_overflows</code>, so a count of 0x80000000 records of 2 bytes can’t pass as a small number.</p>
+<p id="ix-20">After almost every check comes <code>hb_barrier ()</code>. It’s a compiler memory barrier (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-atomic.hh#L188"><code>hb-atomic.hh:188</code></a>) and generates no instructions. No comment says what it is for, but from the code its purpose appears to be to stop the compiler from moving a read of a field to before the check that makes the read safe, which an optimizer is otherwise entitled to do when it can see that the check doesn’t change the field.</p>
+<h3 id="formats-and-dispatch">Formats and dispatch</h3>
+<p id="ix-21">Many tables start with a format number and mean different things for different formats. Those are unions with a <code>dispatch()</code> method, the same one that GSUB’s <code>apply</code> and the subsetter use (the dispatch pattern is in <a href="fonts-as-bytes.html">Fonts as bytes</a>). Here is <code>LigatureSubst</code>’s (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/LigatureSubst.hh#L24"><code>OT/Layout/GSUB/LigatureSubst.hh:24</code></a>, trimmed):</p>
+<pre><code class="language-c++">template &lt;typename context_t, typename ...Ts&gt;
+typename context_t::return_t dispatch (context_t *c, Ts&amp;&amp;... ds) const
+{
+  if (unlikely (!c-&gt;may_dispatch (this, &amp;u.format.v))) return c-&gt;no_dispatch_return_value ();
+  switch (u.format.v) {
+  case 1: hb_barrier (); return c-&gt;dispatch (u.format1, std::forward&lt;Ts&gt; (ds)...);
+  case 2: hb_barrier (); return c-&gt;dispatch (u.format2, std::forward&lt;Ts&gt; (ds)...);
+  default:return c-&gt;default_return_value ();
+  }
+}
+</code></pre>
+<p id="ix-22"><code>may_dispatch</code> is a hook for the sanitizer. Every other context returns <code>true</code>, but the sanitizer checks the format field itself before the <code>switch</code> reads it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L138"><code>hb-sanitize.hh:138</code></a>). <code>default_return_value ()</code> for the sanitizer is <code>true</code> (<code>:143</code>): that’s why unknown formats pass. <code>LigatureSubst</code> has no <code>sanitize()</code> of its own, and doesn’t need one. The sanitizer’s own <code>dispatch</code> prefers an object’s <code>sanitize()</code> if it has one and falls back on its <code>dispatch()</code> if not (<code>:154–163</code>), so the same <code>switch</code> serves for checking, applying, subsetting and the rest.</p>
+<h2 id="a-window-and-a-budget">A window and a budget</h2>
+<p id="ix-23">The context holds very little: the start and end of the bytes being checked, their length, and the budgets. Here is <code>check_range</code>, which nearly every check comes down to (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L276"><code>hb-sanitize.hh:276</code></a>, without its debug message):</p>
+<pre><code class="language-c++">bool check_range (const void *base, unsigned int len) const
+{
+  const char *p = (const char *) base;
+  bool ok = (uintptr_t) (p - this-&gt;start) &lt;= this-&gt;length &amp;&amp;
+            (unsigned int) (this-&gt;end - p) &gt;= len &amp;&amp;
+            ((this-&gt;max_ops -= len) &gt; 0);
+  return likely (ok);
+}
+</code></pre>
+<p>The first line checks that <code>p</code> is in the window, with an unsigned comparison that also catches a <code>p</code> before the start. The second checks that <code>len</code> bytes fit after it. The third is the budget.</p>
+<h3 id="max_ops"><code>max_ops</code></h3>
+<p><code>max_ops</code> is set when checking starts (<code>start_processing</code>, <code>:225</code>) from the length of the table:</p>
+<table>
+<thead>
+<tr>
+<th>Constant</th>
+<th>Value</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-24"><code>HB_SANITIZE_MAX_OPS_FACTOR</code></td>
+<td>64</td>
+<td>the budget is 64 for each byte of the table…</td>
+</tr>
+<tr>
+<td id="ix-25"><code>HB_SANITIZE_MAX_OPS_MIN</code></td>
+<td>16,384</td>
+<td>…but never less than this…</td>
+</tr>
+<tr>
+<td id="ix-26"><code>HB_SANITIZE_MAX_OPS_MAX</code></td>
+<td>0x3FFFFFFF</td>
+<td>…or more than this (about a billion)</td>
+</tr>
+<tr>
+<td id="ix-27"><code>HB_SANITIZE_MAX_SUBTABLES</code></td>
+<td>0x4000 (16,384)</td>
+<td id="ix-28">lookup subtables, over the whole table</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-29">The budget is counted in bytes, not checks: each <code>check_range</code> spends the number of bytes it checks. So a table can, in effect, be read through 64 times over. An honest table is read about once, since each struct is reached by one path or a few. A table that shares its subtables in order to be walked millions of times runs out, and once <code>max_ops</code> reaches zero every later check fails, so the table fails too. The <code>GSUB</code> in <code>good.ttf</code> is 156 bytes long, which would give it 9,984; it gets the minimum, 16,384.</p>
+<p id="ix-30">Two kinds of structure cost more to use than their size suggests, and they spend extra with <code>check_ops</code>. A single substitution or positioning of format 1 charges half the number of glyphs its Coverage covers (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/SingleSubstFormat1.hh#L125"><code>SingleSubstFormat1.hh:125</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/SinglePosFormat1.hh#L39"><code>SinglePosFormat1.hh:39</code></a>), because a Coverage of a few bytes can name every glyph in the font as one range, as the comment there says. And each COLR <code>PaintComposite</code> charges its own size (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L1915"><code>OT/Color/COLR/COLR.hh:1915</code></a>), with the comment “PainComposite can get exponential”: it has two child paints, so a chain of them doubles at each step.</p>
+<p id="ix-31">The second budget, <code>max_subtables</code>, counts lookup subtables across the whole table. <code>Lookup::sanitize</code> adds each lookup’s subtable count to it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L1426"><code>hb-ot-layout-common.hh:1426</code></a>), and the table fails once it passes 16,384.</p>
+<p id="ix-32">The sanitizer’s <code>max_ops</code> is a different budget from the buffer’s <code>max_ops</code>, which the <a href="gsub.html">GSUB chapter</a> mentions and which limits the work of shaping. They share a name and an idea.</p>
+<h3 id="recursion">Recursion</h3>
+<p id="ix-33">Most of a table can only nest as deep as its format allows: a GSUB lookup holds subtables that hold Coverage tables, and that’s the end of it. (A context lookup refers to other lookups by index, not by offset, so the sanitizer doesn’t follow it.) Two structures can nest themselves: COLR’s <code>Paint</code>, and the <code>Condition</code> of a FeatureVariations record, which can be the AND, OR or negation of other conditions. Both count their depth with <code>check_start_recursion</code> and <code>end_recursion</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L380"><code>hb-sanitize.hh:380</code></a>), and fail beyond <code>HB_MAX_NESTING_LEVEL</code>, which is 64 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L4777"><code>hb-ot-layout-common.hh:4777</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L2275"><code>COLR.hh:2275</code></a>). That limit is the same one that limits nested lookups during shaping (see the <a href="limits.html">Limits appendix</a>).</p>
+<h3 id="the-glyph-count">The glyph count</h3>
+<p id="ix-34">Some tables can’t be checked without knowing how many glyphs the font has. <code>gvar</code> has an offset for each glyph, plus one, and <code>sbix</code> the same. An AAT lookup table of format 0 has a value for each glyph, and a CFF charset names glyphs up to the count. So the context carries <code>num_glyphs</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L184"><code>hb-sanitize.hh:184</code></a>), and <code>reference_table</code>, the usual way in, sets it from the face before checking anything (<code>:441</code>). The <a href="blobs-faces-and-lazy-tables.html#the-first-gsub-access-step-by-step">next chapter</a> follows this step, including how <code>maxp</code>, which is where the glyph count comes from, avoids needing the glyph count to load itself.</p>
+<h3 id="a-smaller-window">A smaller window</h3>
+<p id="ix-35">The window can also be narrowed to a single object with <code>hb_sanitize_with_object_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L460"><code>hb-sanitize.hh:460</code></a>), which calls <code>set_object</code> on the way in and <code>reset_object</code> on the way out. While it’s in place, <code>start</code> and <code>end</code> are the bounds of that object, as its own length field states them, so nothing inside it can be checked as valid if it lies beyond its stated end. The <code>kern</code> and <code>kerx</code> tables use this to keep each subtable within its own length. But they make an exception for the last subtable, and the comment explains why (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-kerx-table.hh#L1161"><code>hb-aat-layout-kerx-table.hh:1161</code></a>): the old <code>kern</code> table stores subtable lengths in 16 bits, some versions of Calibri have a <code>kern</code> subtable longer than 64 KB, and Microsoft’s implementation reads only one subtable anyway, so the length is evidently ignored in practice. HarfBuzz ignores it too, for the last subtable only.</p>
+<h2 id="pass-or-fail">Pass or fail</h2>
+<p id="ix-36"><code>sanitize_blob</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L405"><code>hb-sanitize.hh:405</code></a>) runs the top-level <code>sanitize()</code> and acts on the answer. If the table passed, its blob is made immutable and returned. If it failed, the blob is released and the <strong>empty blob</strong> is returned in its place. There’s no third outcome. A table that is missing from the font gives the empty blob too, so the code that uses a table can’t tell “missing” from “broken”, and doesn’t need to: the empty blob reads as the table’s Null object, all zeros, which is a valid, empty table. A failed <code>GSUB</code> reads as a <code>GSUB</code> with no scripts, no features and no lookups. How that result is stored on the face, so that the table is never looked for or checked again, is in <a href="blobs-faces-and-lazy-tables.html#failure-is-cached-as-null">Failure is cached as Null</a>.</p>
+<p id="ix-37">The test font <code>good.ttf</code> has two GSUB lookups that have nothing to do with each other: <code>liga</code> makes <code>f i</code> into <code>f_i</code>, and <code>calt</code> turns <code>a</code> into <code>a.alt</code> before <code>b</code>. Its GPOS has a kerning pair, <code>b a</code>, and a mark-to-base lookup that puts <code>acutecomb</code> over <code>a</code> and <code>b</code>. Here are the lookups, each with tabs for its views:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of good.ttf, lookup 0"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button><button type="button" role="tab" data-view="hex">Bytes</button><button type="button" role="tab" data-view="cpp">HarfBuzz C++</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 0: Ligature substitution (type 4)
+  lookupFlag: none
+  subtable 0: LigatureSubstFormat1
+    coverage: [f]
+    ligatureSet:
+      (f)
+        1. [i] → f_i</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature liga {
+  sub f i by f_i;
+} liga;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;0&quot;&gt;
+  &lt;LookupType value=&quot;4&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;LigatureSubst index=&quot;0&quot;&gt;
+    &lt;LigatureSet glyph=&quot;f&quot;&gt;
+      &lt;Ligature components=&quot;i&quot; glyph=&quot;f_i&quot;/&gt;
+    &lt;/LigatureSet&gt;
+  &lt;/LigatureSubst&gt;
+&lt;/Lookup&gt;</code></pre></div><div class="pane print" data-view="hex" data-label="Bytes" role="tabpanel"><pre><code>── Lookup 0 (at 0x002e)
+002e  00 04   lookupType
+0030  00 00   lookupFlag (none)
+0032  00 01   subTableCount
+0034  00 2e   subtableOffsets[0] → subtable 0
+── subtable 0: LigatureSubstFormat1 (at 0x005c)
+005c  00 01   substFormat
+005e  00 3a   coverageOffset → Coverage
+0060  00 01   ligatureSetCount
+0062  00 24   ligatureSetOffsets[0] → LigatureSet 0
+── LigatureSet 0 (at 0x0080)
+0080  00 01   ligatureCount
+0082  00 10   ligatureOffsets[0] → Ligature 0.0
+── Ligature 0.0 (at 0x0090)
+0090  00 07   ligatureGlyph = f_i
+0092  00 02   componentCount (including the first)
+0094  00 05   componentGlyphIDs[0] = i
+── Coverage (at 0x0096)
+0096  00 01   format
+0098  00 01   glyphCount
+009a  00 04   glyphArray[0] = f</code></pre></div><div class="pane" data-view="cpp" data-label="HarfBuzz C++" role="tabpanel"><pre><code>template &lt;typename Types&gt;
+struct LigatureSubstFormat1_2
+{
+  protected:
+  HBUINT16      format;                 /* Format identifier--format = 1 */
+  typename Types::template LOffsetTo&lt;Coverage&gt;
+                coverage;               /* Offset to Coverage table--from
+                                         * beginning of Substitution table */
+  typename Types::template ArrayOf&lt;typename Types::template OffsetTo&lt;LigatureSet&lt;Types&gt;&gt;&gt;
+                ligatureSet;            /* Array LigatureSet tables
+                                         * ordered by Coverage Index */
+  public:
+  DEFINE_SIZE_ARRAY (2 + Types::LOffset::static_size + Types::HBUINT::static_size, ligatureSet);
+  /* … */
+};</code></pre><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/LigatureSubstFormat1.hh#L11-L23">src/OT/Layout/GSUB/LigatureSubstFormat1.hh:11</a></div><figcaption>good.ttf, lookup 0</figcaption></figure>
+<p id="ix-38">In <code>bad-gsub.ttf</code>, exactly two bytes are different: the <code>coverageOffset</code> of that ligature subtable, <code>00 3a</code> at GSUB offset 0x005e in the Bytes view, has been changed to <code>ff ff</code>, which points far beyond the end of the 156-byte table. Nothing else in <code>GSUB</code>, and nothing in any other table, has changed:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">good.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">bad-gsub.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f=0+500|i=1+500]</code></td></tr><tr><td class="font">good.ttf</td><td class="in"><span class="txt">ab</span><span class="cps">U+0061 U+0062</span></td><td class="opt"></td><td class="out"><code>[a.alt=0+500|b=1+500]</code></td></tr><tr><td class="font">bad-gsub.ttf</td><td class="in"><span class="txt">ab</span><span class="cps">U+0061 U+0062</span></td><td class="opt"></td><td class="out"><code>[a=0+500|b=1+500]</code></td></tr><tr><td class="font">good.ttf</td><td class="in"><span class="txt">ba</span><span class="cps">U+0062 U+0061</span></td><td class="opt"></td><td class="out"><code>[b=0+400|a=1+500]</code></td></tr><tr><td class="font">bad-gsub.ttf</td><td class="in"><span class="txt">ba</span><span class="cps">U+0062 U+0061</span></td><td class="opt"></td><td class="out"><code>[b=0+400|a=1+500]</code></td></tr></tbody></table></div>
+<p id="ix-39">The ligature is gone, as you would expect. But so is the <code>calt</code> substitution, though its lookup is perfect and the bad offset is in a different lookup. HarfBuzz didn’t skip one subtable or one lookup: it dropped the whole table. The kerning of <code>b a</code> is unaffected, because <code>GPOS</code> is a different table, checked on its own, and it passed. The trace shows what GSUB looked like to the shaper:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape bad-gsub.ttf "fi"  --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;&#x27;</td><td class="buf"><code>[f=0|i=1]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;&#x27;</td><td class="buf"><code>[f=0|i=1]</code></td></tr></tbody></table></div>
+<p id="ix-40">Nothing runs between the start of the table and its end. There aren’t even any skipped lookups, since an empty table has no lookups to skip, and the script tag is empty because the table has no scripts to choose from.</p>
+<blockquote>
+<p id="ix-41">For type designers: a single bad offset loses the whole of <code>GSUB</code>, or the whole of <code>GPOS</code>, in HarfBuzz 15.1.0. If a font shapes as though one of its layout tables were missing, try decompiling that table with fontTools (<code>ttx -t GSUB font.ttf</code>). It fails on all three of this page’s broken fonts, and its error names the path to the bad offset, such as <code>('Coverage', 'SubTable', 'Lookup', 'LookupList')</code>. Don’t rely on what other engines do with the same font: as the next section says, they don’t agree.</p>
+</blockquote>
+<h3 id="a-list-of-known-bad-fonts">A list of known bad fonts</h3>
+<p id="ix-42">There’s one other way a sanitized table can be dropped. After <code>GDEF</code>, <code>GSUB</code>, <code>GPOS</code> and <code>morx</code> are sanitized, their accelerators ask <code>is_blocklisted</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L6716"><code>hb-ot-layout-gsubgpos.hh:6716</code></a>) whether this is one of a few specific fonts whose table is known to be harmful, identified by the lengths of their tables. The comment in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L159"><code>hb-ot-layout.cc:159</code></a> lists the <code>GDEF</code> cases: some versions of Times New Roman Italic and Bold Italic class the ASCII double quote as a mark, and many versions of Tahoma class some spacing IPA symbols as marks, so their <code>GDEF</code> is dropped to keep those glyphs from losing their width. The <code>morx</code> list (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout.cc#L215"><code>hb-aat-layout.cc:215</code></a>) has one font. The <code>GSUB</code> and <code>GPOS</code> lists are empty in 15.1.0. A build with <code>HB_NO_OT_LAYOUT_BLOCKLIST</code> defined has none of this.</p>
+<h2 id="why-it-repairs-nothing">Why it repairs nothing</h2>
+<p id="ix-43">The comment at the top of <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh"><code>hb-sanitize.hh</code></a> ends with a note on the name:</p>
+<pre><code class="language-c++">/*
+ * Note:
+ * Sanitize was named so because it used to try to recover from errors by
+ * modifying the data to make it valid.  This is no longer the case, as it
+ * could make HarfBuzz hallucinate new rules if there was aliasing in the
+ * data.  However, the name stuck.  See: https://behdad.github.io/harfbust/
+ */
+</code></pre>
+<p id="ix-44">For a long time, a bad offset didn’t lose the table. When the sanitizer found an offset whose target failed, it wrote zero over the offset, in the font’s own bytes. This was called <strong>neutering</strong> the offset. A zero offset is a null offset, which reads as an empty object, so the subtable or Coverage behind it simply vanished, and the rest of the table, now valid, was kept. The cost was that the sanitizer needed to write to the font. Older versions of <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh"><code>hb-sanitize.hh</code></a> counted the edits a table needed and checked whether editing was allowed (<code>may_edit</code>). If a table needed edits and its blob was read-only, they made the blob writable (copying it, or making a private memory mapping writable with <code>mprotect</code>) and checked it again from the start. There was a limit on edits, to stop a broken font from making checking slow: NEWS for 1.1.0, in 2015, reads “Reject font tables that need more than 8 edits”.</p>
+<h3 id="aliasing">Aliasing</h3>
+<p id="ix-45">The trouble is that a table’s bytes aren’t owned by one struct each. OpenType allows any number of offsets to point at the same bytes, and nothing in the format stops two <em>different</em> structs from overlapping, so that the same two bytes are an offset to one reader and a glyph ID or a count to another. When the sanitizer wrote a zero into such bytes, it didn’t only disable the bad offset. It changed whatever else was stored there, and the changed data could pass its own checks and be used.</p>
+<p id="ix-46">Here is a hand-written illustration, not taken from a real font. An Extension lookup holds a 32-bit offset to its subtable. Suppose the font is arranged so that the high 16 bits of that offset are also read, by another lookup, as a 16-bit offset to a Coverage table, and that offset is bad. Neutering writes <code>00 00</code> into it. The second lookup loses its Coverage, as intended. But the Extension’s 32-bit offset has now lost its high half, and points somewhere much earlier in the table, where it finds whatever bytes happen to be there and reads them as a subtable. If those bytes pass the checks, the font has gained a lookup that its maker never wrote. And since the result depended on which offset the sanitizer checked first, it was hard to reason about at all.</p>
+<h3 id="harfbust">HarfBust</h3>
+<p id="ix-47">In late 2025, Behdad Esfahbod published a puzzle font, HarfBust, made from Anton, which forms a ligature for the word “HarfBust” in HarfBuzz, HarfRust and DirectWrite but not in Core Text, and others for “HarfBuzz” and “HarfRust” in only one engine each. It doesn’t use any special features to do it: its <code>GSUB</code> contains deliberately invalid offsets, arranged so that each engine’s way of handling them produces a different font. His explanation, in a comment on HarfBuzz issue #5535, describes the three ways:</p>
+<ul>
+<li id="ix-48"><strong>Core Text</strong> discards the offending table, and uses the rest of the font.</li>
+<li id="ix-49"><strong>DirectWrite</strong> ignores the out-of-bounds offsets, and processes the rest of the table.</li>
+<li id="ix-50"><strong>HarfBuzz</strong> wrote zeros over the out-of-bounds offsets, which, with aliasing, could create new data.</li>
+</ul>
+<p>The OpenType and ISO Open Font Format specifications say that such data is invalid, but not what an implementation should do with it. Any choice is reasonable as long as it is safe, and the comment adds that a rule requiring the whole <em>font</em> to be rejected would be very costly, since it would force every client to validate everything up front, outlines included.</p>
+<p>HarfBuzz 12.3.0 made the change, and its NEWS entry puts it plainly:</p>
+<blockquote>
+<p id="ix-51">Invalid font tables (eg. GSUB/GPOS) are outright rejected, instead of partially validated and used. This behavior is different from DirectWrite and HarfRust, and is in line with Core Text.</p>
+</blockquote>
+<p>So <code>sanitize()</code> became a pure check: it reads the table and returns <code>true</code> or <code>false</code>, and the bytes it was given are never touched. That also means the result no longer depends on the order of the checks.</p>
+<p id="ix-52">The change had a cost, which NEWS also records. Any check that is stricter than it needs to be now costs a whole table, and 13.0.0 fixed one such case: “Don’t reject malformed <code>cmap</code> subtables, a regression from 12.3.0 when we stopped sanitizing malformed tables.”</p>
+<h3 id="whats-left-of-repairing">What’s left of repairing</h3>
+<p>A few things in the source make sense only as remains of the old design:</p>
+<ul>
+<li id="ix-53"><code>HB_SANITIZE_MAX_EDITS</code> is still defined, as 32 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L107"><code>hb-sanitize.hh:107</code></a>), with the comment “This limits sanitizing time on really broken fonts.” Nothing reads it.</li>
+<li id="ix-54"><code>may_edit</code>, the edit counter and the second, writable pass are gone. There’s no <code>try_set</code> or <code>neuter</code> anywhere in <code>src/</code>.</li>
+<li id="ix-55">The blob memory mode <code>HB_MEMORY_MODE_READONLY_MAY_MAKE_WRITABLE</code>, and <code>try_make_writable_inplace_unix</code>, which calls <code>mprotect</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.cc#L415"><code>hb-blob.cc:415</code></a>), are still there, and fonts opened from a file are still mapped in that mode (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.cc#L654"><code>hb-blob.cc:654</code></a>). But the sanitizer never asks for writable bytes now. <a href="blobs-faces-and-lazy-tables.html#writable-copies-and-why-little-needs-them-now">Blobs, faces and lazy tables</a> covers what does.</li>
+</ul>
+<blockquote>
+<p id="ix-56">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/91722141bb48a8414284cb3b4001b0c98cce9a19"><code>9172214</code></a> (17 November 2026), which removes <code>HB_SANITIZE_MAX_EDITS</code> (the first item).</p>
+</blockquote>
+<h2 id="checks-that-wait">Checks that wait</h2>
+<p id="ix-57">The contract allows a table to leave checks to the code that reads it, as long as that code makes them. Some tables do that for everything, and <code>GPOS</code> does it for a few parts.</p>
+<h3 id="glyf-and-loca">glyf and loca</h3>
+<p id="ix-58"><code>glyf</code>’s <code>sanitize()</code> is the simplest in HarfBuzz (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh#L56"><code>OT/glyf/glyf.hh:56</code></a>):</p>
+<pre><code class="language-c++">bool sanitize (hb_sanitize_context_t *c HB_UNUSED) const
+{
+  TRACE_SANITIZE (this);
+  /* Runtime checks as eager sanitizing each glyph is costy */
+  return_trace (true);
+}
+</code></pre>
+<p id="ix-59"><code>loca</code>’s is the same. The checks are in the <code>glyf</code> accelerator instead. It works out the number of glyphs from the length of <code>loca</code>, so that reading glyph <em>n</em>’s offset and the one after it is always in range (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh#L254"><code>glyf.hh:254</code></a>), takes the smaller of that and the face’s glyph count, and then, each time a glyph is loaded, refuses one whose offsets run backwards or past the end of <code>glyf</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh#L574"><code>glyf.hh:574</code></a>). The glyph’s own data, its contours, points and components, is then read with checks against its own length. A broken glyph is then a missing glyph, and every other glyph still works. <a href="drawing-outlines.html">Drawing outlines</a> has the rest of that code.</p>
+<p id="ix-60">CFF and CFF2 are similar in spirit. At load, the sanitizer checks the structure of the table: the INDEXes, the charset against the glyph count, the FDSelect. A glyph’s charstring is just an entry in an INDEX at that point. Its contents are a program, which can only be checked by running it, and the charstring interpreter does its own checking, with its own limit of operations, <code>HB_CFF_MAX_OPS</code> (200,000).</p>
+<h3 id="the-aat-tables">The AAT tables</h3>
+<p id="ix-61"><code>morx</code> and <code>kerx</code> are driven by state machines. Which entry, action or ligature component a machine will read depends on the glyphs being shaped, so most of their indexes can’t be checked until they are used. The AAT apply context therefore carries a sanitizer of its own, over the table being applied, with the glyph count set and the budget set to the maximum (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout.cc#L71-L74"><code>hb-aat-layout.cc:71–74</code></a>). The state-machine code calls it before each read that depends on the text, as in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-morx-table.hh#L543"><code>hb-aat-layout-morx-table.hh:543</code></a>, where a ligature action is checked before it’s used, and gives up on that action if the check fails. The <a href="aat-inside-harfbuzz.html">AAT chapter</a> covers those machines.</p>
+<h3 id="some-of-gpos">Some of GPOS</h3>
+<p id="ix-62"><code>GSUB</code> and <code>GPOS</code> share one accelerator template, and its constructor sets a flag before it sanitizes the table (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L6713"><code>hb-ot-layout-gsubgpos.hh:6713</code></a>):</p>
+<pre><code class="language-c++">hb_sanitize_context_t sc;
+sc.lazy_some_gpos = true;
+this-&gt;table = sc.reference_table&lt;T&gt; (face);
+</code></pre>
+<p id="ix-63">Nothing in <code>GSUB</code> looks at the flag. Six places in <code>GPOS</code> do, and each of them, when it is set, checks the bounds of an array but doesn’t follow the offsets inside it:</p>
+<table>
+<thead>
+<tr>
+<th>Where</th>
+<th>Checked at load</th>
+<th id="ix-64">Left until use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-65"><code>SinglePos</code> formats 1 and 2 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/ValueFormat.hh#L409"><code>ValueFormat.hh:409</code></a>, <code>:422</code>)</td>
+<td id="ix-66">the value records</td>
+<td id="ix-67">their Device offsets</td>
+</tr>
+<tr>
+<td id="ix-68"><code>PairPos</code> format 1 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/PairSet.hh#L112"><code>PairSet.hh:112</code></a>)</td>
+<td id="ix-69">the pair value records</td>
+<td id="ix-70">their Device offsets</td>
+</tr>
+<tr>
+<td id="ix-71"><code>PairPos</code> format 2 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/PairPosFormat2.hh#L182"><code>PairPosFormat2.hh:182</code></a>)</td>
+<td id="ix-72">the class-by-class matrix of value records</td>
+<td id="ix-73">their Device offsets</td>
+</tr>
+<tr>
+<td id="ix-74"><code>CursivePos</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/CursivePosFormat1.hh#L247"><code>CursivePosFormat1.hh:247</code></a>)</td>
+<td>the array of entry and exit records</td>
+<td id="ix-75">the entry and exit Anchors</td>
+</tr>
+<tr>
+<td id="ix-76"><code>AnchorMatrix</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/AnchorMatrix.hh#L99"><code>AnchorMatrix.hh:99</code></a>), in <code>MarkBasePos</code>, <code>MarkLigPos</code> and <code>MarkMarkPos</code></td>
+<td id="ix-77">the matrix of anchor offsets</td>
+<td id="ix-78">the base, ligature-component and mark2 Anchors</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-79">The mark anchors, in each lookup’s <code>MarkArray</code>, are still checked at load, and so is everything else: coverage tables, class definitions, the value records’ own bytes.</p>
+<p id="ix-80">No comment says why these were chosen, but the pattern is the one the header comment describes for <code>glyf</code>. These are the parts of GPOS that grow fastest with the font: a pair-kerning class matrix has a value record for every pair of classes, a mark-to-base table has an anchor offset for every base and every mark class, and any value record may carry Device offsets. Following every offset in them at load costs time in proportion to all of that, while shaping a line of text uses a handful. Their arrays are still checked whole, which is a single <code>check_range</code> each, so only following the offsets is deferred.</p>
+<p id="ix-81">Those offsets are checked when they are used instead. The context that applies GSUB or GPOS lookups holds a sanitizer of its own, made over the same table blob (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L1170"><code>hb-ot-layout-gsubgpos.hh:1170</code></a>, built at <code>:1207</code>), and a fresh one is made each time a table is applied to a buffer (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L2080"><code>hb-ot-layout.cc:2080</code></a>). Before an anchor is read from a matrix (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/AnchorMatrix.hh#L115"><code>AnchorMatrix.hh:115</code></a>), before a cursive entry or exit anchor (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/CursivePosFormat1.hh#L282"><code>CursivePosFormat1.hh:282</code></a>, <code>:296</code>), and before a Device table is read for a value record (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/ValueFormat.hh#L335"><code>ValueFormat.hh:335</code></a>) or an anchor (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/AnchorFormat3.hh#L40"><code>AnchorFormat3.hh:40</code></a>), the offset is sanitized there, fully, since this sanitizer doesn’t have the flag set. If the check fails, that one item is treated as missing: a Device table reads as Null and adds nothing, and an anchor that isn’t found means the attachment doesn’t happen, so the next subtable gets a chance at the glyph.</p>
+<p id="ix-82">The two other broken fonts show the difference. In <code>bad-gpos.ttf</code>, the <code>markCoverage</code> offset of the mark-to-base subtable points past the end of <code>GPOS</code>. That is checked at load. In <code>bad-anchor.ttf</code>, the offset to the anchor of base glyph <code>b</code> in the same subtable’s base array points past the end. That is left until use:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">good.ttf</td><td class="in"><span class="txt">ba</span><span class="cps">U+0062 U+0061</span></td><td class="opt"></td><td class="out"><code>[b=0+400|a=1+500]</code></td></tr><tr><td class="font">bad-gpos.ttf</td><td class="in"><span class="txt">ba</span><span class="cps">U+0062 U+0061</span></td><td class="opt"></td><td class="out"><code>[b=0+500|a=1+500]</code></td></tr><tr><td class="font">bad-anchor.ttf</td><td class="in"><span class="txt">ba</span><span class="cps">U+0062 U+0061</span></td><td class="opt"></td><td class="out"><code>[b=0+400|a=1+500]</code></td></tr><tr><td class="font">good.ttf</td><td class="in"><span class="txt">a◌́</span><span class="cps">U+0061 U+0301</span></td><td class="opt"></td><td class="out"><code>[a=0+500|acutecomb=0@-250,-100+0]</code></td></tr><tr><td class="font">bad-gpos.ttf</td><td class="in"><span class="txt">a◌́</span><span class="cps">U+0061 U+0301</span></td><td class="opt"></td><td class="out"><code>[a=0+500|acutecomb=0@-250,562+0]</code></td></tr><tr><td class="font">bad-anchor.ttf</td><td class="in"><span class="txt">a◌́</span><span class="cps">U+0061 U+0301</span></td><td class="opt"></td><td class="out"><code>[a=0+500|acutecomb=0@-250,-100+0]</code></td></tr><tr><td class="font">good.ttf</td><td class="in"><span class="txt">b◌́</span><span class="cps">U+0062 U+0301</span></td><td class="opt"></td><td class="out"><code>[b=0+500|acutecomb=0@-250,100+0]</code></td></tr><tr><td class="font">bad-gpos.ttf</td><td class="in"><span class="txt">b◌́</span><span class="cps">U+0062 U+0301</span></td><td class="opt"></td><td class="out"><code>[b=0+500|acutecomb=0@-250,562+0]</code></td></tr><tr><td class="font">bad-anchor.ttf</td><td class="in"><span class="txt">b◌́</span><span class="cps">U+0062 U+0301</span></td><td class="opt"></td><td class="out"><code>[b=0+500|acutecomb=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-83"><code>bad-gpos.ttf</code> has lost all of <code>GPOS</code>. The kerning between <code>b</code> and <code>a</code> has gone, though the bad offset is in a different lookup, and the accents are no longer placed by the font’s anchors at all. They are placed by HarfBuzz’s fallback mark positioning instead, which is what HarfBuzz does for a font with no <code>GPOS</code> (see <a href="fallbacks.html">Fallbacks</a>): above the base glyph’s outline, which here is the same box for <code>a</code> and <code>b</code>, so both accents end up at the same height.</p>
+<p id="ix-84"><code>bad-anchor.ttf</code> keeps its <code>GPOS</code>. The kerning works, and the accent over <code>a</code> is placed by its anchor just as in <code>good.ttf</code>. Only the accent over <code>b</code> is wrong: its anchor failed its check when HarfBuzz tried to use it, so the mark wasn’t attached, and it stays where it was, at zero offset. The rest of the table never noticed.</p>
+<blockquote>
+<p id="ix-85">For type designers: the lazy checks make HarfBuzz forgiving of exactly one kind of mistake, a bad Anchor or Device offset inside a large positioning table. Don’t count on it. Other engines may reject the whole table, and so, it seems, may HarfBuzz’s own subsetter. Its code (not tested here) shows <code>hb-subset</code> loading <code>GPOS</code> with an ordinary sanitizer, without the flag (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan.hh#L206"><code>hb-subset-plan.hh:206</code></a>), so the same font that shapes in HarfBuzz may lose its <code>GPOS</code> when it is subset for the web.</p>
+</blockquote>
+<blockquote>
+<p id="ix-86">For programmers: to watch the sanitizer work, build HarfBuzz with <code>HB_DEBUG_SANITIZE</code> defined to a depth, for example <code>-DHB_DEBUG_SANITIZE=100</code>. Every <code>TRACE_SANITIZE</code> then prints a line for the struct it is checking, and every <code>check_range</code> prints the range it checked and whether it was in bounds (<code>OK</code> or <code>OUT-OF-RANGE</code>), all on standard error. The table’s last line says <code>PASSED</code> or <code>FAILED</code>, and the first <code>OUT-OF-RANGE</code> before a <code>FAILED</code> is usually the check that lost the table.</p>
+</blockquote>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh"><code>src/hb-sanitize.hh</code></a></td>
+<td>the header comment (the contract, and the note on repairing), the limits, <code>hb_sanitize_context_t</code>, <code>sanitize_blob</code>, <code>reference_table</code>, <code>hb_sanitize_with_object_t</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh"><code>src/hb-open-type.hh</code></a></td>
+<td><code>sanitize()</code> for offsets (<code>OffsetTo</code>) and the array types</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-dispatch.hh"><code>src/hb-dispatch.hh</code></a></td>
+<td>the dispatch context that the sanitizer is one kind of</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh"><code>src/hb-ot-layout-gsubgpos.hh</code></a></td>
+<td>the GSUB/GPOS accelerator that sets <code>lazy_some_gpos</code>, and the apply context’s own sanitizer</td>
+</tr>
+<tr>
+<td><code>src/OT/Layout/GPOS/</code></td>
+<td>the deferred checks: <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/ValueFormat.hh"><code>ValueFormat.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/PairSet.hh"><code>PairSet.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/PairPosFormat2.hh"><code>PairPosFormat2.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/CursivePosFormat1.hh"><code>CursivePosFormat1.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/AnchorMatrix.hh"><code>AnchorMatrix.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/AnchorFormat3.hh"><code>AnchorFormat3.hh</code></a></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh"><code>src/hb-ot-layout-common.hh</code></a></td>
+<td><code>Lookup::sanitize</code> (the subtable budget, Extension types) and <code>Condition</code> (recursion)</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh"><code>src/OT/glyf/glyf.hh</code></a></td>
+<td>a table that checks at use instead of at load</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout.cc"><code>src/hb-aat-layout.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-kerx-table.hh"><code>src/hb-aat-layout-kerx-table.hh</code></a></td>
+<td>the AAT apply context’s sanitizer; narrowing the window to one subtable</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>src/hb-ot-layout.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout.cc"><code>src/hb-aat-layout.cc</code></a></td>
+<td><code>is_blocklisted</code></td>
+</tr>
+<tr>
+<td><code>NEWS</code></td>
+<td>12.3.0 (tables rejected outright), 13.0.0 (the <code>cmap</code> regression), 1.1.0 (the old edit limit)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>The sanitizer checks that a table is safe for HarfBuzz’s own code to read, not that it is valid. It is deliberately lenient: unknown formats pass, and anything the reading code checks for itself is left alone.</li>
+<li><code>sanitize()</code> methods are chains of checks in the shape of the structs. Offsets check their own bytes and then dispatch their target, which checks its own bounds.</li>
+<li>Work is bounded: 64 bytes of checking for each byte of table (at least 16,384), 16,384 lookup subtables, and 64 levels of recursion.</li>
+<li>A table passes or fails as a whole. A failed table becomes the empty blob, and everything that reads it sees an empty table. Since 12.3, nothing is repaired, so one bad offset loses the whole of <code>GSUB</code> or <code>GPOS</code>.</li>
+<li>Repairing stopped because writing zeros over bad offsets could change other data that shared those bytes, and so invent rules. Core Text also drops the table. DirectWrite skips the bad offsets and keeps the rest of the table, and NEWS says HarfRust doesn’t drop the table either.</li>
+<li><code>glyf</code>, <code>loca</code> and <code>hmtx</code> are checked by the code that reads them, and CFF charstrings and the AAT state machines as they run. In <code>GPOS</code>, Anchor and Device offsets inside value records, cursive records and anchor matrices are checked only when they are used, and a bad one loses only itself.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="fonts-as-bytes.html">← Fonts as bytes</a><a rel="next" href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

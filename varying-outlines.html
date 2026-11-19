@@ -1,0 +1,665 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Varying outlines · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part VIII · Variations</p>
+<h1 id="varying-outlines">33. Varying outlines</h1>
+<p id="ix-1">The outlines of a TrueType variable font vary in their own table, <code>gvar</code>, which doesn’t use the item variation stores of <a href="deltas.html">the previous chapter</a>. It has to store far more deltas than any other table, two for every point of every glyph at every master, and it is built to keep them small: deltas can be left out and worked out from their neighbors, tuples can share their positions, and runs of small numbers are packed into bytes. This chapter follows HarfBuzz from a request to draw a glyph at some position to the points it draws, and then looks at the two other kinds of variable outline data, CFF2’s blends and <code>cvar</code>, which HarfBuzz reads differently or not at all.</p>
+<h2 id="a-glyphs-points-and-four-more">A glyph’s points, and four more</h2>
+<p id="ix-2">Drawing a glyph, measuring its extents and, when there’s no HVAR, finding its advance all go through one function, <code>Glyph::get_points</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/Glyph.hh#L326"><code>OT/glyf/Glyph.hh:326</code></a>). For a simple glyph, it reads the outline’s points into an array of floats. Then it adds four <strong>phantom points</strong>, which aren’t part of the outline but stand for the glyph’s metrics (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/Glyph.hh#L391"><code>Glyph.hh:391</code></a>):</p>
+<pre><code class="language-c++">int h_delta = (int) header-&gt;xMin - lsb;
+...
+int v_orig  = (int) header-&gt;yMax + tsb;
+unsigned h_adv = glyf_accelerator.hmtx-&gt;get_advance_without_var_unscaled (gid);
+...
+phantoms[PHANTOM_LEFT].x = h_delta;
+phantoms[PHANTOM_RIGHT].x = (int) h_adv + h_delta;
+phantoms[PHANTOM_TOP].y = v_orig;
+phantoms[PHANTOM_BOTTOM].y = v_orig - (int) v_adv;
+</code></pre>
+<p id="ix-3">The left phantom is where the glyph’s origin is, and the right one is where its advance ends; top and bottom do the same vertically. gvar gives deltas for the phantom points like any others, so a glyph’s metrics vary with its outline. The advance, when it comes from the outlines, is the distance between the left and right phantoms.</p>
+<p>The test font’s <code>V</code> has seven points on its one contour, numbered from 0: two up the left side, then five down the right side, from the top. The phantoms are points 7 to 10.</p>
+<h2 id="tuples">Tuples</h2>
+<p id="ix-4">For each glyph, gvar stores a list of <strong>tuple variations</strong>. Each says where in the design space it applies, as a peak and, optionally, a start and end on each axis, the same tents as in the previous chapter. Each then gives x and y deltas, for every point or for some of them. Here is <code>V</code> in <code>var.ttf</code>:</p>
+<figure class="views ttx"><pre><code>&lt;glyphVariations glyph=&quot;V&quot;&gt;
+  &lt;tuple&gt;
+    &lt;coord axis=&quot;wght&quot; value=&quot;-1.0&quot;/&gt;
+    &lt;delta pt=&quot;1&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;6&quot; x=&quot;-60&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;8&quot; x=&quot;-60&quot; y=&quot;0&quot;/&gt;
+  &lt;/tuple&gt;
+  &lt;tuple&gt;
+    &lt;coord axis=&quot;wght&quot; min=&quot;0.0&quot; value=&quot;0.5&quot; max=&quot;1.0&quot;/&gt;
+    &lt;delta pt=&quot;0&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;1&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;2&quot; x=&quot;160&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;3&quot; x=&quot;145&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;4&quot; x=&quot;130&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;5&quot; x=&quot;115&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;6&quot; x=&quot;100&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;7&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;8&quot; x=&quot;160&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;9&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;10&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+  &lt;/tuple&gt;
+  &lt;tuple&gt;
+    &lt;coord axis=&quot;wght&quot; min=&quot;0.5&quot; value=&quot;1.0&quot; max=&quot;1.0&quot;/&gt;
+    &lt;delta pt=&quot;0&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;1&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;2&quot; x=&quot;300&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;3&quot; x=&quot;262&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;4&quot; x=&quot;225&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;5&quot; x=&quot;188&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;6&quot; x=&quot;150&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;7&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;8&quot; x=&quot;300&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;9&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;10&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+  &lt;/tuple&gt;
+  &lt;tuple&gt;
+    &lt;coord axis=&quot;wdth&quot; value=&quot;-1.0&quot;/&gt;
+    &lt;delta pt=&quot;1&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;6&quot; x=&quot;-10&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;8&quot; x=&quot;-10&quot; y=&quot;0&quot;/&gt;
+  &lt;/tuple&gt;
+&lt;/glyphVariations&gt;</code></pre><figcaption>variations/var.ttf: gvar, glyph V (TTX)</figcaption></figure>
+<p id="ix-5">There are four tuples: one for the light master, peaking at weight −1; two for the heavier masters, including the intermediate one, with its own start and end; and one for the narrow master. The light and narrow tuples list only points 1, 6 and 8.</p>
+<h3 id="shared-tuples-and-a-bug-fixed-in-1510">Shared tuples, and a bug fixed in 15.1.0</h3>
+<p id="ix-6">Most glyphs in a font vary at the same places, so gvar has a list of <strong>shared tuples</strong>: peaks that any glyph can refer to by index instead of storing its own. HarfBuzz computes the scalar for a shared peak once per position, in the same kind of cache as the item variation stores use, and every glyph that refers to that peak can reuse it.</p>
+<p id="ix-7">But a tuple can take its peak from the shared list and still have its <em>own</em> start and end, for an intermediate region. Its scalar then depends on more than the peak. HarfBuzz 15.1.0’s release notes list “Fix wrong outlines in <code>gvar</code> fonts with intermediate tuples”, and the fix is the first thing in <code>calculate_scalar</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-common.hh#L112"><code>hb-ot-var-common.hh:112</code></a>):</p>
+<pre><code class="language-c++">/* The gvar shared-tuple cache is clamped to the 12-bit tuple-index range.
+ * Only PrivatePointNumbers may accompany a cached shared-tuple index; any
+ * other flag sets a bit at or above 0x1000, making this range test fail.
+ */
+bool plain_shared_tuple = (tuple_index &amp; ~TupleIndex::PrivatePointNumbers) &lt; shared_tuple_scalar_cache-&gt;length;
+if (likely (plain_shared_tuple))
+{
+  float scalar;
+  if (likely (shared_tuple_scalar_cache-&gt;get (index, &amp;scalar)))
+    return scalar;
+}
+</code></pre>
+<p id="ix-8">and, further down, for a tuple with an intermediate region:</p>
+<pre><code class="language-c++">/* Intermediate regions belong to this tuple, not the shared peak. */
+shared_tuple_scalar_cache = nullptr;
+</code></pre>
+<p id="ix-9">A tuple’s index field holds the shared tuple’s number in its low 12 bits and flags above them. The cache is used only when the field, ignoring the flag for private point numbers, is a plain index, and an intermediate tuple never stores its scalar there. Before the fix, an intermediate tuple and a plain one with the same shared peak could read each other’s scalars from the cache. Which one was wrong depended on which glyph was drawn first.</p>
+<p id="ix-10">The research for this chapter reproduced the bug. It changed one tuple in one of HarfBuzz’s test fonts, <code>TestGVARFour.ttf</code>, so that one shared peak was used plainly by <code>O</code> and as an intermediate by <code>I</code>. HarfBuzz 12.3.0 drew <code>I</code> correctly on its own and wrongly in “OI” and “IO”. 15.1.0 draws it the same in every case, and agrees with fontTools.</p>
+<h2 id="points-that-arent-there-iup">Points that aren’t there: IUP</h2>
+<p id="ix-11">A tuple can list the points it gives deltas for, instead of giving deltas for all of them. For the points it leaves out, the deltas are worked out by <strong>interpolation of untouched points</strong>, IUP, which comes from TrueType hinting. On each contour, an unlisted point takes its delta from the nearest listed points on either side, going round the contour:</p>
+<ul>
+<li>if it lies between them, in x (or in y, for the y delta), its delta is interpolated between theirs;</li>
+<li>if it lies beyond both, it takes the delta of the nearer one;</li>
+<li>if the two have the same coordinate, it takes their delta when they agree, and 0 when they don’t.</li>
+</ul>
+<p id="ix-12">That is <code>infer_delta</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-gvar-table.hh#L665"><code>hb-ot-var-gvar-table.hh:665</code></a>):</p>
+<pre><code class="language-c++">if (prev_val == next_val)
+  return (prev_delta == next_delta) ? prev_delta : 0.f;
+else if (target_val &lt;= hb_min (prev_val, next_val))
+  return (prev_val &lt; next_val) ? prev_delta : next_delta;
+else if (target_val &gt;= hb_max (prev_val, next_val))
+  return (prev_val &gt; next_val) ? prev_delta : next_delta;
+
+/* linear interpolation */
+float r = (target_val - prev_val) / (next_val - prev_val);
+return prev_delta + r * (next_delta - prev_delta);
+</code></pre>
+<p id="ix-13">varLib left points out of <code>V</code>’s light tuple because IUP gets them right. Point 1, the top left, has delta 0, and point 6, the bottom right, has −60. The points from 2 to 5, down the right side, all have the same x as point 6 at the default, which is beyond point 1’s, so they take point 6’s delta, and the whole right edge moves 60 units left. Point 0, the bottom left, is at point 1’s x, below point 6’s, so it takes point 1’s delta of 0. The right phantom, point 8, is listed with −60, so the advance shrinks with the stem.</p>
+<figure class="draw slider"><div class="frames"><div class="frame print" data-value="100" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=100">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L120,700L120,525L120,350L120,175L120,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=100</div><code class="frame-shape">[V=0+200]</code></div><div class="frame" data-value="125" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=125">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L125,700L125,525L125,350L125,175L125,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=125</div><code class="frame-shape">[V=0+205]</code></div><div class="frame" data-value="150" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=150">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L130,700L130,525L130,350L130,175L130,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=150</div><code class="frame-shape">[V=0+210]</code></div><div class="frame" data-value="175" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=175">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L135,700L135,525L135,350L135,175L135,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=175</div><code class="frame-shape">[V=0+215]</code></div><div class="frame" data-value="200" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=200">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L140,700L140,525L140,350L140,175L140,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=200</div><code class="frame-shape">[V=0+220]</code></div><div class="frame" data-value="225" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=225">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L145,700L145,525L145,350L145,175L145,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=225</div><code class="frame-shape">[V=0+225]</code></div><div class="frame" data-value="250" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=250">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L150,700L150,525L150,350L150,175L150,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=250</div><code class="frame-shape">[V=0+230]</code></div><div class="frame" data-value="275" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=275">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L155,700L155,525L155,350L155,175L155,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=275</div><code class="frame-shape">[V=0+235]</code></div><div class="frame" data-value="300" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=300">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L160,700L160,525L160,350L160,175L160,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=300</div><code class="frame-shape">[V=0+240]</code></div><div class="frame" data-value="325" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=325">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L165,700L165,525L165,350L165,175L165,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=325</div><code class="frame-shape">[V=0+245]</code></div><div class="frame" data-value="350" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=350">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L170,700L170,525L170,350L170,175L170,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=350</div><code class="frame-shape">[V=0+250]</code></div><div class="frame" data-value="375" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=375">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L175,700L175,525L175,350L175,175L175,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=375</div><code class="frame-shape">[V=0+255]</code></div><div class="frame print" data-value="400"><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=400">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L180,700L180,525L180,350L180,175L180,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=400</div><code class="frame-shape">[V=0+260]</code></div><div class="frame" data-value="425" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=425">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L196,700L194.5,525L193,350L191.5,175L190,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=425</div><code class="frame-shape">[V=0+276]</code></div><div class="frame" data-value="450" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=450">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L212.01,700L209.01,525L206.01,350L203.01,175L200.01,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=450</div><code class="frame-shape">[V=0+292]</code></div><div class="frame" data-value="475" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=475">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L228.01,700L223.51,525L219.01,350L214.51,175L210,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=475</div><code class="frame-shape">[V=0+308]</code></div><div class="frame" data-value="500" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=500">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L244,700L238,525L232,350L226,175L220,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=500</div><code class="frame-shape">[V=0+324]</code></div><div class="frame" data-value="525" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=525">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L260,700L252.5,525L245,350L237.5,175L230,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=525</div><code class="frame-shape">[V=0+340]</code></div><div class="frame" data-value="550" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=550">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L276,700L267,525L258,350L249,175L240,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=550</div><code class="frame-shape">[V=0+356]</code></div><div class="frame" data-value="575" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=575">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L292.01,700L281.51,525L271.01,350L260.51,175L250.01,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=575</div><code class="frame-shape">[V=0+372]</code></div><div class="frame" data-value="600" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=600">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L308.01,700L296.01,525L284.01,350L272.01,175L260,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=600</div><code class="frame-shape">[V=0+388]</code></div><div class="frame" data-value="625" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=625">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L324,700L310.5,525L297,350L283.5,175L270,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=625</div><code class="frame-shape">[V=0+404]</code></div><div class="frame" data-value="650" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=650">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L340,700L325,525L310,350L295,175L280,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=650</div><code class="frame-shape">[V=0+420]</code></div><div class="frame" data-value="675" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=675">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L354,700L336.7,525L319.5,350L302.3,175L285,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=675</div><code class="frame-shape">[V=0+434]</code></div><div class="frame" data-value="700" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=700">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L368.01,700L348.41,525L329.01,350L309.61,175L290,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=700</div><code class="frame-shape">[V=0+448]</code></div><div class="frame" data-value="725" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=725">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L382.01,700L360.11,525L338.5,350L316.9,175L295,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=725</div><code class="frame-shape">[V=0+462]</code></div><div class="frame" data-value="750" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=750">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L396,700L371.8,525L348,350L324.2,175L300,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=750</div><code class="frame-shape">[V=0+476]</code></div><div class="frame" data-value="775" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=775">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L410,700L383.5,525L357.5,350L331.5,175L305,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=775</div><code class="frame-shape">[V=0+490]</code></div><div class="frame" data-value="800" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=800">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L424,700L395.2,525L367,350L338.8,175L310,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=800</div><code class="frame-shape">[V=0+504]</code></div><div class="frame" data-value="825" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=825">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L438.01,700L406.91,525L376.51,350L346.11,175L315,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=825</div><code class="frame-shape">[V=0+518]</code></div><div class="frame" data-value="850" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=850">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L452.01,700L418.61,525L386,350L353.4,175L320,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=850</div><code class="frame-shape">[V=0+532]</code></div><div class="frame" data-value="875" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=875">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L466,700L430.3,525L395.5,350L360.7,175L325,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=875</div><code class="frame-shape">[V=0+546]</code></div><div class="frame print" data-value="900" hidden><svg viewBox="-40 -840 640 1080" role="img" aria-label="V at wght=900">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L480,700L442,525L405,350L368,175L330,0L80,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=900</div><code class="frame-shape">[V=0+560]</code></div></div><label class="control"><span>wght</span><input type="range" min="100" max="900" step="25" value="400"><output>400</output></label><figcaption><code>hb-vector variations/var.ttf "V" --variations=wght=…</code>, drawn at every 25 from 100 to 900</figcaption></figure>
+<p id="ix-14">Toward the heavy end, varLib <em>did</em> list every point, even though the middle ones lie on a straight line and IUP could have found them: their deltas grow evenly down the edge, 300, 262, 225, 188, 150. It chooses whichever encoding is smaller, and listing which points are present costs bytes too. A font can’t be told from its outlines whether IUP was used.</p>
+<p id="ix-15">HarfBuzz runs IUP on each contour separately. It stops at the last contour’s end, so the phantom points are never inferred: a phantom that isn’t listed gets no delta, which is what the specification intends. A contour with no listed points is left alone; a contour with only one listed point moves as a whole, since every other point takes that point’s delta. And the inference is made against the glyph’s <em>default</em> points, not points already moved by earlier tuples, which is right, and which shapes the fast path below.</p>
+<p id="ix-16">The specification infers from each tuple’s deltas before multiplying them by the tuple’s scalar. HarfBuzz infers from deltas already multiplied. The two are equal, apart from floating-point rounding.</p>
+<h3 id="the-fast-path">The fast path</h3>
+<p id="ix-17">Most tuples in most fonts give deltas for every point. For those, <code>apply_deltas_to_points</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-gvar-table.hh#L769"><code>hb-ot-var-gvar-table.hh:769</code></a>) doesn’t build any arrays: it decodes each delta, multiplies it by the scalar and adds it straight into the point (<code>decompile_deltas_add_to_points</code>, 692). But that’s only safe if no later tuple needs IUP, because IUP needs the default points, and the fast path has changed them. So before taking the fast path, HarfBuzz looks ahead: if any remaining tuple, with a scalar that isn’t 0, has its own list of points, it takes the slow path, which keeps the deltas apart until a copy of the default points has been made.</p>
+<h2 id="composites">Composites</h2>
+<p id="ix-18">A composite glyph is made of other glyphs, each placed at an offset. Under gvar, each component counts as one point, its offset, so a tuple can move a component as a whole. One of HarfBuzz’s test fonts, <code>TestGVAR-Composite-0.ttf</code> from the Unicode text-rendering tests, has an <code>Ö</code> built from an <code>O</code> and a diaeresis, and a tuple on its slant axis that moves only the diaeresis:</p>
+<figure class="draw slider"><div class="frames"><div class="frame print" data-value="-15" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-15">
+<g transform="scale(1,-1)">
+<path d="M159,-10Q116,-10 86.5,11.5Q57,33 45,69Q33,105 44,146L103,366Q114,406 141.5,438.5Q169,471 207,490.5Q245,510 285,510Q328,510 358,488.5Q388,467 400,431.5Q412,396 401,354L342,133Q332,94 303.5,61.5Q275,29 237,9.5Q199,-10 159,-10ZM159,40Q188,40 216,54.5Q244,69 265,93Q286,117 294,146L353,366Q360,393 353.5,414Q347,435 329.5,447.5Q312,460 285,460Q256,460 228,445.5Q200,431 179.5,407Q159,383 151,354L92,133Q85,107 91.5,86Q98,65 115.5,52.5Q133,40 159,40ZM392,575Q380,575 372.5,585Q365,595 368,606L374,630Q376,639 382.6,644.5Q389.2,650 398,650Q409.88,650 417.44,640Q425,630 422,619L416,595Q414,586 407.5,580.5Q401,575 392,575ZM242,575Q230,575 222.5,585Q215,595 218,606L224,630Q226,639 232.6,644.5Q239.2,650 248,650Q259.88,650 267.44,640Q275,630 272,619L266,595Q264,586 257.5,580.5Q251,575 242,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-15</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame" data-value="-14" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-14">
+<g transform="scale(1,-1)">
+<path d="M161.87,-10Q119,-10 89.2,11.43Q59.4,32.87 46.83,68.73Q34.27,104.6 44.53,145.6L99.6,365.6Q109.87,405.67 136.9,438.27Q163.93,470.87 201.67,490.43Q239.4,510 279.47,510Q322.33,510 352.6,488.57Q382.87,467.13 395.43,431.73Q408,396.33 397.73,354.4L342.67,133.47Q333.33,94.33 305.37,61.73Q277.4,29.13 239.67,9.57Q201.93,-10 161.87,-10ZM161.87,40Q190.8,40 218.43,54.43Q246.07,68.87 266.57,92.8Q287.07,116.73 294.53,145.6L349.6,365.6Q356.13,392.67 349.17,413.77Q342.2,434.87 324.37,447.43Q306.53,460 279.47,460Q250.6,460 222.93,445.57Q195.27,431.13 175.23,407.23Q155.2,383.33 147.73,354.4L92.67,133.47Q86.13,107.4 93.1,86.27Q100.07,65.13 117.93,52.57Q135.8,40 161.87,40ZM384.34,575Q372.47,575 364.97,584.83Q357.47,594.67 360.27,605.6L365.87,629.67Q367.74,638.8 374.4,644.4Q381.06,650 389.94,650Q401.76,650 409.28,640.2Q416.8,630.4 414,619.4L408.4,595.33Q406.54,586.27 400,580.63Q393.47,575 384.34,575ZM234.34,575Q222.47,575 214.97,584.83Q207.47,594.67 210.27,605.6L215.87,629.67Q217.74,638.8 224.4,644.4Q231.06,650 239.94,650Q251.76,650 259.28,640.2Q266.8,630.4 264,619.4L258.4,595.33Q256.54,586.27 250,580.63Q243.47,575 234.34,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-14</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame" data-value="-13" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-13">
+<g transform="scale(1,-1)">
+<path d="M164.73,-10Q122,-10 91.9,11.37Q61.8,32.73 48.67,68.47Q35.53,104.2 45.07,145.2L96.2,365.2Q105.73,405.33 132.3,438.03Q158.86,470.73 196.33,490.37Q233.8,510 273.93,510Q316.66,510 347.2,488.63Q377.73,467.27 390.86,431.97Q404,396.67 394.47,354.8L343.33,133.93Q334.67,94.67 307.23,61.97Q279.8,29.27 242.33,9.63Q204.87,-10 164.73,-10ZM164.73,40Q193.6,40 220.87,54.37Q248.13,68.73 268.13,92.6Q288.13,116.47 295.07,145.2L346.2,365.2Q352.27,392.33 344.83,413.53Q337.4,434.73 319.23,447.37Q301.06,460 273.93,460Q245.2,460 217.86,445.63Q190.53,431.27 170.96,407.47Q151.4,383.67 144.47,354.8L93.33,133.93Q87.27,107.8 94.7,86.53Q102.13,65.27 120.37,52.63Q138.6,40 164.73,40ZM376.66,575Q364.93,575 357.43,584.67Q349.93,594.33 352.53,605.2L357.73,629.33Q359.46,638.6 366.18,644.3Q372.9,650 381.86,650Q393.63,650 401.11,640.4Q408.6,630.8 406,619.8L400.8,595.67Q399.06,586.53 392.5,580.77Q385.93,575 376.66,575ZM226.66,575Q214.93,575 207.43,584.67Q199.93,594.33 202.53,605.2L207.73,629.33Q209.46,638.6 216.18,644.3Q222.9,650 231.86,650Q243.63,650 251.11,640.4Q258.6,630.8 256,619.8L250.8,595.67Q249.06,586.53 242.5,580.77Q235.93,575 226.66,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-13</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame" data-value="-12" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-12">
+<g transform="scale(1,-1)">
+<path d="M167.6,-10Q125,-10 94.6,11.3Q64.2,32.6 50.5,68.2Q36.8,103.8 45.6,144.8L92.8,364.8Q101.6,405 127.7,437.8Q153.8,470.6 191,490.3Q228.2,510 268.4,510Q311,510 341.8,488.7Q372.6,467.4 386.3,432.2Q400,397 391.2,355.2L344,134.4Q336,95 309.1,62.2Q282.2,29.4 245,9.7Q207.8,-10 167.6,-10ZM167.6,40Q196.4,40 223.3,54.3Q250.2,68.6 269.7,92.4Q289.2,116.2 295.6,144.8L342.8,364.8Q348.4,392 340.5,413.3Q332.6,434.6 314.1,447.3Q295.6,460 268.4,460Q239.8,460 212.8,445.7Q185.8,431.4 166.7,407.7Q147.6,384 141.2,355.2L94,134.4Q88.4,108.2 96.3,86.8Q104.2,65.4 122.8,52.7Q141.4,40 167.6,40ZM369,575Q357.4,575 349.9,584.5Q342.4,594 344.8,604.8L349.6,629Q351.2,638.4 357.98,644.2Q364.76,650 373.8,650Q385.5,650 392.95,640.6Q400.4,631.2 398,620.2L393.2,596Q391.6,586.8 385,580.9Q378.4,575 369,575ZM219,575Q207.4,575 199.9,584.5Q192.4,594 194.8,604.8L199.6,629Q201.2,638.4 207.98,644.2Q214.76,650 223.8,650Q235.5,650 242.95,640.6Q250.4,631.2 248,620.2L243.2,596Q241.6,586.8 235,580.9Q228.4,575 219,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-12</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame" data-value="-11" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-11">
+<g transform="scale(1,-1)">
+<path d="M170.47,-10Q128,-10 97.3,11.23Q66.6,32.47 52.33,67.93Q38.07,103.4 46.13,144.4L89.4,364.4Q97.47,404.67 123.1,437.57Q148.73,470.47 185.67,490.23Q222.6,510 262.87,510Q305.33,510 336.4,488.77Q367.47,467.53 381.73,432.43Q396,397.33 387.93,355.6L344.67,134.87Q337.33,95.33 310.97,62.43Q284.6,29.53 247.67,9.77Q210.73,-10 170.47,-10ZM170.47,40Q199.2,40 225.73,54.23Q252.27,68.47 271.27,92.2Q290.27,115.93 296.13,144.4L339.4,364.4Q344.53,391.67 336.17,413.07Q327.8,434.47 308.97,447.23Q290.13,460 262.87,460Q234.4,460 207.73,445.77Q181.07,431.53 162.43,407.93Q143.8,384.33 137.93,355.6L94.67,134.87Q89.53,108.6 97.9,87.07Q106.27,65.53 125.23,52.77Q144.2,40 170.47,40ZM361.33,575Q349.87,575 342.37,584.33Q334.87,593.67 337.07,604.4L341.47,628.67Q342.93,638.2 349.77,644.1Q356.61,650 365.73,650Q377.38,650 384.79,640.8Q392.2,631.6 390,620.6L385.6,596.33Q384.13,587.07 377.5,581.03Q370.87,575 361.33,575ZM211.33,575Q199.87,575 192.37,584.33Q184.87,593.67 187.07,604.4L191.47,628.67Q192.93,638.2 199.77,644.1Q206.61,650 215.73,650Q227.38,650 234.79,640.8Q242.2,631.6 240,620.6L235.6,596.33Q234.13,587.07 227.5,581.03Q220.87,575 211.33,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-11</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame" data-value="-10" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-10">
+<g transform="scale(1,-1)">
+<path d="M173.33,-10Q131,-10 100,11.17Q69,32.33 54.17,67.67Q39.33,103 46.67,144L86,364Q93.33,404.33 118.5,437.33Q143.67,470.33 180.33,490.17Q217,510 257.34,510Q299.67,510 331,488.83Q362.33,467.67 377.17,432.67Q392,397.67 384.67,356L345.33,135.33Q338.67,95.67 312.83,62.67Q287,29.67 250.33,9.83Q213.67,-10 173.33,-10ZM173.33,40Q202,40 228.17,54.17Q254.33,68.33 272.83,92Q291.33,115.67 296.67,144L336,364Q340.67,391.33 331.83,412.83Q323,434.33 303.83,447.17Q284.67,460 257.34,460Q229,460 202.67,445.83Q176.33,431.67 158.17,408.17Q140,384.67 134.67,356L95.33,135.33Q90.67,109 99.5,87.33Q108.33,65.67 127.67,52.83Q147,40 173.33,40ZM353.67,575Q342.34,575 334.84,584.17Q327.34,593.33 329.34,604L333.34,628.33Q334.67,638 341.57,644Q348.47,650 357.67,650Q369.26,650 376.63,641Q384,632 382,621L378,596.67Q376.67,587.33 370,581.17Q363.34,575 353.67,575ZM203.67,575Q192.34,575 184.84,584.17Q177.34,593.33 179.34,604L183.34,628.33Q184.67,638 191.57,644Q198.47,650 207.67,650Q219.26,650 226.63,641Q234,632 232,621L228,596.67Q226.67,587.33 220,581.17Q213.34,575 203.67,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-10</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame" data-value="-9" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-9">
+<g transform="scale(1,-1)">
+<path d="M176.2,-10Q134,-10 102.7,11.1Q71.4,32.2 56,67.4Q40.6,102.6 47.2,143.6L82.6,363.6Q89.2,404 113.9,437.1Q138.6,470.2 175,490.1Q211.4,510 251.8,510Q294,510 325.6,488.9Q357.2,467.8 372.6,432.9Q388,398 381.4,356.4L346,135.8Q340,96 314.7,62.9Q289.4,29.8 253,9.9Q216.6,-10 176.2,-10ZM176.2,40Q204.8,40 230.6,54.1Q256.4,68.2 274.4,91.8Q292.4,115.4 297.2,143.6L332.6,363.6Q336.8,391 327.5,412.6Q318.2,434.2 298.7,447.1Q279.2,460 251.8,460Q223.6,460 197.6,445.9Q171.6,431.8 153.9,408.4Q136.2,385 131.4,356.4L96,135.8Q91.8,109.4 101.1,87.6Q110.4,65.8 130.1,52.9Q149.8,40 176.2,40ZM346,575Q334.8,575 327.3,584Q319.8,593 321.6,603.6L325.2,628Q326.4,637.8 333.36,643.9Q340.32,650 349.6,650Q361.13,650 368.46,641.2Q375.8,632.4 374,621.4L370.4,597Q369.2,587.6 362.5,581.3Q355.8,575 346,575ZM196,575Q184.8,575 177.3,584Q169.8,593 171.6,603.6L175.2,628Q176.4,637.8 183.36,643.9Q190.32,650 199.6,650Q211.13,650 218.46,641.2Q225.8,632.4 224,621.4L220.4,597Q219.2,587.6 212.5,581.3Q205.8,575 196,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-9</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame" data-value="-8" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-8">
+<g transform="scale(1,-1)">
+<path d="M179.07,-10Q137,-10 105.4,11.03Q73.8,32.07 57.83,67.13Q41.87,102.2 47.73,143.2L79.2,363.2Q85.07,403.67 109.3,436.87Q133.53,470.07 169.67,490.03Q205.8,510 246.27,510Q288.33,510 320.2,488.97Q352.07,467.93 368.03,433.13Q384,398.33 378.13,356.8L346.67,136.27Q341.33,96.33 316.57,63.13Q291.8,29.93 255.67,9.97Q219.53,-10 179.07,-10ZM179.07,40Q207.6,40 233.03,54.03Q258.47,68.07 275.97,91.6Q293.47,115.13 297.73,143.2L329.2,363.2Q332.93,390.67 323.17,412.37Q313.4,434.07 293.57,447.03Q273.73,460 246.27,460Q218.2,460 192.53,445.97Q166.87,431.93 149.63,408.63Q132.4,385.33 128.13,356.8L96.67,136.27Q92.93,109.8 102.7,87.87Q112.47,65.93 132.53,52.97Q152.6,40 179.07,40ZM338.33,575Q327.27,575 319.77,583.83Q312.27,592.67 313.87,603.2L317.07,627.67Q318.13,637.6 325.15,643.8Q332.17,650 341.53,650Q353,650 360.3,641.4Q367.6,632.8 366,621.8L362.8,597.33Q361.73,587.87 355,581.43Q348.27,575 338.33,575ZM188.33,575Q177.27,575 169.77,583.83Q162.27,592.67 163.87,603.2L167.07,627.67Q168.13,637.6 175.15,643.8Q182.17,650 191.53,650Q203,650 210.3,641.4Q217.6,632.8 216,621.8L212.8,597.33Q211.73,587.87 205,581.43Q198.27,575 188.33,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-8</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame print" data-value="-7" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-7">
+<g transform="scale(1,-1)">
+<path d="M181.93,-10Q140,-10 108.1,10.97Q76.2,31.93 59.67,66.87Q43.13,101.8 48.27,142.8L75.8,362.8Q80.93,403.33 104.7,436.63Q128.47,469.93 164.33,489.97Q200.2,510 240.73,510Q282.67,510 314.8,489.03Q346.93,468.07 363.47,433.37Q380,398.67 374.87,357.2L347.33,136.73Q342.67,96.67 318.43,63.37Q294.2,30.07 258.33,10.03Q222.47,-10 181.93,-10ZM181.93,40Q210.4,40 235.47,53.97Q260.53,67.93 277.53,91.4Q294.53,114.87 298.27,142.8L325.8,362.8Q329.07,390.33 318.83,412.13Q308.6,433.93 288.43,446.97Q268.27,460 240.73,460Q212.8,460 187.47,446.03Q162.13,432.07 145.37,408.87Q128.6,385.67 124.87,357.2L97.33,136.73Q94.07,110.2 104.3,88.13Q114.53,66.07 134.97,53.03Q155.4,40 181.93,40ZM330.67,575Q319.73,575 312.23,583.67Q304.73,592.33 306.13,602.8L308.93,627.33Q309.87,637.4 316.95,643.7Q324.03,650 333.47,650Q344.88,650 352.14,641.6Q359.4,633.2 358,622.2L355.2,597.67Q354.27,588.13 347.5,581.57Q340.73,575 330.67,575ZM180.67,575Q169.73,575 162.23,583.67Q154.73,592.33 156.13,602.8L158.93,627.33Q159.87,637.4 166.95,643.7Q174.03,650 183.47,650Q194.88,650 202.14,641.6Q209.4,633.2 208,622.2L205.2,597.67Q204.27,588.13 197.5,581.57Q190.73,575 180.67,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-7</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame" data-value="-6" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-6">
+<g transform="scale(1,-1)">
+<path d="M184.8,-10Q143,-10 110.8,10.9Q78.6,31.8 61.5,66.6Q44.4,101.4 48.8,142.4L72.4,362.4Q76.8,403 100.1,436.4Q123.4,469.8 159,489.9Q194.6,510 235.2,510Q277,510 309.4,489.1Q341.8,468.2 358.9,433.6Q376,399 371.6,357.6L348,137.2Q344,97 320.3,63.6Q296.6,30.2 261,10.1Q225.4,-10 184.8,-10ZM184.8,40Q213.2,40 237.9,53.9Q262.6,67.8 279.1,91.2Q295.6,114.6 298.8,142.4L322.4,362.4Q325.2,390 314.5,411.9Q303.8,433.8 283.3,446.9Q262.8,460 235.2,460Q207.4,460 182.4,446.1Q157.4,432.2 141.1,409.1Q124.8,386 121.6,357.6L98,137.2Q95.2,110.6 105.9,88.4Q116.6,66.2 137.4,53.1Q158.2,40 184.8,40ZM323,575Q312.2,575 304.7,583.5Q297.2,592 298.4,602.4L300.8,627Q301.6,637.2 308.74,643.6Q315.88,650 325.4,650Q336.75,650 343.97,641.8Q351.2,633.6 350,622.6L347.6,598Q346.8,588.4 340,581.7Q333.2,575 323,575ZM173,575Q162.2,575 154.7,583.5Q147.2,592 148.4,602.4L150.8,627Q151.6,637.2 158.74,643.6Q165.88,650 175.4,650Q186.75,650 193.97,641.8Q201.2,633.6 200,622.6L197.6,598Q196.8,588.4 190,581.7Q183.2,575 173,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-6</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame" data-value="-5" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-5">
+<g transform="scale(1,-1)">
+<path d="M187.67,-10Q146,-10 113.5,10.83Q81,31.67 63.33,66.33Q45.67,101 49.33,142L69,362Q72.67,402.67 95.5,436.17Q118.33,469.67 153.67,489.83Q189,510 229.66,510Q271.33,510 304,489.17Q336.67,468.33 354.33,433.83Q372,399.33 368.33,358L348.67,137.67Q345.33,97.33 322.17,63.83Q299,30.33 263.67,10.17Q228.33,-10 187.67,-10ZM187.67,40Q216,40 240.33,53.83Q264.67,67.67 280.67,91Q296.67,114.33 299.33,142L319,362Q321.33,389.67 310.17,411.67Q299,433.67 278.17,446.83Q257.33,460 229.66,460Q202,460 177.33,446.17Q152.67,432.33 136.83,409.33Q121,386.33 118.33,358L98.67,137.67Q96.33,111 107.5,88.67Q118.67,66.33 139.83,53.17Q161,40 187.67,40ZM315.33,575Q304.66,575 297.16,583.33Q289.66,591.67 290.66,602L292.66,626.67Q293.33,637 300.53,643.5Q307.73,650 317.33,650Q328.62,650 335.81,642Q343,634 342,623L340,598.33Q339.33,588.67 332.5,581.83Q325.66,575 315.33,575ZM165.33,575Q154.66,575 147.16,583.33Q139.66,591.67 140.66,602L142.66,626.67Q143.33,637 150.53,643.5Q157.73,650 167.33,650Q178.62,650 185.81,642Q193,634 192,623L190,598.33Q189.33,588.67 182.5,581.83Q175.66,575 165.33,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-5</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame" data-value="-4" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-4">
+<g transform="scale(1,-1)">
+<path d="M190.53,-10Q149,-10 116.2,10.77Q83.4,31.53 65.17,66.07Q46.93,100.6 49.87,141.6L65.6,361.6Q68.53,402.33 90.9,435.93Q113.27,469.53 148.33,489.77Q183.4,510 224.13,510Q265.67,510 298.6,489.23Q331.53,468.47 349.77,434.07Q368,399.67 365.07,358.4L349.33,138.13Q346.67,97.67 324.03,64.07Q301.4,30.47 266.33,10.23Q231.27,-10 190.53,-10ZM190.53,40Q218.8,40 242.77,53.77Q266.73,67.53 282.23,90.8Q297.73,114.07 299.87,141.6L315.6,361.6Q317.47,389.33 305.83,411.43Q294.2,433.53 273.03,446.77Q251.87,460 224.13,460Q196.6,460 172.27,446.23Q147.93,432.47 132.57,409.57Q117.2,386.67 115.07,358.4L99.33,138.13Q97.47,111.4 109.1,88.93Q120.73,66.47 142.27,53.23Q163.8,40 190.53,40ZM307.67,575Q297.13,575 289.63,583.17Q282.13,591.33 282.93,601.6L284.53,626.33Q285.07,636.8 292.33,643.4Q299.59,650 309.27,650Q320.5,650 327.65,642.2Q334.8,634.4 334,623.4L332.4,598.67Q331.87,588.93 325,581.97Q318.13,575 307.67,575ZM157.67,575Q147.13,575 139.63,583.17Q132.13,591.33 132.93,601.6L134.53,626.33Q135.07,636.8 142.33,643.4Q149.59,650 159.27,650Q170.5,650 177.65,642.2Q184.8,634.4 184,623.4L182.4,598.67Q181.87,588.93 175,581.97Q168.13,575 157.67,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-4</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame" data-value="-3" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-3">
+<g transform="scale(1,-1)">
+<path d="M193.4,-10Q152,-10 118.9,10.7Q85.8,31.4 67,65.8Q48.2,100.2 50.4,141.2L62.2,361.2Q64.4,402 86.3,435.7Q108.2,469.4 143,489.7Q177.8,510 218.6,510Q260,510 293.2,489.3Q326.4,468.6 345.2,434.3Q364,400 361.8,358.8L350,138.6Q348,98 325.9,64.3Q303.8,30.6 269,10.3Q234.2,-10 193.4,-10ZM193.4,40Q221.6,40 245.2,53.7Q268.8,67.4 283.8,90.6Q298.8,113.8 300.4,141.2L312.2,361.2Q313.6,389 301.5,411.2Q289.4,433.4 267.9,446.7Q246.4,460 218.6,460Q191.2,460 167.2,446.3Q143.2,432.6 128.3,409.8Q113.4,387 111.8,358.8L100,138.6Q98.6,111.8 110.7,89.2Q122.8,66.6 144.7,53.3Q166.6,40 193.4,40ZM300,575Q289.6,575 282.1,583Q274.6,591 275.2,601.2L276.4,626Q276.8,636.6 284.12,643.3Q291.44,650 301.2,650Q312.38,650 319.49,642.4Q326.6,634.8 326,623.8L324.8,599Q324.4,589.2 317.5,582.1Q310.6,575 300,575ZM150,575Q139.6,575 132.1,583Q124.6,591 125.2,601.2L126.4,626Q126.8,636.6 134.12,643.3Q141.44,650 151.2,650Q162.38,650 169.49,642.4Q176.6,634.8 176,623.8L174.8,599Q174.4,589.2 167.5,582.1Q160.6,575 150,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-3</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame" data-value="-2" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-2">
+<g transform="scale(1,-1)">
+<path d="M196.27,-10Q155,-10 121.6,10.63Q88.2,31.27 68.83,65.53Q49.47,99.8 50.93,140.8L58.8,360.8Q60.26,401.67 81.7,435.47Q103.13,469.27 137.66,489.63Q172.2,510 213.06,510Q254.33,510 287.8,489.37Q321.26,468.73 340.63,434.53Q360,400.33 358.53,359.2L350.67,139.07Q349.33,98.33 327.77,64.53Q306.2,30.73 271.67,10.37Q237.13,-10 196.27,-10ZM196.27,40Q224.4,40 247.63,53.63Q270.87,67.27 285.37,90.4Q299.87,113.53 300.93,140.8L308.8,360.8Q309.73,388.67 297.16,410.97Q284.6,433.27 262.76,446.63Q240.93,460 213.06,460Q185.8,460 162.13,446.37Q138.46,432.73 124.03,410.03Q109.6,387.33 108.53,359.2L100.67,139.07Q99.73,112.2 112.3,89.47Q124.87,66.73 147.13,53.37Q169.4,40 196.27,40ZM292.33,575Q282.06,575 274.56,582.83Q267.06,590.67 267.46,600.8L268.26,625.67Q268.53,636.4 275.91,643.2Q283.29,650 293.13,650Q304.25,650 311.32,642.6Q318.4,635.2 318,624.2L317.2,599.33Q316.93,589.47 310,582.23Q303.06,575 292.33,575ZM142.33,575Q132.06,575 124.56,582.83Q117.06,590.67 117.46,600.8L118.26,625.67Q118.53,636.4 125.91,643.2Q133.29,650 143.13,650Q154.25,650 161.32,642.6Q168.4,635.2 168,624.2L167.2,599.33Q166.93,589.47 160,582.23Q153.06,575 142.33,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-2</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame" data-value="-1" hidden><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=-1">
+<g transform="scale(1,-1)">
+<path d="M199.13,-10Q158,-10 124.3,10.57Q90.6,31.13 70.67,65.27Q50.73,99.4 51.47,140.4L55.4,360.4Q56.13,401.33 77.1,435.23Q98.07,469.13 132.33,489.57Q166.6,510 207.53,510Q248.67,510 282.4,489.43Q316.13,468.87 336.07,434.77Q356,400.67 355.27,359.6L351.33,139.53Q350.67,98.67 329.63,64.77Q308.6,30.87 274.33,10.43Q240.07,-10 199.13,-10ZM199.13,40Q227.2,40 250.07,53.57Q272.93,67.13 286.93,90.2Q300.93,113.27 301.47,140.4L305.4,360.4Q305.87,388.33 292.83,410.73Q279.8,433.13 257.63,446.57Q235.47,460 207.53,460Q180.4,460 157.07,446.43Q133.73,432.87 119.77,410.27Q105.8,387.67 105.27,359.6L101.33,139.53Q100.87,112.6 113.9,89.73Q126.93,66.87 149.57,53.43Q172.2,40 199.13,40ZM284.66,575Q274.53,575 267.03,582.67Q259.53,590.33 259.73,600.4L260.13,625.33Q260.26,636.2 267.7,643.1Q275.14,650 285.06,650Q296.12,650 303.16,642.8Q310.2,635.6 310,624.6L309.6,599.67Q309.46,589.73 302.5,582.37Q295.53,575 284.66,575ZM134.66,575Q124.53,575 117.03,582.67Q109.53,590.33 109.73,600.4L110.13,625.33Q110.26,636.2 117.7,643.1Q125.14,650 135.06,650Q146.12,650 153.16,642.8Q160.2,635.6 160,624.6L159.6,599.67Q159.46,589.73 152.5,582.37Q145.53,575 134.66,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=-1</div><code class="frame-shape">[Odieresis=0+404]</code></div><div class="frame print" data-value="0"><svg viewBox="-40 -790 505 980" role="img" aria-label="Ö at slnt=0">
+<g transform="scale(1,-1)">
+<path d="M202,-10Q161,-10 127,10.5Q93,31 72.5,65Q52,99 52,140L52,360Q52,401 72.5,435Q93,469 127,489.5Q161,510 202,510Q243,510 277,489.5Q311,469 331.5,435Q352,401 352,360L352,140Q352,99 331.5,65Q311,31 277,10.5Q243,-10 202,-10ZM202,40Q230,40 252.5,53.5Q275,67 288.5,90Q302,113 302,140L302,360Q302,388 288.5,410.5Q275,433 252.5,446.5Q230,460 202,460Q175,460 152,446.5Q129,433 115.5,410.5Q102,388 102,360L102,140Q102,113 115.5,90Q129,67 152,53.5Q175,40 202,40ZM277,575Q267,575 259.5,582.5Q252,590 252,600L252,625Q252,636 259.5,643Q267,650 277,650Q288,650 295,643Q302,636 302,625L302,600Q302,590 295,582.5Q288,575 277,575ZM127,575Q117,575 109.5,582.5Q102,590 102,600L102,625Q102,636 109.5,643Q117,650 127,650Q138,650 145,643Q152,636 152,625L152,600Q152,590 145,582.5Q138,575 127,575Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">slnt=0</div><code class="frame-shape">[Odieresis=0+404]</code></div></div><label class="control"><span>slnt</span><input type="range" min="-15" max="0" step="1" value="0"><output>0</output></label><figcaption><code>hb-vector hb:test/shape/data/text-rendering-tests/fonts/TestGVAR-Composite-0.ttf "Ö" --variations=slnt=…</code>, drawn at every 1 from -15 to 0</figcaption></figure>
+<p id="ix-19">The diaeresis’s offset goes from 52 units at slant 0 to 92 at −15. Each component’s point is marked as the end of its own contour (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/CompositeGlyph.hh#L244"><code>OT/glyf/CompositeGlyph.hh:244</code></a>), so IUP never moves a component that a tuple doesn’t list. A component with the <code>USE_MY_METRICS</code> flag gives the composite its metrics, so its phantom points are copied to the composite’s, and the composite’s own phantom deltas aren’t used, as the specification says.</p>
+<h2 id="where-the-outline-lands">Where the outline lands</h2>
+<p id="ix-20">Two steps happen after the deltas are applied. First, at the top level, every point is shifted by the varied left phantom (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/Glyph.hh#L585"><code>Glyph.hh:585</code></a>), under a comment that reads “Undocumented rasterizer behavior: Shift points horizontally by the updated left side bearing”. So a delta on phantom 0 moves the outline, not just the metrics.</p>
+<p id="ix-21">Second, the points stay floats. Drawing doesn’t round them at all, while extents and advances are rounded in font units, before the font’s size is applied:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">V</span><span class="cps">U+0056</span></td><td class="opt">--variations=wght=613 --show-extents --font-size=100000</td><td class="out"><code>[V=0+39600&lt;8000,70000,23600,-70000&gt;]</code></td></tr></tbody></table></div>
+<p id="ix-22">At weight 613, <code>V</code>’s right edge is drawn at fractional positions: in <code>hb-vector</code>’s output, the top right corner is at x = 316.33. But at 100 times the font’s size, its extents come out as multiples of 100: a width of 23600, not 23633. A renderer that draws the outline and an application that lays out boxes from the extents see slightly different glyphs.</p>
+<h2 id="when-things-go-wrong">When things go wrong</h2>
+<p id="ix-23">HarfBuzz treats damage to gvar in two ways. If a glyph’s variation header can’t be read, its variations are dropped and the glyph is drawn at the default, with the comment “so isn’t applied at all”. But if the data inside a tuple is broken, a run that is too long or a list of points that runs off the end, the whole glyph fails: it isn’t drawn, and if its advance came from the phantoms, it falls back to half an em.</p>
+<p id="ix-24">Some other robustness choices: a point number past the end of the glyph is skipped; a point listed twice gets both deltas added; gvar’s own glyph count is never read, and the face’s glyph count is used instead (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-gvar-table.hh#L659"><code>hb-ot-var-gvar-table.hh:659</code></a>). And HarfBuzz accepts one encoding the specification doesn’t have. The packed deltas in gvar have three kinds of run: zeros, bytes and 16-bit words. HarfBuzz reads them with the same decoder as VARC’s data, which has a fourth, 32-bit run, marked by both flag bits. No conforming font has one in gvar, since to a reader that follows the specification those bits mean a run of zeros.</p>
+<h2 id="gvar">GVAR</h2>
+<p id="ix-25">A font with more than 65,535 glyphs uses <code>GVAR</code>, from the 2026 ISO standard. In HarfBuzz both tables come from one template, <code>gvar_GVAR&lt;T, Types&gt;</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-gvar-table.hh#L318"><code>hb-ot-var-gvar-table.hh:318</code></a>), with <code>SmallTypes</code> for gvar and <code>MediumTypes</code> for GVAR, as in the GSUB chapter’s beyond-64k formats. The glyph count is 24-bit in GVAR, and so is the offset to each glyph’s serialized data, which the standard’s table says too, although a note beside it says the glyph count is the only difference. The standard also says that “bit 1” of the flags selects long offsets, where Microsoft’s specification and HarfBuzz use bit 0.</p>
+<h2 id="cff2">CFF2</h2>
+<p id="ix-26">CFF2 outlines vary differently. There are no stored deltas per point. Instead, a charstring’s <code>blend</code> operator takes a default value and one delta for each region, and the region scalars come from an item variation store. HarfBuzz computes the scalars once for each charstring, at its first <code>blend</code>, and adds the deltas without rounding (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff2-interp-cs.hh"><code>hb-cff2-interp-cs.hh</code></a>). It ignores blended values in the Private DICT, which are hinting values, with the comment “Hint values are ignored here”.</p>
+<h2 id="cvar">cvar</h2>
+<p id="ix-27"><code>cvar</code> varies the control values that TrueType hinting instructions read. HarfBuzz doesn’t hint, so its font functions never read cvar. The only user is the subsetter: when it makes a static instance of a variable font, it adds the cvar deltas at that position into a copy of <code>cvt </code>, rounded (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.cc#L347"><code>hb-subset.cc:347</code></a>), so the instance hints the way the variable font would have there.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/Glyph.hh"><code>src/OT/glyf/Glyph.hh</code></a></td>
+<td><code>get_points</code>, 326: phantom points, composites, the left-side-bearing shift</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh"><code>src/OT/glyf/glyf.hh</code></a></td>
+<td>drawing, extents, and advances from phantom points</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-gvar-table.hh"><code>src/hb-ot-var-gvar-table.hh</code></a></td>
+<td><code>apply_deltas_to_points</code>, 769; <code>infer_delta</code>, 665; the fast path, 692; GVAR</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-common.hh"><code>src/hb-ot-var-common.hh</code></a></td>
+<td><code>calculate_scalar</code>, 112, and the shared-tuple cache; point numbers</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff2-interp-cs.hh"><code>src/hb-cff2-interp-cs.hh</code></a></td>
+<td>CFF2 <code>blend</code> and <code>vsindex</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-cvar-table.hh"><code>src/hb-ot-var-cvar-table.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.cc"><code>src/hb-subset.cc</code></a></td>
+<td>cvar, used only when instancing</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>gvar varies every point, including four phantom points for the metrics. Without HVAR, advances come from the phantoms.</li>
+<li>Points a tuple doesn’t list are inferred per contour from their neighbors, against the default outline. Phantom points are never inferred.</li>
+<li>Shared peaks have cached scalars. In 15.1.0, tuples with their own intermediate regions stopped using that cache, which fixed wrong outlines.</li>
+<li>A component of a composite glyph moves as one point.</li>
+<li>Outlines are drawn unrounded; extents and advances are rounded in font units.</li>
+<li>Broken tuple data makes a glyph vanish; a broken header only drops its variations.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="deltas.html">← Deltas</a><a rel="next" href="variable-components.html">VARC: variable components →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Blobs, faces and lazy tables · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part II · Foundations</p>
+<h1 id="blobs-faces-and-lazy-tables">7. Blobs, faces and lazy tables</h1>
+<p id="ix-1">The <a href="fonts-as-bytes.html">last two chapters</a> showed how HarfBuzz reads a table: it lays a struct over the bytes, and <a href="trust-nothing-the-sanitizer.html">the sanitizer</a> checks those bytes once so that the struct can be trusted afterward. This chapter is about where the bytes come from, and when each table is checked. The answer to the second question is: as late as possible, and only once.</p>
+<p id="ix-2">Two objects hold a font before it has a size. A <strong>blob</strong> is a run of bytes with a reference count and a way to free them. A <strong>face</strong> is a blob seen as one font in an sfnt file: it knows how to find a table by its tag, and it keeps, for each table HarfBuzz uses, a slot that stays empty until something asks for that table. The first request fills the slot, sanitizing the table and often building a faster structure to read it with, and every later request just reads the pointer. There are no locks. If two threads ask at once, both do the work and one of them throws its copy away. If the table is missing or broken, the slot is filled with an empty table, so the work isn’t done again.</p>
+<p id="ix-3">The result is that opening a font costs almost nothing, a font that is never used for vertical text never has its <code>vmtx</code> read, and one face can be shared by every thread in a program. The <code>hb_font_t</code> built on a face, with its size and variation coordinates, is the subject of the <a href="fonts-and-font-functions.html">next chapter</a>.</p>
+<h2 id="blobs">Blobs</h2>
+<p id="ix-4">A blob is small. Here are its fields, from <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.hh#L39"><code>hb-blob.hh:39</code></a>, without the helpers that some encoders use to reuse their output buffers:</p>
+<pre><code class="language-c++">struct hb_blob_t
+{
+  hb_object_header_t header;
+
+  const char *data = nullptr;
+  unsigned int length = 0;
+  hb_memory_mode_t mode = (hb_memory_mode_t) 0;
+
+  void *user_data = nullptr;
+  hb_destroy_func_t destroy = nullptr;
+  /* … */
+};
+</code></pre>
+<p id="ix-5"><code>data</code> and <code>length</code> say where the bytes are. <code>destroy</code> is called with <code>user_data</code> when the last reference to the blob goes, and it’s how the bytes get freed, unmapped, or handed back to whoever owns them. HarfBuzz never frees <code>data</code> itself.</p>
+<p id="ix-6"><code>hb_blob_create</code> takes all five, and it takes ownership of <code>user_data</code> straight away: if it can’t make the blob, because the length is zero, or 2<sup>31</sup> bytes or more, or memory runs out, it calls <code>destroy</code> before returning (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.cc#L69"><code>hb-blob.cc:69</code></a>, <code>:107</code>). A caller never has to work out whether to clean up after a failure. What it gets back on failure is the <strong>empty blob</strong>, <code>hb_blob_get_empty()</code>, which is the blob’s Null object (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.cc#L226"><code>hb-blob.cc:226</code></a>): no data, length zero. The <code>_or_fail</code> variant returns <code>NULL</code> instead.</p>
+<h3 id="memory-modes">Memory modes</h3>
+<p>The mode tells HarfBuzz what it may do with the bytes:</p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-7"><code>HB_MEMORY_MODE_DUPLICATE</code></td>
+<td>Copy the data now. The blob owns the copy, and the caller can reuse its buffer at once.</td>
+</tr>
+<tr>
+<td id="ix-8"><code>HB_MEMORY_MODE_READONLY</code></td>
+<td id="ix-9">Use the caller’s bytes in place, and never write to them.</td>
+</tr>
+<tr>
+<td id="ix-10"><code>HB_MEMORY_MODE_WRITABLE</code></td>
+<td id="ix-11">Use the caller’s bytes in place. HarfBuzz may write to them.</td>
+</tr>
+<tr>
+<td id="ix-12"><code>HB_MEMORY_MODE_READONLY_MAY_MAKE_WRITABLE</code></td>
+<td id="ix-13">Read-only, but HarfBuzz may try to make the pages writable in place, with <code>mprotect</code>.</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-14">The comment above the enum in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.h"><code>hb-blob.h</code></a> gives the advice: use <code>DUPLICATE</code> if the caller might change or free the data, <code>READONLY</code> otherwise, <code>WRITABLE</code> only for a copy made just for HarfBuzz, and not the last mode at all (“using that mode correctly is very tricky. Use <code>HB_MEMORY_MODE_READONLY</code> instead”). <code>DUPLICATE</code> isn’t really a mode of its own: <code>hb_blob_create_or_fail</code> starts the blob as <code>READONLY</code> and immediately makes it writable, which copies it.</p>
+<h3 id="from-a-file">From a file</h3>
+<p id="ix-15"><code>hb_blob_create_from_file_or_fail</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.cc#L789"><code>hb-blob.cc:789</code></a>) first tries to map the file into memory: with <code>mmap</code> (<code>PROT_READ</code>, <code>MAP_PRIVATE</code>) on POSIX systems, or with <code>CreateFileMapping</code> and <code>MapViewOfFile</code> on Windows (<code>_hb_blob_try_mmap</code>, <code>:620</code> and <code>:659</code>). The blob’s destroy function unmaps it. Nothing is read from disk at this point: the operating system brings pages in as they are touched, and pages that are never touched are never read. On a Mac, if the file’s data fork is empty, HarfBuzz maps its resource fork instead, which is where old dfont-style fonts keep their data.</p>
+<p id="ix-16">If mapping fails, or the system has no <code>mmap</code>, HarfBuzz reads the file into memory in growing chunks (<code>_hb_blob_read_file</code>, <code>:732</code>). That route works on pipes too, and it stops at about 512 MiB. The mapped blob is created with the “very tricky” mode, <code>READONLY_MAY_MAKE_WRITABLE</code>. HarfBuzz owns the mapping, and it is private, so even a write to it would never reach the file.</p>
+<h3 id="sub-blobs">Sub-blobs</h3>
+<p id="ix-17">Every table HarfBuzz reads from a file is a <strong>sub-blob</strong>: a blob that points into another blob’s bytes. Here is all of <code>hb_blob_create_sub_blob</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.cc#L169"><code>hb-blob.cc:169</code></a>), without the declarations:</p>
+<pre><code class="language-c++">if (!length || !parent || offset &gt;= parent-&gt;length)
+  return hb_blob_get_empty ();
+
+hb_blob_make_immutable (parent);
+
+blob = hb_blob_create (parent-&gt;data + offset,
+                       hb_min (length, parent-&gt;length - offset),
+                       HB_MEMORY_MODE_READONLY,
+                       hb_blob_reference (parent),
+                       _hb_blob_destroy);
+</code></pre>
+<p id="ix-18">Three things happen. The parent becomes immutable, so its bytes can no longer be swapped out from under its children. The child’s length is cut to what the parent actually has, so a table record that claims more bytes than the file holds gets only what is there. And the child holds a reference to the parent as its <code>user_data</code>, with <code>hb_blob_destroy</code> as its destroy function, so a table blob keeps the whole file alive for as long as anyone holds it. No bytes are copied.</p>
+<h3 id="writable-copies-and-why-little-needs-them-now">Writable copies, and why little needs them now</h3>
+<p id="ix-19">A blob can be made writable: <code>hb_blob_get_data_writable</code> asks for it, and <code>try_make_writable</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.cc#L473"><code>hb-blob.cc:473</code></a>) first tries <code>mprotect</code> on the pages, if the mode allows it, and otherwise copies the data into memory the blob owns. <code>hb_blob_copy_writable_or_fail</code> always copies.</p>
+<p id="ix-20">This used to matter. The sanitizer once repaired broken tables by editing them, and it needed writable bytes to do it. Since HarfBuzz 12.3 it repairs nothing (the <a href="trust-nothing-the-sanitizer.html">sanitizer chapter</a> tells that story): a table either passes, and is made immutable, or is dropped. So nothing on the path from a font file to a shaped run writes to a blob any more, and the <code>mprotect</code> route is, in practice, unused: the file blob is made immutable as soon as a face is made from it, and <code>hb_blob_get_data_writable</code> refuses an immutable blob. The few places in the library that need writable bytes make a copy. <code>cvar</code>, for example, copies the <code>cvt</code> table with <code>hb_blob_copy_writable_or_fail</code> before applying its deltas to it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-cvar-table.hh#L178"><code>hb-ot-var-cvar-table.hh:178</code></a>).</p>
+<h2 id="objects-references-and-user-data">Objects, references and user data</h2>
+<p id="ix-21">Blobs, faces, fonts, buffers and the other public objects all start with the same header (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-object.hh#L213"><code>hb-object.hh:213</code></a>):</p>
+<pre><code class="language-c++">struct hb_object_header_t
+{
+  hb_reference_count_t ref_count;
+  mutable hb_atomic_t&lt;bool&gt; writable = false;
+  hb_atomic_t&lt;hb_user_data_array_t *&gt; user_data;
+};
+</code></pre>
+<p id="ix-22">The reference count is an atomic integer. <code>hb_object_create</code> starts it at one, <code>reference</code> adds one, and <code>destroy</code> takes one away and frees the object when it reaches zero. A count of <em>zero</em> has a special meaning: it marks a static object, such as an empty singleton, which <code>reference</code> and <code>destroy</code> leave alone. The empty blob and the empty face are made with <code>HB_OBJECT_HEADER_STATIC</code>, which is all zeros, so they are never counted, never freed, and, since <code>writable</code> is false, always immutable. <code>hb_face_create_or_fail</code> uses that last fact to recognize the empty face: an immutable face straight from <code>hb_face_create</code> can only be the singleton.</p>
+<p id="ix-23"><code>writable</code> is the immutability flag: <code>make_immutable</code> clears it, and setters check it. <code>user_data</code> lets an application hang its own pointers on any object, each under a key, with a destroy function that runs when the object dies. The array is allocated on first use, published with the same compare-and-swap that the lazy loaders below use, and the array itself is guarded by a mutex. It is the one place in this chapter with a lock in it.</p>
+<h2 id="faces">Faces</h2>
+<p id="ix-24">A face is the struct in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.hh#L47"><code>hb-face.hh:47</code></a>. Trimmed of the per-shaper data and the table-tag callback:</p>
+<pre><code class="language-c++">struct hb_face_t
+{
+  hb_object_header_t header;
+
+  unsigned int index;                       /* Face index in a collection */
+  mutable hb_atomic_t&lt;unsigned&gt; upem;
+  mutable hb_atomic_t&lt;unsigned&gt; num_glyphs;
+
+  hb_reference_table_func_t  reference_table_func;
+  void                      *user_data;
+  hb_destroy_func_t          destroy;
+
+  hb_ot_face_t table;                       /* All the face's tables. */
+  /* … and the shape-plan cache */
+};
+</code></pre>
+<p id="ix-25">There is no blob in it. A face doesn’t know where its bytes are: it has a function, <code>reference_table_func</code>, which it calls with a tag and gets a blob back, and that is the only way any table gets into a face. <code>face-&gt;reference_table (tag)</code> is a thin wrapper that turns a missing function or a <code>NULL</code> result into the empty blob (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.hh#L80"><code>hb-face.hh:80</code></a>).</p>
+<h3 id="hb_face_create">hb_face_create</h3>
+<p id="ix-26">The usual face is made from a blob holding a font file. <code>hb_face_create</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc#L244"><code>hb-face.cc:244</code></a>) does very little:</p>
+<pre><code class="language-c++">blob = hb_sanitize_context_t ().sanitize_blob&lt;OT::OpenTypeFontFile&gt; (hb_blob_reference (blob));
+
+hb_face_for_data_closure_t *closure = _hb_face_for_data_closure_create (blob, index);
+
+face = hb_face_create_for_tables (_hb_face_for_data_reference_table,
+                                  closure,
+                                  _hb_face_for_data_closure_destroy);
+face-&gt;index = index;
+</code></pre>
+<p id="ix-27">It sanitizes the file as an <code>OpenTypeFontFile</code>, which means only the outer container: the sfnt header and its table records, or a TTC header and each face’s directory, or a dfont resource map. No table is looked at. Then it stores the blob and the face index in a small closure and makes a face whose <code>reference_table_func</code> reads from that closure. The face holds its own reference to the blob, so the caller can destroy its reference as soon as the face exists.</p>
+<p id="ix-28">If the file fails that check, the sanitizer hands back the empty blob, and the face is made anyway. <code>hb_face_create</code> never fails, except for lack of memory: given rubbish, it returns a working face with no tables in it, whose upem is 1000 and whose glyph count is zero. <code>hb_face_create_or_fail</code> (<code>:289</code>) is the version that says no. It counts the faces in the blob first, and returns <code>NULL</code> if the index is out of range.</p>
+<h3 id="finding-a-table">Finding a table</h3>
+<p id="ix-29">The function that every table of a file-based face passes through is <code>_hb_face_for_data_reference_table</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc#L185"><code>hb-face.cc:185</code></a>):</p>
+<pre><code class="language-c++">if (tag == HB_TAG_NONE)
+  return hb_blob_reference (data-&gt;blob);
+
+const OT::OpenTypeFontFile &amp;ot_file = *data-&gt;blob-&gt;as&lt;OT::OpenTypeFontFile&gt; ();
+unsigned int base_offset;
+const OT::OpenTypeFontFace &amp;ot_face = ot_file.get_face (data-&gt;index, &amp;base_offset);
+
+const OT::OpenTypeTable &amp;table = ot_face.get_table_by_tag (tag);
+
+hb_blob_t *blob = hb_blob_create_sub_blob (data-&gt;blob, base_offset + table.offset, table.length);
+</code></pre>
+<p id="ix-30">The tag <code>HB_TAG_NONE</code> asks for the whole file. Any other tag is looked up in the face’s table directory, as <a href="fonts-as-bytes.html#finding-a-table">Fonts as bytes</a> describes. A tag that isn’t there finds the Null table record, whose offset and length are zero, and a sub-blob of length zero is the empty blob. A table whose record points past the end of the file gets the empty blob too, or a shortened one, from the clamping in <code>hb_blob_create_sub_blob</code>. None of this touches the table’s contents, so a call to <code>reference_table</code> costs a directory search and one small allocation.</p>
+<blockquote>
+<p id="ix-31">For programmers: <code>hb_face_reference_table</code> is this function, with nothing added. It returns the table’s bytes <em>unsanitized</em>. Only the face’s lazy loaders, below, check what they load. A program that reads a table itself through the public API has to check it itself.</p>
+</blockquote>
+<h3 id="collections-and-the-face-index">Collections and the face index</h3>
+<p id="ix-32">A TrueType Collection (TTC) holds several faces in one file, each with its own table directory. Identical tables can be stored once and pointed at from several directories. The test file <code>pair.ttc</code> is a collection of two of the fonts from the <a href="gsub.html">GSUB chapter</a>, <code>ligatures.ttf</code> and <code>ccmp-first.ttf</code>. Its two directories point at the same bytes for every table except <code>GSUB</code> and <code>head</code>, so the two faces share their glyphs, <code>cmap</code> and metrics, and differ only in the order of their lookups. HarfBuzz counts the faces with <code>hb_face_count</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc#L80"><code>hb-face.cc:80</code></a>), which sanitizes the container and asks it:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">pair.ttc</td><td class="opt">--show-face-count</td><td class="out"><pre><code>Face count: 2</code></pre></td></tr></tbody></table></div>
+<p id="ix-33">The face index picks one. Face 1’s <code>ccmp</code> lookup comes before its <code>liga</code> lookup, so the <code>f i</code> that <code>ccmp</code> makes from <code>x</code> can still ligate:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">pair.ttc</td><td class="in"><span class="txt">x</span><span class="cps">U+0078</span></td><td class="opt">--face-index=0</td><td class="out"><code>[f=0+500|i=0+500]</code></td></tr><tr><td class="font">pair.ttc</td><td class="in"><span class="txt">x</span><span class="cps">U+0078</span></td><td class="opt">--face-index=1</td><td class="out"><code>[f_i=0+900]</code></td></tr></tbody></table></div>
+<p id="ix-34">In a collection, table offsets count from the start of the file, so <code>base_offset</code> is zero. In a dfont, they count from the start of each face’s resource, and <code>get_face</code> returns where that is. A single sfnt ignores the index altogether.</p>
+<p id="ix-35">The index is a 32-bit number, but only its low 16 bits choose a face: the closure stores <code>index &amp; 0xFFFF</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc#L170"><code>hb-face.cc:170</code></a>). The high 16 bits, if they aren’t zero, choose a <strong>named instance</strong> of a variable font, counting from one. The face only keeps them. It is <code>hb_font_create</code> that reads them, and sets the font to named instance <code>(index &gt;&gt; 16) - 1</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2155"><code>hb-font.cc:2155</code></a>). The test font <code>instances.ttf</code> is the variable font from the <a href="design-space.html">design space chapter</a> with three named instances added: Thin, Bold and Black. <code>hb-shape</code> passes <code>--face-index</code> straight to the face, so 65536 (1 &lt;&lt; 16) asks for instance 0, 131072 for instance 1, and so on:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">instances.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt"></td><td class="out"><code>[I=0+260|H=1+600|V=2+260]</code></td></tr><tr><td class="font">instances.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--face-index=65536</td><td class="out"><code>[I=0+200|H=1+560|V=2+200]</code></td></tr><tr><td class="font">instances.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--face-index=131072</td><td class="out"><code>[I=0+370|H=1+668|V=2+448]</code></td></tr><tr><td class="font">instances.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--face-index=196608</td><td class="out"><code>[I=0+410|H=1+700|V=2+560]</code></td></tr><tr><td class="font">instances.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--named-instance=1</td><td class="out"><code>[I=0+370|H=1+668|V=2+448]</code></td></tr><tr><td class="font">instances.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--face-index=262144</td><td class="out"><code>[I=0+260|H=1+600|V=2+260]</code></td></tr></tbody></table></div>
+<p id="ix-36">Index 131072 gives the same result as <code>--named-instance=1</code>, which sets the instance on the font directly. Index 262144 asks for a fourth instance that the font doesn’t have, and gets the default one. This packing gives an index alone enough room to name both a face in a collection and an instance in it, which is how some font systems identify a font. Until HarfBuzz 15.1, <code>hb_face_create_or_fail</code> compared the whole index with the face count, so it refused any index with the high bits set. The <code>hb-shape</code> runs above, which go through it, would have failed.</p>
+<h3 id="faces-from-somewhere-else">Faces from somewhere else</h3>
+<p id="ix-37">Because tables only come in through a callback, a face doesn’t need a font file at all. <code>hb_face_create_for_tables</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc#L130"><code>hb-face.cc:130</code></a>) takes the callback, its <code>user_data</code>, and a destroy function, and makes a face around them. It’s how an application whose fonts live elsewhere (a font editor’s tables in memory, or a system font API that hands out tables one at a time) gives HarfBuzz just the tables it asks for. Such a face can’t list its tables unless <code>hb_face_set_get_table_tags_func</code> is given one more callback that can.</p>
+<p id="ix-38">The <strong>face builder</strong> is a face made this way. <code>hb_face_builder_create</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face-builder.cc#L215"><code>hb-face-builder.cc:215</code></a>) returns a face whose callback reads from a hash map of tag to blob, and <code>hb_face_builder_add_table</code> adds to the map. Asking a builder face for <code>HB_TAG_NONE</code>, through <code>hb_face_reference_blob</code>, makes it write all its tables out as a new font file. The subsetter uses it to assemble its output, and <code>hb_face_reference_blob</code> uses it for any face that can list its tables but can’t give its file as a whole (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc#L742"><code>hb-face.cc:742</code></a>).</p>
+<blockquote>
+<p id="ix-39">For programmers: a <code>reference_table_func</code> may be called more than once for the same tag, and from several threads at once. Two threads that race to load a table both call it (see below), and some accelerators load tables directly rather than through the face’s slot for them. It should return a new reference each time, and be safe to call from any thread.</p>
+</blockquote>
+<h3 id="face-loaders">Face loaders</h3>
+<p id="ix-40">Since HarfBuzz 11.0 there is a second way to choose how a face is read: by a <strong>face loader</strong> name. <code>hb_face_create_from_file_or_fail_using</code> and <code>hb_face_create_or_fail_using</code> take a file or a blob, a face index, and a loader name, and look the name up in a short table (<code>supported_face_loaders</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc#L335"><code>hb-face.cc:335</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Built when</th>
+<th>Reads the font with</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ot</code></td>
+<td>always</td>
+<td id="ix-41">HarfBuzz itself: <code>hb_face_create_or_fail</code></td>
+</tr>
+<tr>
+<td><code>ft</code></td>
+<td>with FreeType</td>
+<td>FreeType, which, depending on how it was built, can read WOFF and WOFF2 too</td>
+</tr>
+<tr>
+<td><code>coretext</code></td>
+<td>with Core Text</td>
+<td>Core Text</td>
+</tr>
+<tr>
+<td><code>directwrite</code></td>
+<td>with DirectWrite</td>
+<td>DirectWrite</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-42">With no name, or an empty one, the <code>HB_FACE_LOADER</code> environment variable is tried, and then the first loader in the table, which is always <code>ot</code>. A name from the environment that isn’t in the table falls back to the default, but one passed in by the caller makes the call fail. <code>hb_face_list_loaders</code> lists what was built in, and the command-line tools take <code>--face-loader</code>. The book’s build of HarfBuzz has only <code>ot</code>. Whatever the loader, the result is an ordinary <code>hb_face_t</code>, and the rest of HarfBuzz can’t tell the difference. Some loaders end up wrapping the font’s bytes in a face much like <code>hb_face_create</code>’s; others make a face whose <code>reference_table_func</code> asks their library for each table.</p>
+<h3 id="units-per-em-and-the-glyph-count">Units per em and the glyph count</h3>
+<p id="ix-43">Two numbers are needed so often that the face keeps them in fields of its own: <code>upem</code> and <code>num_glyphs</code>. Both are atomics and both are filled in lazily, with a sentinel value meaning “not loaded yet”: zero for <code>upem</code>, and <code>UINT_MAX</code> for <code>num_glyphs</code>, which <code>hb_face_create_for_tables</code> sets. The first call to <code>get_upem</code> reads <code>head</code>, and the first call to <code>get_num_glyphs</code> reads <code>maxp</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-static.cc#L79"><code>hb-static.cc:79</code></a> and <code>:86</code>). If two threads do this at once, they both store the same number, which is harmless.</p>
+<p id="ix-44"><code>head</code>’s <code>get_upem</code> returns 1000 for any value outside 16 to 16,384, including the zero that a missing <code>head</code> gives. The empty face has 1000 and zero glyphs built in, so it never loads anything. <code>hb_face_set_upem</code> and <code>hb_face_set_glyph_count</code> can set either number by hand, for faces made from tables that don’t have them.</p>
+<h3 id="immutability">Immutability</h3>
+<p id="ix-45"><code>hb_font_create</code> makes its face immutable (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2113"><code>hb-font.cc:2113</code></a>), and so does <code>hb_shape_plan_create2</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L267"><code>hb-shape-plan.cc:267</code></a>). From then on the face’s setters do nothing: <code>hb_face_set_index</code>, <code>hb_face_set_upem</code>, <code>hb_face_set_glyph_count</code> and <code>hb_face_set_get_table_tags_func</code> all check the flag first. A face is meant to be set up and then only read.</p>
+<p id="ix-46">Immutable doesn’t mean nothing inside it changes. Its tables are still loaded on first use, its shape-plan cache still grows, and both are written to by whichever thread gets there first. What immutability promises is that nothing a caller can <em>see</em> changes, which is what makes lazy loading safe to do behind the caller’s back.</p>
+<h2 id="lazy-tables">Lazy tables</h2>
+<h3 id="one-pointer-per-table">One pointer per table</h3>
+<p id="ix-47">The <code>table</code> field of a face is an <code>hb_ot_face_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-face.hh#L48"><code>hb-ot-face.hh:48</code></a>), and nearly all of it is generated from a list. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-face-table-list.hh"><code>hb-ot-face-table-list.hh</code></a> names every table that a face can load, each with one of two macros:</p>
+<pre><code class="language-c++">HB_OT_TABLE (OT, head)
+HB_OT_ACCELERATOR (OT, maxp)
+HB_OT_ACCELERATOR (OT, cmap)
+/* … */
+HB_OT_ACCELERATOR (OT, GSUB)
+HB_OT_ACCELERATOR (OT, GPOS)
+</code></pre>
+<p id="ix-48"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-face.hh"><code>hb-ot-face.hh</code></a> includes the list twice. The first time it makes an enum, with one entry per table, starting from one. The second time it makes a member per table:</p>
+<pre><code class="language-c++">hb_face_t *face; /* MUST be JUST before the lazy loaders. */
+#define HB_OT_TABLE(Namespace, Type) \
+  hb_table_lazy_loader_t&lt;Namespace::Type, HB_OT_TABLE_ORDER (Namespace, Type)&gt; Type;
+#define HB_OT_ACCELERATOR(Namespace, Type) \
+  hb_face_lazy_loader_t&lt;Namespace::Type##_accelerator_t, HB_OT_TABLE_ORDER (Namespace, Type)&gt; Type;
+#include &quot;hb-ot-face-table-list.hh&quot;
+</code></pre>
+<p id="ix-49">So <code>face-&gt;table.head</code> is a loader for the <code>head</code> table itself, and <code>face-&gt;table.GSUB</code> is a loader for a <code>GSUB_accelerator_t</code>, a structure built from the table. Each loader is exactly one pointer, and it starts as <code>NULL</code>.</p>
+<p id="ix-50">A loader needs the face to load anything, but it doesn’t store a pointer to it. It works out where the face pointer is from its own address. Its position in the enum, <code>WheresData</code>, is the number of pointers between it and the <code>face</code> field just before the loaders, so (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-machinery.hh#L160"><code>hb-machinery.hh:160</code></a>):</p>
+<pre><code class="language-c++">Data * get_data () const
+{ return *(((Data **) (void *) this) - WheresData); }
+</code></pre>
+<p id="ix-51"><code>head</code> is first in the enum, so its loader is one pointer after <code>face</code>. That is why the comment insists that <code>face</code> comes “JUST before” the loaders, and why the enum starts with a dummy <code>ORDER_ZERO</code>. With about forty tables on the list in a full build, the trick halves the size of the table slots. The list’s own header comment is blunt about the cost that remains: “Don’t add a table unless it’s used though. This is not exactly zero-cost.”</p>
+<p id="ix-52">The list is cut down at compile time. A build with <code>HB_NO_VERTICAL</code> has no <code>vhea</code>, <code>vmtx</code> or <code>VORG</code> slots, one with <code>HB_NO_COLOR</code> none for the color tables, and so on. Some tables a face uses aren’t on it at all, because an accelerator loads them for itself: <code>HVAR</code> and <code>VVAR</code> are loaded by the <code>hmtx</code> and <code>vmtx</code> accelerators, and the 24-bit <code>GLYF</code> and <code>LOCA</code> by the <code>glyf</code> accelerator.</p>
+<h3 id="loading-without-a-lock">Loading without a lock</h3>
+<p id="ix-53">Every loader is a <code>hb_lazy_loader_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-machinery.hh#L185"><code>hb-machinery.hh:185</code></a>), and every access, whether <code>face-&gt;table.GSUB-&gt;…</code>, <code>*face-&gt;table.head</code> or a plain <code>get()</code>, comes down to <code>get_stored</code> (<code>:230</code>):</p>
+<pre><code class="language-c++">Stored * get_stored () const
+{
+retry:
+  Stored *p = this-&gt;instance.get_acquire ();
+  if (unlikely (!p))
+  {
+    if (unlikely (this-&gt;is_inert ()))
+      return const_cast&lt;Stored *&gt; (Funcs::get_null ());
+
+    p = this-&gt;template call_create&lt;Stored, Funcs&gt; ();
+    if (unlikely (!p))
+      p = tagged_null (const_cast&lt;Stored *&gt; (Funcs::get_null ()));
+
+    if (unlikely (!cmpexch (nullptr, p)))
+    {
+      do_destroy (p);
+      goto retry;
+    }
+  }
+  return untagged (p);
+}
+</code></pre>
+<p id="ix-54">Once a table is loaded, this is one atomic load and a test. The load is an <em>acquire</em>, which guarantees that a thread that sees the pointer also sees everything that was written into the object before the pointer was published, so a half-built accelerator can never be seen.</p>
+<p id="ix-55">When the pointer is <code>NULL</code>, the thread builds the object itself, then tries to publish it with a compare-and-swap: “if the slot is still <code>NULL</code>, put my pointer there”. If that works, the object is the face’s. If it doesn’t, another thread got there first. The loser destroys what it built and starts again from the top, where it now finds the winner’s pointer and returns that. Both threads end up with the same object, and nothing leaks.</p>
+<p id="ix-56">The cost is that, in a race, the work is done twice, which for <code>GSUB</code> means sanitizing it twice. That’s rare, since it can only happen the first time a table is used, and the alternative, a lock taken on every access or a lock held while a large table is sanitized, would cost every caller every time. (<code>cmpexch</code> is a <code>compare_exchange_weak</code>, which is allowed to fail even when the slot is empty. That just means one more trip round the loop.)</p>
+<p id="ix-57">No locks also means no deadlocks. A loader’s <code>create</code> often needs other tables: loading any table first asks for the glyph count, which loads <code>maxp</code>, and the <code>GDEF</code> accelerator checks the lengths of <code>GSUB</code> and <code>GPOS</code> against its list of known broken fonts, which loads them. Each of those is just another call to <code>get_stored</code>, on another slot. The one loop that would never end, <code>maxp</code> needing the glyph count to load <code>maxp</code>, is broken by hand: the <code>maxp</code> accelerator tells the sanitizer the glyph count is zero rather than asking (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-maxp-table.hh#L193"><code>hb-ot-maxp-table.hh:193</code></a>).</p>
+<p id="ix-58"><code>is_inert</code> is true when the face pointer is <code>NULL</code>. That is the case only for the empty face, whose fields are all zero and live in read-only memory: its loaders return the Null object without trying to build or store anything.</p>
+<h3 id="two-kinds-of-loader">Two kinds of loader</h3>
+<p id="ix-59"><code>hb_table_lazy_loader_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-machinery.hh#L325"><code>hb-machinery.hh:325</code></a>) stores a blob. Its <code>create</code> is two lines:</p>
+<pre><code class="language-c++">static hb_blob_t *create (hb_face_t *face)
+{
+  hb_sanitize_context_t c;
+  return c.reference_table&lt;T&gt; (face);
+}
+</code></pre>
+<p id="ix-60">and reading it turns the blob into the struct with <code>blob-&gt;as&lt;T&gt; ()</code>, which is a cast, or, if the blob is shorter than <code>T</code>’s minimum size, <code>T</code>’s Null object. <code>face-&gt;table.head</code> is used like a pointer to <code>OT::head</code>.</p>
+<p id="ix-61"><code>hb_face_lazy_loader_t</code> (<code>:313</code>) stores an <strong>accelerator</strong>: an object built from one or more tables, with whatever the code that reads them wants to have ready. Its <code>create</code> is the default one, which allocates the accelerator and runs its constructor with the face. The constructor loads and sanitizes the table it’s built on, then does the rest of its setup.</p>
+<table>
+<thead>
+<tr>
+<th id="ix-62">Accelerator</th>
+<th>What it prepares</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-63"><code>cmap</code></td>
+<td id="ix-64">chooses the best subtable once, finds the variation-selector subtable, prepares format 4 for fast searching, and allocates a 1 KB cache of recent lookups</td>
+</tr>
+<tr>
+<td id="ix-65"><code>GSUB</code>, <code>GPOS</code></td>
+<td id="ix-66">the table, its lookup count, and an array of empty slots, one per lookup, for the lookup accelerators</td>
+</tr>
+<tr>
+<td id="ix-67"><code>GDEF</code></td>
+<td id="ix-68">the table, minus a few known-bad ones; small mark-filtering sets flattened into bitmaps</td>
+</tr>
+<tr>
+<td id="ix-69"><code>glyf</code></td>
+<td id="ix-70">chooses <code>GLYF</code>/<code>LOCA</code> or <code>glyf</code>/<code>loca</code>, reads the <code>loca</code> format from <code>head</code>, and keeps pointers to the <code>gvar</code>, <code>hmtx</code> and <code>vmtx</code> accelerators it will need</td>
+</tr>
+<tr>
+<td id="ix-71"><code>hmtx</code>, <code>vmtx</code></td>
+<td id="ix-72">the metrics table and its <code>HVAR</code> or <code>VVAR</code></td>
+</tr>
+<tr>
+<td id="ix-73"><code>maxp</code></td>
+<td id="ix-74">the glyph count, from <code>MAXP</code> if there is one, else <code>maxp</code></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-75">The accelerators are lazy inside, too. A <code>GSUB</code> accelerator doesn’t build the per-lookup accelerators (the set digests and subtable caches the <a href="gsub.html">GSUB chapter</a> relies on) until a lookup is first applied. <code>get_accel</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L6747"><code>hb-ot-layout-gsubgpos.hh:6747</code></a>) fills each lookup’s slot with exactly the same acquire, build, compare-and-swap, destroy-and-retry pattern. So a face whose font has 500 lookups, of which a given text uses 20, builds 20 lookup accelerators. The <code>cmap</code> cache shared by every thread is an <code>hb_cache_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cache.hh"><code>hb-cache.hh</code></a>), whose entries are single atomic integers that hold both a key and a value, so a thread reading an entry that another is writing sees either the old pair or the new one, and at worst misses.</p>
+<h3 id="failure-is-cached-as-null">Failure is cached as Null</h3>
+<p id="ix-76">A table that is missing, or that fails sanitizing, doesn’t leave its slot empty. <code>reference_table</code> returns the empty blob in both cases, and the empty blob is stored like any other, so the next access finds a non-<code>NULL</code> pointer and returns at once. The table is never looked for again, and never sanitized again, for the life of the face. Every caller then reads the Null object of the table’s type, all zeros, which (as <a href="fonts-as-bytes.html">Fonts as bytes</a> explains) reads as a valid, empty table: a <code>GSUB</code> with no scripts, features or lookups. No code that uses a table has to check whether it loaded.</p>
+<p id="ix-77">The <a href="trust-nothing-the-sanitizer.html#pass-or-fail">sanitizer chapter</a> shows what that does to shaping. Seen from the face, it looks like this. <code>broken-gsub.ttf</code> is <code>ligatures.ttf</code> from the GSUB chapter with one offset changed: the GSUB header’s offset to its lookup list points far past the end of the table. The table is still in the font’s directory, with its 274 bytes. But when <code>hb-info</code> asks for the features, what it gets is the Null <code>GSUB</code>, so it lists none:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">broken-gsub.ttf</td><td class="opt">--list-tables</td><td class="out"><pre><code>Table information:
+
+Tag	Size
+------------
+GDEF       40 bytes
+GSUB      274 bytes
+OS/2       96 bytes
+cmap      100 bytes
+glyf      390 bytes
+head       54 bytes
+hhea       36 bytes
+hmtx       62 bytes
+loca       36 bytes
+maxp       32 bytes
+name      123 bytes
+post      124 bytes</code></pre></td></tr><tr><td class="font">broken-gsub.ttf</td><td class="opt">--list-features</td><td class="out"><pre><code>Layout features information:
+
+Showing all font features with duplicates removed.
+
+Table: GSUB
+Table: GPOS</code></pre></td></tr></tbody></table></div>
+<blockquote>
+<p>For type designers: if a font shapes as though it had no layout at all, though <code>hb-info --list-tables</code> shows the table, a table that failed sanitizing is the likely reason.</p>
+</blockquote>
+<p id="ix-78">For accelerators, the failure that matters is of a different kind. An accelerator is built even when its table is missing: it’s an accelerator for an empty table. What can fail is allocating it. Then <code>create</code> returns <code>NULL</code>, which can’t be stored, since <code>NULL</code> means “not loaded yet”. So the loader stores a <strong>tagged Null</strong> instead: the address of the accelerator’s Null object with its lowest bit set (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-machinery.hh#L273"><code>hb-machinery.hh:273</code></a>). Readers clear the bit and get the Null accelerator, and the destroy code recognizes the tag and frees nothing. A comment explains why it checks the bit and not the address: the Null pool is internal to each of HarfBuzz’s libraries (<code>libharfbuzz</code>, <code>libharfbuzz-subset</code> and the rest each have their own copy), so another library sharing the face would not recognize the Null object by its address. The same tagging is used for the per-shaper data on faces and fonts, whose Null is <code>NULL</code> itself.</p>
+<h2 id="the-first-gsub-access-step-by-step">The first GSUB access, step by step</h2>
+<p id="ix-79">To put the pieces together, here is what happens the first time anything asks a fresh face for its <code>GSUB</code>. In an ordinary <code>hb_shape</code> call, that’s while the shape-plan cache builds its key: the key records which of GSUB’s feature variations apply (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-shape-plan.cc#L106"><code>hb-shape-plan.cc:106</code></a>), and that calls <code>get_gsubgpos_table</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L433"><code>hb-ot-layout.cc:433</code></a>):</p>
+<pre><code class="language-c++">case HB_OT_TAG_GSUB: return *face-&gt;table.GSUB-&gt;table;
+</code></pre>
+<p id="ix-80"><strong>1. The loader.</strong> <code>face-&gt;table.GSUB-&gt;</code> calls <code>get_stored</code>. The slot is <code>NULL</code>, and the face pointer, found by stepping back from the slot, isn’t, so the loader calls <code>create (face)</code>, which allocates a <code>GSUB_accelerator_t</code> and runs its constructor.</p>
+<p id="ix-81"><strong>2. The accelerator.</strong> The constructor (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L6710"><code>hb-ot-layout-gsubgpos.hh:6710</code></a>, trimmed) asks the sanitizer for the table:</p>
+<pre><code class="language-c++">hb_sanitize_context_t sc;
+sc.lazy_some_gpos = true;
+this-&gt;table = sc.reference_table&lt;T&gt; (face);
+
+this-&gt;lookup_count = table-&gt;get_lookup_count ();
+this-&gt;accels = (hb_atomic_t&lt;hb_ot_layout_lookup_accelerator_t *&gt; *)
+               hb_calloc (this-&gt;lookup_count, sizeof (*accels));
+</code></pre>
+<p id="ix-82">(<code>lazy_some_gpos</code> lets GPOS leave some checks until its data is used. It makes no difference to GSUB.)</p>
+<p id="ix-83"><strong>3. The glyph count.</strong> <code>reference_table</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L441"><code>hb-sanitize.hh:441</code></a>) first gives the sanitizer the number of glyphs, whatever the table, because some tables’ checks (in <code>gvar</code>, CFF, <code>sbix</code> and the AAT tables) compare against it:</p>
+<pre><code class="language-c++">if (!num_glyphs_set)
+  set_num_glyphs (hb_face_get_glyph_count (face));
+return sanitize_blob&lt;Type&gt; (hb_face_reference_table (face, tableTag));
+</code></pre>
+<p>If the face doesn’t know it yet, this goes through <code>load_num_glyphs</code> to <code>face-&gt;table.maxp</code>: another lazy slot, filled the same way.</p>
+<p id="ix-84"><strong>4. The bytes.</strong> <code>hb_face_reference_table</code> calls the face’s <code>reference_table_func</code>, which for a face from a file is <code>_hb_face_for_data_reference_table</code>. It finds the face in the file, finds <code>GSUB</code> in its directory, and returns a sub-blob of the file blob: no copying, and no check of the contents yet.</p>
+<p id="ix-85"><strong>5. The check.</strong> <code>sanitize_blob</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L405"><code>hb-sanitize.hh:405</code></a>) casts the sub-blob’s bytes to <code>GSUB</code> and calls its <code>sanitize</code>, which walks every script, feature, lookup and subtable offset. The outcome is one of two:</p>
+<pre><code class="language-c++">if (sane)
+{
+  hb_blob_make_immutable (blob);
+  return blob;
+}
+else
+{
+  hb_blob_destroy (blob);
+  return hb_blob_get_empty ();
+}
+</code></pre>
+<p id="ix-86"><strong>6. The rest of the setup.</strong> Back in the constructor, the lookup count is read from the table (zero from the Null table), and the array of lookup slots is allocated, all <code>NULL</code>. If that allocation fails, the accelerator gives up its table and holds the empty blob instead.</p>
+<p id="ix-87"><strong>7. Publishing.</strong> <code>get_stored</code> tries to swap its new accelerator into the slot. If another thread has published one meanwhile, this thread destroys its own, which releases its reference to the table blob, which releases its reference to the file blob, and returns the other thread’s.</p>
+<p id="ix-88"><strong>8. Every call after.</strong> The next access, from any thread, is the acquire load and nothing else. Code that runs during a GSUB lookup and needs the table again, such as a context lookup calling a nested one, uses <code>face-&gt;table.GSUB.get_relaxed ()</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsub-table.hh#L49"><code>hb-ot-layout-gsub-table.hh:49</code></a>), a plain load without even the acquire, since by then this thread has certainly seen the accelerator.</p>
+<h2 id="sharing-a-face-between-threads">Sharing a face between threads</h2>
+<p id="ix-89">These pieces are what make a face safe to share. Everything a caller can change is changed before the face is made immutable, and the face is made immutable as soon as a font or a shape plan uses it. After that, the only writes are the lazy loaders’ (each a single compare-and-swap into a slot that starts <code>NULL</code> and is written once), the <code>upem</code> and <code>num_glyphs</code> fields (written with the same value by everyone), the caches inside accelerators (whose entries are atomic), and the shape-plan cache, a list that grows with the same kind of compare-and-swap and is covered in the chapter on <a href="shape-plans-and-their-cache.html">shape plans</a>. None of these needs a lock. User data, which an application adds and removes as it likes, has one.</p>
+<p id="ix-90">So the pattern HarfBuzz is built for is: one blob per file, one face per face in it, shared by every thread, and a font for each size and set of variation settings, which <a href="fonts-and-font-functions.html">the next chapter</a> covers. Fonts are cheap because faces carry everything that is expensive, and faces are cheap to open because nothing expensive happens until it’s needed. A build with <code>HB_NO_MT</code> replaces the atomics and mutexes with plain variables, for programs that use only one thread.</p>
+<blockquote>
+<p id="ix-91">For programmers: “immutable” is the contract to keep in mind. Set the face up (its index, upem, glyph count, table-tags function) before passing it to <code>hb_font_create</code> or to another thread. After that, it can be used from any number of threads without locks of your own. <code>hb_face_builder_add_table</code> doesn’t check the immutable flag, but a builder face is for assembling a font file, not for shaping with: a slot that has already loaded a table won’t notice a new one.</p>
+</blockquote>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.h"><code>src/hb-blob.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.hh"><code>src/hb-blob.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.cc"><code>src/hb-blob.cc</code></a></td>
+<td>blobs: memory modes, <code>hb_blob_create_sub_blob</code>, making blobs writable, mapping and reading files</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-object.hh"><code>src/hb-object.hh</code></a></td>
+<td>the object header: reference counts, the immutable flag, user data</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.hh"><code>src/hb-face.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc"><code>src/hb-face.cc</code></a></td>
+<td>the face, <code>hb_face_create</code>, <code>_hb_face_for_data_reference_table</code>, <code>hb_face_count</code>, face loaders, immutability</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face-builder.cc"><code>src/hb-face-builder.cc</code></a></td>
+<td>the face builder, and writing its tables out as a font file</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-file.hh"><code>src/hb-open-file.hh</code></a></td>
+<td>the containers: sfnt, TTC and dfont, and the table directory</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-machinery.hh"><code>src/hb-machinery.hh</code></a></td>
+<td><code>hb_lazy_loader_t</code>, <code>hb_table_lazy_loader_t</code>, <code>hb_face_lazy_loader_t</code>, tagged nulls</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-face.hh"><code>src/hb-ot-face.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-face-table-list.hh"><code>src/hb-ot-face-table-list.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-face.cc"><code>src/hb-ot-face.cc</code></a></td>
+<td>the per-face table slots, generated from the table list</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh"><code>src/hb-sanitize.hh</code></a></td>
+<td><code>reference_table</code> and <code>sanitize_blob</code>, where loading meets checking</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh"><code>src/hb-ot-layout-gsubgpos.hh</code></a></td>
+<td>the GSUB/GPOS accelerator and its lazy lookup accelerators</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-static.cc"><code>src/hb-static.cc</code></a></td>
+<td>loading <code>upem</code> and the glyph count</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A blob is bytes with a reference count and a destroy function. Font files are memory-mapped, and every table is a sub-blob of the file: nothing is copied.</li>
+<li>Nothing writes to font data any more, so writable blobs, and the <code>mprotect</code> trick, are now rarely needed.</li>
+<li>A face gets its tables only through <code>reference_table_func</code>. <code>hb_face_create</code> checks only the file’s container, and never fails; <code>hb_face_create_or_fail</code> does.</li>
+<li>The low 16 bits of a face index pick a face in a collection. The high 16 bits, minus one, pick a named instance, which <code>hb_font_create</code> applies.</li>
+<li>Each table a face uses has a one-pointer slot, filled on first use. Racing threads both build, one wins the compare-and-swap, and the other destroys its copy.</li>
+<li>A missing or broken table is stored as the empty blob, so it is never retried, and code reads it as an empty table.</li>
+<li>Accelerators are built lazily in the same way, and so are the lookup accelerators inside GSUB and GPOS. Together with immutability, this lets one face be shared by every thread without locks.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="trust-nothing-the-sanitizer.html">← Trust nothing: the sanitizer</a><a rel="next" href="fonts-and-font-functions.html">Fonts and font functions →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

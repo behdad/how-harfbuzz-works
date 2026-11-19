@@ -1,0 +1,1009 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Fonts as bytes · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part II · Foundations</p>
+<h1 id="fonts-as-bytes">5. Fonts as bytes</h1>
+<p id="ix-1">A font file is a few kilobytes or megabytes of numbers. Most programs that read a binary format parse it: they walk through the bytes once and build objects in memory. HarfBuzz doesn’t. It keeps the font’s bytes as they are, and describes their layout with C++ structs. To read a table, it points the right struct at the right byte and reads the fields where they sit. Nothing is copied, nothing is allocated, and a table that is never used is never touched.</p>
+<p id="ix-2">The <a href="gsub.html">GSUB chapter</a> previewed this in two paragraphs. This chapter is the full account: how HarfBuzz finds a table in a file, the types every table is built from, how a struct says how big it is, what HarfBuzz reads when an offset is zero or an index is out of range, and how one description of a table serves every job HarfBuzz does with it. What makes it <em>safe</em> to read untrusted bytes this way is the sanitizer, the subject of the <a href="trust-nothing-the-sanitizer.html">next chapter</a>. Here we take its work for granted.</p>
+<p id="ix-3">The examples use a small test font, built from <code>fonts/fonts-as-bytes/bytes.fea</code>, and copies of it with one field changed by hand. Every shaping result and <code>hb-info</code> listing on this page was produced by running HarfBuzz 15.1.0 on those fonts when the page was built. The byte dumps were not: a short Python script made them.</p>
+<h2 id="a-font-file-from-the-top">A font file, from the top</h2>
+<p id="ix-4">An OpenType font is an <strong>sfnt</strong>: a short header, a directory of tables, and the tables. Each directory entry, a <strong>table record</strong>, gives a table’s four-letter tag, a checksum, and where the table is and how long. Here are the first bytes of the test font, <code>bytes.ttf</code>, with only the first record shown in full. They were printed by <code>fonts/fonts-as-bytes/dump.py</code>, which reads the file with Python’s <code>struct</code> module, not with HarfBuzz, using the field names of HarfBuzz’s structs:</p>
+<pre><code>── OpenTypeOffsetTable (at 0x0000 in the file)
+0000  00 01 00 00  sfnt_version (0x00010000: TrueType outlines)
+0004  00 0b        tables.len = 11 (numTables)
+0006  00 80        tables.searchRange = 128
+0008  00 03        tables.entrySelector = 3
+000a  00 30        tables.rangeShift = 48
+000c  47 53 55 42  tables[0].tag = 'GSUB'
+0010  20 e8 25 e8  tables[0].checkSum
+0014  00 00 04 e0  tables[0].offset = 1248
+0018  00 00 00 68  tables[0].length = 104
+001c  4f 53 2f 32  tables[1].tag = 'OS/2'
+002c  63 6d 61 70  tables[2].tag = 'cmap'
+003c  67 6c 79 66  tables[3].tag = 'glyf'
+004c  68 65 61 64  tables[4].tag = 'head'
+005c  68 68 65 61  tables[5].tag = 'hhea'
+006c  68 6d 74 78  tables[6].tag = 'hmtx'
+007c  6c 6f 63 61  tables[7].tag = 'loca'
+008c  6d 61 78 70  tables[8].tag = 'maxp'
+009c  6e 61 6d 65  tables[9].tag = 'name'
+00ac  70 6f 73 74  tables[10].tag = 'post'
+</code></pre>
+<p id="ix-5">And here is the struct HarfBuzz lays over them, from <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-file.hh#L80"><code>hb-open-file.hh:80</code></a> (trimmed to its fields):</p>
+<pre><code class="language-c++">typedef struct OpenTypeOffsetTable
+{
+  /* … */
+  protected:
+  Tag		sfnt_version;	/* '\0\001\0\00' if TrueType / 'OTTO' if CFF */
+  BinSearchArrayOf&lt;TableRecord&gt;
+		tables;
+  public:
+  DEFINE_SIZE_ARRAY (12, tables);
+} OpenTypeFontFace;
+</code></pre>
+<p id="ix-6"><code>TableRecord</code> is <code>Tag tag</code>, <code>CheckSum checkSum</code>, <code>Offset32 offset</code> and <code>HBUINT32 length</code>, 16 bytes (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-file.hh#L54"><code>hb-open-file.hh:54</code></a>). <code>BinSearchArrayOf</code> is an array whose count is followed by <code>searchRange</code>, <code>entrySelector</code> and <code>rangeShift</code>, values precomputed for a binary search. HarfBuzz never reads them. The header type, <code>BinSearchHeader</code>, converts itself to a number by returning only its <code>len</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L1111"><code>hb-open-type.hh:1111</code></a>), so the generic sorted array uses the whole 8-byte header as its count.</p>
+<p>HarfBuzz can list the directory itself:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">bytes.ttf</td><td class="opt">--list-tables</td><td class="out"><pre><code>Table information:
+
+Tag	Size
+------------
+GSUB      104 bytes
+OS/2       96 bytes
+cmap      100 bytes
+glyf      390 bytes
+head       54 bytes
+hhea       36 bytes
+hmtx       62 bytes
+loca       36 bytes
+maxp       32 bytes
+name      123 bytes
+post      124 bytes</code></pre></td></tr></tbody></table></div>
+<h3 id="finding-a-table">Finding a table</h3>
+<p id="ix-7">When something asks a face for a table, <code>_hb_face_for_data_reference_table</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc#L185"><code>hb-face.cc:185</code></a>) finds the face in the file, finds the record by its tag, and returns a <strong>sub-blob</strong>: a view of just those bytes, sharing the file’s memory. Blobs are the subject of <a href="blobs-faces-and-lazy-tables.html">blobs, faces and lazy tables</a>.</p>
+<p id="ix-8">The search makes one concession to real fonts (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-file.hh#L100"><code>hb-open-file.hh:100</code></a>). The specification says records are sorted by tag, but some fonts’ aren’t, and other software reads them anyway. So HarfBuzz searches a directory of fewer than 16 tables from the start, and uses binary search, which needs sorting, only for 16 or more.</p>
+<blockquote>
+<p id="ix-9">For type designers: a font with 16 or more tables must have its directory sorted by tag, as the specification says, or HarfBuzz may not find some of its tables. Sorting is by the tag’s bytes, so uppercase tags such as <code>GSUB</code> and <code>OS/2</code> come before lowercase ones such as <code>cmap</code>, as in the listing above. Font compilers do this for you.</p>
+</blockquote>
+<p id="ix-10">If the tag isn’t there, the search gives the index <code>0xFFFF</code>, and the array returns its <strong>Null</strong> record for it, whose offset and length are zero. A sub-blob of length zero is the empty blob. So a missing table is an empty blob, not an error, and whatever reads it gets the table’s Null object (below). A record that runs past the end of the file is cut short there (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-blob.cc#L175"><code>hb-blob.cc:175</code></a>).</p>
+<h3 id="collections-and-resource-forks">Collections and resource forks</h3>
+<p id="ix-11">The first four bytes of the file say what the rest is. <code>OpenTypeFontFile</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-file.hh#L485"><code>hb-open-file.hh:485</code></a>) is a union of the possible layouts, chosen by those bytes:</p>
+<table>
+<thead>
+<tr>
+<th>First four bytes</th>
+<th>What the file is</th>
+<th>Faces</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>00 01 00 00</code></td>
+<td>OpenType with TrueType outlines</td>
+<td>1</td>
+</tr>
+<tr>
+<td id="ix-12"><code>OTTO</code></td>
+<td id="ix-13">OpenType with CFF or CFF2 outlines</td>
+<td>1</td>
+</tr>
+<tr>
+<td id="ix-14"><code>true</code>, <code>typ1</code></td>
+<td id="ix-15">old Apple TrueType and Type 1 sfnts</td>
+<td>1</td>
+</tr>
+<tr>
+<td id="ix-16"><code>ttcf</code></td>
+<td id="ix-17">a TrueType Collection</td>
+<td>one for each directory</td>
+</tr>
+<tr>
+<td><code>00 00 01 00</code></td>
+<td id="ix-18">a Mac resource fork (a “dfont”)</td>
+<td>one for each <code>sfnt</code> resource</td>
+</tr>
+<tr>
+<td>anything else</td>
+<td>not a font HarfBuzz knows</td>
+<td>0</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-19">A <strong>TrueType Collection</strong> holds several fonts that can share tables. Its header (<code>TTCHeaderVersion1</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-file.hh#L219"><code>hb-open-file.hh:219</code></a>) is a list of 32-bit offsets, from the start of the file, to table directories like the one above, and two directories can point to the same table. fontTools made the test file <code>collection.ttc</code> from <code>bytes.ttf</code> and an altered copy of it:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">collection.ttc</td><td class="opt">--show-face-count</td><td class="out"><pre><code>Face count: 2</code></pre></td></tr></tbody></table></div>
+<p id="ix-20">The <strong>face index</strong> chooses the face. HarfBuzz uses its low 16 bits for this (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc#L170"><code>hb-face.cc:170</code></a>); the upper bits ask <code>hb_font_create</code> for a named instance. <a href="blobs-faces-and-lazy-tables.html#collections-and-the-face-index">Blobs, faces and lazy tables</a> shapes with both. A collection header with minor version 1 or more is an <em>extended</em> TTC, from the 5th edition of the ISO Open Font Format: a second list of directories follows the first, and HarfBuzz uses that one.</p>
+<p id="ix-21">A <strong>resource fork</strong> is how classic Mac OS stored fonts, and a “dfont” is a resource fork in a plain file. It doesn’t begin with a tag at all, but with the offset of its resource data, which is usually 256, and HarfBuzz takes those four bytes as the dfont’s “tag”. <code>ResourceForkHeader</code> and the structs after it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-file.hh#L323"><code>hb-open-file.hh:323</code></a>–<code>479</code>) walk the resource map to the <code>sfnt</code> resources, each a complete OpenType font. The face index counts those, and since a face’s table offsets count from the start of its resource, the face lookup returns a base offset to add.</p>
+<p id="ix-22">A file whose first bytes match none of these has no faces. <code>hb_face_create</code> still returns a face, with no tables; <code>hb_face_create_or_fail</code> returns null (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc#L290"><code>hb-face.cc:290</code></a>).</p>
+<h2 id="numbers">Numbers</h2>
+<p id="ix-23">Everything in an OpenType table is built from a few kinds of number, all stored big-endian (most significant byte first), and with no padding: a 32-bit number can start at any byte. HarfBuzz’s types for them are all one template, <code>NumType&lt;BE, Type, Size&gt;</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L57"><code>hb-open-type.hh:57</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th>HarfBuzz type</th>
+<th>OpenType type</th>
+<th>Size</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-24"><code>HBUINT8</code>, <code>HBINT8</code></td>
+<td id="ix-25"><code>uint8</code>, <code>int8</code></td>
+<td>1</td>
+</tr>
+<tr>
+<td id="ix-26"><code>HBUINT16</code>, <code>HBINT16</code></td>
+<td><code>uint16</code>, <code>int16</code></td>
+<td>2</td>
+</tr>
+<tr>
+<td id="ix-27"><code>HBUINT24</code></td>
+<td><code>uint24</code></td>
+<td>3</td>
+</tr>
+<tr>
+<td id="ix-28"><code>HBUINT32</code>, <code>HBINT32</code></td>
+<td><code>uint32</code>, <code>int32</code></td>
+<td>4</td>
+</tr>
+<tr>
+<td id="ix-29"><code>HBUINT64</code>, <code>HBINT64</code></td>
+<td>(none)</td>
+<td>8</td>
+</tr>
+<tr>
+<td><code>FWORD</code>, <code>UFWORD</code></td>
+<td><code>FWORD</code>, <code>UFWORD</code></td>
+<td>2</td>
+</tr>
+<tr>
+<td id="ix-30"><code>F2DOT14</code>, <code>F16DOT16</code></td>
+<td id="ix-31"><code>F2DOT14</code>, <code>Fixed</code></td>
+<td>2, 4</td>
+</tr>
+<tr>
+<td><code>Tag</code></td>
+<td><code>Tag</code></td>
+<td>4</td>
+</tr>
+<tr>
+<td id="ix-32"><code>HBGlyphID16</code>, <code>HBGlyphID24</code></td>
+<td id="ix-33">glyph IDs, 16- and 24-bit</td>
+<td>2, 3</td>
+</tr>
+<tr>
+<td id="ix-34"><code>Offset16</code>, <code>Offset24</code>, <code>Offset32</code></td>
+<td id="ix-35"><code>Offset16</code>, <code>Offset24</code>, <code>Offset32</code></td>
+<td>2, 3, 4</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-36">The number inside a <code>NumType</code> is a plain array of bytes (<code>HBInt</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-algs.hh#L138"><code>hb-algs.hh:138</code></a>), so the struct has an alignment of 1 and can sit at any address, which is what laying structs over a file needs. Reading one converts it: <code>HBUINT16</code> has an <code>operator unsigned ()</code> that puts the two bytes together the right way round. In an optimized build, on a compiler with byte-swapping built-ins, that is one load and one byte swap (<code>HB_FAST_NUM_ACCESS</code>); otherwise it is shifts and adds. Older HarfBuzz code called the byte-array type <code>BEInt</code>; in 15.1.0 it is <code>HBInt</code>, with a flag for byte order.</p>
+<p id="ix-37">There is an unsigned 24-bit type but no signed one. A comment at <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L123"><code>hb-open-type.hh:123</code></a> explains why: the conversion relies on the compiler to extend the sign, and C++ has no 24-bit type to extend it from.</p>
+<p id="ix-38">A few types add behavior to a plain number. <code>Tag</code> converts to a <code>const char *</code> pointing at its own four bytes, which are <em>not</em> followed by a NUL, so the code prints tags with <code>&quot;%.4s&quot;</code>. A tag is always four bytes; a shorter name is padded with spaces, as in the table <code>'cvt '</code>, the language system <code>'TRK '</code> or the script <code>'nko '</code>, and the spaces are part of the tag. <code>Index</code> (a 16-bit index into a list of scripts, features or languages) and <code>VarIdx</code> (a 32-bit index into an item variation store) each have a value that means “none”, <code>0xFFFF</code> and <code>0xFFFFFFFF</code>, which matters for Null objects below. The fixed-point types (<code>HBFixed</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L247"><code>hb-open-type.hh:247</code></a>) refuse to convert to an integer, so an <code>F2DOT14</code> can’t be used as one by accident.</p>
+<p id="ix-39">None of these structs can be made on its own. The array types declare <code>HB_DELETE_CREATE_COPY_ASSIGN</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-meta.hh#L221"><code>hb-meta.hh:221</code></a>), which deletes their default constructor and copying, and so does any struct that holds one. There is no way to make a Coverage table except by pointing at bytes that hold one.</p>
+<h2 id="how-big-is-a-struct">How big is a struct?</h2>
+<p id="ix-40">An OpenType table is full of arrays whose length is in the font, not in the code. C++ has no way to write that, so HarfBuzz declares each such array with one element:</p>
+<pre><code class="language-c++">  LenType	len;
+  Type		arrayZ[HB_VAR_ARRAY];   /* HB_VAR_ARRAY is 1 */
+</code></pre>
+<p id="ix-41">Fields like this have names ending in <code>Z</code> (<code>arrayZ</code>, <code>bytesZ</code>), a reminder that C++ doesn’t know their length. It also means <code>sizeof</code> gives the wrong answer for nearly every table struct, so each struct says how big it is with one of the <code>DEFINE_SIZE_*</code> macros from <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-machinery.hh#L111"><code>hb-machinery.hh:111</code></a>–<code>141</code>. Each declares some constants and, through a <code>static_assert</code>, makes the compiler check that the struct as declared matches the size the specification gives:</p>
+<table>
+<thead>
+<tr>
+<th>Macro</th>
+<th>For</th>
+<th>Declares</th>
+<th>Checks at compile time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DEFINE_SIZE_STATIC (n)</code></td>
+<td>a fixed-size record</td>
+<td><code>static_size</code>, <code>min_size</code>, <code>null_size</code> = n, and <code>get_size ()</code></td>
+<td><code>sizeof (*this) == n</code></td>
+</tr>
+<tr>
+<td><code>DEFINE_SIZE_MIN (n)</code></td>
+<td>a struct whose size depends on its content</td>
+<td><code>min_size</code>, <code>null_size</code> = n</td>
+<td><code>sizeof (*this) &gt;= n</code></td>
+</tr>
+<tr>
+<td><code>DEFINE_SIZE_ARRAY (n, array)</code></td>
+<td>a header of n bytes, then an array</td>
+<td><code>min_size</code>, <code>null_size</code> = n</td>
+<td><code>sizeof (*this) == n + sizeof (array[0])</code>, and that the element type has a static size</td>
+</tr>
+<tr>
+<td><code>DEFINE_SIZE_UNION (n, member)</code></td>
+<td>a union of formats</td>
+<td><code>min_size</code>, <code>null_size</code> = n</td>
+<td>that <code>u.member</code> is n bytes</td>
+</tr>
+<tr>
+<td><code>DEFINE_SIZE_UNBOUNDED (n)</code></td>
+<td>a struct with no meaningful empty form</td>
+<td><code>min_size</code> only</td>
+<td><code>sizeof (*this) &gt;= n</code></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-42">So <code>TableRecord</code> says <code>DEFINE_SIZE_STATIC (16)</code>, and if someone added a field to it, the build would fail. <code>OpenTypeOffsetTable</code> says <code>DEFINE_SIZE_ARRAY (12, tables)</code>: four bytes of version, eight of <code>BinSearchHeader</code>, then the records. A Coverage table says <code>DEFINE_SIZE_UNION (2, format.v)</code>: all that every format of it has in common is its first two bytes.</p>
+<p>The three constants have three jobs:</p>
+<ul>
+<li id="ix-43"><strong><code>min_size</code></strong> is how many bytes must be there before any field is read. The sanitizer checks that many first (<code>check_struct</code>), and a table blob shorter than its table’s <code>min_size</code> reads as that table’s Null object (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-array.hh#L301"><code>hb-array.hh:301</code></a>).</li>
+<li><strong><code>static_size</code></strong> is the size of a record that is always the same size. Arrays need it, to find element <em>i</em> at <code>i * static_size</code> bytes on, so a variable-size type can’t be the element of a plain array: <code>DEFINE_SIZE_ARRAY</code> doesn’t compile.</li>
+<li id="ix-44"><strong><code>null_size</code></strong> is how many bytes of the Null pool the type’s Null object uses. A type with a <code>min_size</code> but no <code>null_size</code>, as <code>DEFINE_SIZE_UNBOUNDED</code> makes, is saying it can’t be Null (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-null.hh#L60"><code>hb-null.hh:60</code></a>–<code>64</code>).</li>
+</ul>
+<h3 id="walking-past-variable-size-fields">Walking past variable-size fields</h3>
+<p id="ix-45">Some tables put a field <em>after</em> a variable-length array. A lookup is <code>lookupType</code>, <code>lookupFlag</code>, an array of subtable offsets, and then, if the flag says so, a mark-filtering-set index. No struct field can be declared there, so <code>Lookup</code> reads it with <code>StructAfter</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L1315"><code>hb-ot-layout-common.hh:1315</code></a>):</p>
+<pre><code class="language-c++">const HBUINT16 &amp;markFilteringSet = StructAfter&lt;const HBUINT16&gt; (subTable);
+</code></pre>
+<p id="ix-46"><code>StructAfter&lt;T&gt; (x)</code> is <code>StructAtOffset&lt;T&gt; (&amp;x, x.get_size ())</code>: the <code>T</code> that starts where <code>x</code> ends. <code>StructAtOffset&lt;T&gt; (p, n)</code> is the most basic tool of all, a cast of “the bytes <em>n</em> on from <em>p</em>” to a <code>T</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-machinery.hh#L45"><code>hb-machinery.hh:45</code></a>–<code>84</code>).</p>
+<p id="ix-47">Fields added in later versions are declared anyway, and read only after a version check. A version 1.0 GSUB header is ten bytes, and 1.1 adds an offset to FeatureVariations. <code>GSUBGPOS</code> declares every field, says <code>DEFINE_SIZE_MIN (10)</code>, and reads <code>featureVars</code> only if the version is 1.1 or more (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L6485"><code>hb-ot-layout-gsubgpos.hh:6485</code></a>): in a 1.0 table those bytes are whatever comes next.</p>
+<h2 id="offsets-that-know-their-targets">Offsets that know their targets</h2>
+<p id="ix-48">An OpenType table is a tree: a header points at lists, which point at records, which point at subtables. Each pointer is an <strong>offset</strong>, a number of bytes counted from the start of some other structure. In HarfBuzz, an offset is a number that also knows the type of what it points to:</p>
+<pre><code class="language-c++">template &lt;typename Type, typename OffsetType, typename BaseType=void, bool has_null=true&gt;
+struct OffsetTo : Offset&lt;OffsetType, has_null&gt;
+{
+  /* … */
+  const Type&amp; operator () (const void *base) const
+  {
+    if (unlikely (this-&gt;is_null ())) return *_hb_has_null&lt;Type, has_null&gt;::get_null ();
+    return StructAtOffset&lt;const Type&gt; (base, *this);
+  }
+  /* … */
+  friend const Type&amp; operator + (const Base &amp;base, const OffsetTo &amp;offset) { return offset ((const void *) base); }
+  /* … */
+};
+</code></pre>
+<p id="ix-49">That is <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L410"><code>hb-open-type.hh:410</code></a>–<code>446</code>, much trimmed. <code>Offset16To&lt;Coverage&gt;</code> is the same with a 16-bit offset. The <code>operator +</code> lets the code write what the specification says. Here are two lines of <code>SingleSubstFormat1_3::apply</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/SingleSubstFormat1.hh#L206"><code>OT/Layout/GSUB/SingleSubstFormat1.hh:206</code></a>):</p>
+<pre><code class="language-c++">unsigned int index = (this+coverage).get_coverage (glyph_id);
+if (index == NOT_COVERED) return_trace (false);
+</code></pre>
+<p id="ix-50"><code>this</code> is the subtable, <code>coverage</code> is its offset field, and <code>this+coverage</code> is the Coverage table, as a <code>const Coverage &amp;</code>. The type comes from the offset’s declaration; no cast is written.</p>
+<p id="ix-51">The code always names the base, because OpenType counts offsets from different places, and only the code holding the offset knows which. A coverage offset counts from the start of its subtable, an offset in a ScriptList from the start of the ScriptList, a Device-table offset in a GPOS value record from the start of the <em>subtable</em> that holds the record, and a TTC’s directory offsets from the start of the file. HarfBuzz has types for some of these patterns:</p>
+<ul>
+<li id="ix-52"><code>List16OfOffsetTo&lt;Type, OffsetType&gt;</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L857"><code>hb-open-type.hh:857</code></a>) is an array of offsets counted from the start of the array itself, which is what the LookupList is. Its <code>operator []</code> follows the offset, so <code>lookupList[i]</code> is the <em>i</em>th Lookup, not the <em>i</em>th number.</li>
+<li id="ix-53"><code>RecordListOf&lt;Type&gt;</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L955"><code>hb-ot-layout-common.hh:955</code></a>) is the same for an array of tag-and-offset records, such as the ScriptList and FeatureList.</li>
+<li id="ix-54">The <code>BaseType</code> parameter can name a type that the base must be. GPOS uses a dummy type, <code>ValueBase</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/ValueFormat.hh#L12"><code>OT/Layout/GPOS/ValueFormat.hh:12</code></a>), for Device-table offsets, so that only a pointer that has been declared to be a value record’s base can be added to one, and passing <code>this</code> by mistake doesn’t compile.</li>
+</ul>
+<h3 id="zero-means-nothing-except-when-it-doesnt">Zero means nothing, except when it doesn’t</h3>
+<p id="ix-55">An offset of zero would point at the base itself, which is never what a font means. So OpenType uses zero for “there is no table here”, and <code>OffsetTo</code> follows it. A zero offset doesn’t give a pointer to the base. It gives the target type’s <strong>Null object</strong>: a read-only, empty instance of the type, which every method can be called on. The code that follows the offset doesn’t check for zero. It just uses what it gets.</p>
+<p id="ix-56">Not every offset may be null. In a resource fork, for example, an offset of zero is a real offset to the first resource. For those, HarfBuzz has <code>NNOffsetTo</code>, <code>NNOffset16To</code> and the rest (“non-null”, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L545"><code>hb-open-type.hh:545</code></a>), where <code>has_null</code> is false and zero means zero.</p>
+<p id="ix-57">A nullable offset to a type that can’t be Null doesn’t compile. A <code>static_assert</code> in <code>OffsetTo</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L416"><code>hb-open-type.hh:416</code></a>) refuses one to any type with a <code>min_size</code> but no <code>null_size</code>, such as <code>UnsizedArrayOf</code>, whose length the struct can’t know. Its Null object would have no safe size, so an offset that might produce one isn’t allowed.</p>
+<h2 id="arrays">Arrays</h2>
+<p>There are several kinds of array, because OpenType stores lengths in several ways:</p>
+<table>
+<thead>
+<tr>
+<th>HarfBuzz type</th>
+<th>How the length is stored</th>
+<th>Used for, for example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-58"><code>ArrayOf&lt;Type, LenType&gt;</code>, <code>Array16Of</code>, <code>Array24Of</code>, <code>Array32Of</code></td>
+<td>a count, then the elements</td>
+<td>most arrays</td>
+</tr>
+<tr>
+<td id="ix-59"><code>SortedArrayOf</code>, <code>SortedArray16Of</code> and so on</td>
+<td>the same, sorted, with <code>bsearch</code> and <code>bfind</code></td>
+<td id="ix-60">Coverage format 1 glyphs, range records</td>
+</tr>
+<tr>
+<td id="ix-61"><code>BinSearchArrayOf</code></td>
+<td>a count and the three search fields</td>
+<td id="ix-62">the table directory, <code>kerx</code> format 0 pairs</td>
+</tr>
+<tr>
+<td id="ix-63"><code>HeadlessArrayOf</code>, <code>HeadlessArray16Of</code></td>
+<td>a count that includes a first element that isn’t stored</td>
+<td id="ix-64">a ligature’s components</td>
+</tr>
+<tr>
+<td id="ix-65"><code>ArrayOfM1</code></td>
+<td>the count minus one</td>
+<td id="ix-66">Mac resource maps</td>
+</tr>
+<tr>
+<td id="ix-67"><code>UnsizedArrayOf</code></td>
+<td>not stored: the caller supplies it</td>
+<td id="ix-68">arrays sized by a field elsewhere, such as <code>hmtx</code></td>
+</tr>
+<tr>
+<td id="ix-69"><code>SortedUnsizedArrayOf</code></td>
+<td>the same, sorted</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-70"><code>VarSizedBinSearchArrayOf</code></td>
+<td>a header giving the size and number of elements</td>
+<td id="ix-71">AAT lookup tables</td>
+</tr>
+<tr>
+<td id="ix-72"><code>List16OfOffsetTo</code>, <code>Array16OfOffset16To</code> and so on</td>
+<td id="ix-73">a count, then offsets to the elements</td>
+<td id="ix-74">the LookupList, a lookup’s subtables</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-75">They share one rule: indexing past the end doesn’t read past the end. <code>ArrayOf::operator []</code> checks the index against <code>len</code> and returns <code>Null (Type)</code> if it is too big (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L719"><code>hb-open-type.hh:719</code></a>), and so do the other sized arrays. <code>UnsizedArrayOf</code> doesn’t know its length, so it can’t check, and its users have to; reading <code>arrayZ</code> directly skips the check too.</p>
+<p id="ix-76"><code>HeadlessArrayOf</code>, the GSUB chapter’s ligature <code>component</code>, is indexed from 1. <code>VarSizedBinSearchArrayOf</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L1168"><code>hb-open-type.hh:1168</code></a>) is for AAT lookups, where the element size is in the font, and a last element of <code>0xFFFF</code>s is a terminator that isn’t counted.</p>
+<h3 id="a-coverage-table-byte-by-byte">A Coverage table, byte by byte</h3>
+<p id="ix-77">The test font’s first lookup is a single substitution that turns <code>a</code> into <code>a.alt1</code> and <code>e</code> into <code>e.init</code>. Since the two glyphs move by different amounts, feaLib stored it as format 2, a list of output glyphs. Here are its bytes, made by the same script as before; offsets are counted from the start of GSUB:</p>
+<pre><code>── SingleSubstFormat2 (lookup 0's subtable, at 0x0048 in GSUB)
+0048  00 02        format = 2
+004a  00 18        coverage = 0x0018   → Coverage at 0x0060
+004c  00 02        substitute.len = 2
+004e  00 0d        substitute[0] = glyph 13
+0050  00 10        substitute[1] = glyph 16
+
+── CoverageFormat1 (at 0x0060 in GSUB)
+0060  00 01        coverageFormat = 1
+0062  00 02        glyphArray.len = 2
+0064  00 02        glyphArray[0] = glyph 2
+0066  00 03        glyphArray[1] = glyph 3
+</code></pre>
+<p>The structs for these are, with their methods left out:</p>
+<pre><code class="language-c++">template &lt;typename Types&gt;
+struct SingleSubstFormat2_4
+{
+  HBUINT16      format;
+  typename Types::template LOffsetTo&lt;Coverage&gt;
+                coverage;
+  typename Types::template ArrayOf&lt;typename Types::HBGlyphID&gt;
+                substitute;
+  DEFINE_SIZE_ARRAY (2 + Types::LOffset::static_size + Types::HBUINT::static_size, substitute);
+};
+
+template &lt;typename Types&gt;
+struct CoverageFormat1_3
+{
+  HBUINT16      coverageFormat;
+  typename Types::template SortedArrayOf&lt;typename Types::HBGlyphID&gt;
+                glyphArray;
+  DEFINE_SIZE_ARRAY (2 + Types::HBUINT::static_size, glyphArray);
+};
+</code></pre>
+<p id="ix-78">With <code>SmallTypes</code> (explained at the end of this chapter), <code>LOffsetTo&lt;Coverage&gt;</code> is a 16-bit offset, <code>ArrayOf</code> has a 16-bit count, and a glyph ID is 16 bits, so the struct fields line up with the bytes one for one. Now follow <code>e</code>, glyph 3, through the lookup:</p>
+<ol>
+<li id="ix-79">The subtable is at 0x48. <code>this+coverage</code> adds the offset, 0x18, to the subtable’s address and gets the <code>Coverage</code> at 0x60.</li>
+<li id="ix-80"><code>Coverage::get_coverage</code> reads the first two bytes, <code>00 01</code>, and switches to format 1 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/Common/Coverage.hh#L87"><code>OT/Layout/Common/Coverage.hh:87</code></a>).</li>
+<li id="ix-81"><code>CoverageFormat1_3::get_coverage</code> calls <code>glyphArray.bfind (3)</code>, a binary search of the sorted array. It finds glyph 3 at index 1. That index, the <strong>coverage index</strong>, is what Coverage tables are for: it says which entry of the subtable’s own arrays belongs to this glyph.</li>
+<li id="ix-82">Back in the subtable, <code>substitute[1]</code> checks 1 against <code>substitute.len</code>, 2, and reads <code>00 10</code>: glyph 16, <code>e.init</code>.</li>
+</ol>
+<p id="ix-83">At no point did HarfBuzz make a list of the covered glyphs, or allocate anything. Every step was arithmetic on the address of the font’s bytes. (The set digests of the GSUB chapter are a cache in front of this code, not a replacement for it.)</p>
+<p id="ix-84">Format 2 stores ranges instead: <code>RangeRecord</code>s of a first glyph, a last glyph and the coverage index of the first. <code>CoverageFormat2_4::get_coverage</code> binary-searches them for the range that holds the glyph. If there is none, <code>bsearch</code> returns the Null <code>RangeRecord</code>, and the code goes on to check <code>range.first &lt;= range.last</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/Common/CoverageFormat2.hh#L61"><code>OT/Layout/Common/CoverageFormat2.hh:61</code></a>). That works only because the Null <code>RangeRecord</code> isn’t all zeros, which is the next subject.</p>
+<h2 id="null-objects">Null objects</h2>
+<p id="ix-85">The Null pool is 640 bytes of zeros, <code>_hb_NullPool</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-null.hh#L40"><code>hb-null.hh:40</code></a>, defined in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-static.cc#L51"><code>hb-static.cc:51</code></a>). <code>Null (T)</code> returns those bytes as a <code>const T &amp;</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-null.hh#L110"><code>hb-null.hh:110</code></a>–<code>124</code>):</p>
+<pre><code class="language-c++">template &lt;typename Type&gt;
+struct Null {
+  static Type const &amp; get_null ()
+  {
+    static_assert (hb_null_size (Type) &lt;= HB_NULL_POOL_SIZE, &quot;Increase HB_NULL_POOL_SIZE.&quot;);
+    return *reinterpret_cast&lt;Type const *&gt; (_hb_NullPool);
+  }
+};
+</code></pre>
+<p id="ix-86">Types share the one pool: the Null <code>GSUB</code>, the Null <code>Coverage</code> and the Null <code>Lookup</code> are at the same address. The <code>static_assert</code> makes sure the pool is big enough for every type ever used as Null.</p>
+<h3 id="why-zeros-are-an-empty-table">Why zeros are an empty table</h3>
+<p id="ix-87">In OpenType, zero bytes nearly always read as nothing. Every count is zero, so every array is empty. Every offset is zero, so following one gives another Null object. Every format and version field is zero, and most tables have no format 0 or version 0, so their switches take the <code>default</code> case. As long as each method’s <code>default</code> case does the empty thing, a Null table behaves like a table with nothing in it. A Null <code>Coverage</code> has format 0, for which <code>get_coverage</code> returns <code>NOT_COVERED</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/Common/Coverage.hh#L96"><code>OT/Layout/Common/Coverage.hh:96</code></a>). A Null GSUB has version 0, so <code>has_data ()</code> is false, and it has no scripts, features or lookups. A Null <code>Lookup</code> has no subtables.</p>
+<p id="ix-88">So a font with no GSUB, a GSUB with no lookups, and a lookup whose coverage offset is zero all go down the same code. The shaping code doesn’t check whether the font has a GSUB, and HarfBuzz’s table code has hardly an <code>if (table)</code> in it.</p>
+<p id="ix-89">Here it is happening. <code>bytes.ttf</code> has two lookups in its <code>liga</code> feature: lookup 0 is the format 2 substitution above, and lookup 1 turns <code>x</code> into <code>f</code>. <code>null-coverage.ttf</code> is a copy with lookup 0’s coverage offset, at 0x4a, changed to zero. <code>unknown-format.ttf</code> is a copy with the Coverage table’s format changed from 1 to 9, a format that doesn’t exist:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">bytes.ttf</td><td class="in"><span class="txt">aex</span><span class="cps">U+0061 U+0065 U+0078</span></td><td class="opt"></td><td class="out"><code>[a.alt1=0+500|e.init=1+500|f=2+500]</code></td></tr><tr><td class="font">null-coverage.ttf</td><td class="in"><span class="txt">aex</span><span class="cps">U+0061 U+0065 U+0078</span></td><td class="opt"></td><td class="out"><code>[a=0+500|e=1+500|f=2+500]</code></td></tr><tr><td class="font">unknown-format.ttf</td><td class="in"><span class="txt">aex</span><span class="cps">U+0061 U+0065 U+0078</span></td><td class="opt"></td><td class="out"><code>[a=0+500|e=1+500|f=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-90">In both copies, lookup 0 now covers nothing, and lookup 1 still works. The null offset gave the Null Coverage. The unknown format went to the <code>default</code> cases. A table format from the future, which the code doesn’t know, is meant to be handled the same way: the sanitizer passes unknown formats (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/Common/Coverage.hh#L76"><code>Coverage.hh:76</code></a>), and every reader of them returns nothing.</p>
+<p id="ix-91">Compare a third copy, <code>outside.ttf</code>, whose coverage offset is changed to 0xFFF0, far past the end of the 104-byte GSUB:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">outside.ttf</td><td class="in"><span class="txt">aex</span><span class="cps">U+0061 U+0065 U+0078</span></td><td class="opt"></td><td class="out"><code>[a=0+500|e=1+500|x=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-92">Now neither lookup applies, because HarfBuzz has thrown away the whole GSUB table. An offset that points outside its table can’t be made safe by a Null object, because the code would follow it into memory that isn’t the font’s. The sanitizer finds such offsets when the table is loaded, and since HarfBuzz 12.3 it rejects the whole table when it finds one. Why it does that, and not something gentler, is the subject of the <a href="trust-nothing-the-sanitizer.html">next chapter</a>.</p>
+<h3 id="when-a-zero-would-mean-something">When a zero would mean something</h3>
+<p id="ix-93">The “zero is nothing” rule has exceptions, where a field’s zero value means something real. For those types, HarfBuzz defines a Null object with other bytes, using <code>DECLARE_NULL_NAMESPACE_BYTES</code> in the type’s header and <code>DEFINE_NULL_NAMESPACE_BYTES</code> in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-static.cc#L54"><code>hb-static.cc:54</code></a>–<code>61</code>, which specializes <code>Null&lt;T&gt;</code> to point at those bytes instead of the pool. In 15.1.0 there are eight:</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th id="ix-94">Null bytes</th>
+<th>Why zeros would be wrong</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-95"><code>OT::Index</code></td>
+<td><code>FF FF</code></td>
+<td id="ix-96">Index 0 is a real feature, script or language. <code>0xFFFF</code> is <code>NOT_FOUND_INDEX</code>.</td>
+</tr>
+<tr>
+<td id="ix-97"><code>OT::VarIdx</code></td>
+<td><code>FF FF FF FF</code></td>
+<td>Index 0 is a real delta set. <code>0xFFFFFFFF</code> is “no variation”.</td>
+</tr>
+<tr>
+<td id="ix-98"><code>OT::LangSys</code></td>
+<td><code>00 00 FF FF 00 00</code></td>
+<td id="ix-99">Its second field is the required feature index; zero would make feature 0 required for every script with no default language system.</td>
+</tr>
+<tr>
+<td id="ix-100"><code>OT::RangeRecord</code></td>
+<td><code>01 00 …</code></td>
+<td id="ix-101">A zero range is glyph 0 to glyph 0: the Null record would cover <code>.notdef</code>. With a first byte of 1, it runs from glyph 256 to glyph 0, which is nothing.</td>
+</tr>
+<tr>
+<td id="ix-102"><code>OT::ClipRecord</code> (COLR)</td>
+<td><code>01 00 …</code></td>
+<td id="ix-103">The same, for a range of glyphs given a clip box.</td>
+</tr>
+<tr>
+<td id="ix-104"><code>OT::CmapSubtableLongGroup</code></td>
+<td id="ix-105">start 1, end 0, glyph 0</td>
+<td id="ix-106">A zero group would map U+0000 to glyph 0.</td>
+</tr>
+<tr>
+<td id="ix-107"><code>AAT::SettingName</code></td>
+<td><code>FF FF FF FF</code></td>
+<td>A real setting and name ID would otherwise be 0.</td>
+</tr>
+<tr>
+<td id="ix-108"><code>AAT::Lookup</code></td>
+<td><code>FF FF …</code></td>
+<td id="ix-109">Format 0 has a value for <em>every</em> glyph, so a zero Null lookup would cover every glyph and read past the end of the pool. Format <code>0xFFFF</code> covers nothing.</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-110">The <code>RangeRecord</code>’s Null is nine bytes, enough for the 24-bit kind, and is declared by hand (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/Common/RangeRecord.hh#L88"><code>OT/Layout/Common/RangeRecord.hh:88</code></a>), because the macro can’t yet handle a type two namespaces deep.</p>
+<h3 id="where-the-rule-breaks">Where the rule breaks</h3>
+<p id="ix-111">“Every default case does the empty thing” is a convention, not something the compiler checks. 15.1.0 has at least one place where it doesn’t hold. <code>Coverage::get_population</code> counts a Coverage table’s glyphs, and for an unknown format, including the Null Coverage’s format 0, its <code>default</code> case returns <code>NOT_COVERED</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/Common/Coverage.hh#L138"><code>Coverage.hh:138</code></a>), which is <code>0xFFFFFFFF</code>, not 0. <code>SingleSubstFormat1_3::sanitize</code> charges the sanitizer’s work budget half the population of its coverage (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/SingleSubstFormat1.hh#L125"><code>OT/Layout/GSUB/SingleSubstFormat1.hh:125</code></a>), so that a tiny table can’t make it do a lot of work. With a null coverage offset, that charge is about two billion, the budget runs out, and the whole table is rejected. <code>null-coverage-f1.ttf</code> is <code>bytes.ttf</code> with lookup 1, a format 1 single substitution, given a null coverage offset:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">null-coverage-f1.ttf</td><td class="in"><span class="txt">aex</span><span class="cps">U+0061 U+0065 U+0078</span></td><td class="opt"></td><td class="out"><code>[a=0+500|e=1+500|x=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-112">Made to lookup 0, a format 2 subtable, the change switched off one lookup. Made to lookup 1, a format 1 subtable, it switches off all of GSUB. Real fonts don’t have null coverage offsets, so this is unlikely to matter, but it shows what holds the Null pattern together: every method of every type, in its <code>default</code> case.</p>
+<blockquote>
+<p id="ix-113">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/6426ee4ca8a218ecf7e8b8dd92997f6d435ff03f"><code>6426ee4</code></a> (17 November 2026), so main’s <code>get_population</code> returns 0 for an unknown format, and a null coverage switches off only its own subtable.</p>
+</blockquote>
+<h3 id="crap-nulls-writable-twin">Crap: Null’s writable twin</h3>
+<p id="ix-114"><code>Null (T)</code> is <code>const</code>. Code with a <em>writable</em> struct, such as the subsetter, sometimes follows an offset or an index that isn’t there, and needs something writable back. It gets <code>Crap (T)</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-null.hh#L174"><code>hb-null.hh:174</code></a>–<code>188</code>): a second 640-byte pool, into which the Null object’s bytes are copied each time. The name is spelled out in a comment, “Common Region for Access Protection”: writing there only stops a bug from doing damage elsewhere. Nothing correct relies on what is in it, which is why threads can share it without a lock. <code>CrapOrNull (T)</code> picks whichever fits the constness, and <code>hb_nonnull_ptr_t&lt;T&gt;</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-null.hh#L205"><code>hb-null.hh:205</code></a>) is a pointer that reads as <code>Null (T)</code> when it is null; <code>hb_blob_ptr_t</code>, which holds a loaded table, keeps its blob in one.</p>
+<h2 id="dispatch-contexts">Dispatch contexts</h2>
+<p id="ix-115">HarfBuzz does many things with a GSUB table besides applying it. It checks it, works out which glyphs it can produce (closure, for the subsetter), collects the glyphs it mentions, asks whether a lookup would apply to a sequence, and copies what a subset font keeps. Each job walks the same tree: the LookupList, each Lookup, each subtable, through Extension subtables, into each format.</p>
+<p id="ix-116">HarfBuzz writes the walk once and passes in the job. The job is a <strong>context</strong>, a struct whose <code>dispatch</code> method says what to do with each object it is handed, and every table struct with more than one format has a <code>dispatch</code> method that picks the format and hands it on. Here is <code>SingleSubst</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/SingleSubst.hh#L27"><code>OT/Layout/GSUB/SingleSubst.hh:27</code></a>–<code>41</code>):</p>
+<pre><code class="language-c++">template &lt;typename context_t, typename ...Ts&gt;
+typename context_t::return_t dispatch (context_t *c, Ts&amp;&amp;... ds) const
+{
+  if (unlikely (!c-&gt;may_dispatch (this, &amp;u.format.v))) return c-&gt;no_dispatch_return_value ();
+  TRACE_DISPATCH (this, u.format.v);
+  switch (u.format.v) {
+  case 1: hb_barrier (); return_trace (c-&gt;dispatch (u.format1, std::forward&lt;Ts&gt; (ds)...));
+  case 2: hb_barrier (); return_trace (c-&gt;dispatch (u.format2, std::forward&lt;Ts&gt; (ds)...));
+#ifndef HB_NO_BEYOND_64K
+  case 3: hb_barrier (); return_trace (c-&gt;dispatch (u.format3, std::forward&lt;Ts&gt; (ds)...));
+  case 4: hb_barrier (); return_trace (c-&gt;dispatch (u.format4, std::forward&lt;Ts&gt; (ds)...));
+#endif
+  default:return_trace (c-&gt;default_return_value ());
+  }
+}
+</code></pre>
+<p id="ix-117"><code>u</code> is a union of the formats, each a struct that starts with the same two-byte format field, and <code>u.format.v</code> is that field. The <code>dispatch</code> doesn’t know what the context will do. It only knows how to find the right format. (<code>hb_barrier</code> keeps the compiler from reading ahead of the check on the format; it is the sanitizer’s business, and the next chapter’s.)</p>
+<p id="ix-118">One level up, <code>SubstLookupSubTable::dispatch</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/SubstLookupSubTable.hh#L49"><code>OT/Layout/GSUB/SubstLookupSubTable.hh:49</code></a>) switches on the lookup type instead, which isn’t in the subtable but in the Lookup that holds it, so it is passed in. And <code>Lookup::dispatch</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L1338"><code>hb-ot-layout-common.hh:1338</code></a>) loops over the subtables:</p>
+<pre><code class="language-c++">for (unsigned int i = 0; i &lt; count; i++) {
+  typename context_t::return_t r = get_subtable&lt;TSubTable&gt; (i).dispatch (c, lookup_type, ds...);
+  if (c-&gt;stop_sublookup_iteration (r))
+    return_trace (r);
+}
+return_trace (c-&gt;default_return_value ());
+</code></pre>
+<p id="ix-119"><code>Lookup</code> is shared by GSUB and GPOS, so its array of subtable offsets is declared as plain <code>Offset16</code>s, with no target type. The caller says what they point to, <code>SubstLookupSubTable</code> or <code>PosLookupSubTable</code>, as the template argument <code>TSubTable</code>, and <code>get_subtable</code> casts the array to offsets of that type.</p>
+<h3 id="the-contexts">The contexts</h3>
+<p id="ix-120">Every context derives from <code>hb_dispatch_context_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-dispatch.hh#L38"><code>hb-dispatch.hh:38</code></a>):</p>
+<pre><code class="language-c++">template &lt;typename Context, typename Return=hb_empty_t, unsigned int MaxDebugDepth=0&gt;
+struct hb_dispatch_context_t
+{
+  /* … */
+  template &lt;typename T, typename F&gt;
+  bool may_dispatch (const T *obj HB_UNUSED, const F *format HB_UNUSED) { return true; }
+  template &lt;typename T, typename ...Ts&gt;
+  return_t dispatch (const T &amp;obj, Ts&amp;&amp;... ds)
+  { return obj.dispatch (thiz (), std::forward&lt;Ts&gt; (ds)...); }
+  static return_t no_dispatch_return_value () { return Context::default_return_value (); }
+  static bool stop_sublookup_iteration (const return_t r HB_UNUSED) { return false; }
+  /* … */
+};
+</code></pre>
+<p id="ix-121">This is the “curiously recurring template pattern”, as a comment in the file says: each context passes itself as <code>Context</code>, so the base calls the context’s own methods without virtual functions, and the compiler can inline the whole walk for each job. A context overrides what it needs: <code>dispatch</code> for what to do at a leaf, <code>return_t</code>, <code>default_return_value</code> for what an unknown format or an empty lookup gives, and <code>stop_sublookup_iteration</code> for whether one subtable’s result ends the loop over a lookup’s subtables.</p>
+<p id="ix-122">The main contexts in 15.1.0:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-123">Context</th>
+<th>At each subtable, it…</th>
+<th>Returns</th>
+<th>Stops when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-124"><code>hb_sanitize_context_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L123"><code>hb-sanitize.hh:123</code></a>)</td>
+<td>checks it</td>
+<td><code>bool</code>, true by default</td>
+<td>a check fails</td>
+</tr>
+<tr>
+<td id="ix-125"><code>hb_ot_apply_context_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L1127"><code>hb-ot-layout-gsubgpos.hh:1127</code></a>)</td>
+<td>applies it to the buffer</td>
+<td><code>bool</code>, false by default</td>
+<td>a subtable applies</td>
+</tr>
+<tr>
+<td id="ix-126"><code>hb_accelerate_subtables_context_t</code> (<code>:1419</code>)</td>
+<td>records it, its <code>apply</code> function and its coverage digest</td>
+<td>nothing</td>
+<td>never</td>
+</tr>
+<tr>
+<td id="ix-127"><code>hb_would_apply_context_t</code> (<code>:286</code>)</td>
+<td id="ix-128">asks whether it would apply to a glyph sequence</td>
+<td><code>bool</code></td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-129"><code>hb_closure_context_t</code>, <code>hb_closure_lookups_context_t</code> (<code>:68</code>, <code>:207</code>)</td>
+<td id="ix-130">adds the glyphs it can produce, or the lookups it reaches</td>
+<td>nothing</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-131"><code>hb_collect_glyphs_context_t</code> (<code>:329</code>)</td>
+<td id="ix-132">collects its input, context and output glyphs</td>
+<td>nothing</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-133"><code>hb_depend_context_t</code> (<code>:402</code>)</td>
+<td id="ix-134">records glyph dependencies, for hb-depend</td>
+<td>nothing</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-135"><code>hb_subset_context_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.hh#L40"><code>hb-subset.hh:40</code></a>)</td>
+<td>writes its subset copy</td>
+<td><code>bool</code></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-136">There are a dozen more: small questions about lookups in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh"><code>hb-ot-layout-gsubgpos.hh</code></a> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>hb-ot-layout.cc</code></a>, subsetting helpers in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh"><code>hb-ot-layout-common.hh</code></a>, the AAT apply context, and painting, closure and dependency contexts for COLRv1 paint graphs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L65"><code>OT/Color/COLR/COLR.hh:65</code></a>). Writing a font is not among them. The serializer, <code>hb_serialize_context_t</code>, is not a dispatch context: tables have <code>serialize</code> methods that are called directly, and the subset context holds a serializer and walks the old table by dispatch, writing the new one as it goes.</p>
+<h3 id="choosing-the-method-to-call">Choosing the method to call</h3>
+<p id="ix-137">The sanitizer walks <em>every</em> struct through <code>c-&gt;dispatch</code>, not only the leaves, so its <code>dispatch</code> has to call <code>sanitize</code> where a struct has one and the struct’s own <code>dispatch</code> where it doesn’t. It chooses at compile time (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L154"><code>hb-sanitize.hh:154</code></a>):</p>
+<pre><code class="language-c++">template &lt;typename T, typename ...Ts&gt; auto
+_dispatch (const T &amp;obj, hb_priority&lt;1&gt;, Ts&amp;&amp;... ds) HB_AUTO_RETURN
+( obj.sanitize (this, std::forward&lt;Ts&gt; (ds)...) )
+template &lt;typename T, typename ...Ts&gt; auto
+_dispatch (const T &amp;obj, hb_priority&lt;0&gt;, Ts&amp;&amp;... ds) HB_AUTO_RETURN
+( obj.dispatch (this, std::forward&lt;Ts&gt; (ds)...) )
+</code></pre>
+<p id="ix-138"><code>hb_priority&lt;1&gt;</code> derives from <code>hb_priority&lt;0&gt;</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-meta.hh#L79"><code>hb-meta.hh:79</code></a>), so when both overloads compile, C++ prefers the first. When the struct has no <code>sanitize</code>, the first doesn’t compile and is quietly dropped, leaving the second. So <code>SingleSubst</code>, which has no <code>sanitize</code>, is sanitized through its <code>dispatch</code>, which picks the format, whose <code>sanitize</code> is called. The subset context does the same with <code>subset</code>, and the apply context uses the trick to prefer <code>apply (c, cache)</code> to <code>apply (c)</code>. The sanitizer also overrides <code>may_dispatch</code>, to check that the format field itself is inside the table before anything switches on it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-sanitize.hh#L136"><code>hb-sanitize.hh:136</code></a>).</p>
+<h3 id="dispatch-once-not-every-glyph">Dispatch once, not every glyph</h3>
+<p id="ix-139">Following the chain of <code>dispatch</code> calls through Lookup, Extension, lookup type and format for every glyph would be slow. So HarfBuzz walks it once per lookup, when the lookup’s accelerator is made (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L6197"><code>hb-ot-layout-gsubgpos.hh:6197</code></a>). At each leaf, <code>hb_accelerate_subtables_context_t</code> stores the subtable’s address, a pointer to a function that calls that format’s <code>apply</code>, and a digest of its coverage (<code>:1562</code>). From then on, <code>accel.apply</code> in the GSUB chapter’s loop runs through that flat array, and the switches on lookup type and format aren’t run again while shaping.</p>
+<blockquote>
+<p id="ix-140">For programmers: a new operation over layout tables is a new context, derived from <code>hb_dispatch_context_t&lt;YourContext, YourReturn&gt;</code>, with a <code>default_return_value</code> and a <code>dispatch</code> that calls your method on each leaf. Every struct that already dispatches can then be walked by it; only the leaves need the new method.</p>
+</blockquote>
+<h2 id="smalltypes-and-mediumtypes">SmallTypes and MediumTypes</h2>
+<p id="ix-141">The structs above were templates on <code>Types</code>. That parameter is one of two structs in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-dual.hh#L38"><code>hb-ot-dual.hh:38</code></a>–<code>73</code>, which bundle the widths of the basic fields:</p>
+<table>
+<thead>
+<tr>
+<th>Member</th>
+<th id="ix-142"><code>SmallTypes</code></th>
+<th id="ix-143"><code>MediumTypes</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-144"><code>size</code></td>
+<td>2</td>
+<td>3</td>
+</tr>
+<tr>
+<td><code>HBUINT</code></td>
+<td id="ix-145"><code>HBUINT16</code></td>
+<td id="ix-146"><code>HBUINT24</code></td>
+</tr>
+<tr>
+<td><code>HBGlyphID</code></td>
+<td id="ix-147"><code>HBGlyphID16</code></td>
+<td id="ix-148"><code>HBGlyphID24</code></td>
+</tr>
+<tr>
+<td><code>Offset</code>, <code>OffsetTo&lt;T&gt;</code></td>
+<td>16-bit</td>
+<td>24-bit</td>
+</tr>
+<tr>
+<td><code>LOffset</code>, <code>LOffsetTo&lt;T&gt;</code> (“long”)</td>
+<td>16-bit</td>
+<td>32-bit</td>
+</tr>
+<tr>
+<td><code>ArrayOf&lt;T&gt;</code>, <code>SortedArrayOf&lt;T&gt;</code></td>
+<td>16-bit count</td>
+<td>24-bit count</td>
+</tr>
+<tr>
+<td><code>large_int</code></td>
+<td><code>uint32_t</code></td>
+<td><code>uint64_t</code></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-149"><code>SmallTypes</code> is the OpenType everyone knows. <code>MediumTypes</code> is the “beyond 64k” extension in the 5th edition of the ISO Open Font Format, for fonts with more than 65,535 glyphs, supported by default since HarfBuzz 15.0. The same struct, with the same code, describes both. The <code>Coverage</code> union is:</p>
+<pre><code class="language-c++">union {
+struct { HBUINT16 v; }        format;         /* Format identifier */
+CoverageFormat1_3&lt;SmallTypes&gt; format1;
+CoverageFormat2_4&lt;SmallTypes&gt; format2;
+#ifndef HB_NO_BEYOND_64K
+CoverageFormat1_3&lt;MediumTypes&gt;format3;
+CoverageFormat2_4&lt;MediumTypes&gt;format4;
+#endif
+} u;
+</code></pre>
+<p id="ix-150">Coverage format 3 is format 1 with 24-bit glyph IDs and count, format 4 is format 2 likewise, and they are not separate code. The struct names say so: <code>CoverageFormat1_3</code> is “format 1, or 3”, and <code>LigatureSubstFormat1_2</code> “format 1, or 2”. The union turns the format number into a choice of types. A build with <code>HB_NO_BEYOND_64K</code> defined (or <code>HB_MINI</code>) leaves the wider formats out of every union, and they fall into the <code>default</code> cases like any unknown format.</p>
+<p id="ix-151">Some beyond-64k tables are separate tables with uppercase tags, such as <code>GLYF</code> and <code>HMTX</code> beside <code>glyf</code> and <code>hmtx</code>. If the uppercase table has data, <code>hb_dual_accelerator_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-dual.hh#L79"><code>hb-ot-dual.hh:79</code></a>) loads the lowercase one from the empty face, so it is ignored entirely; <a href="where-metrics-come-from.html">where metrics come from</a> has more.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh"><code>src/hb-open-type.hh</code></a></td>
+<td>the basic types: <code>NumType</code> and its typedefs, <code>Tag</code>, <code>Index</code>, <code>Offset</code>, <code>OffsetTo</code>, every kind of array</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-algs.hh"><code>src/hb-algs.hh</code></a></td>
+<td><code>HBInt</code>, the bytes inside a <code>NumType</code>, and <code>HB_FAST_NUM_ACCESS</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-machinery.hh"><code>src/hb-machinery.hh</code></a></td>
+<td><code>StructAtOffset</code>, <code>StructAfter</code>, the <code>DEFINE_SIZE_*</code> macros (and lazy loaders, for the <a href="blobs-faces-and-lazy-tables.html">blobs and faces chapter</a>)</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-null.hh"><code>src/hb-null.hh</code></a></td>
+<td><code>Null</code>, <code>Crap</code>, <code>CrapOrNull</code>, the size traits, <code>DECLARE_NULL_NAMESPACE_BYTES</code>, <code>hb_nonnull_ptr_t</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-static.cc"><code>src/hb-static.cc</code></a></td>
+<td>the Null and Crap pools, and the non-zero Null bytes</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-file.hh"><code>src/hb-open-file.hh</code></a></td>
+<td>the container: <code>OpenTypeFontFile</code>, <code>OpenTypeOffsetTable</code>, <code>TableRecord</code>, TTC headers, Mac resource forks</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face.cc"><code>src/hb-face.cc</code></a></td>
+<td>finding a face in a file and a table in a face</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-dispatch.hh"><code>src/hb-dispatch.hh</code></a></td>
+<td><code>hb_dispatch_context_t</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-dual.hh"><code>src/hb-ot-dual.hh</code></a></td>
+<td><code>SmallTypes</code>, <code>MediumTypes</code>, and the dual accelerators for beyond-64k tables</td>
+</tr>
+<tr>
+<td><code>src/OT/Layout/Common/</code></td>
+<td>Coverage and <code>RangeRecord</code>, a small, complete example of the whole pattern</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src/OT/Layout/GSUB"><code>src/OT/Layout/GSUB/SingleSubst*.hh</code></a></td>
+<td>a format union with <code>dispatch</code>, and its two format templates</td>
+</tr>
+</tbody>
+</table>
+<p>The test fonts and the scripts that make them are in <code>fonts/fonts-as-bytes/</code>: <code>build-fonts.py</code> builds <code>bytes.ttf</code> and the altered copies, and <code>dump.py</code> prints the bytes shown on this page.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>HarfBuzz doesn’t parse fonts. It describes their bytes with structs and reads fields in place, with no copying and no allocation.</li>
+<li>A face is found from the file’s first four bytes (sfnt, TTC or dfont) and a table from the directory; a missing table is an empty blob.</li>
+<li>Numbers are byte arrays that convert themselves from big-endian when read, so structs can sit at any address.</li>
+<li><code>DEFINE_SIZE_*</code> gives each struct its real size and has the compiler check it against the declaration.</li>
+<li><code>this+offset</code> follows an offset to a typed target. The code always names the base, because OpenType counts offsets from different places.</li>
+<li>A zero offset, an out-of-range index or a too-short table gives a Null object: zeros, or special bytes where zeros would mean something. A zeroed table is an empty one, so the code rarely checks for missing data.</li>
+<li>Format unions <code>dispatch</code> to their formats, and contexts say what to do there: one description of a table serves sanitizing, applying, closure, subsetting and the rest.</li>
+<li><code>SmallTypes</code> and <code>MediumTypes</code> let one template describe both 16-bit OpenType and its 24-bit “beyond 64k” formats.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="quick-start.html">← Quick start: shaping text, then drawing it</a><a rel="next" href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

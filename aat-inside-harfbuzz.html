@@ -1,0 +1,835 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AAT inside HarfBuzz · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part VII · Apple Advanced Typography</p>
+<h1 id="aat-inside-harfbuzz">29. AAT inside HarfBuzz</h1>
+<p id="ix-1">Apple’s fonts don’t carry GSUB. Their substitutions are in <code>morx</code>, the extended glyph metamorphosis table, and its older form <code>mort</code>: a list of state machines that walk along the glyphs and change, join, insert or reorder them as they go. OpenType asks the shaping engine to know how a script behaves; <code>morx</code> puts that knowledge in the font (<a href="why-shaping-exists.html#where-the-rules-live">Where the rules live</a> has the history).</p>
+<p id="ix-2">HarfBuzz has no separate AAT shaper and no AAT backend. A font with <code>morx</code> is shaped by the same <code>ot</code> pipeline as any other, and at one step, where GSUB would run, <code>morx</code> runs instead. When it does, GSUB doesn’t run at all. This chapter is about that step: when HarfBuzz takes it, how a <code>morx</code> table is laid out, how OpenType feature tags reach it, the loop that drives every state machine, and the five kinds of subtable that loop runs. Positioning with <code>kerx</code>, <code>ankr</code> and <code>trak</code> is the next chapter’s subject, <a href="aat-positioning.html">AAT positioning</a>.</p>
+<p id="ix-3">The examples come from small test fonts built by <code>fonts/aat-inside-harfbuzz/build-fonts.py</code>, whose <code>morx</code> tables are written as TTX and compiled by fontTools, and from a few of HarfBuzz’s own test fonts. Every shaping result and trace on this page was produced by running HarfBuzz 15.1.0 on those fonts when the page was built.</p>
+<h2 id="when-morx-is-used">When morx is used</h2>
+<p id="ix-4">The decision is made once, when the shape plan is made, by <code>_hb_apply_morx</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L60"><code>hb-ot-shape.cc:60</code></a>):</p>
+<pre><code class="language-c++">return hb_aat_layout_has_substitution (face) &amp;&amp;
+       (HB_DIRECTION_IS_HORIZONTAL (props.direction) ||
+        !hb_ot_layout_has_substitution (face));
+</code></pre>
+<p id="ix-5"><code>hb_aat_layout_has_substitution</code> is true if the font has a <code>morx</code> or a <code>mort</code> table (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout.cc#L278"><code>hb-aat-layout.cc:278</code></a>). So in horizontal text, <code>morx</code> wins whenever it is there, whatever else the font has. In vertical text it is used only if there is no GSUB (HarfBuzz issue #2124). If a font has both <code>morx</code> and <code>mort</code>, only <code>morx</code> is read (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout.cc#L299-L327"><code>hb-aat-layout.cc:299–327</code></a>).</p>
+<p id="ix-6">That wasn’t always so. HarfBuzz 2.0.0 added AAT shaping, used only when GSUB and GPOS were missing, with an environment variable, <code>HB_OPTIONS=aat</code>, to prefer <code>morx</code> and <code>kerx</code>. Since 2.6.5, “AAT is now always preferred for horizontal scripts when both AAT and OT layout tables exist at the same time” (<code>NEWS</code>). The variable is gone: nothing in 15.1.0’s source reads an <code>aat</code> option.</p>
+<p id="ix-7"><code>latin-gsub.ttf</code> has a <code>morx</code> that makes f i into f_i, and a GSUB whose <code>ccmp</code> makes f l into f_l:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">latin-gsub.ttf</td><td class="in"><span class="txt">fi␣fl</span><span class="cps">U+0066 U+0069 U+0020 U+0066 U+006C</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900|space=2+250|f=3+500|l=4+500]</code></td></tr><tr><td class="font">latin-gsub.ttf</td><td class="in"><span class="txt">fi␣fl</span><span class="cps">U+0066 U+0069 U+0020 U+0066 U+006C</span></td><td class="opt">--direction=ttb</td><td class="out"><code>[f=0@-250,-750+0,-1000|i=1@-250,-750+0,-1000|space=2@-125,-500+0,-1000|f_l=3@-450,-750+0,-1000]</code></td></tr></tbody></table></div>
+<p id="ix-8">Horizontally, only <code>morx</code>’s ligature is made. Vertically, the font’s GSUB rules out <code>morx</code>, and only GSUB’s is.</p>
+<p id="ix-9">When the plan uses <code>morx</code>, step 13 of <a href="pipeline-step-by-step.html#substituting">the pipeline</a> calls <code>hb_aat_layout_substitute</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L916"><code>hb-ot-shape.cc:916</code></a>) instead of the GSUB lookups. Four things follow:</p>
+<ul>
+<li id="ix-10"><strong>No GSUB.</strong> Not one GSUB lookup runs, not even <code>ccmp</code> or <code>rvrn</code>. The OpenType map is still built, from the same features, because GPOS may still use it.</li>
+<li id="ix-11"><strong>The <code>dumber</code> shaper.</strong> The planner replaces any script shaper but the default one with <code>dumber</code>, which reorders nothing and inserts no dotted circles (<a href="choosing-a-script-shaper.html#aat-fonts">AAT fonts</a>). The font is expected to do all of that itself.</li>
+<li id="ix-12"><strong>Glyph classes.</strong> If the font has no GDEF classes, they are made from Unicode before <code>morx</code> runs, as they would be for GSUB. If it has GDEF, every glyph <code>morx</code> writes gets its class from GDEF (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-common.hh#L202-L281"><code>hb-aat-layout-common.hh:202–281</code></a>).</li>
+<li id="ix-13"><strong>Deleted glyphs.</strong> Glyphs that <code>morx</code> deletes stay in the buffer, marked, until GPOS is about to run, or until after positioning if it isn’t (<a href="pipeline-step-by-step.html#after-positioning">step 22</a>).</li>
+</ul>
+<p id="ix-14">Whether GPOS, <code>kerx</code> or <code>kern</code> then positions the glyphs is decided separately: see <a href="aat-positioning.html">AAT positioning</a>, and <a href="fallbacks.html">Fallbacks</a> for marks.</p>
+<h2 id="chains-flags-and-features">Chains, flags and features</h2>
+<p id="ix-15">A <code>morx</code> table is a version (2 or 3; <code>mort</code> is version 1) and a list of <strong>chains</strong>. Each chain holds:</p>
+<ul>
+<li id="ix-16"><strong>default flags</strong>, a 32-bit mask;</li>
+<li id="ix-17"><strong>feature entries</strong>, each a feature type and setting, with an enable mask and a disable mask;</li>
+<li id="ix-18">subtables, each with a coverage field, its type, and its own 32-bit <strong>sub-feature flags</strong>.</li>
+</ul>
+<p id="ix-19">The chains are independent. For each, HarfBuzz works out a set of flags, and each subtable in the chain runs if its sub-feature flags share a bit with them. The flags start as the default flags, and each feature entry whose type and setting were asked for changes them: <code>flags = (flags &amp; disable) | enable</code> (<code>Chain::compile_flags</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-morx-table.hh#L1138"><code>hb-aat-layout-morx-table.hh:1138</code></a>). The chain of <code>latin.ttf</code> has three subtables, with flags 0x1 (a ligature), 0x4 (word-final e) and 0x2 (small capitals), and these default flags and feature entries:</p>
+<figure class="views ttx"><pre><code>&lt;DefaultFlags value=&quot;0x00000005&quot;/&gt;
+&lt;!-- StructLength=418 --&gt;
+&lt;!-- MorphFeatureCount=6 --&gt;
+&lt;!-- MorphSubtableCount=3 --&gt;
+&lt;MorphFeature index=&quot;0&quot;&gt;
+  &lt;FeatureType value=&quot;1&quot;/&gt;
+  &lt;FeatureSetting value=&quot;2&quot;/&gt;
+  &lt;EnableFlags value=&quot;0x00000001&quot;/&gt;
+  &lt;DisableFlags value=&quot;0xFFFFFFFF&quot;/&gt;
+&lt;/MorphFeature&gt;
+&lt;MorphFeature index=&quot;1&quot;&gt;
+  &lt;FeatureType value=&quot;1&quot;/&gt;
+  &lt;FeatureSetting value=&quot;3&quot;/&gt;
+  &lt;EnableFlags value=&quot;0x00000000&quot;/&gt;
+  &lt;DisableFlags value=&quot;0xFFFFFFFE&quot;/&gt;
+&lt;/MorphFeature&gt;
+&lt;MorphFeature index=&quot;2&quot;&gt;
+  &lt;FeatureType value=&quot;36&quot;/&gt;
+  &lt;FeatureSetting value=&quot;0&quot;/&gt;
+  &lt;EnableFlags value=&quot;0x00000004&quot;/&gt;
+  &lt;DisableFlags value=&quot;0xFFFFFFFF&quot;/&gt;
+&lt;/MorphFeature&gt;
+&lt;MorphFeature index=&quot;3&quot;&gt;
+  &lt;FeatureType value=&quot;36&quot;/&gt;
+  &lt;FeatureSetting value=&quot;1&quot;/&gt;
+  &lt;EnableFlags value=&quot;0x00000000&quot;/&gt;
+  &lt;DisableFlags value=&quot;0xFFFFFFFB&quot;/&gt;
+&lt;/MorphFeature&gt;
+&lt;MorphFeature index=&quot;4&quot;&gt;
+  &lt;FeatureType value=&quot;37&quot;/&gt;
+  &lt;FeatureSetting value=&quot;0&quot;/&gt;
+  &lt;EnableFlags value=&quot;0x00000000&quot;/&gt;
+  &lt;DisableFlags value=&quot;0xFFFFFFFD&quot;/&gt;
+&lt;/MorphFeature&gt;
+&lt;MorphFeature index=&quot;5&quot;&gt;
+  &lt;FeatureType value=&quot;37&quot;/&gt;
+  &lt;FeatureSetting value=&quot;1&quot;/&gt;
+  &lt;EnableFlags value=&quot;0x00000002&quot;/&gt;
+  &lt;DisableFlags value=&quot;0xFFFFFFFF&quot;/&gt;
+&lt;/MorphFeature&gt;</code></pre><figcaption>latin.ttf: morx chain 0 features (TTX)</figcaption></figure>
+<p id="ix-20">The default flags, 0x5, turn on the ligature and the final e. Asking for feature type 37 (Lower Case) with setting 1 (Small Caps) adds 0x2; setting 0 takes it away again.</p>
+<p id="ix-21">Subtables run in order, chain after chain, each over the whole buffer. The trace names them <code>chainsubtable</code> and numbers them through the whole table, not per chain:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape latin.ttf "ae"  --trace</code></div><table><tbody><tr><td class="what">start table morx</td><td class="buf"><code>[a=0|e=1]</code></td></tr><tr><td class="what">skipped chainsubtable 0 because no glyph matches</td><td class="buf"><code>[a=0|e=1]</code></td></tr><tr><td class="what">start chainsubtable 1</td><td class="buf"><code>[a=0|e=1]</code></td></tr><tr><td class="what">end chainsubtable 1</td><td class="buf"><code>[a=0|e.fina=1]</code></td></tr><tr><td class="what">end table morx</td><td class="buf"><code>[a=0|e.fina=1]</code></td></tr></tbody></table></div>
+<p id="ix-22">Two subtables don’t run here, for different reasons. Subtable 0 is skipped “because no glyph matches”: no glyph in the buffer can start its machine. Subtable 2, the small capitals, is skipped without a message, because its flag is off.</p>
+<h3 id="coverage">Coverage</h3>
+<p id="ix-23">The top byte of a subtable’s coverage field (<code>ChainSubtable::Coverage</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-morx-table.hh#L1055"><code>hb-aat-layout-morx-table.hh:1055</code></a>) says which text it applies to and in which order it reads the glyphs:</p>
+<table>
+<thead>
+<tr>
+<th>Bit</th>
+<th>Name</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0x80</td>
+<td><code>Vertical</code></td>
+<td>applies only to vertical text; if clear, only to horizontal text</td>
+</tr>
+<tr>
+<td>0x40</td>
+<td><code>Backwards</code></td>
+<td id="ix-24">reads the glyphs in the opposite order</td>
+</tr>
+<tr>
+<td>0x20</td>
+<td id="ix-25"><code>AllDirections</code></td>
+<td>applies to both, and <code>Vertical</code> is ignored</td>
+</tr>
+<tr>
+<td>0x10</td>
+<td><code>Logical</code></td>
+<td id="ix-26">reads in logical order instead of layout order</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-27">The buffer is in logical order during substitution. HarfBuzz reverses it before a subtable that wants the other order, and back when a later one does, or the chain ends (<code>:1239</code>):</p>
+<table>
+<thead>
+<tr>
+<th><code>Logical</code></th>
+<th><code>Backwards</code></th>
+<th>Order</th>
+<th>Buffer reversed when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>0</td>
+<td>layout order (left to right)</td>
+<td>the text is right to left</td>
+</tr>
+<tr>
+<td>0</td>
+<td>1</td>
+<td>reverse layout order</td>
+<td>the text is left to right</td>
+</tr>
+<tr>
+<td>1</td>
+<td>0</td>
+<td id="ix-28">logical order</td>
+<td>never</td>
+</tr>
+<tr>
+<td>1</td>
+<td>1</td>
+<td id="ix-29">reverse logical order</td>
+<td>always</td>
+</tr>
+</tbody>
+</table>
+<h2 id="from-feature-tags-to-feature-types">From feature tags to feature types</h2>
+<p id="ix-30">AAT has no feature tags. Its features are numbered <strong>feature types</strong>, each with numbered <strong>selectors</strong> (also called settings): type 1 is Ligatures, whose selector 2 turns common ligatures on and 3 off. A request for <code>liga</code> or <code>smcp</code> has to be translated.</p>
+<p id="ix-31">The translation is a table of 78 entries, <code>feature_mappings</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout.cc#L106-L186"><code>hb-aat-layout.cc:106–186</code></a>), “Table data courtesy of Apple”, sorted by tag and searched by <code>hb_aat_layout_find_feature_mapping</code> (<code>:200</code>). A few of its rows:</p>
+<table>
+<thead>
+<tr>
+<th>Tag</th>
+<th id="ix-32">Feature type</th>
+<th>Selector to enable</th>
+<th>Selector to disable</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-33"><code>liga</code></td>
+<td>1 Ligatures</td>
+<td>2 common ligatures on</td>
+<td>3 common ligatures off</td>
+</tr>
+<tr>
+<td id="ix-34"><code>rlig</code></td>
+<td>1 Ligatures</td>
+<td>0 required ligatures on</td>
+<td>1 required ligatures off</td>
+</tr>
+<tr>
+<td id="ix-35"><code>vert</code></td>
+<td>4 Vertical Substitution</td>
+<td>0 on</td>
+<td>1 off</td>
+</tr>
+<tr>
+<td id="ix-36"><code>onum</code></td>
+<td>21 Number Case</td>
+<td>0 lower case numbers</td>
+<td>2 (none)</td>
+</tr>
+<tr>
+<td id="ix-37"><code>ss01</code></td>
+<td>35 Stylistic Alternatives</td>
+<td>2 alternative one on</td>
+<td>3 off</td>
+</tr>
+<tr>
+<td id="ix-38"><code>calt</code></td>
+<td>36 Contextual Alternatives</td>
+<td>0 on</td>
+<td>1 off</td>
+</tr>
+<tr>
+<td id="ix-39"><code>smcp</code></td>
+<td>37 Lower Case</td>
+<td>1 small caps</td>
+<td>0 default lower case</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-40">Some features are exclusive: one of their selectors is always in force, and there is no “off”. For those, the table sometimes gives a disabling selector that doesn’t exist, like Number Case’s 2, so turning the feature off matches no feature entry and leaves the chain’s default. <code>aalt</code> isn’t in the table: <code>hb_aat_map_builder_t::add_feature</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-map.cc#L43"><code>hb-aat-map.cc:43</code></a>) sends it to type 17, Character Alternatives, with the feature’s value as the selector.</p>
+<h3 id="only-what-the-application-asks-for">Only what the application asks for</h3>
+<p id="ix-41">The OpenType features HarfBuzz turns on by itself, <code>liga</code>, <code>calt</code>, <code>ccmp</code> and the rest, never reach <code>morx</code>. The plan’s own AAT map, <code>plan-&gt;aat_map</code>, is compiled with no features at all (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L114"><code>hb-ot-shape.cc:114</code></a>), so it holds the chains’ default flags and nothing else. Only when the application passes features does <code>hb_aat_layout_substitute</code> build a map of its own, for that call (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout.cc#L291-L298"><code>hb-aat-layout.cc:291–298</code></a>). A feature turned on selects the mapping’s enabling selector, and one with value 0 its disabling one.</p>
+<h3 id="only-with-a-feat-table">Only with a feat table</h3>
+<p id="ix-42"><code>add_feature</code> starts with this line (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-map.cc#L41"><code>hb-aat-map.cc:41</code></a>):</p>
+<pre><code class="language-c++">if (!face-&gt;table.feat-&gt;has_data ()) return;
+</code></pre>
+<p id="ix-43">and then drops any feature whose type the font’s <code>feat</code> table doesn’t list. <code>feat</code> names a font’s features for a user interface, and HarfBuzz reads it as the list of features the font accepts. (One exception: a request for small caps is let through if <code>feat</code> lists only the deprecated Letter Case type, because <code>compile_flags</code> matches a chain’s old Letter Case small-caps entries against the new Lower Case ones; issues #1342 and #2307.) <code>latin-nofeat.ttf</code> is <code>latin.ttf</code> without its <code>feat</code> table:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">latin.ttf</td><td class="in"><span class="txt">fife</span><span class="cps">U+0066 U+0069 U+0066 U+0065</span></td><td class="opt">--features=-liga,smcp</td><td class="out"><code>[f=0+500|i=1+500|f=2+500|e.sc=3+450]</code></td></tr><tr><td class="font">latin-nofeat.ttf</td><td class="in"><span class="txt">fife</span><span class="cps">U+0066 U+0069 U+0066 U+0065</span></td><td class="opt">--features=-liga,smcp</td><td class="out"><code>[f_i=0+900|f=2+500|e.fina=3+600]</code></td></tr></tbody></table></div>
+<p id="ix-44">The same chain, the same feature entries, and without <code>feat</code> neither request does anything.</p>
+<blockquote>
+<p id="ix-45">For type designers: a <code>morx</code> font whose features should be reachable from OpenType tags needs a <code>feat</code> table that lists each feature type. Without one, HarfBuzz shapes it with its default flags, always.</p>
+</blockquote>
+<h3 id="ranges">Ranges</h3>
+<p id="ix-46">A feature can apply to part of the text, as it can for GSUB (a range in <code>hb_feature_t</code>, <code>smcp[1:2]</code> in <code>hb-shape</code>’s syntax). Since 7.0.0, <code>hb_aat_map_builder_t::compile</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-map.cc#L85"><code>hb-aat-map.cc:85</code></a>) sorts the features’ starts and ends, and compiles each chain’s flags once for every stretch of text with the same active features, giving each chain a list of flags and the clusters they cover (<code>mortmorx::compile_flags</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-morx-table.hh#L1426"><code>hb-aat-layout-morx-table.hh:1426</code></a>). A budget, <code>HB_BUDGET_AAT_MAP</code> (2²⁴), limits the work; when it runs out, the last range compiled is stretched to the end of the text.</p>
+<p id="ix-47">While a subtable runs, the driver looks up each glyph’s cluster in that list. Where the subtable’s flag is off, the machine goes back to its start state and the glyph passes untouched:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">latin.ttf</td><td class="in"><span class="txt">aaa</span><span class="cps">U+0061 U+0061 U+0061</span></td><td class="opt">--features=smcp[1:2]</td><td class="out"><code>[a=0+500|a.sc=1+450|a=2+500]</code></td></tr><tr><td class="font">latin.ttf</td><td class="in"><span class="txt">fifi</span><span class="cps">U+0066 U+0069 U+0066 U+0069</span></td><td class="opt">--features=-liga[1:2]</td><td class="out"><code>[f=0+500|i=1+500|f_i=2+900]</code></td></tr></tbody></table></div>
+<p id="ix-48">In the second line the <code>i</code> of cluster 1 is outside the ligature’s flags, so the first f i can’t ligate; the second pair can.</p>
+<h3 id="asked-for-twice">Asked for twice</h3>
+<p id="ix-49">When the same feature is asked for twice, the OpenType map lets the later request win (<a href="from-features-to-lookups.html#when-a-tag-is-asked-for-twice">When a tag is asked for twice</a>). The AAT map does the opposite. <code>compile</code> sorts the active features by type, by selector pair, and then by the order they were asked for, and keeps the first request for each feature (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-map.cc#L139-L155"><code>hb-aat-map.cc:139–155</code></a>):</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">latin.ttf</td><td class="in"><span class="txt">fifi</span><span class="cps">U+0066 U+0069 U+0066 U+0069</span></td><td class="opt">--features=-liga,liga</td><td class="out"><code>[f=0+500|i=1+500|f=2+500|i=3+500]</code></td></tr><tr><td class="font">latin.ttf</td><td class="in"><span class="txt">fifi</span><span class="cps">U+0066 U+0069 U+0066 U+0069</span></td><td class="opt">--features=liga,-liga</td><td class="out"><code>[f_i=0+900|f_i=2+900]</code></td></tr><tr><td class="font">gsub/ligatures.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--features=-liga,liga</td><td class="out"><code>[f_i=0+900]</code></td></tr></tbody></table></div>
+<p id="ix-50">The same request turns ligatures off in a <code>morx</code> font and on in a GSUB font. Nothing in the source says this is intended.</p>
+<blockquote>
+<p>Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/f346ea17a9cedce7ba98f45782aa27faa597a0e3"><code>f346ea1</code></a> (17 November 2026), so on main the later request wins in AAT too, as it does in OpenType.</p>
+</blockquote>
+<h2 id="the-state-machine">The state machine</h2>
+<p id="ix-51">Every <code>morx</code> subtable but one is a <strong>state machine</strong>, a finite-state transducer, and HarfBuzz runs them all with one loop. A machine’s <code>StateTable</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-common.hh#L920"><code>hb-aat-layout-common.hh:920</code></a>) has four parts:</p>
+<ul>
+<li id="ix-52">a <strong>class table</strong>, an AAT lookup table (<a href="fonts-as-bytes.html#arrays">Arrays</a>) that gives each glyph a class;</li>
+<li id="ix-53">a <strong>state array</strong>, one row per state and one column per class, each cell the index of an entry;</li>
+<li id="ix-54">an <strong>entry table</strong>, each entry a new state, 16 bits of flags, and, for some subtable types, a few more fields;</li>
+<li><code>nClasses</code>, the width of a row.</li>
+</ul>
+<p>The first four classes are reserved (<code>:912</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Name</th>
+<th>Given to</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>end of text</td>
+<td id="ix-55">nothing: it is fed once, after the last glyph</td>
+</tr>
+<tr>
+<td>1</td>
+<td>out of bounds</td>
+<td id="ix-56">any glyph the class table doesn’t list</td>
+</tr>
+<tr>
+<td>2</td>
+<td id="ix-57">deleted glyph</td>
+<td id="ix-58">the glyph 0xFFFF, which an earlier subtable deleted</td>
+</tr>
+<tr>
+<td>3</td>
+<td>end of line</td>
+<td>nothing in HarfBuzz</td>
+</tr>
+</tbody>
+</table>
+<p>Two states are reserved too: 0, start of text, and 1, start of line. HarfBuzz always starts in state 0, and reaches state 1 only if the font’s entries lead there.</p>
+<h3 id="the-loop">The loop</h3>
+<p><code>StateTableDriver::drive</code> (<code>:1282</code>) is that loop. Trimmed of the range check, a fast path and the safe-to-break bookkeeping, with two of its variables written out, it is:</p>
+<pre><code class="language-c++">int state = STATE_START_OF_TEXT;
+for (buffer-&gt;idx = 0; buffer-&gt;successful;)
+{
+  unsigned klass = buffer-&gt;idx &lt; buffer-&gt;len ?
+                   machine.get_class (buffer-&gt;cur().codepoint, num_glyphs, cache) :
+                   CLASS_END_OF_TEXT;
+  const Entry &amp;entry = machine.get_entry (state, klass);
+  int next_state = machine.new_state (entry.newState);
+
+  c-&gt;transition (buffer, this, entry);   /* the subtable's own action */
+  state = next_state;
+
+  if (buffer-&gt;idx == buffer-&gt;len)
+    break;
+
+  if (!(entry.flags &amp; DontAdvance) || buffer-&gt;max_ops-- &lt;= 0)
+    buffer-&gt;next_glyph ();
+}
+</code></pre>
+<p id="ix-59">At each glyph it finds the class and the entry, lets the subtable act, and moves to the new state. When the glyphs run out, it makes one more transition, with class 0, so a machine can finish what it started, and stops.</p>
+<p id="ix-60">An entry with the <strong>DontAdvance</strong> flag doesn’t move on: the machine reads the same position again, in its new state. That is how a font runs two rules on one glyph, and how it could loop for ever, so each such transition takes one from the buffer’s operations budget, <code>max_ops</code> (4,096 per glyph, at least 65,536; <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L41-L45"><code>hb-limits.hh:41–45</code></a>), and once that is spent, DontAdvance is ignored. <code>loop.ttf</code> has a subtable in which <code>a</code>, in state 0, marks itself and goes back to state 0 without advancing, and after it a second subtable that makes every <code>e</code> into <code>e.sc</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">loop.ttf</td><td class="in"><span class="txt">ae</span><span class="cps">U+0061 U+0065</span></td><td class="opt"></td><td class="out"><code>[a=0+500|e=1+500]</code></td></tr></tbody></table></div>
+<p id="ix-61">The loop ends, but the budget is gone. Before each subtable HarfBuzz charges a pass over the buffer (<code>charge_buffer_pass</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-common.hh#L171"><code>hb-aat-layout-common.hh:171</code></a>), and that fails, so the buffer is marked as failed and the second subtable never runs: the <code>e</code> stays an <code>e</code>.</p>
+<p id="ix-62">The fast path, from 12.3.0, skips runs of glyphs of one class that lead from the start state back to it and do nothing.</p>
+<h3 id="deleted-glyphs-are-still-there">Deleted glyphs are still there</h3>
+<p id="ix-63">A glyph deleted by a ligature or replaced by 0xFFFF isn’t taken out of the buffer until after <code>morx</code> (<a href="unicode-inside-harfbuzz.html#the-hidden-ones">Unicode inside HarfBuzz</a> explains how it is marked). Later subtables see it, as class 2, and a font has to say what to do with it, usually nothing: stay in the same state. <code>deva.ttf</code> does that in every state. <code>deva-deleted.ttf</code> is the same font, except that its second and third subtables treat class 2 like any glyph they don’t know, and go back to state 0:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">deva.ttf</td><td class="in"><span class="txt">क्षि</span><span class="cps">U+0915 U+094D U+0937 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra=0+300|k_ssa=0+800]</code></td></tr><tr><td class="font">deva-deleted.ttf</td><td class="in"><span class="txt">क्षि</span><span class="cps">U+0915 U+094D U+0937 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[k_ssa=0+800|iMatra=0+300|dottedcircle=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-64">The first subtable makes <code>ka virama ssa</code> into <code>k_ssa</code>, followed by two deleted glyphs. In <code>deva-deleted.ttf</code> they reset the later machines, so the vowel sign seems to have no consonant: it gets a dotted circle, and moves before that instead of the conjunct. The trace of <code>deva.ttf</code> shows the deleted glyphs, as <code>gid65535</code>:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape deva.ttf "क्षि" --language=hi --trace</code></div><table><tbody><tr><td class="what">start table morx</td><td class="buf"><code>[ka=0|virama=0|ssa=2|iMatra=2]</code></td></tr><tr><td class="what">start chainsubtable 0</td><td class="buf"><code>[ka=0|virama=0|ssa=2|iMatra=2]</code></td></tr><tr><td class="what">end chainsubtable 0</td><td class="buf"><code>[k_ssa=0|gid65535=0|gid65535=0|iMatra=0]</code></td></tr><tr><td class="what">start chainsubtable 1</td><td class="buf"><code>[k_ssa=0|gid65535=0|gid65535=0|iMatra=0]</code></td></tr><tr><td class="what">end chainsubtable 1</td><td class="buf"><code>[k_ssa=0|gid65535=0|gid65535=0|iMatra=0]</code></td></tr><tr><td class="what">start chainsubtable 2</td><td class="buf"><code>[k_ssa=0|gid65535=0|gid65535=0|iMatra=0]</code></td></tr><tr><td class="what">end chainsubtable 2</td><td class="buf"><code>[iMatra=0|k_ssa=0|gid65535=0|gid65535=0]</code></td></tr><tr><td class="what">end table morx</td><td class="buf"><code>[iMatra=0|k_ssa=0|gid65535=0|gid65535=0]</code></td></tr></tbody></table></div>
+<blockquote>
+<p id="ix-65">For type designers: give class 2, deleted glyph, a “stay where you are” entry in every state of every subtable that comes after one that can delete.</p>
+</blockquote>
+<h3 id="before-the-loop">Before the loop</h3>
+<p id="ix-66">Each chain has an accelerator, made when it is first used (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-morx-table.hh#L998"><code>hb-aat-layout-morx-table.hh:998</code></a>). For each subtable it collects the glyphs whose class, in state 0, leads to another state, an action, or a mark or push (<code>StateTable::collect_initial_glyphs</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-common.hh#L934"><code>hb-aat-layout-common.hh:934</code></a>), and a subtable is skipped if the buffer holds none of them: the “no glyph matches” of the trace above. <code>morx</code> version 3 adds a glyph coverage table per subtable for the same purpose; HarfBuzz checks it and doesn’t otherwise read it. The accelerator also caches glyph classes.</p>
+<p id="ix-67">The machine itself is mostly checked as it runs, since the entries and actions it reaches depend on the text (<a href="trust-nothing-the-sanitizer.html#the-aat-tables">The AAT tables</a>). A table has at most 1,024 subtables (<code>HB_AAT_MAX_SUBTABLES</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L98"><code>hb-limits.hh:98</code></a>), and one known-broken <code>morx</code>, that of AALMAGHRIBI.ttf, is ignored (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout.cc#L215"><code>hb-aat-layout.cc:215</code></a>, issue #4108).</p>
+<h2 id="the-five-kinds-of-subtable">The five kinds of subtable</h2>
+<p id="ix-68">A subtable’s type is the low byte of its coverage field: 0 Rearrangement, 1 Contextual, 2 Ligature, 4 Noncontextual, 5 Insertion. Type 3 is unused, and a subtable of an unknown type is skipped (<code>ChainSubtable::dispatch</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-morx-table.hh#L1080"><code>hb-aat-layout-morx-table.hh:1080</code></a>). Each state-machine type has a <code>driver_context_t</code> whose <code>transition</code> is called by the loop.</p>
+<h3 id="rearrangement">Rearrangement</h3>
+<p id="ix-69">A <strong>Rearrangement subtable</strong> moves glyphs within a stretch of text. Its entries have three flags: <strong>MarkFirst</strong> marks the current glyph as the first of the stretch, <strong>MarkLast</strong> marks it as the last, and the low four bits are a <strong>verb</strong>, which says what to do with the stretch once both are marked. Each verb moves one or two glyphs from one end to the other, sometimes swapping them as they go (<code>:106</code>):</p>
+<table>
+<thead>
+<tr>
+<th id="ix-70">Verb</th>
+<th>Change</th>
+<th id="ix-71">Verb</th>
+<th>Change</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>no change</td>
+<td>8</td>
+<td>AxCD ⇒ CDxA</td>
+</tr>
+<tr>
+<td>1</td>
+<td>Ax ⇒ xA</td>
+<td>9</td>
+<td>AxCD ⇒ DCxA</td>
+</tr>
+<tr>
+<td>2</td>
+<td>xD ⇒ Dx</td>
+<td>10</td>
+<td>ABxD ⇒ DxAB</td>
+</tr>
+<tr>
+<td>3</td>
+<td>AxD ⇒ DxA</td>
+<td>11</td>
+<td>ABxD ⇒ DxBA</td>
+</tr>
+<tr>
+<td>4</td>
+<td>ABx ⇒ xAB</td>
+<td>12</td>
+<td>ABxCD ⇒ CDxAB</td>
+</tr>
+<tr>
+<td>5</td>
+<td>ABx ⇒ xBA</td>
+<td>13</td>
+<td>ABxCD ⇒ CDxBA</td>
+</tr>
+<tr>
+<td>6</td>
+<td>xCD ⇒ CDx</td>
+<td>14</td>
+<td>ABxCD ⇒ DCxAB</td>
+</tr>
+<tr>
+<td>7</td>
+<td>xCD ⇒ DCx</td>
+<td>15</td>
+<td>ABxCD ⇒ DCxBA</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-72"><code>x</code> is everything in between, of any length, including nothing. HarfBuzz works in place, merges the clusters of the whole stretch, and does nothing if the stretch is longer than 64 glyphs (<code>HB_MAX_CONTEXT_LENGTH</code>).</p>
+<p id="ix-73">The third subtable of <code>deva.ttf</code> marks the first consonant of a cluster as first, and the vowel sign I as last, with verb 2, which moves the last glyph to the front:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">deva.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra=0+300|ka=0+600]</code></td></tr><tr><td class="font">deva.ttf</td><td class="in"><span class="txt">क्कि</span><span class="cps">U+0915 U+094D U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra=0+300|ka=0+600|virama=0+300|ka=0+600]</code></td></tr></tbody></table></div>
+<p>In the second, the stretch is <code>ka virama ka iMatra</code>, and the vowel sign moves before all of it. This is the work the Indic shaper does for an OpenType font; for this font, HarfBuzz’s <code>dumber</code> shaper does none of it.</p>
+<h3 id="contextual">Contextual</h3>
+<p id="ix-74">A <strong>Contextual subtable</strong> replaces glyphs, one at a time, according to what came before. Its entries have a <strong>SetMark</strong> flag, which remembers the current glyph as the <strong>marked glyph</strong>, and two indices: one says how to replace the marked glyph, the other how to replace the current one. In <code>morx</code> each index chooses one of the subtable’s lookup tables, and 0xFFFF means no replacement. In <code>mort</code> they are offsets into one shared array of glyphs instead. So a contextual subtable can change a glyph <em>after</em> it has seen what follows it, by changing the marked one.</p>
+<p id="ix-75">The second subtable of <code>latin.ttf</code> marks every <code>e</code>. When the glyph after a marked <code>e</code> is one it has no class for, such as a space, or when the text ends, it replaces the marked glyph with <code>e.fina</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">latin.ttf</td><td class="in"><span class="txt">fe␣fee</span><span class="cps">U+0066 U+0065 U+0020 U+0066 U+0065 U+0065</span></td><td class="opt"></td><td class="out"><code>[f=0+500|e.fina=1+600|space=2+250|f=3+500|e=4+500|e.fina=5+600]</code></td></tr></tbody></table></div>
+<p id="ix-76">HarfBuzz has one rule here that doesn’t come from Apple’s specification. At the end of text, it makes no replacement at all unless a glyph has been marked: “Looks like CoreText applies neither mark nor current substitution for end-of-text if mark was not explicitly set” (<code>:252</code>). A replaced marked glyph is flagged unsafe to break from it to the current position.</p>
+<h3 id="ligature">Ligature</h3>
+<p id="ix-77">A <strong>Ligature subtable</strong> joins glyphs. Its machine pushes glyphs on a stack and pops them when it has seen enough. <strong>SetComponent</strong> pushes the current glyph’s position. <strong>PerformAction</strong>, in <code>morx</code> (in <code>mort</code>, a non-zero action offset), runs a list of <strong>ligature actions</strong>, each a 32-bit word:</p>
+<ul>
+<li id="ix-78">popping one glyph from the stack;</li>
+<li id="ix-79">adding <code>component[glyph + offset]</code> to a running ligature index, where the offset is a signed 30-bit number in the action;</li>
+<li id="ix-80">and, if the action has its Store or Last bit, replacing that glyph with <code>ligature[index]</code>.</li>
+</ul>
+<p id="ix-81">Last ends the list. When a ligature is stored, it takes the place of the earliest glyph it was made from, and the others popped since are deleted: they become 0xFFFF, and their clusters are merged into the ligature’s (<code>:561–583</code>). The ligature itself stays on the stack, so a later action can join it again.</p>
+<p><code>latin.ttf</code>’s first subtable has two classes, f and i, and three states:</p>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>f</th>
+<th>i</th>
+<th>anything else</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0, start of text</td>
+<td>push, go to 2</td>
+<td>stay</td>
+<td>stay</td>
+</tr>
+<tr>
+<td>1, start of line</td>
+<td>push, go to 2</td>
+<td>stay</td>
+<td>stay</td>
+</tr>
+<tr>
+<td>2, after f</td>
+<td>push, stay</td>
+<td>push, act, go to 0</td>
+<td>go to 0</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-82">The action pops the i and then the f. Both actions’ offsets point at the same entry of <code>component</code>, whose value is 0, so the index is 0, and <code>ligature[0]</code> is <code>f_i</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">latin.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">latin.ttf</td><td class="in"><span class="txt">ffi</span><span class="cps">U+0066 U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f=0+500|f_i=1+900]</code></td></tr></tbody></table></div>
+<p id="ix-83">In <code>ffi</code>, both fs and the i are pushed, and the action pops only two. The stack is a ring of 64 positions, so pushing more overwrites the oldest; popping from an empty one clears it and stops the action. An action on the end-of-text transition is ignored, “TODO Work on previous instead?” (<code>:520</code>), so a font can’t finish a ligature there.</p>
+<h3 id="noncontextual">Noncontextual</h3>
+<p id="ix-84">A <strong>Noncontextual subtable</strong> is not a state machine. It is one lookup table, from glyph to glyph, applied to every glyph in the buffer, in place (<code>:641</code>). <code>latin.ttf</code>’s small capitals are one, and so are the subtables of the <code>ltag</code> example below. It obeys feature ranges with its own copy of the driver’s range check.</p>
+<h3 id="insertion">Insertion</h3>
+<p id="ix-85">An <strong>Insertion subtable</strong> adds glyphs. Each entry can insert a list of up to 31 glyphs at the current glyph, at the marked glyph, or both, before or after it, depending on its flags (CurrentInsertBefore, MarkedInsertBefore). The counts are five-bit fields in the flags, and the lists are runs of glyphs in one shared array.</p>
+<p>The second subtable of <code>deva.ttf</code> inserts a dotted circle before a vowel sign I that follows no consonant:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">deva.ttf</td><td class="in"><span class="txt">ि</span><span class="cps">U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra=0+300|dottedcircle=0+500]</code></td></tr><tr><td class="font">deva.ttf</td><td class="in"><span class="txt">कि␣ि</span><span class="cps">U+0915 U+093F U+0020 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra=0+300|ka=0+600|space=2+250|iMatra=2+300|dottedcircle=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-86">The circle takes the vowel sign’s cluster, and the rearrangement after it then moves the vowel sign in front, as it would for a consonant. With an OpenType font, HarfBuzz would insert the circle itself (<a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a>); with <code>morx</code>, only the font does.</p>
+<p id="ix-87">After an insertion at the current glyph, HarfBuzz moves past the inserted glyphs, unless the entry has DontAdvance; then the first inserted glyph is the next one read (<code>:853–868</code>, issue #1224, reading an ambiguous specification). Apple’s two styles of insertion, “kashida-like” and “split-vowel-like”, are ignored: “TODO We ignore KashidaLike setting” (<code>:818</code>). Each inserted glyph costs one of <code>max_ops</code>. Insertion at the end of the text was fixed in 14.3.1.</p>
+<h2 id="mort">mort</h2>
+<p id="ix-88"><code>mort</code> is the older form, from QuickDraw GX (<a href="why-shaping-exists.html#apple-gx-aat-and-atsui">Apple: GX, AAT and ATSUI</a>). HarfBuzz reads it with the same templates, <code>mortmorx&lt;…, ObsoleteTypes&gt;</code> instead of <code>ExtendedTypes</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-common.hh#L1195-L1269"><code>hb-aat-layout-common.hh:1195–1269</code></a>). The differences are in the sizes and in how things are found:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th id="ix-89"><code>morx</code> (<code>ExtendedTypes</code>)</th>
+<th id="ix-90"><code>mort</code> (<code>ObsoleteTypes</code>)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>lengths, counts, coverage</td>
+<td>32 bits</td>
+<td>16 bits</td>
+</tr>
+<tr>
+<td id="ix-91">class table</td>
+<td id="ix-92">an AAT lookup table</td>
+<td id="ix-93">a first glyph and an array of 8-bit classes</td>
+</tr>
+<tr>
+<td id="ix-94">cells of the state array</td>
+<td>16-bit entry indices</td>
+<td>8-bit entry indices</td>
+</tr>
+<tr>
+<td>new state</td>
+<td>an index</td>
+<td id="ix-95">a byte offset, made into an index</td>
+</tr>
+<tr>
+<td>contextual replacements</td>
+<td id="ix-96">per-entry lookup tables</td>
+<td id="ix-97">offsets into one glyph array</td>
+</tr>
+<tr>
+<td id="ix-98">ligature actions</td>
+<td id="ix-99">an index, with a PerformAction flag</td>
+<td id="ix-100">an offset in the low 14 bits of the flags</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-101">A state given as an offset can come before the first state: some Apple <code>kern</code> tables start that way, and HarfBuzz allows such negative states in <code>kern</code> and <code>mort</code> alike (<code>StateTable::sanitize</code>, <code>:999</code>). 15.1.0 fixed those tables, which had been ignored. The <code>mort</code> font of the text-rendering tests in HarfBuzz’s test suite has one chain of five subtables, one of each kind:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape hb:test/shape/data/text-rendering-tests/fonts/TestAATMort.ttf "ABCEFGX"  --trace</code></div><table><tbody><tr><td class="what">start table mort</td><td class="buf"><code>[A=0|B=1|C=2|E=3|F=4|G=5|X=6]</code></td></tr><tr><td class="what">start chainsubtable 0</td><td class="buf"><code>[A=0|B=1|C=2|E=3|F=4|G=5|X=6]</code></td></tr><tr><td class="what">end chainsubtable 0</td><td class="buf"><code>[B=0|A=0|C=2|E=3|F=4|G=5|X=6]</code></td></tr><tr><td class="what">start chainsubtable 1</td><td class="buf"><code>[B=0|A=0|C=2|E=3|F=4|G=5|X=6]</code></td></tr><tr><td class="what">end chainsubtable 1</td><td class="buf"><code>[B=0|A=0|D=2|E=3|F=4|G=5|X=6]</code></td></tr><tr><td class="what">start chainsubtable 2</td><td class="buf"><code>[B=0|A=0|D=2|E=3|F=4|G=5|X=6]</code></td></tr><tr><td class="what">end chainsubtable 2</td><td class="buf"><code>[B=0|A=0|D=2|one=3|gid65535=3|G=5|X=6]</code></td></tr><tr><td class="what">start chainsubtable 3</td><td class="buf"><code>[B=0|A=0|D=2|one=3|gid65535=3|G=5|X=6]</code></td></tr><tr><td class="what">end chainsubtable 3</td><td class="buf"><code>[B=0|A=0|D=2|one=3|gid65535=3|H=5|X=6]</code></td></tr><tr><td class="what">start chainsubtable 4</td><td class="buf"><code>[B=0|A=0|D=2|one=3|gid65535=3|H=5|X=6]</code></td></tr><tr><td class="what">end chainsubtable 4</td><td class="buf"><code>[B=0|A=0|D=2|one=3|gid65535=3|H=5|X=6|Y=6]</code></td></tr><tr><td class="what">end table mort</td><td class="buf"><code>[B=0|A=0|D=2|one=3|gid65535=3|H=5|X=6|Y=6]</code></td></tr></tbody></table></div>
+<p id="ix-102">A B is rearranged into B A, C is replaced by D, E F become <code>one</code> and a deleted glyph, G becomes H, and Y is inserted after X.</p>
+<h2 id="feat-and-ltag">feat and ltag</h2>
+<p>Two small tables complete the picture.</p>
+<p id="ix-103"><strong>feat</strong>, the feature name table, lists a font’s feature types, their selectors, whether they are exclusive and which is the default, and <code>name</code> IDs for a menu (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-feat-table.hh"><code>hb-aat-layout-feat-table.hh</code></a>). Besides being the gate described above, it is what three functions read for applications, since 2.2.0: <code>hb_aat_layout_get_feature_types</code>, <code>hb_aat_layout_feature_type_get_name_id</code> and <code>hb_aat_layout_feature_type_get_selector_infos</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout.cc#L423-L482"><code>hb-aat-layout.cc:423–482</code></a>). The last gives each selector’s name ID and the selectors that enable and disable it: for an exclusive feature, the disabling one is the default; otherwise it is the selector plus one, by Apple’s convention that “on” selectors are even and “off” ones odd. The AAT map relies on that convention when it treats two selectors that differ only in the lowest bit as one feature (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-map.cc#L149-L152"><code>hb-aat-map.cc:149–152</code></a>).</p>
+<p id="ix-104"><strong>ltag</strong>, the language tag table, is a list of language-tag strings such as <code>sr</code> or <code>zh-Hant</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-ltag-table.hh"><code>hb-aat-ltag-table.hh</code></a>). HarfBuzz uses it twice. A <code>name</code> record on platform 0 (Unicode) has its language ID looked up in it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/name/name.hh#L109"><code>OT/name/name.hh:109</code></a>). And in <code>morx</code>, a feature entry of type 39, Language Tag, with setting <em>n</em>, applies when the buffer’s language matches tag <em>n</em> − 1, with or without any feature request, and with or without <code>feat</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-morx-table.hh#L1168"><code>hb-aat-layout-morx-table.hh:1168</code></a>). The match is “rudimentary”, as the source says: the font’s tag, lower-cased, must be the buffer’s language or a prefix of it ending at a hyphen (<code>ltag::matches_language</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-ltag-table.hh#L79"><code>hb-aat-ltag-table.hh:79</code></a>). This test font from HarfBuzz has tags <code>sr</code> and <code>Zh_Hant</code>, and a Noncontextual subtable for each:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hb:test/shape/data/in-house/fonts/882a555639995ed746c7575416acb689ecb9549d.ttf</td><td class="in"><span class="txt">A</span><span class="cps">U+0041</span></td><td class="opt">--language=en</td><td class="out"><code>[gid1=0+600]</code></td></tr><tr><td class="font">hb:test/shape/data/in-house/fonts/882a555639995ed746c7575416acb689ecb9549d.ttf</td><td class="in"><span class="txt">A</span><span class="cps">U+0041</span></td><td class="opt">--language=sr</td><td class="out"><code>[gid2=0+600]</code></td></tr><tr><td class="font">hb:test/shape/data/in-house/fonts/882a555639995ed746c7575416acb689ecb9549d.ttf</td><td class="in"><span class="txt">A</span><span class="cps">U+0041</span></td><td class="opt">--language=sr-Latn-RS</td><td class="out"><code>[gid2=0+600]</code></td></tr><tr><td class="font">hb:test/shape/data/in-house/fonts/882a555639995ed746c7575416acb689ecb9549d.ttf</td><td class="in"><span class="txt">A</span><span class="cps">U+0041</span></td><td class="opt">--language=srb</td><td class="out"><code>[gid1=0+600]</code></td></tr><tr><td class="font">hb:test/shape/data/in-house/fonts/882a555639995ed746c7575416acb689ecb9549d.ttf</td><td class="in"><span class="txt">A</span><span class="cps">U+0041</span></td><td class="opt">--language=zh-hant</td><td class="out"><code>[gid3=0+600]</code></td></tr><tr><td class="font">hb:test/shape/data/in-house/fonts/882a555639995ed746c7575416acb689ecb9549d.ttf</td><td class="in"><span class="txt">A</span><span class="cps">U+0041</span></td><td class="opt">--language=zh</td><td class="out"><code>[gid1=0+600]</code></td></tr></tbody></table></div>
+<p id="ix-105"><code>sr-Latn-RS</code> matches <code>sr</code>, but <code>srb</code> doesn’t, and <code>zh</code> doesn’t match <code>zh-hant</code>. Language-specific forms in AAT came in 5.0.0. HarfBuzz uses no other AAT table for substitution: <code>bsln</code> and <code>just</code> are compiled “just so we compile it; unused otherwise” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout.cc#L32-L34"><code>hb-aat-layout.cc:32–34</code></a>).</p>
+<h2 id="clusters-and-safe-breaking">Clusters and safe breaking</h2>
+<p id="ix-106">Ligatures merge the clusters of their components, rearrangement those of its whole stretch, and an inserted glyph takes the cluster of the glyph it was inserted at. Deleted glyphs, when they are finally removed, hand their clusters to a neighbor (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-buffer.cc#L694"><code>hb-buffer.cc:694</code></a>).</p>
+<p id="ix-107">For safe breaking, <code>morx</code> is careless in one way and careful in another. Before it runs anything, <code>mortmorx::apply</code> marks the whole buffer unsafe to concatenate (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-morx-table.hh#L1465"><code>hb-aat-layout-morx-table.hh:1465</code></a>). A GSUB font marks only the glyphs a lookup looked at:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">gsub/ligatures.ttf</td><td class="in"><span class="txt">la␣la</span><span class="cps">U+006C U+0061 U+0020 U+006C U+0061</span></td><td class="opt">--show-flags --unsafe-to-concat</td><td class="out"><code>[l=0+500|a=1+500|space=2+250|l=3+500|a=4+500]</code></td></tr><tr><td class="font">latin.ttf</td><td class="in"><span class="txt">la␣la</span><span class="cps">U+006C U+0061 U+0020 U+006C U+0061</span></td><td class="opt">--show-flags --unsafe-to-concat</td><td class="out"><code>[l=0+500#2|a=1+500#2|space=2+250#2|l=3+500#2|a=4+500#2]</code></td></tr></tbody></table></div>
+<p id="ix-108">Unsafe to break is worked out glyph by glyph, as precisely as the driver can (issue #2860). Breaking before the current glyph is safe only if this transition has no action, if starting afresh from state 0 here would reach the same state, with the same DontAdvance and no action, and if the current state’s end-of-text entry has no action (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-common.hh#L1366-L1426"><code>hb-aat-layout-common.hh:1366–1426</code></a>):</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">latin.ttf</td><td class="in"><span class="txt">fife␣fee</span><span class="cps">U+0066 U+0069 U+0066 U+0065 U+0020 U+0066 U+0065 U+0065</span></td><td class="opt">--show-flags</td><td class="out"><code>[f_i=0+900|f=2+500|e.fina=3+600|space=4+250#1|f=5+500|e=6+500|e.fina=7+600#1]</code></td></tr><tr><td class="font">latin.ttf</td><td class="in"><span class="txt">fife␣fee</span><span class="cps">U+0066 U+0069 U+0066 U+0065 U+0020 U+0066 U+0065 U+0065</span></td><td class="opt">--verify</td><td class="out"><code>[f_i=0+900|f=2+500|e.fina=3+600|space=4+250|f=5+500|e=6+500|e.fina=7+600]</code></td></tr></tbody></table></div>
+<p id="ix-109">The second <code>e</code> of <code>fee</code> is flagged: breaking before it would leave the first <code>e</code> at the end of a text, and make it final. The space is flagged more cautiously than it needs to be, because the <code>e</code> before it was replaced on the space’s transition. <code>--verify</code> reshapes wherever nothing is flagged, and finds no difference (<a href="buffers.html#glyph-flags">Buffers</a> explains the flags).</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>src/hb-ot-shape.cc</code></a></td>
+<td><code>_hb_apply_morx</code> (<code>:60</code>), the swap to <code>dumber</code> (<code>:100</code>), the plan’s AAT map (<code>:114</code>), the call to <code>hb_aat_layout_substitute</code> (<code>:916</code>) and the removal of deleted glyphs (<code>:945</code>, <code>:954</code>)</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout.cc"><code>src/hb-aat-layout.cc</code></a></td>
+<td>the feature mapping table (<code>:106</code>), the <code>morx</code> blocklist, <code>hb_aat_layout_substitute</code>, the <code>feat</code> API, and the apply context’s sanitizer</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-map.cc"><code>src/hb-aat-map.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-map.hh"><code>src/hb-aat-map.hh</code></a></td>
+<td>the AAT map builder: features to type and selector, <code>feat</code> as a gate, ranges, and the budget</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-morx-table.hh"><code>src/hb-aat-layout-morx-table.hh</code></a></td>
+<td>the five subtable types and their <code>transition</code>s, <code>ChainSubtable</code> and its coverage, <code>Chain::compile_flags</code> and <code>Chain::apply</code>, <code>mortmorx</code> and its accelerator</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-common.hh"><code>src/hb-aat-layout-common.hh</code></a></td>
+<td>the apply context, AAT lookup tables, <code>StateTable</code>, the reserved classes and states, <code>ObsoleteTypes</code> and <code>ExtendedTypes</code>, and <code>StateTableDriver</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-feat-table.hh"><code>src/hb-aat-layout-feat-table.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-ltag-table.hh"><code>src/hb-aat-ltag-table.hh</code></a></td>
+<td><code>feat</code> and <code>ltag</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/shape/data/in-house/tests/aat-morx.tests"><code>test/shape/data/in-house/tests/aat-morx.tests</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/test/shape/data/text-rendering-tests/tests"><code>test/shape/data/text-rendering-tests/tests/MORX-*.tests</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/test/shape/data/text-rendering-tests/tests/MORT-1.tests"><code>test/shape/data/text-rendering-tests/tests/MORT-1.tests</code></a></td>
+<td>HarfBuzz’s <code>morx</code> and <code>mort</code> tests</td>
+</tr>
+</tbody>
+</table>
+<p><code>HB_NO_AAT_SHAPE</code> leaves <code>morx</code>, <code>mort</code>, <code>kerx</code> and <code>trak</code> shaping out of the build; <code>HB_NO_AAT</code> does that and also leaves out the <code>feat</code> and <code>ltag</code> API and <code>ltag</code>’s use in <code>name</code> (<code>HB_NO_OT_NAME_LANGUAGE_AAT</code>). <code>HB_MINI</code> sets <code>HB_NO_AAT</code>, and <code>HB_NO_SHAPER</code> and <code>HB_NO_OT_SHAPE</code> set <code>HB_NO_AAT_SHAPE</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh#L94-L171"><code>hb-config.hh:94–171</code></a>). <code>HB_NO_AAT_LAYOUT_BLOCKLIST</code>, set by <code>HB_NO_LEGACY</code>, keeps AALMAGHRIBI.ttf’s <code>morx</code>. The feature mapping table is compiled whenever AAT is in, or Core Text is, since the <code>coretext</code> backend uses it to pass features to Core Text (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext-shape.cc#L220"><code>hb-coretext-shape.cc:220</code></a>).</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>There is no AAT shaper. In the <code>ot</code> pipeline, <code>morx</code> (or <code>mort</code>, if there is no <code>morx</code>) replaces GSUB in horizontal text whenever it is present, and in vertical text when there is no GSUB. GSUB then doesn’t run at all, and the script shaper becomes <code>dumber</code>.</li>
+<li>A <code>morx</code> table is chains of subtables. Each chain’s flags start from its default flags, and feature entries for the features asked for change them; a subtable runs if its flags share a bit with the chain’s.</li>
+<li>OpenType tags reach <code>morx</code> through a fixed mapping to feature types and selectors, only when the application asks for them, and only if the font’s <code>feat</code> table lists the type. Of two requests for one feature, the first wins.</li>
+<li>One loop drives every state machine: class, entry, action, new state, and a last transition at the end of text. DontAdvance re-reads a glyph, bounded by the buffer’s operations budget. Deleted glyphs stay in the buffer, as class 2, until after <code>morx</code>.</li>
+<li>The five kinds rearrange (16 verbs), replace the marked or current glyph, ligate through a stack, replace glyph for glyph, and insert up to 31 glyphs.</li>
+<li><code>ltag</code> lets feature entries apply by language. A <code>morx</code> buffer is wholly unsafe to concatenate, but unsafe to break is set glyph by glyph.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="dotted-circles-and-broken-clusters.html">← Dotted circles and broken clusters</a><a rel="next" href="aat-positioning.html">AAT positioning →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

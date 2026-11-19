@@ -1,0 +1,859 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Universal Shaping Engine · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part VI · Scripts</p>
+<h1 id="the-universal-shaping-engine">27. The Universal Shaping Engine</h1>
+<p id="ix-1">The <strong>Universal Shaping Engine</strong> (<strong>USE</strong>) is Microsoft’s answer to a problem of numbers. Unicode encodes dozens of scripts built like Devanagari, a consonant with marks above, below and around it, and each dedicated shaper like the Indic one in <a href="indic-model.html">the last chapters</a> took years of script-by-script rules. USE replaces the rules with data: every character gets a class derived from Unicode’s properties, one grammar says which sequences make a cluster, and one short reordering step moves the few things that must move. Microsoft announced it in 2015.</p>
+<p id="ix-2">HarfBuzz implemented USE in version 1.0.0, whose <code>NEWS</code> links to Microsoft’s specification and its announcement. HarfBuzz USE follows that specification, but it isn’t the same as Microsoft USE. It has categories and cluster types of its own, it departs from the specification in places, some on purpose, and it takes scripts that Microsoft USE doesn’t. Where the specification is silent, the two engines can differ, and Core Text, Apple’s implementation, sometimes differs from both.</p>
+<blockquote>
+<p id="ix-3">This chapter describes HarfBuzz USE. Where it parts from the specification or from Microsoft’s engine, the chapter says so.</p>
+</blockquote>
+<p id="ix-4">HarfBuzz USE is the Indic model with most of the model taken out. It keeps the four parts: categories from a generated table, syllables from a Ragel machine, GSUB features in stages with pauses between them, and a reordering pass. It drops the base consonant, the positions, the questions put to the font, the per-script table and the second reordering. What is left is about 500 lines of C++ (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use.cc"><code>hb-ot-shaper-use.cc</code></a>) and a 300-line grammar, and they serve 91 scripts, from Tibetan to the Unicode 18.0 additions, the same 91 that Microsoft’s specification lists. HarfBuzz also sends it the nine Indic scripts when a font uses their <code>3</code> tags (<a href="choosing-a-script-shaper.html#from-tags-to-a-shaper">Choosing a script shaper</a>), as Apple’s Core Text does; Microsoft USE doesn’t take them, and on Windows they go to the Indic engine.</p>
+<p id="ix-5">The examples use two families of test fonts with plain boxes for glyphs, built by <code>fonts/universal-shaping-engine/build-fonts.py</code>. The Devanagari fonts come in pairs, compiled from one feature file under <code>dev2</code> (the Indic shaper) or <code>dev3</code> (HarfBuzz USE, since Microsoft USE doesn’t support it): <code>deva2.ttf</code> and <code>deva3.ttf</code> have lookups for <code>rphf</code>, <code>akhn</code>, <code>blwf</code>, <code>half</code>, <code>init</code> and <code>pres</code>; the <code>-half-first</code> pair has the same lookups with <code>half</code>’s first in the LookupList; the <code>-no-half</code> pair has no <code>half</code>. <code>balinese.ttf</code> has a few Balinese letters and signs, and a <code>blwf</code> that makes two subjoined consonants; <code>balinese-no-blwf.ttf</code> doesn’t. Every result and trace on this page was produced by running HarfBuzz 15.1.0 on them when the page was built.</p>
+<h2 id="what-use-keeps-and-what-it-drops">What USE keeps, and what it drops</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Indic shaper</th>
+<th id="ix-6">HarfBuzz USE</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>table</td>
+<td id="ix-7">category and position, from three Unicode files</td>
+<td id="ix-8">one category, positions folded in, from nine files</td>
+</tr>
+<tr>
+<td>syllables</td>
+<td id="ix-9">Ragel scanner, six types</td>
+<td id="ix-10">Ragel scanner, nine types, over a filtered buffer</td>
+</tr>
+<tr>
+<td>base consonant</td>
+<td>searched for, from the font’s answers</td>
+<td>none</td>
+</tr>
+<tr>
+<td id="ix-11">basic features</td>
+<td id="ix-12">one stage each, with masks set by the reordering</td>
+<td id="ix-13">all in one stage, on the whole syllable, except <code>rphf</code> and <code>pref</code></td>
+</tr>
+<tr>
+<td>reordering</td>
+<td id="ix-14">initial (sort by position) and final (reph, pre-base vowels, <code>pref</code>)</td>
+<td id="ix-15">one pass after the basic features: reph forward, pre-base glyphs back</td>
+</tr>
+<tr>
+<td>per-script rules</td>
+<td>a configuration table and many <code>if</code>s</td>
+<td>none</td>
+</tr>
+<tr>
+<td id="ix-16"><code>init</code></td>
+<td>a pre-base vowel sign at the start of a word</td>
+<td id="ix-17">a topographical form of a whole cluster</td>
+</tr>
+<tr>
+<td>mark widths</td>
+<td>not zeroed</td>
+<td id="ix-18">zeroed from GDEF, before GPOS</td>
+</tr>
+</tbody>
+</table>
+<p>The rest of this chapter takes those rows in turn.</p>
+<h2 id="categories">Categories</h2>
+<p id="ix-19"><code>setup_masks_use</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use.cc#L189"><code>hb-ot-shaper-use.cc:189</code></a>) looks each character up with <code>hb_use_get_category</code> and keeps the answer in the scratch byte <code>use_category</code> (<a href="buffers.html#eight-bytes-of-scratch-space">Buffers</a>). There is no position byte. Where the Indic table gives a vowel sign a category and a position, USE folds the position into the category: a vowel sign is <code>VPre</code>, <code>VAbv</code>, <code>VBlw</code> or <code>VPst</code>.</p>
+<h3 id="where-they-come-from">Where they come from</h3>
+<p id="ix-20"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use-table.hh"><code>hb-ot-shaper-use-table.hh</code></a> is generated by <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-use-table.py"><code>gen-use-table.py</code></a> from nine files (<code>update-unicode-tables.make:37</code>). Seven are Unicode’s: <code>IndicSyllabicCategory.txt</code>, <code>IndicPositionalCategory.txt</code>, <code>ArabicShaping.txt</code> (for joining types), <code>DerivedCoreProperties.txt</code> (for default ignorables), <code>UnicodeData.txt</code> (for general categories), <code>Blocks.txt</code> and <code>Scripts.txt</code>. Two are Microsoft’s: <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/ms-use/IndicSyllabicCategory-Additional.txt"><code>ms-use/IndicSyllabicCategory-Additional.txt</code></a> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/ms-use/IndicPositionalCategory-Additional.txt"><code>ms-use/IndicPositionalCategory-Additional.txt</code></a>, MIT-licensed and maintained by Andrew Glass, whose headers record an update for every Unicode version since 7.0, the last “for Unicode 18.0 … 2026-09-04”. The generated header records version 18.0.0 of every Unicode file but one: <code>DerivedCoreProperties.txt</code> is 17.0.0.</p>
+<p id="ix-21">The Microsoft files do two things. They override Unicode’s values where they don’t suit shaping, each with its reason: DOTTED CIRCLE is a <code>Consonant</code>, “Reassigned to allow it to cluster as a generic base”; TIBETAN VOWEL SIGN I is <code>Bottom</code>, “Not really below, but need to override to fit into Universal model”. And they give values to scripts that Unicode’s Indic properties don’t cover at all, such as Mongolian, N’Ko, Adlam and the Egyptian hieroglyph format controls.</p>
+<p id="ix-22">Microsoft publishes the files in its <a href="https://github.com/microsoft/font-tools/tree/master/USE">font-tools repository</a>, and that is where a character’s category is questioned and corrected: most problems are found by David Corbett, who develops HarfBuzz USE, and fixed by Glass, who updates the files once for each Unicode version; HarfBuzz’s copies in 15.1.0 are the same as the repository’s. Questions about the specification itself go to Microsoft’s <a href="https://github.com/MicrosoftDocs/typography-issues/issues/?q=%5BUSE%5D">typography-issues</a> tracker, where many have been open since 2019, and HarfBuzz’s own choices are argued in HarfBuzz’s issues. The rest of this chapter cites all three where the specification, Microsoft’s engine and HarfBuzz part company.</p>
+<p id="ix-23">The generator reads the files into one record per code point (<code>:59</code>–<code>:108</code>), and drops five scripts that never reach USE, <code>DISABLED_SCRIPTS</code> (<code>:40</code>): Arabic, Lao, Samaritan, Syriac and Thai. A character in no file is <code>O</code>. Then, for each character, it asks a list of predicates, <code>is_BASE</code>, <code>is_HALANT</code> and so on, which follow the derivations in Microsoft’s specification, and asserts that exactly one says yes (<code>map_to_use</code>, <code>:382</code>). If the category has positions, a suffix from the positional category is added (<code>use_positions</code>, <code>:334</code>): <code>Top</code> gives <code>Abv</code>, <code>Bottom</code> or <code>Overstruck</code> <code>Blw</code>, <code>Right</code> <code>Pst</code>, <code>Left</code> <code>Pre</code>. A vowel sign in two or three places takes the first of pre, above and below that it has a part in: <code>Left_And_Right</code> is <code>VPre</code>, <code>Top_And_Bottom</code> <code>VAbv</code>, <code>Bottom_And_Right</code> <code>VBlw</code>.</p>
+<h3 id="harfbuzzs-own-changes">HarfBuzz’s own changes</h3>
+<p id="ix-24">The predicates don’t follow the specification everywhere. The differences, with what the source says of each:</p>
+<table>
+<thead>
+<tr>
+<th>Where</th>
+<th>What HarfBuzz does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>:85</code></td>
+<td id="ix-25">Microsoft’s <code>Consonant_Final_Modifier</code> (only U+1C36 LEPCHA SIGN RAN) is read as <code>Syllable_Modifier</code>: “TODO”, with a link to Microsoft’s typography-issues #336</td>
+</tr>
+<tr>
+<td><code>:88</code></td>
+<td>the positional value <code>NA</code> in the Microsoft file, under “Deliberately suppressed”, is read as <code>Not_Applicable</code></td>
+</tr>
+<tr>
+<td><code>:389</code>–<code>:398</code></td>
+<td>U+1CE2 to U+1CE8 (Vedic signs) become <code>Cantillation_Mark</code>, and four Tibetan signs (U+0F18, U+0F19, U+0F3E, U+0F3F) <code>Vowel_Dependent</code>, because they “don’t have UISC assigned in Unicode 13.0.0, but have UIPC”; U+1CED becomes <code>Tone_Mark</code></td>
+</tr>
+<tr>
+<td><code>:408</code></td>
+<td>U+11302, U+11303 (Grantha) and U+114C1 (Tirhuta) are <code>Top</code>, citing HarfBuzz pull request 1037 and issue 1631</td>
+</tr>
+<tr>
+<td><code>:218</code></td>
+<td id="ix-26">a joining letter (types C, D, L, R) is a base, but not if it is a joiner: ZWJ has joining type C (“TODO”, typography-issues #484)</td>
+</tr>
+<tr>
+<td><code>:227</code></td>
+<td id="ix-27"><code>CGJ</code> takes in ZWJ, the variation selectors and every default-ignorable mark, not only U+034F: “Also includes VARIATION_SELECTOR and ZWJ”. This beats the Microsoft file, which makes VS1 to VS16 isolated bases</td>
+</tr>
+<tr>
+<td><code>:246</code>–<code>:286</code></td>
+<td id="ix-28">three kinds of virama are split off from <code>H</code>, which in the specification covers viramas and invisible stackers alike: <code>HVM</code> for U+0DCA SINHALA SIGN AL-LAKUNA, <code>Sk</code> for U+1A60 TAI THAM SIGN SAKOT, and <code>IS</code> for the other invisible stackers. <code>HVM</code> began with the Brahmi virama, which also marks short vowels (“Should be properly reported to Unicode and USE”, <a href="https://github.com/harfbuzz/harfbuzz/issues/1102">HarfBuzz #1102</a>); <code>Sk</code> came with Tai Tham (<a href="https://github.com/harfbuzz/harfbuzz/issues/170">#170</a>), whose support the specification still calls “currently limited” (<a href="https://github.com/harfbuzz/harfbuzz/issues/2061">#2061</a>, open)</td>
+</tr>
+<tr>
+<td><code>:236</code></td>
+<td><code>Consonant_Initial_Postfixed</code> is a medial consonant: “new in Unicode 11; not in the spec” (<a href="https://github.com/MicrosoftDocs/typography-issues/issues/916">typography-issues #916</a>, open)</td>
+</tr>
+<tr>
+<td><code>:271</code></td>
+<td><code>O</code> takes in the specification’s <code>IND</code> (independent bases) and <code>S</code> (symbols): “Also includes BASE_IND and SYM”</td>
+</tr>
+<tr>
+<td><code>:295</code></td>
+<td id="ix-29"><code>WJ</code> takes in other default ignorables and every unassigned code point, the specification’s <code>Rsv</code></td>
+</tr>
+<tr>
+<td><code>:288</code></td>
+<td>symbol modifiers are a class of their own, <code>SMAbv</code> and <code>SMBlw</code>; the specification counts them as consonant modifiers</td>
+</tr>
+<tr>
+<td><code>:340</code>–<code>:348</code></td>
+<td id="ix-30">positions the specification’s subclasses don’t list: a medial consonant <code>Bottom_And_Left</code> or <code>Bottom_And_Right</code> is <code>MBlw</code>, and <code>Top_And_Bottom_And_Left</code> <code>MPre</code>; a consonant modifier <code>Overstruck</code> is <code>CMBlw</code> (<a href="https://github.com/MicrosoftDocs/typography-issues/issues/928">typography-issues #928</a>, <a href="https://github.com/MicrosoftDocs/typography-issues/issues/1078">#1078</a>, both open)</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-31">With <code>--rust</code> the generator writes HarfRust’s copy, and with <code>HB_OPTIMIZE_SIZE</code> the table is packed harder (<code>:493</code>).</p>
+<h3 id="the-categories">The categories</h3>
+<p id="ix-32">The machine’s categories (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use-machine.rl#L65"><code>hb-ot-shaper-use-machine.rl:65</code></a>) are numbered, and the numbers are not contiguous. They are the ones the shaper and grammar use:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-33">Category</th>
+<th>What it is</th>
+<th>Examples (Balinese, Devanagari, Tibetan)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>B</code></td>
+<td>a base: consonant, independent vowel, digit, joining letter</td>
+<td>KA U+1B13, A U+1B05; KA U+0915, RA U+0930, digit zero U+0966; DOTTED CIRCLE U+25CC</td>
+</tr>
+<tr>
+<td><code>GB</code></td>
+<td>a generic base</td>
+<td>NO-BREAK SPACE, U+00D7 MULTIPLICATION SIGN, U+2010 HYPHEN</td>
+</tr>
+<tr>
+<td><code>R</code></td>
+<td>an encoded repha</td>
+<td>MALAYALAM LETTER DOT REPH U+0D4E</td>
+</tr>
+<tr>
+<td><code>CS</code></td>
+<td>a consonant with stacker</td>
+<td></td>
+</tr>
+<tr>
+<td><code>H</code>, <code>IS</code>, <code>HVM</code>, <code>Sk</code></td>
+<td>viramas: visible, invisible, Sinhala’s, Tai Tham’s</td>
+<td>adeg-adeg U+1B44; virama U+094D</td>
+</tr>
+<tr>
+<td><code>SUB</code></td>
+<td>a subjoined consonant</td>
+<td>TIBETAN SUBJOINED LETTER KA U+0F90</td>
+</tr>
+<tr>
+<td><code>CMAbv</code>, <code>CMBlw</code></td>
+<td>consonant modifiers, such as nuktas</td>
+<td>rerekan U+1B34; TIBETAN VOWEL SIGN AA U+0F71 (a <code>Nukta</code> by Microsoft’s override)</td>
+</tr>
+<tr>
+<td id="ix-34"><code>MPre</code>, <code>MAbv</code>, <code>MBlw</code>, <code>MPst</code></td>
+<td>medial consonants</td>
+<td>Javanese cakra U+A9BF, pengkal U+A9BE</td>
+</tr>
+<tr>
+<td id="ix-35"><code>VPre</code>, <code>VAbv</code>, <code>VBlw</code>, <code>VPst</code></td>
+<td>vowel signs, and pure killers</td>
+<td>taling U+1B3E, ulu U+1B36, suku U+1B38, tedung U+1B35; vowel sign I U+093F, U U+0941</td>
+</tr>
+<tr>
+<td><code>VMPre</code>, <code>VMAbv</code>, <code>VMBlw</code>, <code>VMPst</code></td>
+<td id="ix-36">vowel modifiers: bindus, visargas, tone marks</td>
+<td>cecek U+1B02, bisah U+1B04; anusvara U+0902</td>
+</tr>
+<tr>
+<td id="ix-37"><code>FAbv</code>, <code>FBlw</code>, <code>FPst</code></td>
+<td id="ix-38">final consonants</td>
+<td>surang U+1B03</td>
+</tr>
+<tr>
+<td><code>FMAbv</code>, <code>FMBlw</code>, <code>FMPst</code></td>
+<td id="ix-39">final modifiers</td>
+<td></td>
+</tr>
+<tr>
+<td><code>SMAbv</code>, <code>SMBlw</code></td>
+<td>symbol modifiers</td>
+<td>Balinese musical symbol marks</td>
+</tr>
+<tr>
+<td><code>N</code>, <code>HN</code></td>
+<td>Brahmi joining numbers, and the number joiner</td>
+<td></td>
+</tr>
+<tr>
+<td><code>G</code>, <code>J</code>, <code>SB</code>, <code>SE</code>, <code>HR</code>, <code>HM</code></td>
+<td>Egyptian hieroglyphs, joiners, segment and mark brackets, mirror, modifiers</td>
+<td></td>
+</tr>
+<tr>
+<td><code>RK</code></td>
+<td>a reordering killer</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-40"><code>ZWNJ</code>, <code>WJ</code>, <code>CGJ</code></td>
+<td>non-joiner; word joiner and unassigned; ignorables</td>
+<td id="ix-41">ZWNJ; U+2060; ZWJ, CGJ, variation selectors</td>
+</tr>
+<tr>
+<td><code>O</code></td>
+<td>everything else</td>
+<td>space, danda U+0964, U+2022 BULLET</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-42">(The examples were looked up with HarfBuzz’s <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/test-use-table.cc"><code>test-use-table.cc</code></a>, compiled separately, not when the book is built.)</p>
+<p id="ix-43">DOTTED CIRCLE is a <code>B</code>, not a <code>GB</code>. Microsoft’s file made it a <code>Consonant</code> in 2019 so that, in Glass’s words, it can “appear in subjoined forms also” (<a href="https://github.com/MicrosoftDocs/typography-issues/issues/289">typography-issues #289</a>), but the specification still calls it a generic base (<a href="https://github.com/MicrosoftDocs/typography-issues/issues/482">#482</a>, open). The specification also names U+2015, U+2022 and U+25FB to U+25FE as generic bases, and so does the generator’s <code>is_BASE_OTHER</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-use-table.py#L224"><code>gen-use-table.py:224</code></a>), but they come out <code>O</code>: the generator makes a record only for a character that is in one of Unicode’s Indic, joining or default-ignorable files (<code>:101</code>–<code>:108</code>), and these are in none of them (draft 82 in <a href="testing-harfbuzz.html#the-bugs-this-book-found">Testing HarfBuzz</a>).</p>
+<p id="ix-44">Two things in this table matter later. RA is a plain <code>B</code>: nothing in the category says it can be a reph, which the font must say instead. And ZWJ is <code>CGJ</code>, which the grammar never sees.</p>
+<h2 id="syllables">Syllables</h2>
+<p id="ix-45">The first GSUB pause, before any lookup, finds the syllables (<code>setup_syllables_use</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use.cc#L297"><code>hb-ot-shaper-use.cc:297</code></a>), marks each one unsafe to break, and sets two kinds of mask, for <code>rphf</code> and for the topographical features, both described below. <code>found_syllable</code> writes the type and a serial number into the <code>syllable</code> byte, exactly as the Indic machine does (<a href="indic-model.html#finding-syllables">Finding syllables</a>), and <code>foreach_syllable</code> hands out at most 64 glyphs at a time (<a href="indic-model.html#a-limit-on-syllable-length">A limit on syllable length</a>). That limit is HarfBuzz’s. The specification gives “a practical maximum cluster length” of 31 characters, after which “a cluster break may be forced”; HarfBuzz forces no break, and only processes a syllable longer than 64 glyphs in pieces.</p>
+<h3 id="the-grammar">The grammar</h3>
+<p id="ix-46">The grammar, trimmed of the hieroglyph and number rules (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use-machine.rl#L114"><code>hb-ot-shaper-use-machine.rl:114</code></a>):</p>
+<pre><code>h = H | HVM | IS | Sk;
+
+consonant_modifiers = CMAbv* CMBlw* ((h B | SUB) CMAbv* CMBlw*)*;
+medial_consonants = MPre? MAbv? MBlw? MPst?;
+dependent_vowels = VPre* VAbv* VBlw* VPst* | H;
+vowel_modifiers = HVM? VMPre* VMAbv* VMBlw* VMPst*;
+final_consonants = FAbv* FBlw* FPst*;
+final_modifiers = FMAbv* FMBlw* | FMPst?;
+
+complex_syllable_start = (R | CS)? (B | GB);
+complex_syllable_middle =
+	consonant_modifiers
+	medial_consonants
+	dependent_vowels
+	vowel_modifiers
+	(Sk B)*
+;
+complex_syllable_tail =
+	complex_syllable_middle
+	final_consonants
+	final_modifiers
+;
+symbol_cluster_tail = SMAbv+ SMBlw* | SMBlw+;
+
+virama_terminated_cluster_tail = consonant_modifiers (IS | RK);
+virama_terminated_cluster = complex_syllable_start virama_terminated_cluster_tail;
+sakot_terminated_cluster_tail = complex_syllable_middle Sk;
+sakot_terminated_cluster = complex_syllable_start sakot_terminated_cluster_tail;
+standard_cluster = complex_syllable_start complex_syllable_tail;
+tail = complex_syllable_tail | sakot_terminated_cluster_tail | symbol_cluster_tail | virama_terminated_cluster_tail;
+broken_cluster = R? (tail | number_joiner_terminated_cluster_tail | numeral_cluster_tail);
+symbol_cluster = (O | GB | SB) tail?;
+</code></pre>
+<p id="ix-47">(Line breaks are trimmed.) Where the Indic grammar is built around how Indic syllables are spelled, this one is a single template, the specification’s “maximal cluster scheme”: an optional repha, a base, consonants joined to it by viramas or subjoined, then one medial in each place, vowel signs in the order pre, above, below, post, vowel modifiers in the same order, final consonants, and a final modifier. Each group is optional, and their order is fixed. A visible virama counts as a vowel sign, “Treat visible viramas like dependent vowels” (<code>NEWS</code> for 4.1.0), so a syllable can end in one. Every syllable may end in a ZWNJ (<code>:173</code>). Three parts of the template are HarfBuzz’s, not the specification’s: the virama among the vowel signs, <code>HVM</code> before the vowel modifiers, and the sakot groups, <code>(Sk B)*</code> and the sakot-terminated cluster. Under the specification’s own grammar, a Tai Tham syllable with a sakot after its vowel isn’t valid.</p>
+<p>The syllable types, and what HarfBuzz does with each:</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>What it is</th>
+<th>Reordered</th>
+<th>Joins topographically</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-48"><strong>standard cluster</strong></td>
+<td>the template above</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td id="ix-49"><strong>virama-terminated cluster</strong></td>
+<td>a base and its consonants, ending in an invisible stacker or reordering killer</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td id="ix-50"><strong>sakot-terminated cluster</strong></td>
+<td>the same, ending in Tai Tham’s sakot</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>number-joiner-terminated, numeral</td>
+<td>Brahmi numbers (U+11052 to U+11065) joined by U+1107F BRAHMI NUMBER JOINER</td>
+<td>no</td>
+<td>yes</td>
+</tr>
+<tr>
+<td id="ix-51">symbol cluster</td>
+<td>a space, symbol, punctuation or generic base, with any tail</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td id="ix-52">hieroglyph cluster</td>
+<td>Egyptian hieroglyphs and their format controls</td>
+<td>no</td>
+<td>no</td>
+</tr>
+<tr>
+<td id="ix-53">broken cluster</td>
+<td>a tail with no base</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>non-cluster</td>
+<td>anything else, and a lone <code>FMPst</code></td>
+<td>no</td>
+<td>no</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-54">Six of these are the specification’s seven, not always with the same members. Its seventh, the independent cluster, for spaces, punctuation and other characters that stand alone, HarfBuzz folds into the symbol cluster (<a href="#spaces-as-bases">Spaces as bases</a>). Its virama-terminated cluster can end in a visible virama; HarfBuzz’s can’t, since it counts a visible virama as a vowel sign, so such a syllable is a standard cluster. The sakot-terminated cluster is HarfBuzz’s alone. And the specification has no broken cluster or non-cluster as types: it describes invalid text in words (“Defective clusters”), while HarfBuzz’s machine needs a type for everything it reads.</p>
+<p id="ix-55">The order is strict. In Balinese, suku (below) may follow ulu (above), but not the other way round; and a final consonant such as surang comes after the vowel signs:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">balinese.ttf</td><td class="in"><span class="txt">ᬓᬶᬸ</span><span class="cps">U+1B13 U+1B36 U+1B38</span></td><td class="opt">--language=ban</td><td class="out"><code>[ka=0+600|ulu=0+0|suku=0+0]</code></td></tr><tr><td class="font">balinese.ttf</td><td class="in"><span class="txt">ᬓᬸᬶ</span><span class="cps">U+1B13 U+1B38 U+1B36</span></td><td class="opt">--language=ban</td><td class="out"><code>[ka=0+600|suku=0+0|dottedcircle=0+500|ulu=0+0]</code></td></tr><tr><td class="font">balinese.ttf</td><td class="in"><span class="txt">ᬓᬸᬃ</span><span class="cps">U+1B13 U+1B38 U+1B03</span></td><td class="opt">--language=ban</td><td class="out"><code>[ka=0+600|suku=0+0|surang=0+0]</code></td></tr><tr><td class="font">balinese.ttf</td><td class="in"><span class="txt">ᬓᬃᬸ</span><span class="cps">U+1B13 U+1B03 U+1B38</span></td><td class="opt">--language=ban</td><td class="out"><code>[ka=0+600|surang=0+0|dottedcircle=0+500|suku=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-56">In the second and fourth lines, the syllable ends where the order breaks, and the mark left over is a broken cluster, given a dotted circle (<a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a> covers that, and the vowel constraints that USE’s <code>preprocess_text</code> applies). Unicode’s canonical ordering doesn’t help: these signs all have combining class 0, so normalization leaves them as typed. Where marks do have combining classes, Microsoft gives them positions that make the canonical order a valid one (“standard procedure”, Glass says in <a href="https://github.com/microsoft/font-tools/issues/53">font-tools #53</a>), since the specification assumes no normalization: CGJ “will need to be updated if USE is modified to support normalization”. HarfBuzz normalizes, and changes three combining classes so that the order comes out right: TAI THAM SIGN SAKOT goes after the tone marks, TIBETAN SYMBOL PADMA GDAN after the vowel signs, and TIBETAN MARK TSA -PHRU before U+0F74 TIBETAN VOWEL SIGN U (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh#L108"><code>hb-unicode.hh:108</code></a>).</p>
+<h3 id="what-the-machine-doesnt-see">What the machine doesn’t see</h3>
+<p id="ix-57">The machine doesn’t run over the buffer itself, but over a filtered view of it (<code>find_syllables_use</code>, <code>:258</code>), built from HarfBuzz’s iterators:</p>
+<pre><code class="language-c++">auto p =
+  + hb_iter (info, buffer-&gt;len)
+  | hb_enumerate
+  | hb_filter ([] (const hb_glyph_info_t &amp;i) { return not_ccs_default_ignorable (i); },
+	       hb_second)
+  | hb_filter ([&amp;] (const hb_pair_t&lt;unsigned, const hb_glyph_info_t &amp;&gt; p)
+	       {
+		 if (p.second.use_category() == USE(ZWNJ))
+		   for (unsigned i = p.first + 1; i &lt; buffer-&gt;len; ++i)
+		     if (not_ccs_default_ignorable (info[i]))
+		       return !_hb_glyph_info_is_unicode_mark (&amp;info[i]);
+		 return true;
+	       })
+  | hb_enumerate
+  | machine_index
+  ;
+</code></pre>
+<p id="ix-58">The first filter drops every <code>CGJ</code>, so CGJ, ZWJ and the variation selectors can stand anywhere: the specification says CGJ “may occur anywhere in a cluster with no effect”. The second drops a ZWNJ that is followed, past any of those, by a mark: such a ZWNJ continues the cluster instead of ending it, as the specification says it should. This is Microsoft’s ruling on a question the specification left open: “CGJ is ignored and the ZWJ/ZWNJ should not see it when determining a cluster break” (<a href="https://github.com/MicrosoftDocs/typography-issues/issues/216">typography-issues #216</a>). The syllable types are then written back over the ranges of original indices, so the hidden characters get the syllable of their neighbors. A ZWNJ between KA and suku doesn’t leave the suku without a base:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">balinese.ttf</td><td class="in"><span class="txt">ᬓᬸ</span><span class="cps">U+1B13 U+1B38</span></td><td class="opt">--language=ban</td><td class="out"><code>[ka=0+600|suku=0+0]</code></td></tr><tr><td class="font">balinese.ttf</td><td class="in"><span class="txt">ᬓ⟨ZWNJ⟩ᬸ</span><span class="cps">U+1B13 U+200C U+1B38</span></td><td class="opt">--language=ban</td><td class="out"><code>[ka=0+600|space=1+0|suku=1+0]</code></td></tr></tbody></table></div>
+<p id="ix-59">(The ZWNJ is shown as the font’s space glyph with no advance, as HarfBuzz shows every default ignorable it keeps.)</p>
+<p id="ix-60">ZWJ is where HarfBuzz and the specification part. The specification says ZWJ “continues a preceding cluster and joins it to a following character”, so two letters with a ZWJ between them would be one cluster. HarfBuzz hides ZWJ from the grammar, and the two letters stay two clusters. Microsoft’s engine doesn’t join them either: Glass confirmed what the specification means, and called the engine’s behavior a known issue (“the spec is correct, the implementation is lacking”, <a href="https://github.com/MicrosoftDocs/typography-issues/issues/232">typography-issues #232</a>). On HarfBuzz’s side, Corbett has said that its USE “intentionally ignores a few misguided requirements of the USE specification” (<a href="https://github.com/harfbuzz/harfbuzz/issues/542">HarfBuzz #542</a>). So in practice the two engines agree, and both differ from the text.</p>
+<h3 id="spaces-as-bases">Spaces as bases</h3>
+<p id="ix-61">A symbol cluster starts with <code>O</code>, <code>GB</code> or a hieroglyph bracket, and may take “any non-numeric tail” (<code>NEWS</code> for 4.0.1). Since <code>O</code> is also the space, a vowel sign after a space has a base, gets no dotted circle, and a pre-base one is moved before the space:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">deva2.ttf</td><td class="in"><span class="txt">क␣ि</span><span class="cps">U+0915 U+0020 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|space=1+250|iMatra.init=1+250|dottedcircle=1+500]</code></td></tr><tr><td class="font">deva3.ttf</td><td class="in"><span class="txt">क␣ि</span><span class="cps">U+0915 U+0020 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|iMatra=1+250|space=1+250]</code></td></tr><tr><td class="font">balinese.ttf</td><td class="in"><span class="txt">␣ᬾ</span><span class="cps">U+0020 U+1B3E</span></td><td class="opt">--language=ban</td><td class="out"><code>[taling=0+300|space=0+250]</code></td></tr></tbody></table></div>
+<p id="ix-62">The Indic shaper shows the stray vowel sign on a dotted circle; USE draws it on the space, or before it. The specification has an <strong>independent cluster</strong> for <code>O</code>, which takes nothing but a variation selector, and a symbol cluster only for symbols (<code>S</code>) and generic bases; HarfBuzz has merged the specification’s <code>O</code>, <code>IND</code> and <code>S</code> into one category (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-use-table.py#L271"><code>gen-use-table.py:271</code></a>), and so they all take marks.</p>
+<p id="ix-63">The wide tail is deliberate. The specification’s symbol cluster takes only consonant modifiers, <code>&lt; S | GB &gt; [VS] (CMAbv)* (CMBlw)*</code>, but HarfBuzz chose “any non-numeric tail”, and Microsoft’s engine is permissive too: when the specification was widened in 2024, Glass said the engine “has always been this way” (<a href="https://github.com/MicrosoftDocs/typography-issues/issues/1179">typography-issues #1179</a>). Core Text, by a report in the same issue, shows dotted circles instead. What no discussion explains is the space: the specification puts white space in <code>O</code>, an independent cluster that takes no marks, and only HarfBuzz’s merging lets it take them (draft 30 in <a href="testing-harfbuzz.html#the-bugs-this-book-found">Testing HarfBuzz</a>).</p>
+<h2 id="features-and-stages">Features and stages</h2>
+<p id="ix-64"><code>collect_features_use</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use.cc#L110"><code>hb-ot-shaper-use.cc:110</code></a>) lays out the stages. The middle rows are the specification’s groups, under its names. The first row is HarfBuzz’s, as are <code>Buzz</code> and <code>BUZZ</code> in the last: the specification has nothing before its pre-processing group, and doesn’t mention the direction features, <code>frac</code>, <code>numr</code>, <code>dnom</code> or <code>rand</code>.</p>
+<table>
+<thead>
+<tr>
+<th id="ix-65">Stage</th>
+<th id="ix-66">Features</th>
+<th id="ix-67">Pause after it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-68">after <code>rvrn</code>’s</td>
+<td id="ix-69">the direction features, <code>frac</code>, <code>numr</code>, <code>dnom</code>, <code>rand</code>, <code>Harf</code>, <code>HARF</code></td>
+<td><code>setup_syllables_use</code></td>
+</tr>
+<tr>
+<td id="ix-70">“Default glyph pre-processing group”</td>
+<td id="ix-71"><code>locl</code>, <code>ccmp</code>, <code>nukt</code>, <code>akhn</code></td>
+<td id="ix-72"><code>_hb_clear_substitution_flags</code></td>
+</tr>
+<tr>
+<td>“Reordering group”</td>
+<td id="ix-73"><code>rphf</code></td>
+<td id="ix-74"><code>record_rphf_use</code>, then <code>_hb_clear_substitution_flags</code></td>
+</tr>
+<tr>
+<td></td>
+<td id="ix-75"><code>pref</code></td>
+<td><code>record_pref_use</code></td>
+</tr>
+<tr>
+<td>“Orthographic unit shaping group”</td>
+<td id="ix-76"><code>rkrf</code>, <code>abvf</code>, <code>blwf</code>, <code>half</code>, <code>pstf</code>, <code>vatu</code>, <code>cjct</code></td>
+<td id="ix-77"><code>reorder_use</code>, then <code>hb_syllabic_clear_var</code></td>
+</tr>
+<tr>
+<td id="ix-78">“Topographical features”</td>
+<td id="ix-79"><code>isol</code>, <code>init</code>, <code>medi</code>, <code>fina</code></td>
+<td>none</td>
+</tr>
+<tr>
+<td>“Standard typographic presentation”</td>
+<td id="ix-80"><code>abvs</code>, <code>blws</code>, <code>haln</code>, <code>pres</code>, <code>psts</code>; then <code>Buzz</code>, <code>BUZZ</code>, the common and horizontal features, and the application’s</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-81">(<a href="from-features-to-lookups.html#stages-and-pauses">From features to lookups</a> explains <code>rvrn</code>, <code>Harf</code> and <code>Buzz</code>.) <a href="feature-order.html#the-universal-shaping-engine">Feature order</a> lists these stages beside the other shapers’. Within each group, lookups run in LookupList order, whatever their features. The specification says so: “it is, therefore, up to the font developer to specify the order of lookups for these features in the font’s OTL. The order given here is recommended but not required.” Only <code>rphf</code> and <code>pref</code> have stages of their own, because what each did must be recorded before the next.</p>
+<p id="ix-82">The flags differ from the Indic shaper’s too. They are HarfBuzz’s choices, since the specification doesn’t say how lookups treat joiners:</p>
+<ul>
+<li id="ix-83">Every feature up to the reordering is per syllable, but the topographical and presentation features are not: the syllables have been released before they run. Per syllable is HarfBuzz’s reading of the specification’s “applied together, one cluster at a time”, and it is strict: a rule’s backtrack and lookahead must also be inside the syllable. Core Text, by one report, requires only the input to be (<a href="https://github.com/MicrosoftDocs/typography-issues/issues/296">typography-issues #296</a>, open). An Indic font’s <code>pres</code> cannot ligate across syllables; a USE font’s can. <code>deva2.ttf</code> and <code>deva3.ttf</code> have a <code>pres</code> ligature of TA + TA, here two syllables:</li>
+</ul>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">deva2.ttf</td><td class="in"><span class="txt">तत</span><span class="cps">U+0924 U+0924</span></td><td class="opt">--language=hi</td><td class="out"><code>[ta=0+550|ta=1+550]</code></td></tr><tr><td class="font">deva3.ttf</td><td class="in"><span class="txt">तत</span><span class="cps">U+0924 U+0924</span></td><td class="opt">--language=hi</td><td class="out"><code>[ta_ta=0+900]</code></td></tr></tbody></table></div>
+<ul>
+<li id="ix-84"><code>akhn</code>, <code>rphf</code>, <code>pref</code>, the basic and the presentation features have <code>F_MANUAL_ZWJ</code>, so their input doesn’t pass over ZWJ, but not <code>F_MANUAL_ZWNJ</code>: a rule’s backtrack and lookahead pass over ZWNJ (<a href="gsub.html#joiners">Joiners</a>). The Indic shaper sets both.</li>
+<li id="ix-85"><code>rphf</code> and the topographical features are added with <code>add_feature</code>, so they have mask bits and apply only where the shaper sets them. Everything else is on everywhere: there is no mask for <code>half</code>, <code>blwf</code> or <code>pstf</code>, because there is no base to say which consonants should take them.</li>
+<li id="ix-86"><code>liga</code> stays on. The Indic shaper turns it off.</li>
+</ul>
+<p id="ix-87">The shaper zeroes the advances of GDEF marks before GPOS (<code>HB_OT_SHAPE_ZERO_WIDTH_MARKS_BY_GDEF_EARLY</code>, <code>:509</code>), “what Windows does” (<code>NEWS</code> for 1.2.0); the Indic shaper zeroes none. The specification now says so too: “OT processing cancels the width associated with a mark”, so a base classed as a mark, to keep it out of contextual lookups, needs its width back from <code>dist</code>. It wasn’t the original plan. As Behdad Esfahbod tells it, Microsoft zeroed the widths because its Tibetan shaper did, and Tibetan was moving to USE (<a href="https://github.com/MicrosoftDocs/typography-issues/issues/271">typography-issues #271</a>). Its normalization is the Indic shaper’s, with one rule in <code>compose_use</code> (<code>:482</code>), “Avoid recomposing split matras”, explained in <a href="normalization.html">Normalization</a>. So a split vowel sign such as Balinese taling tedung, U+1B40, is always split into taling and tedung, and taling moves:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">balinese.ttf</td><td class="in"><span class="txt">ᬓᭀ</span><span class="cps">U+1B13 U+1B40</span></td><td class="opt">--language=ban</td><td class="out"><code>[taling=0+300|ka=0+600|tedung=0+300]</code></td></tr></tbody></table></div>
+<h2 id="reordering">Reordering</h2>
+<p id="ix-88">USE reorders once, after the basic features, and only three kinds of glyph move: a reph, which moves forward, and pre-base vowel signs and pre-base vowel modifiers, which move back. Nothing is sorted. What counts as a reph or a pre-base form is decided by the categories, or by what the font’s <code>rphf</code> and <code>pref</code> lookups did.</p>
+<h3 id="what-the-font-did">What the font did</h3>
+<p id="ix-89">Before any lookup, <code>setup_rphf_mask</code> (<code>:213</code>) gives the <code>rphf</code> bit to the first three glyphs of each syllable, or only to the first if it is an encoded repha (<code>R</code>). The three are the specification’s: “Feature application is scoped to the first three glyphs in a cluster.” It doesn’t say whether characters the grammar never sees, such as ZWJ or CGJ, count among them. In HarfBuzz they do, so a ZWJ after RA takes one of the three places (<a href="https://github.com/MicrosoftDocs/typography-issues/issues/279">typography-issues #279</a>, open since 2019). After <code>rphf</code>, <code>record_rphf_use</code> (<code>:311</code>) finds the first glyph in that prefix that a substitution produced, and makes it <code>R</code>. The pause before <code>rphf</code> cleared every glyph’s substituted flag, so only <code>rphf</code>’s own work counts. In <code>deva3.ttf</code>, <code>rphf</code> ligates RA and virama, and the ligature is <code>R</code> from then on.</p>
+<p id="ix-90"><code>pref</code> is on for the whole syllable. <code>record_pref_use</code> (<code>:335</code>) makes the first glyph in each syllable that <code>pref</code> substituted a <code>VPre</code>, “as they behave the same way”. The specification’s example is Javanese, which “may reorder a medial consonant to the beginning of a cluster based on context”, and leaves the context to the font.</p>
+<h3 id="the-move">The move</h3>
+<p><code>reorder_syllable_use</code> (<code>:362</code>) skips number, hieroglyph and non-clusters. Then:</p>
+<pre><code class="language-c++">/* Move things forward. */
+if (info[start].use_category() == USE(R) &amp;&amp; end - start &gt; 1)
+{
+  /* Got a repha.  Reorder it towards the end, but before the first post-base
+   * glyph. */
+  for (unsigned int i = start + 1; i &lt; end; i++)
+  {
+    bool is_post_base_glyph = (FLAG64_UNSAFE (info[i].use_category()) &amp; POST_BASE_FLAGS64) ||
+			      is_halant_use (info[i]);
+    if (is_post_base_glyph || i == end - 1)
+    {
+      if (is_post_base_glyph)
+	i--;
+
+      buffer-&gt;merge_clusters (start, i + 1);
+      /* ... move info[start] to i ... */
+      break;
+    }
+  }
+}
+
+/* Move things back. */
+unsigned int j = start;
+for (unsigned int i = start; i &lt; end; i++)
+{
+  uint32_t flag = FLAG_UNSAFE (info[i].use_category());
+  if (is_halant_use (info[i]))
+    j = i + 1;
+  else if (((flag) &amp; (FLAG (USE(VPre)) | FLAG (USE(VMPre)))) &amp;&amp;
+	   /* Only move the first component of a MultipleSubst. */
+	   0 == _hb_glyph_info_get_lig_comp (&amp;info[i]) &amp;&amp;
+	   j &lt; i)
+  {
+    buffer-&gt;merge_clusters (j, i + 1);
+    /* ... move info[i] to j ... */
+  }
+}
+</code></pre>
+<p id="ix-91">(trimmed). A <strong>post-base glyph</strong> is any final, medial or vowel sign, any vowel modifier (<code>POST_BASE_FLAGS64</code>, <code>:377</code>), or a virama that wasn’t ligated (<code>is_halant_use</code>, <code>:355</code>, which counts <code>H</code>, <code>HVM</code> and <code>IS</code> but not the sakot). A reph moves forward past everything else, bases, half forms and subjoined forms, and stops before the first post-base glyph, or goes to the end. A pre-base vowel sign or modifier moves back to the start of the syllable, or to just after the last unligated virama before it. Each move merges the clusters it passes. This is the specification’s rule that “reordering components do not reorder past an explicit virama”. Its advice follows: a font that wants the reph or vowel sign to pass a virama can “substitute the virama for an alternate glyph” during the basic features. In HarfBuzz that isn’t enough. A substituted glyph keeps the virama’s category, and <code>is_halant_use</code> lets it pass only if it was ligated, so the virama must be ligated with something, as Balinese’s <code>blwf</code> does below. Behdad Esfahbod said in 2019 that HarfBuzz “should probably change that” (<a href="https://github.com/MicrosoftDocs/typography-issues/issues/270">typography-issues #270</a>); 15.1.0 hasn’t.</p>
+<p id="ix-92">Balinese shows the virama rule. The adeg-adeg is a virama, and with <code>blwf</code> it is ligated into the subjoined form of TA; without, it stays:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">balinese.ttf</td><td class="in"><span class="txt">ᬓ᭄ᬢᬾ</span><span class="cps">U+1B13 U+1B44 U+1B22 U+1B3E</span></td><td class="opt">--language=ban</td><td class="out"><code>[taling=0+300|ka=0+600|ta.sub=0+0]</code></td></tr><tr><td class="font">balinese-no-blwf.ttf</td><td class="in"><span class="txt">ᬓ᭄ᬢᬾ</span><span class="cps">U+1B13 U+1B44 U+1B22 U+1B3E</span></td><td class="opt">--language=ban</td><td class="out"><code>[ka=0+600|adeg=0+0|taling=2+300|ta=2+600]</code></td></tr><tr><td class="font">balinese.ttf</td><td class="in"><span class="txt">ᬓ᭄ᬓ᭄ᬢᬾ</span><span class="cps">U+1B13 U+1B44 U+1B13 U+1B44 U+1B22 U+1B3E</span></td><td class="opt">--language=ban</td><td class="out"><code>[taling=0+300|ka=0+600|ka.sub=0+0|ta.sub=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-93">With <code>blwf</code>, taling moves to the front of the syllable; without, only to after the adeg-adeg. The trace of the first, through GSUB:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape balinese.ttf "ᬓ᭄ᬢᬾ" --language=ban --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;bali&#x27;</td><td class="buf"><code>[ka=0|adeg=0|ta=2|taling=2]</code></td></tr><tr><td class="what">start lookup 0 feature &#x27;blwf&#x27;</td><td class="buf"><code>[ka=0|adeg=0|ta=2|taling=2]</code></td></tr><tr><td class="what">ligating glyphs at 1,2</td><td class="buf"><code>[ka=0|adeg=0|ta=2|taling=2]</code></td></tr><tr><td class="what">ligated glyph at 1</td><td class="buf"><code>[ka=0|ta.sub=0|taling=0]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;blwf&#x27;</td><td class="buf"><code>[ka=0|ta.sub=0|taling=0]</code></td></tr><tr><td class="what">start reordering USE</td><td class="buf"><code>[ka=0|ta.sub=0|taling=0]</code></td></tr><tr><td class="what">skipped inserting dotted-circles because there is no broken syllables</td><td class="buf"><code>[ka=0|ta.sub=0|taling=0]</code></td></tr><tr><td class="what">end reordering USE</td><td class="buf"><code>[taling=0|ka=0|ta.sub=0]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;bali&#x27;</td><td class="buf"><code>[taling=0|ka=0|ta.sub=0]</code></td></tr></tbody></table></div>
+<p>Two pre-base vowel signs in one syllable come out in reverse order. Each moves back to the same place, <code>j</code>, ahead of the one moved before it, so the second typed ends up first, outermost from the base. The specification doesn’t say what should happen. Glass agreed in 2021 that this, “ordering outward from the nucleus”, is right, and that DirectWrite, which doesn’t do it, should be fixed (<a href="https://github.com/MicrosoftDocs/typography-issues/issues/750">typography-issues #750</a>, open).</p>
+<p id="ix-94">The reordering inserts dotted circles first, before the moves (<code>reorder_use</code>, <code>:448</code>), into broken clusters, after any leading <code>R</code>, as a <code>B</code>. At its end it releases <code>use_category</code>, and the next pause releases <code>syllable</code>.</p>
+<p id="ix-95">When dotted circles should go in is the longest-running question about USE. The specification doesn’t say. Glass has said after GSUB and before GPOS, so that a font can’t substitute the warning away. Tests in 2019 found Core Text and DirectWrite inserting them before any GSUB, so that <code>ccmp</code> and <code>blwf</code> see them. HarfBuzz inserts them midway, after the basic features, and its issue to move them earlier is still open: Corbett’s case for midway is that a font can then tell an inserted circle from a typed one (<a href="https://github.com/MicrosoftDocs/typography-issues/issues/281">typography-issues #281</a>, <a href="https://github.com/harfbuzz/harfbuzz/issues/1924">HarfBuzz #1924</a>). HarfBuzz also gives a run of stray marks one circle, where the specification says “a sequence of marks without a valid base forms separate clusters for each mark”; Glass closed that as not worth making consistent (<a href="https://github.com/MicrosoftDocs/typography-issues/issues/289">typography-issues #289</a>). <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a> has the rest of the story.</p>
+<h2 id="topographical-forms">Topographical forms</h2>
+<p id="ix-96">The joining scripts under USE, such as Mongolian and N’Ko, take their <code>isol</code>, <code>init</code>, <code>medi</code> and <code>fina</code> masks from the Arabic joining machine, as <a href="joining-scripts.html#joining-scripts-under-use">Joining scripts</a> describes. For every other USE script, <code>setup_topographical_masks</code> (<code>:232</code>) sets them by syllable instead. Each syllable that joins is at first isolated; if the syllable before it was isolated or final, that one becomes initial or medial and this one final. A hieroglyph or non-cluster breaks the chain. The masks are set before any lookup, from the first syllables found, and only for those of the four features the font has.</p>
+<p id="ix-97">This is HarfBuzz’s own design. The specification says the topographical features invoke forms “based on non-joining or white space boundaries”, and adds: “Support for topographical features for non-joining scripts is not currently implemented in USE. Additional specification is required.”</p>
+<p id="ix-98"><code>deva3.ttf</code>’s <code>init</code> lookup shows it. Under <code>dev2</code> the same lookup is the Indic shaper’s <code>init</code>, which takes a pre-base vowel sign at the start of a word (<a href="indic-model.html#init"><code>init</code></a>); under <code>dev3</code> it takes a whole cluster that another cluster follows:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">deva2.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|ka=0+600]</code></td></tr><tr><td class="font">deva3.ttf</td><td class="in"><span class="txt">कि</span><span class="cps">U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra=0+250|ka=0+600]</code></td></tr><tr><td class="font">deva3.ttf</td><td class="in"><span class="txt">किक</span><span class="cps">U+0915 U+093F U+0915</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|ka=0+600|ka=2+600]</code></td></tr><tr><td class="font">deva3.ttf</td><td class="in"><span class="txt">कि␣</span><span class="cps">U+0915 U+093F U+0020</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|ka=0+600|space=2+250]</code></td></tr><tr><td class="font">deva3.ttf</td><td class="in"><span class="txt">कि␣कि</span><span class="cps">U+0915 U+093F U+0020 U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra.init=0+250|ka=0+600|space=2+250|iMatra=3+250|ka=3+600]</code></td></tr><tr><td class="font">deva3.ttf</td><td class="in"><span class="txt">कि⁠कि</span><span class="cps">U+0915 U+093F U+2060 U+0915 U+093F</span></td><td class="opt">--language=hi</td><td class="out"><code>[iMatra=0+250|ka=0+600|space=2+0|iMatra=3+250|ka=3+600]</code></td></tr></tbody></table></div>
+<p id="ix-99">Alone, the cluster is isolated, and the vowel sign keeps its ordinary form. Before another cluster it is initial. It is initial before a space too: a space is a symbol cluster, which joins, so in the fifth line the first cluster is initial and the second final (a form this font has no lookup for), as if the space weren’t there. Only the word joiner, a non-cluster, ends the chain. ZWNJ doesn’t end it either, since it belongs to the cluster before it. For a font that uses <code>init</code> or <code>fina</code> for word-initial or word-final forms in a non-joining USE script, the edge of a word is the edge of the run (inferred from the code; the specification’s “white space boundaries” suggest otherwise).</p>
+<h2 id="the-nine-indic-scripts-under-dev3">The nine Indic scripts under <code>dev3</code></h2>
+<p id="ix-100">Shaping the nine Indic scripts with USE is HarfBuzz’s and Apple’s extension of it, not part of USE as Microsoft specifies it. The specification’s list of scripts doesn’t include them, and the <code>3</code> tags that select it aren’t in the OpenType registry (<a href="choosing-a-script-shaper.html#from-a-script-to-script-tags">Choosing a script shaper</a>). HarfBuzz added them in 2018 because “Apple does that and we want to put it in OpenType itself” (<a href="https://github.com/harfbuzz/harfbuzz/issues/539">HarfBuzz #539</a>), and that hasn’t happened. HarfBuzz’s own developers treat the route as secondary: asked about a <code>knd3</code> font in 2019, Corbett replied that “'knd2' already does what you want and is more widely supported”, and that “The USE and the Kannada shaper were never meant to be identical” (<a href="https://github.com/harfbuzz/harfbuzz/issues/1677">#1677</a>).</p>
+<p id="ix-101"><a href="choosing-a-script-shaper.html#the-same-text-in-seven-fonts">Choosing a script shaper</a> showed three Devanagari syllables shaped alike under <code>dev2</code> and <code>dev3</code>. That is the common case, but not the only one. The same lookups, under the two tags:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">deva2.ttf</td><td class="in"><span class="txt">क्त</span><span class="cps">U+0915 U+094D U+0924</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka.half=0+400|ta=2+550]</code></td></tr><tr><td class="font">deva3.ttf</td><td class="in"><span class="txt">क्त</span><span class="cps">U+0915 U+094D U+0924</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka.half=0+400|ta=2+550]</code></td></tr><tr><td class="font">deva2-half-first.ttf</td><td class="in"><span class="txt">क्र</span><span class="cps">U+0915 U+094D U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|rakar=0+0]</code></td></tr><tr><td class="font">deva3-half-first.ttf</td><td class="in"><span class="txt">क्र</span><span class="cps">U+0915 U+094D U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka.half=0+400|ra=2+500]</code></td></tr><tr><td class="font">deva2.ttf</td><td class="in"><span class="txt">र्कुं</span><span class="cps">U+0930 U+094D U+0915 U+0941 U+0902</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|uMatra=0+0|reph=0+0|anusvara=0+0]</code></td></tr><tr><td class="font">deva3.ttf</td><td class="in"><span class="txt">र्कुं</span><span class="cps">U+0930 U+094D U+0915 U+0941 U+0902</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|reph=0+0|uMatra=0+0|anusvara=0+0]</code></td></tr><tr><td class="font">deva2-no-half.ttf</td><td class="in"><span class="txt">र्क्त</span><span class="cps">U+0930 U+094D U+0915 U+094D U+0924</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|virama=0+0|reph=0+0|ta=4+550]</code></td></tr><tr><td class="font">deva3-no-half.ttf</td><td class="in"><span class="txt">र्क्त</span><span class="cps">U+0930 U+094D U+0915 U+094D U+0924</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|reph=0+0|virama=0+0|ta=4+550]</code></td></tr></tbody></table></div>
+<p id="ix-102"><strong>Lookup order.</strong> KA, virama, RA: the Indic shaper asks <code>blwf</code> about RA, finds it below-base, makes KA the base, and runs <code>blwf</code> in a stage before <code>half</code>, so RA becomes rakar whatever the LookupList says. USE asks nothing. With <code>half</code>’s lookup first, KA + virama becomes the half form, and <code>blwf</code> then has no virama to match. Under <code>dev3</code>, the LookupList order is the font’s shaping logic.</p>
+<p id="ix-103"><strong>The reph.</strong> In Devanagari the Indic shaper puts the reph at the end of the syllable, before any anusvara; USE puts it before the first post-base glyph, here the vowel sign U, between KA and its mark. Both orders look the same once marks are positioned, but <code>abvs</code>, <code>blws</code> and GPOS see a different sequence. And where a virama stays visible, the Indic shaper moves the reph after it (step 2 of its reph rules, <a href="indic-model.html#the-reph_1">The reph</a>); USE stops before it.</p>
+<p>The joiners behave differently too:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">deva2.ttf</td><td class="in"><span class="txt">क्⟨ZWNJ⟩र</span><span class="cps">U+0915 U+094D U+200C U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka=0+600|virama=0+0|space=2+0|ra=3+500]</code></td></tr><tr><td class="font">deva3.ttf</td><td class="in"><span class="txt">क्⟨ZWNJ⟩र</span><span class="cps">U+0915 U+094D U+200C U+0930</span></td><td class="opt">--language=hi</td><td class="out"><code>[ka.half=0+400|space=2+0|ra=3+500]</code></td></tr><tr><td class="font">deva2.ttf</td><td class="in"><span class="txt">र्⟨ZWJ⟩क</span><span class="cps">U+0930 U+094D U+200D U+0915</span></td><td class="opt">--language=hi</td><td class="out"><code>[ra=0+500|virama=0+0|space=0+0|ka=3+600]</code></td></tr><tr><td class="font">deva3.ttf</td><td class="in"><span class="txt">र्⟨ZWJ⟩क</span><span class="cps">U+0930 U+094D U+200D U+0915</span></td><td class="opt">--language=hi</td><td class="out"><code>[space=0+0|ka=0+600|reph=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-104">KA, virama, ZWNJ is how a visible virama is written inside a word. The Indic shaper honors it: ZWNJ clears the <code>half</code> mask. USE has no <code>half</code> mask, the ZWNJ comes after the two glyphs the half form needs, and the half form forms. A font can’t stop it with a lookahead either, since USE’s lookups pass over ZWNJ in their context (read from the code; not tried with a font). RA, virama, ZWJ asks for an eyelash RA rather than a reph. The Indic shaper won’t make a reph when a joiner follows the virama; USE doesn’t look, and makes one. Both look like differences a <code>dev3</code> font can’t easily work round (inferred), and Microsoft’s specification doesn’t say how its engine treats them. HarfBuzz’s position is that text “should be renderable with either an Indic2 or Indic3 font”, but the two shapers disagree about which strings are valid, and the issue that says so is still open (<a href="https://github.com/harfbuzz/harfbuzz/issues/1746">#1746</a>). Kannada shows the cost. Under <code>knd3</code>, a bare RA and virama form a reph, where Kannada writers expect one only inside a word, and a font can’t test for the letter before, since <code>rphf</code> sees only its own cluster. Behdad Esfahbod pointed to HarfBuzz’s own <code>HARF</code> feature as a way round, and noted that, since “indic3 is not part of OpenType (yet)”, there was nowhere official to report the problem (<a href="https://github.com/harfbuzz/harfbuzz/issues/1683">HarfBuzz #1683</a>).</p>
+<p id="ix-105">Everything the Indic chapter’s <a href="indic-model.html#script-by-script">Script by script</a> table lists is absent under <code>3</code> tags, as are the reph positions, the <code>blwf</code> modes and the Uniscribe heuristics. A Malayalam dot reph is an <code>R</code> and moves like any other reph, in HarfBuzz. The specification still says that “the category REPHA is not currently supported by USE”, a note that, as an open issue points out, seems to describe Microsoft’s engine (<a href="https://github.com/MicrosoftDocs/typography-issues/issues/696">typography-issues #696</a>).</p>
+<blockquote>
+<p id="ix-106">For type designers: under a <code>3</code> tag, the shaper tells your lookups nothing about which consonant is the base. <code>half</code>, <code>blwf</code>, <code>pstf</code> and the other basic features apply to every glyph of the syllable, together, in the order of your LookupList, so their lookups must say themselves, by context and order, where each form belongs. The shaper only moves what your <code>rphf</code> and <code>pref</code> produced, and pre-base vowel signs, and never past a virama your lookups left standing.</p>
+</blockquote>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use.cc"><code>src/hb-ot-shaper-use.cc</code></a></td>
+<td>the features and stages, the <code>rphf</code> and topographical masks, recording <code>rphf</code> and <code>pref</code>, the reordering, <code>compose</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use-machine.rl"><code>src/hb-ot-shaper-use-machine.rl</code></a></td>
+<td>the categories, the syllable types and the grammar, in Ragel, and the filtered view the machine runs over</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use-machine.hh"><code>src/hb-ot-shaper-use-machine.hh</code></a></td>
+<td>the machine Ragel generated from it, committed</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use-table.hh"><code>src/hb-ot-shaper-use-table.hh</code></a></td>
+<td>the generated categories</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-use-table.py"><code>src/gen-use-table.py</code></a></td>
+<td>the generator, with HarfBuzz’s own changes to the derivations</td>
+</tr>
+<tr>
+<td><code>src/ms-use/</code></td>
+<td>Microsoft’s additional category files, and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/ms-use/IndicShapingInvalidCluster.txt"><code>IndicShapingInvalidCluster.txt</code></a> for the vowel constraints</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/test-use-table.cc"><code>src/test-use-table.cc</code></a></td>
+<td>prints the category of a code point, or of all of them</td>
+</tr>
+<tr>
+<td><code>src/update-unicode-tables.make</code></td>
+<td>which files each generator reads</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-syllabic.cc"><code>src/hb-ot-shaper-syllabic.cc</code></a></td>
+<td>inserting dotted circles, and releasing <code>syllable</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc"><code>src/hb-ot-shaper-arabic.cc</code></a></td>
+<td>the joining machine USE borrows for joining scripts</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>USE gives every character one category, derived from Unicode’s Indic syllabic and positional categories, joining types, general categories and default ignorables, with Microsoft’s override files and HarfBuzz’s own changes. ZWJ, CGJ and the variation selectors are invisible to the grammar.</li>
+<li>One Ragel grammar, a single template of base, consonant modifiers, medials, vowels, vowel modifiers and finals in a fixed order, divides the run into nine kinds of cluster. A space is a symbol cluster and can carry marks.</li>
+<li>There is no base consonant and no question put to the font. The basic features apply together, to the whole syllable, in LookupList order; only <code>rphf</code> (on the first three glyphs) and <code>pref</code> have stages of their own, and what they substitute is recorded as a reph or a pre-base glyph.</li>
+<li>One reordering pass moves the reph forward to before the first post-base glyph, and pre-base vowel signs, modifiers and <code>pref</code> forms back to the start of the syllable, neither past an unligated virama.</li>
+<li>Non-joining USE scripts get HarfBuzz’s own topographical forms, cluster by cluster, which spaces and ZWNJ don’t interrupt.</li>
+<li>HarfBuzz departs from Microsoft’s specification in places, some deliberately: ZWJ doesn’t join clusters (nor does Microsoft’s engine), a virama must be ligated, not just substituted, to let things pass it, and dotted circles go in midway through GSUB. Where the specification is silent, as on two pre-base vowels, Microsoft has sometimes agreed HarfBuzz is right. The discussion is in Microsoft’s typography-issues and font-tools repositories and in HarfBuzz’s issues.</li>
+<li>Under <code>dev3</code> and the other <code>3</code> tags, Devanagari and its kin follow all of this: LookupList order decides forms, the reph lands earlier, and ZWNJ and ZWJ after a virama don’t stop a half form or a reph.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="khmer-and-myanmar.html">← Khmer and Myanmar</a><a rel="next" href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

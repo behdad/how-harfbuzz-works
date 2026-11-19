@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>hb-raster: rendering to pixels · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part IX · Drawing</p>
+<h1 id="hb-raster-rendering-to-pixels">37. hb-raster: rendering to pixels</h1>
+<p id="ix-1">The draw and paint APIs end at a callback. HarfBuzz walks the font’s data and calls the client: move here, curve to there, push this clip, fill with that gradient. For most of HarfBuzz’s life, what happened next was someone else’s business: FreeType, cairo, Skia or the platform turned the callbacks into pixels. Since 13.0.0 HarfBuzz has its own renderers, in three separate libraries. <strong>hb-raster</strong> turns glyphs into pixel images on the CPU. <a href="hb-vector.html">hb-vector</a> writes them out as SVG or PDF. <a href="hb-gpu.html">hb-gpu</a> encodes them so that a fragment shader can draw them on the GPU. Each is a client of the APIs that <a href="drawing-outlines.html">Drawing outlines</a> and <a href="color.html">Color</a> describe, and nothing more.</p>
+<p id="ix-2">This chapter is about the first. hb-raster is a small anti-aliasing rasterizer: it makes 8-bit coverage masks from outlines, and premultiplied BGRA images from color glyphs. It sees glyphs exactly as an application would, with variations, synthetic bold and slant (<a href="fonts-and-font-functions.html#synthetic-bold-and-slant">Fonts and font functions</a>) and the font’s scale already applied. What it doesn’t do is as important as what it does: it doesn’t hint, and text that needs hinting needs FreeType beside it.</p>
+<p id="ix-3">The chapter is in two parts, <a href="#outlines">Outlines</a> and <a href="#color-glyphs">Color glyphs</a>; a reader who draws only ordinary text can stop after the first. Every image on this page is hb-raster’s own PNG output, made by the <code>hb-raster</code> tool when the page was built and shown enlarged; the code is hand-written usage.</p>
+<h2 id="the-library">The library</h2>
+<p id="ix-4">hb-raster is a shared library of its own, <code>libharfbuzz-raster</code>, with one header, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster.h"><code>hb-raster.h</code></a>. It is built unless the <a href="building-harfbuzz.html#optional-dependencies-and-backends">Meson option</a> <code>raster</code> is disabled (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson_options.txt#L36"><code>meson_options.txt:36</code></a>), and uses libpng when it is found (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/meson.build#L757"><code>src/meson.build:757</code></a>). Its history is short and all of it in 2026 (<code>NEWS</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Version</th>
+<th>What happened</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>13.0.0</td>
+<td id="ix-5">hb-raster arrives, “experimental”: A8 and BGRA32 images, outlines, and color glyphs from COLR and SVG</td>
+</tr>
+<tr>
+<td>13.1.0</td>
+<td id="ix-6"><code>CBDT</code> and <code>sbix</code> bitmaps; PNG reading and writing, with libpng; the <code>hb-raster</code> tool is installed</td>
+</tr>
+<tr>
+<td>13.1.1</td>
+<td id="ix-7">gzip-compressed SVG glyphs, with zlib</td>
+</tr>
+<tr>
+<td>14.2.0</td>
+<td id="ix-8">the API review: <code>_clear</code>, <code>_glyph_or_fail</code>, palette and background setters; SVG glyphs dropped</td>
+</tr>
+<tr>
+<td>14.5.0</td>
+<td id="ix-9">work budgets shared with the font code</td>
+</tr>
+<tr>
+<td>14.5.1</td>
+<td>accumulator overflows with very many overlapping edges fixed</td>
+</tr>
+<tr>
+<td>15.0.0</td>
+<td>“no longer considered experimental”: API and ABI stability now apply</td>
+</tr>
+<tr>
+<td>15.1.0</td>
+<td>rotated and skewed rectangle clips fixed</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-10">There are two contexts, one for each API. A <strong>draw context</strong>, <code>hb_raster_draw_t</code>, is a set of draw funcs with state: it collects outlines and renders them to an A8 coverage mask. A <strong>paint context</strong>, <code>hb_raster_paint_t</code>, is a set of paint funcs with state: it paints color glyphs into a BGRA32 image. Both are ordinary reference-counted HarfBuzz objects, made with <code>_create_or_fail</code> and configured with setters: a 2×3 transform, a scale factor that divides it, and the output’s extents.</p>
+<p id="ix-11">A context is fed glyphs by <code>hb_raster_draw_glyph</code> or <code>hb_raster_paint_glyph</code>. These are a “convenience”: <code>hb_raster_draw_glyph_or_fail (draw, font, glyph)</code> is documented as equivalent to <code>hb_font_draw_glyph_or_fail (font, glyph, hb_raster_draw_get_funcs (draw), draw)</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-draw.cc#L1195"><code>hb-raster-draw.cc:1195</code></a>). So a client can also drive a context through its funcs directly, to draw shapes of its own. Since 14.2.0 the plain <code>_glyph</code> functions return nothing, and each has a <code>_glyph_or_fail</code> twin that says whether the font had anything to draw or paint.</p>
+<p id="ix-12"><code>_render</code> turns what has been collected into an <code>hb_raster_image_t</code>, and clears the context even when it fails (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-draw.cc#L1683"><code>hb-raster-draw.cc:1683</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L2566"><code>hb-raster-paint.cc:2566</code></a>), so the same context can be used glyph after glyph. <code>_clear</code> throws away what has been collected and keeps the settings; <code>_reset</code> restores the defaults too. <code>_recycle_image</code> hands a finished image back to the context, which reuses its memory for the next render instead of allocating.</p>
+<p id="ix-13">Both contexts implement the budget callbacks of <a href="drawing-outlines.html#the-budget">Drawing outlines</a>, and recharge the budget when they are cleared. So one budget of 2²⁴ covers everything drawn between one render and the next, which, as hb-raster is normally used, is one glyph.</p>
+<h2 id="outlines">Outlines</h2>
+<h3 id="the-draw-context">The draw context</h3>
+<p id="ix-14">Hand-written, the whole path from a glyph to a mask is a handful of calls. This is the sequence the library’s own documentation gives (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-image.cc#L44"><code>hb-raster-image.cc:44</code></a>), with the pen position in the transform:</p>
+<pre><code class="language-c">hb_raster_draw_t *draw = hb_raster_draw_create_or_fail ();
+hb_raster_draw_set_scale_factor (draw, 64.f, 64.f);  /* font scale is 26.6 */
+hb_raster_draw_set_transform (draw, 1, 0, 0, 1, pen_x, pen_y);
+
+hb_glyph_extents_t glyph_extents;
+hb_font_get_glyph_extents (font, gid, &amp;glyph_extents);
+hb_raster_draw_set_glyph_extents (draw, &amp;glyph_extents);
+
+hb_raster_draw_glyph (draw, font, gid);
+hb_raster_image_t *mask = hb_raster_draw_render (draw);   /* A8 */
+/* … hb_raster_image_get_buffer (mask), hb_raster_image_get_extents … */
+hb_raster_draw_recycle_image (draw, mask);
+</code></pre>
+<p id="ix-15">Every point that arrives is multiplied by the transform and then divided by the scale factor (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-draw.cc#L119"><code>hb-raster-draw.cc:119</code></a>). With neither set, one unit of the font’s scale is one pixel. Setting the scale factor to 64 lets a client keep its font scale in 26.6 fixed point, 64 units to the pixel, as hb-ft does and as the <code>hb-raster</code> tool does (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/raster-output.hh#L190"><code>util/raster-output.hh:190</code></a>). The pen position can be fractional: nothing rounds it, so glyphs can be placed at any fraction of a pixel.</p>
+<p id="ix-16">Several glyphs can be drawn into one context before it is rendered, each with its own transform. The <code>hb-raster</code> tool draws a whole line that way, into one mask (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/raster-output.hh#L245"><code>util/raster-output.hh:245</code></a>).</p>
+<h3 id="flattening">Flattening</h3>
+<p id="ix-17"><code>hb_raster_draw_t</code> doesn’t keep curves. Each segment is transformed to pixel space as it arrives and <strong>flattened</strong>: cut into straight edges close enough to the curve that the difference can’t be seen. A quadratic or cubic is split in half, de Casteljau style, until a flatness test passes or it has been split 16 times (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-draw.cc#L625"><code>hb-raster-draw.cc:625</code></a>, <code>:834</code>). The tests are the ones FreeType uses, according to the comments: for a quadratic, the control point’s distance from the middle of the chord, at most a quarter of a pixel in each direction; for a cubic, a test at the chord’s thirds, at most half a pixel (“FreeType behavior”, <code>:684</code>, <code>:889</code>). Each split costs one unit of the work budget; when the budget is spent, the rest of the curve becomes its chord.</p>
+<p id="ix-18">When the image’s extents are known in advance, a curve whose control points lie entirely outside them is replaced by its chord straight away. The header explains why that is safe: a curve’s crossings of rows outside the image cancel out, so the chord “is exact for coverage inside the box” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster.hh#L34"><code>hb-raster.hh:34</code></a>).</p>
+<p id="ix-19">The edges are stored in 24.8 fixed point, 256 steps to the pixel, each with a direction, up or down. Horizontal edges are dropped, since they cover nothing (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-draw.cc#L593"><code>hb-raster-draw.cc:593</code></a>).</p>
+<h3 id="coverage-and-the-nonzero-rule">Coverage and the nonzero rule</h3>
+<p id="ix-20"><code>hb_raster_draw_render</code> then makes the A8 image with an <strong>analytic coverage</strong> rasterizer. Instead of sampling a few points in each pixel, it computes how much of each pixel’s area the outline covers. The comment above it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-draw.cc#L1238"><code>hb-raster-draw.cc:1238</code></a>, trimmed) gives the whole method:</p>
+<pre><code class="language-c++">/*
+ * For each line-segment edge and each pixel row it crosses, we compute
+ * exact area/cover contributions per pixel cell.  A left-to-right sweep
+ * then converts accumulated (area, cover) into alpha values.
+ *
+ *   cover[x] = Σ dy · wind        — signed vertical extent per cell
+ *   area[x]  = Σ (fx₀+fx₁)·dy·wind — twice the signed trapezoidal area
+ *
+ * Sweep:
+ *   cover_accum += cover[x]
+ *   α = min(|cover_accum·(2·ONE_PIXEL) − area[x]|, FULL_COVERAGE)
+ *       · 255 / FULL_COVERAGE
+ */
+</code></pre>
+<p id="ix-21">An edge adds to a row’s cells only where it passes through them. The running sum of cover from the left counts how many times the outline winds around a pixel, up edges against down ones; the area term corrects that count for an edge passing through the pixel itself. Taking the absolute value and capping it at full coverage makes this the <strong>nonzero winding rule</strong>: a pixel is inside if the outline winds around it any number of times, in either direction. It is the rule TrueType and CFF outlines are designed for, and the only one hb-raster has. In this chapter’s test font, <code>o</code> is a square with a counter wound the other way, <code>q</code> the same square with its counter wound the same way, and <code>x</code> two squares that overlap:</p>
+<div class="rasters"><figure class="raster"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAF4AAAAsCAYAAADsOA+kAAAAs0lEQVR4nO3aQQ6CMBRAQWu8/5XrXkNEESbKmyWbNi+fpDSMOee85HBXvYGzKjxSeKTwSOGRwiOFR26PD8YYuy649Nmg1n1l676W1m3ikcIjhUcKjxQeeTrVLHn3VLD3KeXXNfHI6on/V+rNbOKRwiOFRwqPFB4pPFJ45PTn+K0+vedv4pHVE9/dy3c18UjhkcIjhUcKj4z+jzeaeKTwSOGRwiOFRwqPFB4pPFJ4pPBI4ZE7lukXXKqjEB4AAAAASUVORK5CYII=" width="376" height="176" alt="oqx, rendered by hb-raster"><figcaption><code>hb-raster raster.ttf oqx --font-size=40</code> (94 × 44 pixels, shown 4 times larger)</figcaption></figure></div>
+<p id="ix-22">The counter of <code>o</code> is a hole; the counter of <code>q</code> is filled, because the winding there is 2, not 0. In the overlap of <code>x</code> the winding is also 2, and is capped: overlapping contours, which variable fonts often keep, are not drawn darker where they overlap.</p>
+<p id="ix-23">Because the coverage is exact area, a glyph’s position within a pixel shows. In the test font, <code>l</code> is a bar exactly one pixel wide at 20 pixels per em, and has an advance of 5¼ pixels, so each <code>l</code> starts a quarter of a pixel to the right of where the one before did:</p>
+<div class="rasters"><figure class="raster"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACQAAAAYCAYAAACSuF9OAAAAW0lEQVRIie3WsRHAMAhDUchm2kyjsRmpHftO7kKhX8LZ90qyuzsG9fwN+GaQyiDVXFBmbksAUVXLjGSQXGZVFQC297d/HkFTMkhlkMoglUGq9IEmMkhlkGoc6AUiKhQ20XH68QAAAABJRU5ErkJggg==" width="360" height="240" alt="llllll, rendered by hb-raster"><figcaption><code>hb-raster raster.ttf llllll --font-size=20</code> (36 × 24 pixels, shown 10 times larger)</figcaption></figure></div>
+<p>The first bar starts on a pixel boundary and is one black column. The second covers three quarters of one column and a quarter of the next, and is drawn as two grays; the third is two middle grays; the fifth is on a boundary again. Nothing is wrong here: that is what a bar one pixel wide between two pixels covers. It is also the problem that hinting exists to solve, <a href="#what-hb-raster-doesnt-do">below</a>.</p>
+<p id="ix-24">Rows are swept with 16-bit accumulators, or 64-bit ones when more than 127 edges are active in a row (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-draw.cc#L1257"><code>hb-raster-draw.cc:1257</code></a>, <code>:1754</code>), presumably the fix for the “accumulator overflows” of 14.5.1 (inferred).</p>
+<h3 id="the-a8-image">The A8 image</h3>
+<p id="ix-25">The result is an <code>hb_raster_image_t</code> in <code>HB_RASTER_FORMAT_A8</code>: one byte of coverage per pixel, 0 for none and 255 for full. Its <code>hb_raster_extents_t</code> give its size in pixels, its <code>stride</code> in bytes, a multiple of 4 for A8 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-draw.cc#L1679"><code>hb-raster-draw.cc:1679</code></a>), and its origin: <code>x_origin</code> and <code>y_origin</code> are the pixel coordinates of its left and bottom edges. The rows are stored bottom to top, as <code>hb_raster_image_get_buffer</code> says (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-image.cc#L1033"><code>hb-raster-image.cc:1033</code></a>), since y goes up in font coordinates. The documentation asks a client that caches glyph images to place them by that origin, not by the glyph’s bearings (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-image.cc#L74"><code>hb-raster-image.cc:74</code></a>).</p>
+<p id="ix-26">Where the extents come from is up to the client. <code>hb_raster_draw_set_extents</code> sets them outright. <code>hb_raster_draw_set_glyph_extents</code> takes the glyph’s extents from <code>hb_font_get_glyph_extents</code>, puts their corners through the transform and the scale factor, and rounds the box outward to whole pixels (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-draw.cc#L421"><code>hb-raster-draw.cc:421</code></a>). With neither, <code>render</code> uses the bounding box of the edges it collected.</p>
+<h3 id="limits">Limits</h3>
+<p id="ix-27">Fonts can’t be trusted (<a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a>). Besides the work budget, hb-raster bounds its own work (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L184-L268"><code>hb-limits.hh:184–268</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Value</th>
+<th>What it bounds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-28"><code>HB_RASTER_MAX_DRAW_EDGES</code></td>
+<td>2²⁰</td>
+<td>edges collected between renders</td>
+</tr>
+<tr>
+<td id="ix-29"><code>HB_RASTER_MAX_AUTO_DIMENSION</code></td>
+<td>4,096</td>
+<td>pixels a side, when the size comes from the font</td>
+</tr>
+<tr>
+<td id="ix-30"><code>HB_RASTER_MAX_BUFFER_SIZE</code></td>
+<td>1 GiB</td>
+<td>one image’s buffer</td>
+</tr>
+<tr>
+<td id="ix-31"><code>HB_BUDGET_RASTER_PIXELS</code>, <code>HB_BUDGET_RASTER_PAINT_PASSES</code></td>
+<td>2²⁶, 4</td>
+<td>pixel work, below</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-32">The <strong>edge limit</strong> counts the straight edges the flattener has made. When it is reached, further edges are silently dropped (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-draw.cc#L597"><code>hb-raster-draw.cc:597</code></a>), so a glyph with more than a million edges is drawn in part. The dimension cap applies only to sizes that come from the font: from glyph extents, from the edges’ bounding box, or from a PNG’s header. Sizes a client sets with <code>set_extents</code> aren’t capped: the client is trusted with its own allocations, the font isn’t.</p>
+<p id="ix-33">The sweep visits every edge once for each row it spans, and neither cap bounds that product. So before sweeping, <code>render</code> estimates the work, each edge’s height plus its width in pixels, and if that exceeds 2²⁶ units or four passes over the image, whichever is more, it returns a blank image instead of a slow one (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-draw.cc#L1705"><code>hb-raster-draw.cc:1705</code></a>). An unlimited budget turns this check off.</p>
+<h3 id="checking-against-freetype">Checking against FreeType</h3>
+<p id="ix-34"><code>hb-ft-raster</code>, built only with FreeType and not installed, is “like hb-raster but uses FreeType’s rasterizer for pixel-level comparison”: it shapes the same way, then renders each glyph with FreeType’s <code>FT_Outline_Render</code> into a gray PPM image (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-ft-raster.cc#L27"><code>util/hb-ft-raster.cc:27</code></a>). It loads the glyphs with <code>FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-ft-raster.cc#L209"><code>util/hb-ft-raster.cc:209</code></a>, <code>:252</code>), so it compares unhinted outlines, the only kind hb-raster draws from HarfBuzz’s own font funcs.</p>
+<p id="ix-35">Run by hand on <code>Roboto-Regular.ttf</code> from HarfBuzz’s test suite, “Hamburgefonts” at 11 pixels, with <code>hb-raster --ink --margin=0 -O ppm</code> for the same framing, the two tools make images of the same size, 77 × 12 pixels. 267 of the 924 pixels differ, and none by more than 5 levels out of 255. At 48 pixels the largest difference is 11 levels. Both compute coverage by area, from slightly differently rounded edges.</p>
+<h3 id="what-hb-raster-doesnt-do">What hb-raster doesn’t do</h3>
+<p id="ix-36">HarfBuzz’s <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.md"><code>README.md</code></a> is direct about it: “Notable missing feature: font hinting (including autohinting) is not implemented. For hinted rasterization, use FreeType or Skrifa.” In full, hb-raster has none of the following, and nothing in its source mentions them:</p>
+<ul>
+<li id="ix-37"><strong>No hinting of any kind.</strong> No TrueType bytecode interpreter: the <code>fpgm</code>, <code>prep</code> and <code>cvt </code> tables, and the instructions in each glyph, are never run. HarfBuzz touches <code>cvt </code> only to apply <code>cvar</code> deltas when it instances a font (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-cvar-table.hh"><code>hb-ot-var-cvar-table.hh</code></a>), never to hint. No autohinter, which would detect stems and blue zones in an unhinted font. No CFF or PostScript hints: the charstring interpreter of <a href="drawing-outlines.html#cff-and-cff2-running-charstrings">Drawing outlines</a> counts the stem hints only to know how long the hint masks after them are, so that it can skip them (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-cff-interp-cs-common.hh#L371-L389"><code>hb-cff-interp-cs-common.hh:371–389</code></a>). The outline hb-raster draws is the outline the font funcs give it, scaled and nothing else.</li>
+<li id="ix-38"><strong>No gamma correction.</strong> A pixel’s coverage is its covered area, scaled linearly to 0–255 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-draw.cc#L1581"><code>hb-raster-draw.cc:1581</code></a>). A display doesn’t turn values into light linearly, so text whose coverage is blended without correction looks thinner or heavier than its outline, depending on the colors. Correcting for that is left to whatever composites the mask. The paint side composites in the same uncorrected values (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster.hh#L73"><code>hb-raster.hh:73</code></a>).</li>
+<li id="ix-39"><strong>No LCD or subpixel rendering.</strong> The only formats are A8, one coverage value per pixel, and BGRA32 color (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster.h#L45"><code>hb-raster.h:45</code></a>). There is no mode that renders at three times the horizontal resolution for the red, green and blue stripes of an LCD, and no filter for the color fringes that would cause. Subpixel <em>positioning</em> is another matter: glyphs can be placed at any fraction of a pixel, as the bars above show.</li>
+<li id="ix-40"><strong>No stem darkening.</strong> Nothing thickens thin stems at small sizes to make up for the lack of gamma correction and hinting. hb-gpu’s shaders offer an optional <code>hb_gpu_stem_darken</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-gpu.cc#L329"><code>hb-gpu.cc:329</code></a>); hb-raster has no counterpart.</li>
+<li><strong>No bi-level rendering.</strong> Every result is anti-aliased. There is no black-and-white mode, and so no TrueType dropout control.</li>
+</ul>
+<p id="ix-41">At a large size, or on a screen with many pixels to the inch, none of this matters much: a stem many pixels wide has a gray edge, and nobody can see where within the pixel it fell. At a small size on an ordinary screen, a stem may be about one pixel wide, and then, as the bars above show, whether it is one black column or two gray ones depends on where it falls. Hinting is the font’s way of choosing, at each size, where stems, heights and curves land on the pixel grid. Beat Stamm’s <a href="http://rastertragedy.com">The Raster Tragedy at Low-Resolution Revisited</a> is the long account: on <a href="http://rastertragedy.com/RTRCh6.htm#Sec0">what hinting is</a>, on <a href="http://rastertragedy.com/RTRCh5.htm#Sec3">gamma</a>, on <a href="http://rastertragedy.com/RTRCh2.htm#Sec2">subpixel anti-aliasing</a>, and on how hinting fights with <a href="http://rastertragedy.com/RTRCh3.htm#Sec32">fractional advance widths</a>.</p>
+<h3 id="when-hb-raster-is-enough">When hb-raster is enough</h3>
+<p id="ix-42">What it does well follows from what it is: exact anti-aliased coverage, fractional positions, full color glyphs, and no dependencies beyond libpng. What it lacks matters most where pixels are few. This is the book’s own assessment, not HarfBuzz’s:</p>
+<ul>
+<li id="ix-43"><strong>High-resolution screens</strong>, such as phones, tablets and laptops at well over 100 pixels per inch, where unhinted anti-aliased text is the norm and an em has enough pixels to draw a letter without help.</li>
+<li id="ix-44"><strong>Large text</strong> at any resolution: headings, display type, generous UI labels. Hinting matters less as the ppem rises.</li>
+<li id="ix-45"><strong>Glyph atlases</strong>, as games and other GPU applications use them: glyphs rasterized once on the CPU, at the sizes needed, and drawn as textured rectangles. Text that zooms or scales continuously is better drawn from outlines on the GPU, by <a href="hb-gpu.html">hb-gpu</a>.</li>
+<li id="ix-46"><strong>Moving text</strong>: animation, zooming and smooth scrolling. Unhinted glyphs at fractional positions move smoothly, where hinted ones snap from one pixel to the next.</li>
+<li id="ix-47"><strong>Images rather than screens</strong>: thumbnails and previews made on a server, font specimens and proofs, figures, visual regression tests, where the same output everywhere matters more than legibility at 9 pixels.</li>
+<li id="ix-48"><strong>Color glyphs and emoji</strong>, where hb-raster implements every composite mode the <a href="color.html">Color</a> chapter describes.</li>
+<li id="ix-49"><strong>Small or sandboxed builds</strong>, such as WebAssembly, where one library that shapes and draws is simpler than two.</li>
+</ul>
+<p id="ix-50">It falls short in the opposite cases. Small text on screens of about 100 pixels per inch looks soft unhinted, as the 11-pixel example below shows. Light text on a dark background, or anything else sensitive to contrast, needs the gamma correction or stem darkening hb-raster doesn’t do, unless the application adjusts the coverage itself. Output with no grays at all, for some e-ink modes, segment displays or printers, needs a bilevel mode it doesn’t have. And a few fonts, mostly older Chinese ones, don’t draw correctly at all without their own hinting: FreeType calls them “tricky” and always hints them, whatever it is asked (<code>FT_FACE_FLAG_TRICKY</code> in FreeType 2.15.0’s <code>freetype.h</code>). For those, hinting comes from FreeType or Skrifa, and hb-raster can still do the rasterizing, as the next section shows.</p>
+<h3 id="hinting-with-freetype">Hinting with FreeType</h3>
+<p id="ix-51">A text stack that needs hinted text needs a hinting engine beside HarfBuzz: in practice FreeType, or Skrifa, the Rust scaler that <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/README.md"><code>README.md</code></a> also names. Skrifa, part of Google’s <a href="https://github.com/googlefonts/fontations">Fontations</a> crates, is a full alternative to FreeType here: version 0.49, the one HarfBuzz builds against (<code>src/rust/Cargo.toml:10</code>), has its own TrueType bytecode interpreter, CFF stem hinting, and an autohinter modeled on FreeType’s, with targets for “Monochrome, grayscale, light grayscale, or horizontal or vertical subpixel rendering” that correspond to FreeType’s load targets (its <code>src/lib.rs:61</code>, and <code>src/outline/glyf/hint/</code>, <code>cff/hint.rs</code> and <code>autohint/</code>); its README says it “is tested glyph by glyph against FreeType”. It is also the library behind HarfBuzz’s own <code>fontations</code> funcs, but they use it unhinted, “at one pixel per font unit” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/rust/font.rs#L142"><code>src/rust/font.rs:142</code></a>), even for the few fonts whose outlines are only correct once hinted (<code>:146</code>). So hinting with Skrifa means calling it directly.</p>
+<p id="ix-52">FreeType fits in through hb-ft, the font funcs of <a href="fonts-and-font-functions.html#the-other-funcs">Fonts and font functions</a>. With hb-ft, FreeType answers HarfBuzz’s questions about the font: advances come from <code>FT_Get_Advance</code> and outlines from <code>FT_Load_Glyph</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L557"><code>hb-ft.cc:557</code></a>, <code>:1026</code>), each called with the font’s <strong>load flags</strong>. Those default to <code>FT_LOAD_DEFAULT | FT_LOAD_NO_HINTING</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L130"><code>hb-ft.cc:130</code></a>, <code>:1926</code>), so hb-ft is unhinted until a client asks otherwise with <code>hb_ft_font_set_load_flags</code>. Turn hinting on, and two things change at once: the outlines that the draw funcs hand to hb-raster are FreeType’s hinted outlines, and the advances that shaping uses are FreeType’s hinted advances, rounded to whole pixels. FreeType does the hinting; hb-raster still does the rasterizing.</p>
+<p id="ix-53">The <code>hb-raster</code> tool can show this, since it takes <code>--font-funcs</code> and <code>--ft-load-flags</code>, whose default is 2, <code>FT_LOAD_NO_HINTING</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/font-options.hh#L73"><code>util/font-options.hh:73</code></a>). Here is <code>Roboto-Regular.ttf</code>, which has TrueType hinting, at 11 pixels per em: first with HarfBuzz’s own <code>ot</code> funcs, then with FreeType’s and load flags 0, <code>FT_LOAD_DEFAULT</code>, which runs the font’s instructions, then with 65,536, <code>FT_LOAD_TARGET_LIGHT</code>, which FreeType’s header describes as “snapping glyphs to the pixel grid only vertically” (<code>freetype.h</code> in FreeType 2.15.0):</p>
+<div class="rasters"><figure class="raster"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFEAAAASCAYAAAAjQzL0AAAFf0lEQVRYhe1YXUgUaxh+5swqbbVqi0usW1h2o8mmUrbMIiHVEqwQlGKEhakRKSEUhWCsQpmBoYaFiBcRQkTYFkWCeSORdNGFReUfRRhbuynbrj+7yTazPuei03QWxbNyPP0cfOC7mO99nvd95xlmvm8+gSSxjH+FP352A/8HLJu4BFg2cQnww0zs7+/H1NTUjyoHAHj79i2cTic+f/78n9ZRTfR6vcjJyYkIejwe5ObmLkmhEydOYGhoaElyRYPBwUHk5OSgv78fsiwvWv/x40eMjo5GxVVNVBQFAwMDEUFZljE4OLjoBn4F9Pb2oqCgABcuXEB8fPyi9Z2dnWhubo6OzL/g8XiYkJDAv+Pdu3c0GAwkSVmWWVNTQ0mSmJ2dzQcPHpAkb968yfLyctpsNm7evJlXr15lfX0909LSaLVaOTQ0RJKUJInHjx9nRkYGJUni8+fPSZIOh0PNFQwGabVaSZLNzc0sLy9neno6+/r6+OzZM0qSxIyMDFZVVfHYsWMkSb/fz6KiIprNZubn53NsbIzd3d3cuHEjTSYTjx49SpJ89OgRJUnili1bePLkSc7MzJAk9+3bx/r6em7bto3bt2/nq1eveP36daakpNBoNLK2tpYk2djYyPT0dGZlZfHGjRsRPkWYqNVq2dDQoI7q6mrVxO7ublZUVFBRFA4PD9NgMHB2dpYtLS20WCycmpqiy+XiypUr2dTURJK8ePEiS0pKVBOrq6spyzJv375Ns9lMkiwuLmZHRwdJcnp6mjqdjiR55swZ7ty5k6OjowyFQkxNTaXT6aQsy6yqquKuXbtIkocPH+alS5dIki0tLWq9xsZGnj59miT56dMnGo1GvnjxgoqisLS0lA6HgySZlpbGuro6zs7OsqGhgcXFxWquyspKkuTIyAg3bdrEQCBAt9vN1NRUBgIB1cSIhUUQBOj1enUkJCSosT179qCsrAxNTU3o6OiAz+dTvzUWiwU6nQ7r1q2DyWRCXl4eAGDr1q1wu91qjr1790Kj0SA/Px9jY2Pw+/0LviV2ux3Jycnwer2YnJzE/v37odFoYLPZVM7du3cRCoVw+fJleL1e9PX1zcnT29uL7OxsmM1miKKIU6dO4f79+2q8oKAAgiAgKysrot9vSEpKQkxMDM6fP483b95gYGAAq1atUuMRJsbGxqKsrEwdBw4cUGMPHz5ERUUFMjMzUVhYCFEU571xQRAgCMKC5gCAKIoIhUL/yAO+fq9XrFgxZ54kFEWBwWBAfHw8NmzYgHPnzs3L02q16nVsbCymp6ejqg0Aq1evxtOnT2E2m3HlyhXk5uYiHA6r8ai3OI8fP4bNZoPNZoMoigiHw1jsH+PLly8BfN3uaDQarF27Fnq9Hu/fvwcAjIyMzKszmUxQFEXVf+MJggBJkhAXF4eSkhIUFhYiKSlpjt5iseDJkyfw+XwAAKfTiR07dizYq0ajUR9yT08PamtrUVRUhFu3bsHlcsHlcn3nRmvAoUOHkJeXh66uLiQmJkKn08Hj8UQrBwB0dXWhvb0dbrcbbW1tEAQBpaWlsNvtuHfvHtasWTOvThRFtLa2wm63w2g0QqvVIiYmBgDQ1taGgwcPorW1FePj4zh79uwc/fr161FXVwdJkpCYmAhRFNHZ2blgr1arFTU1NdDr9XA4HLh27RqsVismJiawe/duJCcnfydzEQiHw5yYmFiMZA6CwSBlWY6YUxSFk5OTC+o+fPhAWZYZDAbZ3t7OI0eORMT9fj+/fPmyYI5wOEyfzxd1r4FAQF3FSXJmZobBYHAOTyB/j1OcyspKvH79GikpKejp6cGdO3dgNpt/dlsAgN/GRAAYHh7G+Pg4MjMzERcX97PbUfFbmfirYvkUZwnwJ4vqKfVxPOGrAAAAAElFTkSuQmCC" width="648" height="144" alt="Hamburgefonts, rendered by hb-raster"><figcaption><code>hb-raster Roboto-Regular.ttf Hamburgefonts --font-size=11</code> (81 × 18 pixels, shown 8 times larger)</figcaption></figure><figure class="raster"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFIAAAASCAYAAADIdIn3AAAFAUlEQVRYhe2Y70uTaxjHP1trILi0tn5sC56xXC3YshoFU0yxqC0KlMiKyOgHIfSLCP+D6kW96E0FI6JCg+rNRr9WTZgQhPki0LFmTFs4cjktoyQ0bdd50Wk0tMPOOXbiiB+4eR64r+u6v3y5r+d57kclIsIM/xr17xYwXZgxcoqYMXKKmNZGPnnyBEVR2Llz569fTP4klUpJcXGx/EgikRCDwSBTQTgclqqqqimplS+VlZVy7do1GRsb++VrTesd2dvby7p169BoNP8of/bs2XnH5m3k2NgYx44dw2g0otfrOXv2LACtra24XC6qqqooKipi3759XLhwgXnz5mE0Grlz5062RjqdprKykqKiIurr6/ny5QstLS14vd5sTG1tLYFAgNbWVkpLS3G5XDQ2NiIiHD9+nLlz5+JyuaioqCAQCABw7tw5DAYDJpMJn88HgNvtJpFIYLVaaW5uBuDMmTPMnz8fo9HIqVOnAGhubsbj8VBeXo5Op6OhoYEPHz6gUqkYHx9HpVIxODjI6Ogou3fvRqfTUVJSwv3793MN+r41U6mUABPG99ZOJpNy5coVGRoakr6+PjGbzfL27VsJh8OycOFCiUQi0tfXJ4qiyK5du+TTp0/S1NQkq1evFpFvra3X66W9vV36+/vF7XbL5cuXJRQKicfjybZITU2N+P1+CYfDYjAYpKOjQ75+/SqBQEDsdru8fv1aYrGYKIoifr9fQqGQeL1eGRwclJcvX4rdbpdEIiEiIhaLJXt/9+5dWbp0qXR3d0sikRCHwyF+v1+amprEZDJJLBaTZDIper1eXr16JSIiGo0mq+vWrVtSXV0t7969k2AwKF6v9+etXVxcjIhkRyKRyM6ZzWbi8TjLly/HbDbz5s0bBgYGAHA6nTgcDoxGI6WlpWzfvp3CwkLWr19POp3O1nA6naxZs4YFCxZw8OBB2tra/rILHA4HK1asQK1W8/TpU/bu3YuiKNjtdlatWgXAgwcPCAaDGAwGli1bRldXF5FIZEKtR48ecejQIZYsWYLFYuHo0aM8fPgQgOrqaux2O4sXL6akpIT+/v4J+WvXriUej7Nt2zYikQg3b97Mmc+7tYPBII8fP6atrY3x8XFWrlw5aZxarUalUgFkr5ORyWSyMZLH4WrWrFmo1ZPLPX36dM4G2Lp164QYrVabk5/JZBgdHZ0Q9zPNFouFrq4uTpw4wYsXL3IeR/A3jPz48SOFhYUUFBQQCoXo7u7Oy4AfiUQiPHv2jIGBAa5evYrb7WbRokVEo1HS6TQdHR20t7dPmlteXs7169dJJpPEYjGeP38OfNtNPp+PaDTK+/fv8fl8DA8PT8jftGkTPp+Pnp4eent7uXTpEh6P5y/1qlQqUqkUmUyG8+fP09jYSFlZGUeOHCEWi+XE5v06q62t5fbt21itVsrKyrBYLKRSKbRabb4lUBSFkydP0tnZSU1NDXv27EGr1eLxeLBardhsNoxG46S5mzdvpqWlBafTidVqZc6cOWg0GrZs2UJnZycbNmzg8+fP1NfXU1BQMCF/48aN7N+/n4qKCkZGRjh8+DB1dXXcuHHjp3rr6uqw2WzE43EOHDhAQ0MDNpsNnU7HxYsXc4On7EPqFzMyMiL37t2T4eFhiUajYjKZpKen53fLyvK/MXJoaEh27Ngher1ezGaz+Hy+3y0pB5XIzG+0qWBan2z+S2aMnCL+AGAb5tPr7cdhAAAAAElFTkSuQmCC" width="656" height="144" alt="Hamburgefonts, rendered by hb-raster"><figcaption><code>hb-raster Roboto-Regular.ttf Hamburgefonts --font-size=11 --font-funcs=ft --ft-load-flags=0</code> (82 × 18 pixels, shown 8 times larger)</figcaption></figure><figure class="raster"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFIAAAASCAYAAADIdIn3AAAE1klEQVRYhe2YTUxTWRiG37ZTDT+Soja0C4RavP1BEkoitsVEQA2SsCEaFxibCoiyaQh0RWAjJC6a+BNAIyRgYty40oaImtJQCGjqwhXpCtsF2tImsqgQMG3fWTjesSPDVIcJg+FJTnJzz/ee8533fuf+SUgSu/xrpNudwK/CrpFbxK6RW8Qva2QikYDdbofBYEAkEvnP5xONjEQiyM/PT+sMhUJQKpVbMpHFYsHr16+3ZKxMcLvdWFxcxPz8PFQq1Q/r/X4/nj9/nnH8jqjIn3mxCIVCKC8vh1T6c0v0+/148eJF5gL+QTgcpkKh4LcEg0EePHiQJPnp0ydevnyZZWVlNBqNfPToEUlyYGCAdXV1tFqtLCws5PXr1+l0OnnkyBHqdDq+ffuWJGk2m9nU1ESdTkdBEDgzM0OStNvtfPjwIUkyHo8zNzeXJOl0OllTU0ONRsPp6Wn6fD4KgkC9Xk+bzcbTp0+TJCORCOvr63n06FFarVYGAgFOTEywqKiIarWaLS0tJMknT56wtLSUBoOBly5dYjweJ0nq9Xp2dnayvLycWq2Wb9684djYGIuLi6lSqdjT00OS7O7upkajoSAIHBwc5F9JM1IqlVKv14tNq9WKRs7OzvLu3bskyWg0ygMHDjCVSnFgYIAnT57k58+fGY1GmZOTw/v375Mk79y5Q5vNJhp548YNkuTLly9ZUlLyj0ZeuHCBiUSCyWSSxcXF9Hg8JMm+vj7RyHPnztHtdpMkx8fHefbsWZKky+Wi0+kkSX748IEFBQV89+4dSdLhcLCrq0s08vbt22JRNDU1iccdHR0kyfn5eQqCwEQiweXlZVZVVYkX4itpdZ+Xl4dAICA2j8cj9h0/fhyxWAwNDQ24cuUKlpeXkUwmAQAmkwlyuRxKpRJqtRq1tbUAAKPRiGg0Ko5RXV0NADhz5gzi8Thisdimu+XYsWOQyWR4//49kskkTp06BQAwm81izMTEBHp7e2EymdDd3b3hg8Xn8+HEiRPQaDQAgPb29rT7X11dHQBAr9en5fsVjUaDvLw8XLt2DV6vFx6PB7m5uWkxv226km8YHh7GwsICnj59CplMhqysrEylG5JKpTKOlUqlkEgk350nCYlEAq/Xi/379/+tfu/evWn3ylQqhfX19Yznz8rKwqtXrzA9PQ23242+vj74/X7I5fI/c8x0sHA4jH379kEmk2F8fBzr6+s/ZAYAeL1eAMDk5CQUCgWUSiVUKhUCgQAAYGZmZkOdWq2GXC7H1NQUAGBubg4AIJFIUFNTg1u3bgEAgsEghoaGvtNbrVbMzs4iGAwCAEZGRlBfX79prnK5HCsrKwCAZ8+e4eLFi6iurobL5cLHjx8RDofT4jOuyPb2dpw/fx5arRZVVVUoLS3F0tJSpnIAX56kBoMBJDE6OgoAuHr1KhobG/H48WNUVlZuqJNKpXjw4AFaW1sBfNmCMpkMAHDv3j20tbVBEATs2bMHg4OD3+kLCgowMjKCxsZGrK6uoqKiAsPDw5vmWltbi/7+fjgcDty8eRMejwcmkwnxeBzNzc04dOhQWryE3Bk/LbxeL8xmM7Kzs9Hb24u1tTW4XK7tTksk44rcbhYXF2GxWEAShw8fxtjY2HanlMaOqcj/Ozviy2YnsGvkFvE7Ar3TaUYslioAAAAASUVORK5CYII=" width="656" height="144" alt="Hamburgefonts, rendered by hb-raster"><figcaption><code>hb-raster Roboto-Regular.ttf Hamburgefonts --font-size=11 --font-funcs=ft --ft-load-flags=65536</code> (82 × 18 pixels, shown 8 times larger)</figcaption></figure></div>
+<p id="ix-54">The first is soft. The crossbar of the <code>H</code> falls across two rows, and is two mid-grays (coverage 117 and 99 out of 255). In the second, the crossbar is one black row (255), the tops of the lowercase letters are darker, and the text is sharper overall. Some stems have moved sideways too: the stem of the <code>b</code>, two columns of 198 and 55 in the first line, is 64 and 191 in the second, though most stems are still a dark column beside a light one. The third also puts the crossbar on one row, at 215, but leaves the stems where the unhinted line has them: the <code>b</code>’s are 199 and 56. The hinted line is also one pixel wider, because its advances have changed. <code>hb-shape</code>, run by hand from the FreeType build with the same font at the same size, shows how (positions in 64ths of a pixel; the first line from <code>--font-funcs=ot</code>, the second from <code>--font-funcs=ft --ft-load-flags=0</code>, both with <code>--font-size=704</code>):</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>H</th>
+<th>a</th>
+<th>m</th>
+<th>b</th>
+<th>u</th>
+<th>r</th>
+<th>g</th>
+<th>e</th>
+<th>f</th>
+<th>o</th>
+<th>n</th>
+<th>t</th>
+<th>s</th>
+<th>total</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>unhinted</td>
+<td>502</td>
+<td>383</td>
+<td>617</td>
+<td>395</td>
+<td>388</td>
+<td>231</td>
+<td>395</td>
+<td>373</td>
+<td>244</td>
+<td>402</td>
+<td>388</td>
+<td>230</td>
+<td>363</td>
+<td>76.73 px</td>
+</tr>
+<tr>
+<td>hinted</td>
+<td>512</td>
+<td>384</td>
+<td>640</td>
+<td>384</td>
+<td>384</td>
+<td>249</td>
+<td>384</td>
+<td>384</td>
+<td>256</td>
+<td>384</td>
+<td>384</td>
+<td>256</td>
+<td>384</td>
+<td>77.89 px</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-55">Every hinted advance is a whole number of pixels, a multiple of 64, except the <code>r</code>’s: 249 is 256 less a GPOS kern of 7 against the <code>g</code>. HarfBuzz scales GPOS values itself, so kerning stays fractional; with <code>--features=-kern</code> the <code>r</code> is 256. A line set with hinted advances has a different length, and may break differently: an application has to choose before it shapes, not only before it draws.</p>
+<p id="ix-56">A fractional size doesn’t survive hinting either. FreeType keeps a size in two forms: a ppem rounded to the nearest whole pixel, and a fractional scale that outlines and metrics are multiplied by. Unhinted, outlines follow the fractional scale. But a TrueType font with bit 3 of its <code>head</code> table’s flags set asks for a whole-number ppem in all its scaling, and when FreeType hints such a font it recomputes the scale from the rounded ppem, so a font requested at 10.5 pixels per em is hinted, drawn and measured at 11. That is in FreeType 2.15.0’s TrueType driver, whose comment says “Nearly all TrueType fonts have this bit set, as hinting won’t work really well otherwise” (its <code>src/truetype/ttobjs.c</code>, <code>tt_size_reset_height</code> and <code>tt_size_reset</code>).</p>
+<blockquote>
+<p id="ix-57">For programmers: hb-ft passes the font’s scale straight to <code>FT_Set_Char_Size</code>, which takes 26.6 fixed point (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L190"><code>hb-ft.cc:190</code></a>), so FreeType hints at a size of the scale divided by 64. <code>hb_ft_font_create_referenced</code> on an <code>FT_Face</code> sized with <code>FT_Set_Pixel_Sizes</code> sets the scale that way itself, to the pixel size times 64 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L1509"><code>hb-ft.cc:1509</code></a>); <code>hb-shape</code>’s <code>--font-size=704</code> above is 11 × 64 for the same reason. Then shape with that font, set hb-raster’s scale factor to 64, and draw each glyph at its shaped position. A font whose scale is in pixels or font units gets hinted at a meaningless size; with hinting off, as by default, the size doesn’t matter, which is why hb-ft can leave it so (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L75"><code>hb-ft.cc:75</code></a>).</p>
+</blockquote>
+<p id="ix-58">The pairing has costs: hinted outlines and advances are good only at the size they were hinted for, so they can’t be cached once and scaled, and hb-ft takes a lock around every FreeType call (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L528"><code>hb-ft.cc:528</code></a>). Where hinting makes no visible difference, HarfBuzz’s own funcs and hb-raster need nothing else.</p>
+<h2 id="color-glyphs">Color glyphs</h2>
+<h3 id="the-paint-context">The paint context</h3>
+<p id="ix-59"><code>hb_raster_paint_t</code> is a set of paint funcs with state, and turns the paint calls of <a href="color.html">Color</a> into a BGRA32 image. Feeding it is like feeding the draw context, with three more settings: a foreground color, a background color and a palette index. <code>hb_raster_paint_glyph</code> sets the extents from the glyph’s, if the client hasn’t set any, pushes the context’s transform, and calls <code>hb_font_paint_glyph</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L2460"><code>hb-raster-paint.cc:2460</code></a>). That call falls back to filling the outline in the foreground color, so a paint context draws ordinary glyphs too. The <code>_or_fail</code> twin calls <code>hb_font_paint_glyph_or_fail</code>, which doesn’t fall back.</p>
+<p id="ix-60">The <code>hb-raster</code> tool uses the paint context when the font has COLR or bitmap glyphs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/raster-output.hh#L85"><code>util/raster-output.hh:85</code></a>). Here is the COLR version 1 test font from <a href="color.html#colr-version-1-the-paint-graph">Color</a>: two composite modes, a linear gradient, the three extend modes of a radial gradient, a sweep gradient, and a rotated PaintColrGlyph:</p>
+<div class="rasters"><figure class="raster"><img src="data:image/png;base64,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" width="776" height="116" alt="XMLPRFSG, rendered by hb-raster"><figcaption><code>hb-raster color/colr1.ttf XMLPRFSG --font-size=48</code> (388 × 58 pixels, shown 2 times larger)</figcaption></figure></div>
+<h3 id="transforms-clips-and-surfaces">Transforms, clips and surfaces</h3>
+<p id="ix-61">The context keeps three stacks (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.hh#L118"><code>hb-raster-paint.hh:118</code></a>). Transforms are multiplied together as they are pushed. Surfaces are premultiplied BGRA32 images, all the size of the output. Clips are A8 masks, also the size of the output. The first paint call sets up the bottom of each: a surface filled with the background color, and a clip that covers everything (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L106"><code>hb-raster-paint.cc:106</code></a>).</p>
+<p id="ix-62">A glyph clip is rasterized by a draw context the paint context keeps for the purpose, through the current transform, and multiplied pixel by pixel into the clip below it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L283"><code>hb-raster-paint.cc:283</code></a>). So clips are anti-aliased exactly as outlines are. A rectangle clip is cheaper. One that stays aligned with the pixel axes is kept as a rectangle, rounded outward to whole pixels, until something forces it to become a mask. A rotated or skewed one is made a mask by testing each pixel’s center against the transformed rectangle (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L661"><code>hb-raster-paint.cc:661</code></a>), so its edges are not anti-aliased. <code>fill_glyph</code>, the call that fills a plain outline, skips the clip stack: it rasterizes the glyph and fills through that mask directly (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L934"><code>hb-raster-paint.cc:934</code></a>).</p>
+<h3 id="groups-and-the-composite-modes">Groups and the composite modes</h3>
+<p id="ix-63"><code>push_group</code> adds a fresh, transparent surface to the stack; everything painted until the matching <code>pop_group</code> goes there. <code>pop_group</code> then composites it onto the surface below with the mode it is given (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L807"><code>hb-raster-paint.cc:807</code></a>). hb-raster implements all 28 modes of <code>hb_paint_composite_mode_t</code> pixel by pixel (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-image.cc#L411"><code>hb-raster-image.cc:411</code></a>): the 13 Porter–Duff operators, such as SRC_OVER, DEST_OUT and XOR; the 11 separable blend modes, such as MULTIPLY and SCREEN, computed on unpremultiplied components; and the four non-separable HSL modes. In the drawing above, <code>X</code> is a crescent, the blue disc with the red one cut out by DEST_OUT, and <code>M</code> darkens where the discs overlap. hb-vector’s SVG can’t express the first; hb-raster draws both as COLR describes them.</p>
+<h3 id="gradients">Gradients</h3>
+<p id="ix-64">Each gradient is computed per pixel, at the pixel’s center, mapped back through the inverse of the current transform into the glyph’s coordinates (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L1327"><code>hb-raster-paint.cc:1327</code></a>), and drawn through the current clip. Colors between stops are interpolated in premultiplied color, as the COLR specification asks (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L1167"><code>hb-raster-paint.cc:1167</code></a>). When the clip covers at least 64 × 64 pixels, the color line is first sampled into a table of 256 entries and looked up instead (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L1157"><code>hb-raster-paint.cc:1157</code></a>). The extend modes, pad, repeat and reflect, are applied to the position along the line before the lookup. Since the gradient is sampled once per pixel, a hard edge inside it, where a repeating gradient starts again, is not anti-aliased: it shows as the stair-steps in the rings of <code>R</code> above.</p>
+<h3 id="images">Images</h3>
+<p id="ix-65">The <code>image</code> callback accepts two formats (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L979"><code>hb-raster-paint.cc:979</code></a>): BGRA, raw premultiplied pixels such as hb-ft produces, and PNG, which libpng decodes, after checking that its header promises no more than 4,096 pixels a side. Anything else is refused, and the paint API moves on to the glyph’s next representation, as <a href="color.html#bitmaps-sbix-and-cbdt">Color</a> describes. That includes SVG, since 14.2.0, and PNG too in a build without libpng. The image is stretched over the glyph’s extents and sampled bilinearly (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L1100"><code>hb-raster-paint.cc:1100</code></a>). In the test font’s <code>P</code>, an sbix glyph, the first image below uses the 100-pixel strike, scaled down; the second, with <code>--font-ppem=10</code>, uses the 10-pixel strike, and bilinear sampling blurs its 8 pixels across 48:</p>
+<div class="rasters"><figure class="raster"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADQAAAA6CAYAAAD/cnqbAAACjElEQVRoge2YTUhUYRSGz52koExzYZFliolYhKZDKUQMBTJFG0MCm0Jd2UCrfihcaNAqKPqTIpMCw2qwKBAyiiAmGonS0kVZoBJhoLsRi2bunXFauYkazzn33PHL+Z71+37febj/10gkEglYRLgWegBptJDqaCHV0UKqo4VUJ0N6QTNuQSRmws5Ac9Lcrnw3nN1xBLKWrRDd35B69flpRaDr4xPoGH5E7vbuvwAFWWslxpARuj/yDM69vWN7mNDBTshcutzWGraEzLgF27qbbA3wJ6e3N4Bvk5fdtyVU3nWIvXEyjrt90LhlH6vLFnJKZo6jFQeguayW3GPdtj0BP6dG4tqHB6weWejiwD0IR2dYm1HhXJ9koZ4vL8ibcDHjFpzp7yR1SEJtoZvwKxYlbWCXvrHXpDxJqG88RFpcAnM2BsdeXkLnSULWbIw8kATT0R/oLFroZPAKaxgJBqc+o7OL7m0bLRSO4A+7E4xPf0fl0ELvJj+xh5Hg+tBDVC59T7mi7HVOzjEvNQVVqBxaaGPOwgp5C6tRufQ95fzldU7OkZSSnA3oLFqoeNV61jASrCR8lpNOOfeaUvIwEtze04rOkoQoC0tRlJ1HypNvCltXl1ArbFyGAY9rz5M6rH8KnoA/JV+tw413yR3WbTtYf4NTI8G9XtnPoaGGbm51Xjz5lezrlS1kGAb0+25x6//EW1gNV3efYPdFfgW3hjqgd/SV3WXgad1lyMvMtbWG2M/6bzNT0P6+B55/fUPutlQ1QX1pjcQYckJzjIUnYDQ8AaeC7UlzZbnFcHjzXvRLJxZxob8xMDkCAAAZriWOP8dSIpRK0vfz4X9BC6mOFlIdLaQ6Wkh1tJDqaCHV+Q2F0brHsd9LdwAAAABJRU5ErkJggg==" width="156" height="174" alt="P, rendered by hb-raster"><figcaption><code>hb-raster color/images.ttf P --font-size=48</code> (52 × 58 pixels, shown 3 times larger)</figcaption></figure><figure class="raster"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADQAAAA6CAYAAAD/cnqbAAAD9klEQVRoge2aWW/bRhRGzyykJJNarMV2nSYN0Jf+/x9TFEVR1GmMxNosyaQki7P0YRQ33RyQNhrC4PcyBCHdO2dmeIfzgcJ773lBkl+7A8+tBqjuaoDqrhcHpMv+wTsH1oK1uCK0OFctuxCgFCLSCKXCtXraGJcGwlrsJsNlOe4ux27u8IWplFwoieqmyG6K7CaobgqqVSnWJ5WfIWNxWY75OMNMF5jpHLfbVUoutEafT9BnIyI3QbRaqPb/DIQJM2SmCw6//c7h6j3uLquUXMQRcb7FO4tst5CDXqU4n6s0kDMGd5dR3Mw4XL1n/+PPuNWmUnLRisF5ZLuFPR0QVVy6n+txIO/xhwJfFPhDgTsU2MUt5sMUO51jpnPsYoVdrSslF+0WZr6kuJkjT/uoQQ8PyDiCKHpoyxSKR4G8c7h8i11vcOsMs95gZguKd9cUN3NcluPNE0b1GN/MFsiTTujQaoPud1H9Hv7Y8lxAOIfNcsxsSfFxivkwpbiZYedL7GyJ3WShbFcG8tgsR86XHAC/22Fv19iLCdHFGZGUyOQEEUfPBeQfRrB4d83h13cUH6ahZOdbXL6rXLIB8GGGCsDt9tjlCj2/xe/vESLAqPGwVMgvPEMOn+8w8yWHq2v2P/2Cub7Be4e3DrwDV/045a2DfIvd7rGLW4RSmOkCpEAmJ+izUekV8Pgz5ME7C4UJxWF/j9vvKwP8aw7rgPCm4SkQnT3u/hBm3rrQiRJ6ce9yDVDd1QDVXQ1Q3dUA1V0NUN3VANVdX/YUtEZ22qj0BDXo4fIt3lowFm+CL+ef4MuJoy/H0ZdTg16wtjrtcF+IZwSSEpUmqPGQ6M0rvPeofg93lz14c3aTVTcapUCmCbKbPPhyejIifvsafT5BdlOELufjPPprqY6nxsmQ2DtEu4U+7VPczBDTBeYjuO0OXxSVeMKptIMeD//0584n4fp8hOyloNXzAXFMGE1GyFYLdTrADAeIThsAv91hlreVYIC/nEzjN5fEb18TfXMWnNReikwTxLMCSYFKk+BonvbxxqCPZ3y/22MXq+BJV5RQKgCNh8TffUvrh++JLi/CMtMKoVXp+F+YIRGKwt/WsT4bY5Yr9O2aaL1BJielYSD4ctHleVhikxF6NESd9ivFeuhb6U5ojUwTovPx0Z0R2GxbKbmII+I3r8Iy63VL2VX/pfLetlKoXoo7GxMLiUwT/K6acSIijRoP0ZMRatCF6CsAyUjjuwnRp5I+GUJF91RIhUg6oZKmSbB+nyhR+jsF74MX5x3Ouup7EMc9U0iQAqRESFl6I/1HzObDi5qrAaq7GqC6qwGquxqguqsBqrsaoLqrAaq7XhzQH/UWwQEGi8V7AAAAAElFTkSuQmCC" width="156" height="174" alt="P, rendered by hb-raster"><figcaption><code>hb-raster color/images.ttf P --font-size=48 --font-ppem=10</code> (52 × 58 pixels, shown 3 times larger)</figcaption></figure></div>
+<p id="ix-66">A CBDT font goes the same way. Here is the subset of Noto Color Emoji from HarfBuzz’s test suite:</p>
+<div class="rasters"><figure class="raster"><img src="data:image/png;base64,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" width="368" height="122" alt="89®, rendered by hb-raster"><figcaption><code>hb-raster NotoColorEmoji.subset.ttf 89® --font-size=48</code> (184 × 61 pixels, shown 2 times larger)</figcaption></figure></div>
+<h3 id="palettes-foreground-and-background">Palettes, foreground and background</h3>
+<p id="ix-67"><code>hb_raster_paint_set_palette</code> chooses the CPAL palette, <code>hb_raster_paint_set_custom_palette_color</code> overrides single entries, which the context then hands back through the <code>custom_palette_color</code> callback (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L1862"><code>hb-raster-paint.cc:1862</code></a>), and <code>hb_raster_paint_clear_custom_palette_colors</code> drops the overrides. The foreground color, opaque black by default, is what the font’s “text color” entry becomes, and what a glyph without color is filled with. The background, transparent by default (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.hh#L114"><code>hb-raster-paint.hh:114</code></a>; the tool makes it white), fills the surface before anything is painted. These are the COLR version 0 glyphs of <a href="color.html#palettes-cpal">Color</a>, first in palette 1, then with a red foreground, then with entry 1 replaced:</p>
+<div class="rasters"><figure class="raster"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEQAAAAoCAYAAABHJVyTAAACtklEQVRoge2YzWsTQRiHf7OTmJAmtazR0KJNg0WLFSq0IFL16tGD4EXxolc9eOi9p+Kh+A946k3FghdFRBRRPORgPKiFHtpEMLaJwSRNyUdnxkP8wHE23c3mw8V5jrOzvDPPvjPz7hAhhIDmF0a/B/CvoYVIaCESWoiET9W4dOchNrL5rgaODUdx5dp55bN+xlcKefksiZUPa10d0MSxhKWQfsbXS0ZCmSF2iVCCiRCHuadZyhTqBCvbBsrMu6VNW0KmwgIXDzBMDQhQ8ufkmSBIVQjub1K82yIdGWQvcSQkRAluHtzB7F5m2YcSgemwwHSY41WJ4vYnH7Y9lDG295CID1gcr7eUIXN6kGFxvI4I9U6m2BJiEGDuEMNYwPmXHgsIzI3uwPCIE1tCzg5xzETsZ4bMTIThzJA3lo0tIZdi3HWgy7H2hfYS5abKOQMXzQkkgoBJG9h2OR+TMsQDBGvV3zGs4Nz9B9gNqxhEdR+yf98I8oVsVwcUNYeR+/pZ+Wz2xAUQEexqfEGqeJ168Fe7rlQltBAJLURCuakeP3oS6XQGABAPAufMzpwQTwoU6R+bajw+atkvFoth80uxIzFbxVChFHI4PolGJQQAoJTg6pE6goa7OqLKCZ5+9GMk/DNGwrKvaZpdF2KaprJ91yVTZQKPC9T1AB4VDNQ8UIrY2kPu5gyUWfu1d4kZuJdzL7UX2BJSbAALGR8YnEthIFhIUxQbjl/tC7ZPmbdlgvl1HyrcvpQtRjC/TpHy0L2Io2M3WSK4vurHi28UokW2CBA8L1LcWPUjWfLWye74xixbA25lKJY2KE4NckwOCET9zf+CfMPA+wrBm5KBbK3jY+0Jbd+pZmvAcs7Acg4AvLFh2sFb+dwDtBAJ5e///4zOEAktREILkdBCJLQQCS1EQguR0EIkvgOzPtWl9hNv5AAAAABJRU5ErkJggg==" width="204" height="120" alt="AB, rendered by hb-raster"><figcaption><code>hb-raster color/colr0.ttf AB --font-size=32 --font-palette=1</code> (68 × 40 pixels, shown 3 times larger)</figcaption></figure><figure class="raster"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEQAAAAoCAYAAABHJVyTAAAC6ElEQVRoge2YPUwTYRzGn14PrtCWg0LTkhRRkIikCUFEFhKNOElwY+jgwiJLNx2IYSB+DK44wGKiJo5uYnAwrbq0idEaghhjNfhVUPthv2mv50BC4usdXu/aO4nvb2ruo8+TX+7+d/eaRFEUQdmFMbrAvwYVQkCFEFAhBKzUxuzqXQjZzboGm60uWL3nJfcZmS8ppLDxBOX4m7oWYh1HZIUYmU9vGQLJK0QpGaEZa9le/NhuAwC0NyYwYH0HmzlXk3JGoEpIJN2Pe7EJvEz3o1Qx/7avgREwZH8Nn3sZg/b1mpTUk6qE5CtNuPF+GsHEsOwxpYoZ4ZQX4ZQXpxzPcengLTQxec1F9ULxDEkLVvjXZ/eUQRKID8O/PouM0KyqnBEoEiKCwfXoBURznqoDojkPrkVnIO6T+a2oZSAxglDKqzoklPIiGB9Rfb6eKBJy58s5zUG3v2r/Dz2QHKpiWYRY2vkdLXQhlnWAQ1FTUCzrQDTtwSHLp90MWfRYkZDJMEmth4RODqKw8bOufSwHWjAajEju+7hwGo1t5brmbydYdPkf/7F9f0w6HaFCCKgQAsmh6hzvRnFzZ/h9yHvw8PtYTcLOOp+i2/IZAMC55N9pGjs6ACFWk8w9MySQFMIfd6EcTwIArJU85iITyAucpgJN5iIuDj4Cx9h2gh0u2WNZnkc5Xl8hLM9Lbv/rLcMxRUw6g5oLTDoD4Jhtzf9TbxTNEJ/7AfiGjOqQVjYDn3tZ9fl6okgIz6Yx17MI1iRUHcCaBMz1LoJn01WfawSKnzLH7Gu42ncTNlb5p7ydzeHK4QUM2ddUlTOCqh67J1oiWDo6j3FHGIxJ/vWaMYk40x7C0sA8RvlXmkvqSdUrZp3cFi73LGK6eB/PkkNYzfThW6kVAOBsSMJre4ux1hfo5LZqXlYPVK+pdnJbmHKtYMq1Uss+hkPfVAmoEALJz///GXqFEFAhBFQIARVCQIUQUCEEVAgBFULwC2FD1M5PNB0GAAAAAElFTkSuQmCC" width="204" height="120" alt="AB, rendered by hb-raster"><figcaption><code>hb-raster color/colr0.ttf AB --font-size=32 --foreground=C02020</code> (68 × 40 pixels, shown 3 times larger)</figcaption></figure><figure class="raster"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEQAAAAoCAYAAABHJVyTAAACwElEQVRoge2ZvW/TQBiHH3/ETppAgpsqEUuRSoUQX2XoRIWAiQEGVIlODKxMlToBA2LqAmv/gTLwJ7BSytSloKIKFakqA6JKm3ZwEztxbIagDlenuM5XI+4ZbV/eV4/ufj5flCAIAiSHqP1u4LQhhQhIIQJSiIAedvFgbZHGwXZXC2vpAumrT0Lv9bN+qBDn5xJe+XtXG9KtSy2F9LO+XDICoTMkKnagsl432G1oAAxrDS4namQUvyPN9YNYQr7WTN4fZFitmXjCtk5X4KbhMpO2uW64neixp5xISBWVN/s5PjnJls94Aay4Jiuuye2ky1xujxSDM2MiZ4gdqMzu5o+VIbLkmMzu5rGDwYmqSJ0GisL8vsVm/eQrbLOuM79vESjKicf2g0hCPlaTrLhG7CIrrsFSNRV7fC+JJOSdfbbtQov2mbZ/oxeErgG37lNzm0G42UiwVQVotFVoqw7rFY0LWh0Ao946aH2/+yHcqoYSdh4yMT7Clx87XW3oxsU8qxul0HvLb6cYL3Q3iDe2fabmlo9cH5z47xFSiIAUIhAaqs8eXeP3ry0AtrwEH6pDHSl2P1VhVG+GavH8aMvnCoUCEJ4vnaJZ4yihQqbvjOGVPQDcQGWtVMDx29tYJdWAVyPbmH8//HRrrOWzlmXhlbsrxLKs0Ov/XDKm4vMgVWm7gYdDlUMZp5lIGTKTtslq8f+tyKk+j4fs2ON7SSQhWbXBy2wZPcaq0RV4kdsnq7a3sesVkd8yE4bL63N7ZNToMyWjBrzOlZkwnFjN9YMTvXYnjSoLwyXuphzUY2aLqsC9lMPCcIlJc3BkQIwTs6Lm8Txb5mlG57OT5FvdZMdves2rPlcSLreSDkXN63izvSD2mWpR85hO20wzGGEZFblTFZBCBEI///9n5AwRkEIEpBABKURAChGQQgSkEAEpROAPVhDRv1WsLnUAAAAASUVORK5CYII=" width="204" height="120" alt="AB, rendered by hb-raster"><figcaption><code>hb-raster color/colr0.ttf AB --font-size=32 --custom-palette=1=#2E8B57</code> (68 × 40 pixels, shown 3 times larger)</figcaption></figure></div>
+<h3 id="bgra32-output-and-png">BGRA32 output and PNG</h3>
+<p id="ix-68"><code>hb_raster_paint_render</code> returns the bottom surface: an image in <code>HB_RASTER_FORMAT_BGRA32</code>, four bytes a pixel, blue, green, red and alpha, premultiplied, rows bottom to top, its stride four times its width. It returns <code>NULL</code> if no extents were set (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L2562"><code>hb-raster-paint.cc:2562</code></a>). <code>hb_raster_image_serialize_to_png_or_fail</code> (13.1.0) turns such an image into a PNG: it flips the rows and divides out the alpha, since PNG stores colors unpremultiplied (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-image.cc#L709"><code>hb-raster-image.cc:709</code></a>). It accepts only BGRA32 images, and needs libpng. <code>hb_raster_image_deserialize_from_png_or_fail</code> goes the other way, into a BGRA32 image with its origin at (0, 0).</p>
+<h3 id="the-pixel-budget">The pixel budget</h3>
+<p id="ix-69">A paint session has two budgets, kept apart on purpose (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.hh#L131"><code>hb-raster-paint.hh:131</code></a>). The outline budget is the shared one of <a href="drawing-outlines.html#the-budget">Drawing outlines</a>: the context hands it to its internal draw context before each glyph clip and reads back what is left (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc#L213"><code>hb-raster-paint.cc:213</code></a>, <code>:230</code>), so all the outlines a COLR glyph uses share one budget of 2²⁴. The <strong>pixel budget</strong> counts pixel work instead: clearing a surface, compositing a group, filling a gradient or a solid color over the clip, rendering and applying a mask. It starts, once the surface size is known, at 2²⁶ units or four passes over the surface, whichever is more. When it runs out, further operations are skipped: a hostile COLR graph that asks for thousands of full-surface groups gets a partly painted image, not a long wait. An unlimited budget turns it off.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster.h"><code>src/hb-raster.h</code></a></td>
+<td>the API: images, the draw context, the paint context</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster.hh"><code>src/hb-raster.hh</code></a></td>
+<td>the flattening clip box, the pixel-work estimate, premultiplied pixel helpers</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-draw.cc"><code>src/hb-raster-draw.cc</code></a></td>
+<td>flattening, 593–1037; the analytic coverage rasterizer, 1238; <code>hb_raster_draw_render</code>, 1631</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.hh"><code>src/hb-raster-paint.hh</code></a></td>
+<td>the clip, surface and transform stacks; the two budgets</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-paint.cc"><code>src/hb-raster-paint.cc</code></a></td>
+<td>the paint callbacks: clips, 283–775; groups, 787; images, 979; gradients, 1157–1860; <code>hb_raster_paint_render</code>, 2562</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-raster-image.cc"><code>src/hb-raster-image.cc</code></a></td>
+<td>the library’s overview documentation, 33; the 28 composite modes, 411; PNG through libpng, 542–790</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>src/hb-limits.hh</code></a></td>
+<td>the edge, size and buffer limits and the pixel budget, 184–268</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc"><code>src/hb-ft.cc</code></a></td>
+<td>load flags, 130 and 283; sizing FreeType from the font’s scale, 177; hinted advances and outlines, 525 and 1012</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/raster-output.hh"><code>util/raster-output.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-raster.cc"><code>util/hb-raster.cc</code></a></td>
+<td>the <code>hb-raster</code> tool</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-ft-raster.cc"><code>util/hb-ft-raster.cc</code></a></td>
+<td>the FreeType comparison tool</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>hb-raster is HarfBuzz’s CPU renderer, added in 13.0.0 and stable since 15.0.0. Its draw and paint contexts are draw and paint funcs with state.</li>
+<li>Outlines are flattened into 24.8 fixed-point edges and filled by exact area coverage under the nonzero winding rule, into A8 masks stored bottom to top. Glyphs can be placed at any fraction of a pixel.</li>
+<li>An edge limit, a size cap on font-derived extents, and a pixel budget bound what a font can make it do; it fails toward partial or blank images.</li>
+<li>It doesn’t hint, correct gamma, render for LCD subpixels or darken stems. Hinted text needs FreeType (or Skrifa) beside it: through hb-ft with hinting load flags, FreeType supplies hinted outlines and whole-pixel advances, and hb-raster rasterizes them.</li>
+<li>Color glyphs are painted on premultiplied BGRA32 surfaces, with all 28 composite modes, per-pixel gradients, and bilinearly sampled PNG or BGRA images; SVG glyphs are refused. The result can be written as PNG.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="color.html">← Color</a><a rel="next" href="hb-vector.html">hb-vector: rendering to SVG and PDF →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

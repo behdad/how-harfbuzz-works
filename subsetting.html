@@ -1,0 +1,1026 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Subsetting · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part X · Writing fonts</p>
+<h1 id="subsetting">40. Subsetting</h1>
+<p id="ix-1">A web page that uses a font for one heading doesn’t need the font’s two thousand other glyphs. A <strong>subsetter</strong> takes a font and a description of what to keep, usually a set of characters, and writes a new, smaller font that still does for those characters what the original did: maps them to glyphs, substitutes and positions those glyphs, draws them.</p>
+<p id="ix-2">HarfBuzz’s subsetter is a separate library, <code>harfbuzz-subset</code>, with its own header, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.h"><code>hb-subset.h</code></a>. It was declared stable in 3.0.0, whose NEWS credits Garret Rieger and Qunxin Liu of Google Fonts and earlier work by Michiharu Ariza of Adobe. It reads fonts with the table structs shaping uses, through one more dispatch context, <code>subset</code> (<a href="fonts-as-bytes.html#dispatch-contexts">Fonts as bytes</a>), and writes them with the serializer and repacker of <a href="writing-tables.html">the next chapter</a>.</p>
+<p id="ix-3">It works in two phases. First it makes a <strong>plan</strong>: everything that can be decided before a byte is written, above all which glyphs to keep. Then it executes the plan, table by table. The heart of the plan is the glyph closure: a fixed sequence of stages, each run once, with a bounded loop only inside GSUB. That is usually enough, and this chapter shows where it isn’t.</p>
+<p id="ix-4">The examples use small fonts made by <code>fonts/subsetting/build-subsetting-fonts.py</code>, and subsets of them cut by HarfBuzz’s own <a href="command-line-tools.html#hb-subset"><code>hb-subset</code> tool</a> in <code>fonts/subsetting/build.sh</code> when the fonts are built. Every block on this page reads them with <code>hb-info</code> and <code>hb-shape</code> from HarfBuzz 15.1.0. Each subset was made with <code>--glyph-names</code>, so that glyph names survive: by default they don’t.</p>
+<h2 id="four-calls">Four calls</h2>
+<p id="ix-5">The simplest use is four calls (hand-written, not from a test):</p>
+<pre><code class="language-c">hb_subset_input_t *input = hb_subset_input_create_or_fail ();
+hb_set_add_range (hb_subset_input_unicode_set (input), 'a', 'z');
+hb_subset_input_set_flags (input, HB_SUBSET_FLAGS_NO_HINTING);
+hb_face_t *subset = hb_subset_or_fail (face, input);
+</code></pre>
+<p id="ix-6"><code>hb_subset_or_fail</code> returns a new <a href="blobs-faces-and-lazy-tables.html">face builder</a>, or <code>NULL</code>; <code>hb_face_reference_blob</code> turns it into the bytes of a font file. The work can also be split in two, <code>hb_subset_plan_create_or_fail</code> and <code>hb_subset_plan_execute_or_fail</code> (4.0.0), so that a program can ask the plan in between which glyph IDs the new font will use (<code>hb_subset_plan_old_to_new_glyph_mapping</code> and two siblings). The <code>hb-subset</code> tool takes the same input as options.</p>
+<h2 id="the-input">The input</h2>
+<p id="ix-7">An <code>hb_subset_input_t</code> is eight sets and a word of flags. Each set is an <code>hb_set_t</code> the caller edits in place, reached through <code>hb_subset_input_set</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.h"><code>hb-subset.h</code></a>). The defaults are set in the constructor (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-input.cc#L33"><code>hb-subset-input.cc:33</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th>Set</th>
+<th>What it holds</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>UNICODE</code></td>
+<td id="ix-8">the characters to keep</td>
+<td>empty</td>
+</tr>
+<tr>
+<td><code>GLYPH_INDEX</code></td>
+<td id="ix-9">glyph IDs to keep as well</td>
+<td>empty</td>
+</tr>
+<tr>
+<td><code>DROP_TABLE_TAG</code></td>
+<td>tables to leave out</td>
+<td id="ix-10"><code>morx</code>, <code>mort</code>, <code>kerx</code>, <code>kern</code>, <code>JSTF</code>, <code>DSIG</code>, <code>EBDT</code>, <code>EBLC</code>, <code>EBSC</code>, <code>SVG </code>, <code>PCLT</code>, <code>LTSH</code>, and the Graphite tables</td>
+</tr>
+<tr>
+<td><code>NO_SUBSET_TABLE_TAG</code></td>
+<td>tables to copy unchanged</td>
+<td id="ix-11"><code>gasp</code>, <code>fpgm</code>, <code>prep</code>, <code>VDMX</code>, <code>DSIG</code></td>
+</tr>
+<tr>
+<td><code>NAME_ID</code></td>
+<td id="ix-12"><code>name</code> records to keep</td>
+<td>IDs 0 to 6</td>
+</tr>
+<tr>
+<td><code>NAME_LANG_ID</code></td>
+<td id="ix-13">their languages</td>
+<td>0x409 (English, United States)</td>
+</tr>
+<tr>
+<td><code>LAYOUT_FEATURE_TAG</code></td>
+<td id="ix-14">GSUB and GPOS features to keep</td>
+<td>about eighty: see below</td>
+</tr>
+<tr>
+<td><code>LAYOUT_SCRIPT_TAG</code></td>
+<td id="ix-15">scripts to keep</td>
+<td>all (an inverted, empty set)</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-16">A table in both lists, like <code>DSIG</code>, is dropped: dropping is checked first.</p>
+<p id="ix-17">The default features are a list “copied from <code>_layout_features_groups</code> in fonttools” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-input.cc#L81"><code>hb-subset-input.cc:81</code></a>): the features HarfBuzz’s shapers turn on by themselves (<code>ccmp</code>, <code>locl</code>, <code>liga</code>, <code>kern</code>, <code>mark</code>, the script features), the direction, vertical and fraction features, <code>rand</code>, <code>jalt</code>, the East Asian spacing features (<code>palt</code> since 14.2.1), and HarfBuzz’s private <code>Harf</code>/<code>HARF</code>/<code>Buzz</code>/<code>BUZZ</code>. Features a user must switch on are left out: <code>smcp</code>, <code>onum</code>, <code>dlig</code>, stylistic sets, character variants, <code>ssty</code> and the other math features. A subset made with the defaults shapes like the original <em>with default features</em>.</p>
+<p id="ix-18"><code>hb_subset_input_keep_everything</code> (7.0.0) makes six of the sets hold everything, empties the drop list and sets five flags.</p>
+<p id="ix-19">The flags (<code>hb_subset_flags_t</code>) are booleans, all off by default:</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NO_HINTING</code></td>
+<td id="ix-20">drop the hinting tables (<code>fpgm</code>, <code>prep</code>, <code>cvt </code>, <code>cvar</code>, <code>hdmx</code>, <code>VDMX</code>), glyf instructions, CFF hints and GPOS device tables</td>
+</tr>
+<tr>
+<td><code>RETAIN_GIDS</code></td>
+<td id="ix-21">keep every glyph at its old glyph ID</td>
+</tr>
+<tr>
+<td><code>DESUBROUTINIZE</code></td>
+<td id="ix-22">inline CFF and CFF2 subroutines</td>
+</tr>
+<tr>
+<td><code>NAME_LEGACY</code></td>
+<td id="ix-23">keep non-Unicode <code>name</code> records</td>
+</tr>
+<tr>
+<td><code>SET_OVERLAPS_FLAG</code></td>
+<td id="ix-24">mark every simple glyf glyph as overlapping</td>
+</tr>
+<tr>
+<td><code>PASSTHROUGH_UNRECOGNIZED</code></td>
+<td id="ix-25">copy tables the subsetter doesn’t know, instead of dropping them</td>
+</tr>
+<tr>
+<td><code>NOTDEF_OUTLINE</code></td>
+<td>keep the outline of a glyf <code>.notdef</code> (otherwise it is emptied)</td>
+</tr>
+<tr>
+<td><code>GLYPH_NAMES</code></td>
+<td id="ix-26">keep <code>post</code> glyph names</td>
+</tr>
+<tr>
+<td><code>NO_PRUNE_UNICODE_RANGES</code></td>
+<td id="ix-27">leave the <code>OS/2</code> Unicode range bits alone</td>
+</tr>
+<tr>
+<td><code>NO_LAYOUT_CLOSURE</code> (7.2.0)</td>
+<td id="ix-28">don’t add glyphs that GSUB can produce</td>
+</tr>
+<tr>
+<td><code>OPTIMIZE_IUP_DELTAS</code> (8.5.0)</td>
+<td id="ix-29">re-optimize <code>gvar</code> deltas</td>
+</tr>
+<tr>
+<td><code>NO_BIDI_CLOSURE</code> (11.1.0)</td>
+<td id="ix-30">don’t add the mirrors of the requested characters</td>
+</tr>
+<tr>
+<td><code>DOWNGRADE_CFF2</code> (13.0.0), <code>CFF_IDENTITY_CHARSET</code> (14.3.0)</td>
+<td id="ix-31">CFF conversions</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-32">Two more need <code>HB_EXPERIMENTAL_API</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.h#L86"><code>hb-subset.h:86</code></a>): <code>IFTB_REQUIREMENTS</code> forces long outline offsets, for incremental font transfer, and <code>RETAIN_NUM_GLYPHS</code> keeps the glyph count with <code>RETAIN_GIDS</code>. <code>hb_subset_input_set_flags</code> replaces the whole word, so setting one flag clears the others.</p>
+<p id="ix-33">Three things in the input aren’t sets. The axis settings, from <code>hb_subset_input_pin_axis_location</code> and its relatives, turn subsetting into instancing; they are inputs to the plan here, and <a href="instancing.html">Instancing</a> is about what they do. A glyph map (<code>hb_subset_input_old_to_new_glyph_mapping</code>, 7.3.0) asks for particular new glyph IDs. And with the experimental API, <code>hb_subset_input_override_name_table</code> replaces, adds or removes a <code>name</code> record.</p>
+<h2 id="the-plan">The plan</h2>
+<p id="ix-34">The plan is built by the constructor of <code>hb_subset_plan_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan.cc#L686"><code>hb-subset-plan.cc:686</code></a>); any failure clears its <code>successful</code> flag, and <code>hb_subset_plan_create_or_fail</code> then returns <code>NULL</code>. It copies the input, creates an empty face builder for the output, and refuses to pass a <code>VARC</code> table through unchanged while glyph IDs change or axes are instanced. It normalizes the axis settings, then works out the characters to keep (<code>_populate_unicodes_to_retain</code>), the glyphs to keep (<code>_populate_gids_to_retain</code>) and their new IDs (<code>_create_old_gid_to_new_gid_map</code>). Last, it collects what particular tables will need, such as the GDEF mark glyph sets still in use and, when instancing, new metrics. The result is sixty-six members (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan-member-list.hh"><code>hb-subset-plan-member-list.hh</code></a>): glyph maps and sets, the lookups and features kept and their new indices, COLR layers and palettes, <code>name</code> IDs, axis locations, a cache of sanitized source tables. Each table’s <code>subset</code> reads what it needs from there.</p>
+<h2 id="characters-first">Characters first</h2>
+<p id="ix-35"><code>_populate_unicodes_to_retain</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan.cc#L244"><code>hb-subset-plan.cc:244</code></a>) maps the requested characters to glyphs through <code>cmap</code>, and drops any the font doesn’t have. Before that, <code>_unicode_closure</code> adds to them. Since 11.1.0 it adds the <strong>bidi closure</strong>: the mirror of each character, from the Unicode Bidi_Mirroring_Glyph property, so that ( brings ) with it. Shaping right-to-left text replaces a character with its mirror when the font has one (<a href="pipeline-step-by-step.html#mirroring">The pipeline, step by step</a>), so a subset without the mirror would draw an unmirrored glyph. <code>paren.ttf</code> was cut from the demo font with the text <code>(</code>, and <code>paren-nobidi.ttf</code> the same way with <code>--no-bidi-closure</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">demo.ttf</td><td class="in"><span class="txt">(</span><span class="cps">U+0028</span></td><td class="opt">--direction=rtl</td><td class="out"><code>[parenright=0+500]</code></td></tr><tr><td class="font">paren.ttf</td><td class="in"><span class="txt">(</span><span class="cps">U+0028</span></td><td class="opt">--direction=rtl</td><td class="out"><code>[parenright=0+500]</code></td></tr><tr><td class="font">paren-nobidi.ttf</td><td class="in"><span class="txt">(</span><span class="cps">U+0028</span></td><td class="opt">--direction=rtl</td><td class="out"><code>[parenleft=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-36">Requested glyph IDs go in too, with every <code>cmap</code> entry that maps to one of them. That is all the character closure does. Its own comment says what it doesn’t:</p>
+<pre><code class="language-c++">// TODO: we may want to also consider pulling in reachable unicode composition and decompositions.
+//       see: https://github.com/harfbuzz/harfbuzz/issues/2283
+</code></pre>
+<p id="ix-37"><a href="normalization.html">Normalization</a> decomposes a character the font has no glyph for, and composes a sequence when the font has a glyph for the whole. The subsetter does neither. The demo font has no glyph for Á, so shaping decomposes it into A and a combining acute, which the font does have. A subset cut for the text Á keeps neither, since neither is the glyph of Á:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">aacute.ttf</td><td class="opt">--list-glyphs</td><td class="out"><pre><code>Glyph-set information:
+
+GlyphID	Glyph name
+------------------
+0	.notdef</code></pre></td></tr></tbody></table></div>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">demo.ttf</td><td class="in"><span class="txt">Á</span><span class="cps">U+00C1</span></td><td class="opt"></td><td class="out"><code>[A=0+500|acutecomb=0+0]</code></td></tr><tr><td class="font">aacute.ttf</td><td class="in"><span class="txt">Á</span><span class="cps">U+00C1</span></td><td class="opt"></td><td class="out"><code>[.notdef=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-38">The other direction changes the result too. The font has a precomposed é, and shaping composes e followed by U+0301 into it. A subset cut for those two characters keeps <code>e</code> and <code>acutecomb</code>, but not <code>eacute</code>, which is the glyph of another character. Its GPOS still puts the accent on the e, so the result looks much the same here; but it isn’t the glyph the designer drew:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">demo.ttf</td><td class="in"><span class="txt">e◌́</span><span class="cps">U+0065 U+0301</span></td><td class="opt"></td><td class="out"><code>[eacute=0+500]</code></td></tr><tr><td class="font">e-acute.ttf</td><td class="in"><span class="txt">e◌́</span><span class="cps">U+0065 U+0301</span></td><td class="opt"></td><td class="out"><code>[e=0+500|acutecomb=0@-250,-100+0]</code></td></tr></tbody></table></div>
+<p id="ix-39">The user manual says that <code>hb-subset</code> makes a font “that covers the input text exactly like the input font does” (<code>docs/usermanual-utilities.xml:152</code>). It covers the input <em>characters</em>. Text that arrives in another normalization form can come out differently.</p>
+<blockquote>
+<p id="ix-40">For type designers and web developers: when subsetting for text you don’t control, list both forms of every accented letter, or ask for the base letters and combining marks as well. Nothing in the subsetter will add them for you.</p>
+</blockquote>
+<h2 id="the-glyph-closure-stage-by-stage">The glyph closure, stage by stage</h2>
+<p id="ix-41">The <strong>glyph closure</strong> is the set of glyphs the subset must contain for the requested characters to work: their own glyphs, and every glyph that can come from them. <code>_populate_gids_to_retain</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan.cc#L448"><code>hb-subset-plan.cc:448</code></a>) builds it in stages. Here it is, trimmed to its structure:</p>
+<pre><code class="language-c++">plan-&gt;_glyphset_gsub.add (0); // Not-def
+_cmap_closure (plan-&gt;source, &amp;plan-&gt;unicodes, &amp;plan-&gt;_glyphset_gsub);
+plan-&gt;_glyphset_cmaped = plan-&gt;_glyphset_gsub;
+
+if (!drop_tables-&gt;has (HB_OT_TAG_MATH))
+  _math_closure (plan, &amp;plan-&gt;_glyphset_gsub);
+plan-&gt;_glyphset_mathed = plan-&gt;_glyphset_gsub;
+
+layout_populate_gids_to_retain (plan, drop_tables);   /* GSUB, then GPOS */
+
+hb_set_t cur_glyphset = plan-&gt;_glyphset_gsub;
+if (!drop_tables-&gt;has (HB_OT_TAG_COLR))
+  _colr_closure (plan, &amp;cur_glyphset);
+plan-&gt;_glyphset_colred = cur_glyphset;
+
+if (!drop_tables-&gt;has (OT::VARC::tableTag))
+  plan-&gt;source-&gt;table.VARC-&gt;closure_glyphs (&amp;cur_glyphset);
+plan-&gt;_glyphset_varced = cur_glyphset;
+
+_nameid_closure (plan, drop_tables);
+for (hb_codepoint_t gid : cur_glyphset)        /* glyf composites */
+  _glyf_add_gid_and_children (glyf, gid, &amp;plan-&gt;_glyphset, ...);
+for (hb_codepoint_t gid : cur_glyphset)        /* CFF seac accents */
+  _add_cff_seac_components (*cff, gid, &amp;plan-&gt;_glyphset);
+</code></pre>
+<p id="ix-42">Each stage reads the set the stages before it built, adds to it, and is never run again. A stage is skipped when its table is being dropped (5.3.0 fixed glyphs being added from dropped MATH and COLR tables). After each one, the set is copied into a member of the plan, a snapshot, and the snapshots are the key to the design:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-43">Stage</th>
+<th>Adds</th>
+<th>Snapshot</th>
+<th>Read later by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-44"><code>.notdef</code>, <code>cmap</code></td>
+<td id="ix-45">glyph 0, the characters’ glyphs (found earlier), and <code>cmap</code> format 14 variation glyphs</td>
+<td><code>_glyphset_cmaped</code></td>
+<td id="ix-46">MATH’s glyph variants</td>
+</tr>
+<tr>
+<td id="ix-47">MATH</td>
+<td id="ix-48">size variants and assembly parts of those glyphs</td>
+<td><code>_glyphset_mathed</code></td>
+<td id="ix-49">MATH’s glyph info</td>
+</tr>
+<tr>
+<td>layout</td>
+<td id="ix-50">glyphs GSUB can produce</td>
+<td><code>_glyphset_gsub</code></td>
+<td id="ix-51">GSUB, GPOS, GDEF</td>
+</tr>
+<tr>
+<td id="ix-52">COLR</td>
+<td id="ix-53">COLRv0 layers and every glyph a COLRv1 paint graph uses (<a href="color.html">Color</a>)</td>
+<td><code>_glyphset_colred</code></td>
+<td id="ix-54">COLR</td>
+</tr>
+<tr>
+<td id="ix-55">VARC</td>
+<td id="ix-56">the components of <a href="variable-components.html">variable composites</a></td>
+<td><code>_glyphset_varced</code></td>
+<td id="ix-57">VARC</td>
+</tr>
+<tr>
+<td id="ix-58">glyf, CFF</td>
+<td id="ix-59">composite components; the two glyphs of a CFF <code>seac</code> accent</td>
+<td><code>_glyphset</code></td>
+<td>everything else</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-60">The <code>name</code> stage in the middle collects no glyphs: it keeps the <code>name</code> IDs that STAT, fvar, CPAL and the kept GSUB and GPOS features refer to.</p>
+<p id="ix-61">The order follows how a glyph reaches each table. Text becomes glyphs through <code>cmap</code>; MATH comes next, so that GSUB is closed over its size variants too (in the math font below, the mirrored display-size integral is kept only because of that). After GSUB, the stages add glyphs that are only <em>drawn</em>: a color layer, a component, an accent CFF builds from two glyphs. None is ever in a buffer, so none goes back to GSUB, and GSUB, GPOS and GDEF are subset against <code>_glyphset_gsub</code>, without them: a kerning pair only a COLR layer could use is dropped (inferred from the snapshots; no comment states the reason).</p>
+<p id="ix-62">The demo font’s ★ is a COLRv0 glyph with two layers. The second, <code>star.ring</code>, is a glyf composite of two copies of <code>dot</code>. Cutting a subset for ★ runs three stages: <code>cmap</code> finds <code>star</code>, COLR adds the two layers, and glyf adds <code>dot</code>, which COLR has never heard of:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">star.ttf</td><td class="opt">--list-glyphs</td><td class="out"><pre><code>Glyph-set information:
+
+GlyphID	Glyph name
+------------------
+0	.notdef
+1	star
+2	star.back
+3	star.ring
+4	dot</code></pre></td></tr></tbody></table></div>
+<figure class="views ttx"><pre><code>&lt;COLR&gt;
+  &lt;version value=&quot;0&quot;/&gt;
+  &lt;ColorGlyph name=&quot;star&quot;&gt;
+    &lt;layer colorID=&quot;0&quot; name=&quot;star.back&quot;/&gt;
+    &lt;layer colorID=&quot;1&quot; name=&quot;star.ring&quot;/&gt;
+  &lt;/ColorGlyph&gt;
+&lt;/COLR&gt;</code></pre><figcaption>star.ttf: COLR (TTX)</figcaption></figure>
+<p id="ix-63">The glyf stage has limits. Components are followed <code>HB_MAX_NESTING_LEVEL</code> (64) deep, within a budget of <code>HB_MAX_COMPOSITE_OPERATIONS_PER_GLYPH</code> (64) operations per glyph in the set; and the kept glyphs’ bytes may add up to at most <code>HB_SUBSET_GLYF_MAX_BYTES_FACTOR</code> (16) times the glyf table’s size, or the plan fails (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L126"><code>hb-limits.hh:126</code></a>), since a <code>loca</code> could point many glyph IDs at the same bytes.</p>
+<h2 id="the-layout-stage">The layout stage</h2>
+<p id="ix-64">The layout stage (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan-layout.cc"><code>hb-subset-plan-layout.cc</code></a>) does more than add glyphs. For GSUB and then GPOS, <code>_closure_glyphs_lookups_features</code> (<code>:410</code>) decides which features and lookups survive:</p>
+<ol>
+<li id="ix-65"><strong>Collect.</strong> The table’s feature and script tags are filtered by the input’s sets, and <code>hb_ot_layout_collect_features</code> turns the survivors into feature indices, from every language system of the kept scripts. Their lookups are collected, including lookups that FeatureVariations can substitute.</li>
+<li id="ix-66"><strong>Close the glyphs.</strong> For GSUB only, unless <code>NO_LAYOUT_CLOSURE</code> is set, <code>hb_ot_layout_lookups_substitute_closure</code> adds every glyph those lookups can produce (<code>:436</code>).</li>
+<li id="ix-67"><strong>Close the lookups.</strong> <code>closure_lookups</code> adds the lookups that contextual lookups call, then removes every lookup whose coverage doesn’t intersect the glyph set: those can never fire.</li>
+<li id="ix-68"><strong>Prune features.</strong> <code>prune_features</code> drops a feature that has no lookups left, with two exceptions (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L6630"><code>hb-ot-layout-gsubgpos.hh:6630</code></a>): a <code>size</code> feature with parameters, and <code>pref</code>, which is kept even when empty because HarfBuzz chooses its Khmer shaper by whether the font has it (“Never ever drop feature 'pref'”). Then features with the same tag and, after subsetting, the same lookups are merged (12.0.0), and language systems are pruned.</li>
+</ol>
+<p id="ix-69"><a href="gpos.html">GPOS</a> takes part in steps 1, 3 and 4, but adds no glyphs. Since GSUB is closed first, GPOS’s step 3 sees every glyph that can reach it.</p>
+<p id="ix-70">The demo font has <code>liga</code> and <code>dlig</code>. A subset for <code>ct</code> loses <code>dlig</code>, which is not a default feature, and with it the <code>c_t</code> ligature; asking for it with <code>--layout-features+=dlig</code> keeps both. Its kerning and mark lookups go too, since their glyphs are gone, and with them the GPOS features:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">demo.ttf</td><td class="opt">--list-features</td><td class="out"><pre><code>Layout features information:
+
+Showing all font features with duplicates removed.
+
+Table: GSUB
+	Feature: dlig
+	Feature: liga
+Table: GPOS
+	Feature: kern
+	Feature: mark</code></pre></td></tr><tr><td class="font">ct.ttf</td><td class="opt">--list-features</td><td class="out"><pre><code>Layout features information:
+
+Showing all font features with duplicates removed.
+
+Table: GSUB
+Table: GPOS</code></pre></td></tr><tr><td class="font">ct-dlig.ttf</td><td class="opt">--list-features</td><td class="out"><pre><code>Layout features information:
+
+Showing all font features with duplicates removed.
+
+Table: GSUB
+	Feature: dlig
+Table: GPOS</code></pre></td></tr></tbody></table></div>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">demo.ttf</td><td class="in"><span class="txt">ct</span><span class="cps">U+0063 U+0074</span></td><td class="opt">--features=dlig</td><td class="out"><code>[c_t=0+900]</code></td></tr><tr><td class="font">ct.ttf</td><td class="in"><span class="txt">ct</span><span class="cps">U+0063 U+0074</span></td><td class="opt">--features=dlig</td><td class="out"><code>[c=0+500|t=1+500]</code></td></tr><tr><td class="font">ct-dlig.ttf</td><td class="in"><span class="txt">ct</span><span class="cps">U+0063 U+0074</span></td><td class="opt">--features=dlig</td><td class="out"><code>[c_t=0+900]</code></td></tr></tbody></table></div>
+<h3 id="how-the-gsub-closure-works">How the GSUB closure works</h3>
+<p id="ix-71">The closure is another dispatch context, <code>hb_closure_context_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L68"><code>hb-ot-layout-gsubgpos.hh:68</code></a>): each subtable has a <code>closure</code> method that adds what it could produce from the glyphs in the set. For the lookup types of <a href="gsub.html">GSUB</a>: a single or alternate substitution adds the substitute of each covered glyph that is in the set; a multiple substitution adds its sequence; a ligature adds its ligature glyph when <em>every</em> component is in the set; a contextual rule calls its nested lookups when its input, backtrack and lookahead can all be matched from the set.</p>
+<p id="ix-72">It works on sets, not strings. It doesn’t know in what order the glyphs come, or whether they ever meet. The subset <code>if.ttf</code> was cut for the text “if”, which never forms the <code>fi</code> ligature, but <code>f</code> and <code>i</code> are both in the set, so <code>f_i</code> is kept and its rule with it, while <code>f_l</code> is not:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">if.ttf</td><td class="opt">--list-glyphs</td><td class="out"><pre><code>Glyph-set information:
+
+GlyphID	Glyph name
+------------------
+0	.notdef
+1	f
+2	i
+3	f_i</code></pre></td></tr></tbody></table></div>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of if.ttf, lookup 0"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="ttx">TTX</button><button type="button" role="tab" data-view="hex">Bytes</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 0: Ligature substitution (type 4)
+  lookupFlag: none
+  subtable 0: LigatureSubstFormat1
+    coverage: [f]
+    ligatureSet:
+      (f)
+        1. [i] → f_i</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;0&quot;&gt;
+  &lt;LookupType value=&quot;4&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;LigatureSubst index=&quot;0&quot;&gt;
+    &lt;LigatureSet glyph=&quot;f&quot;&gt;
+      &lt;Ligature components=&quot;i&quot; glyph=&quot;f_i&quot;/&gt;
+    &lt;/LigatureSet&gt;
+  &lt;/LigatureSubst&gt;
+&lt;/Lookup&gt;</code></pre></div><div class="pane" data-view="hex" data-label="Bytes" role="tabpanel"><pre><code>── Lookup 0 (at 0x0036)
+0036  00 04   lookupType
+0038  00 00   lookupFlag (none)
+003a  00 01   subTableCount
+003c  00 08   subtableOffsets[0] → subtable 0
+── subtable 0: LigatureSubstFormat1 (at 0x003e)
+003e  00 01   substFormat
+0040  00 12   coverageOffset → Coverage
+0042  00 01   ligatureSetCount
+0044  00 08   ligatureSetOffsets[0] → LigatureSet 0
+── LigatureSet 0 (at 0x0046)
+0046  00 01   ligatureCount
+0048  00 04   ligatureOffsets[0] → Ligature 0.0
+── Ligature 0.0 (at 0x004a)
+004a  00 03   ligatureGlyph = f_i
+004c  00 02   componentCount (including the first)
+004e  00 02   componentGlyphIDs[0] = i
+── Coverage (at 0x0050)
+0050  00 01   format
+0052  00 01   glyphCount
+0054  00 01   glyphArray[0] = f</code></pre></div><figcaption>if.ttf, lookup 0</figcaption></figure>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">demo.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">if.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900]</code></td></tr></tbody></table></div>
+<p id="ix-73">So the closure over-approximates on purpose. Keeping a glyph that turns out not to be needed costs bytes; dropping one that is needed changes the text.</p>
+<p id="ix-74">The function that runs it is short (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc#L1675"><code>hb-ot-layout.cc:1675</code></a>, trimmed):</p>
+<pre><code class="language-c++">do
+{
+  c.reset_lookup_visit_count ();
+  glyphs_length = glyphs-&gt;get_population ();
+  for (auto lookup_index : *lookups)
+    gsub.get_lookup (lookup_index).closure (&amp;c, lookup_index);
+} while (iteration_count++ &lt;= HB_CLOSURE_MAX_STAGES &amp;&amp;
+         glyphs_length != glyphs-&gt;get_population ());
+</code></pre>
+<p id="ix-75">Each pass runs every lookup in index order, and each lookup’s output is added to the set as soon as it finishes (<code>c-&gt;flush ()</code> in <code>SubstLookup::closure</code>), so a later lookup in the same pass sees it. A lookup that has already run with the same set of input glyphs is skipped. Passes repeat while the set grows, but at most <code>HB_CLOSURE_MAX_STAGES</code> + 2 times: 14.</p>
+<h2 id="why-fixed-stages-and-not-a-fixpoint">Why fixed stages, and not a fixpoint</h2>
+<p id="ix-76">A <strong>fixpoint</strong> would be the obvious design: run every closure again and again until a whole round adds nothing. HarfBuzz doesn’t, at either level.</p>
+<p id="ix-77">Between tables, the order above makes most of a loop unnecessary: what later stages add is drawn, not shaped. Within GSUB, the bound is explained by the comment on its definition (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L65"><code>hb-limits.hh:65</code></a>):</p>
+<pre><code class="language-c++">/*
+ * The maximum number of times a lookup can be applied during shaping.
+ * Used to limit the number of iterations of the closure algorithm.
+ * This must be larger than the number of times add_gsub_pause() is
+ * called in a collect_features call of any shaper.
+ */
+#define HB_CLOSURE_MAX_STAGES 12
+</code></pre>
+<p id="ix-78">The reasoning is that shaping itself runs in stages. Within a stage, lookups run once each, in index order, which is the order of one pass. A lookup can run again only in a later stage, after a pause (<a href="from-features-to-lookups.html#stages-and-pauses">From features to lookups</a>), so a chain of substitutions that goes back to a lower lookup index needs one more pass per stage, and no more passes are needed than there are stages.</p>
+<p id="ix-79">The second reason is in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/SubstLookup.hh#L209"><code>SubstLookup.hh:209</code></a>, where a contextual lookup calls a nested one. The nested lookup’s output is <em>not</em> added to the set straight away:</p>
+<pre><code class="language-c++">/* While in theory we should flush here, it will cause timeouts because a recursive
+ * lookup can keep growing the glyph set.  Skip, and outer loop will retry up to
+ * HB_CLOSURE_MAX_STAGES time, which should be enough for every realistic font. */
+//c-&gt;flush ();
+</code></pre>
+<p id="ix-80">The limit is a defense against hostile fonts as much as a shortcut: a closure run to a fixpoint could be made to run for a very long time (8.1.0 reverted an optimization that “could cause timeout during subsetting with malicious fonts”). <a href="hb-depend.html">hb-depend</a> takes the other side: its closure follows edges “to a fixed point”, while “the subsetter’s iterative closure (<code>HB_CLOSURE_MAX_STAGES</code>) truncates these chains” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/depend-for-closure.md"><code>docs/depend-for-closure.md</code></a>).</p>
+<h3 id="where-the-fixed-order-misses">Where the fixed order misses</h3>
+<p id="ix-81">“Enough for every realistic font” is a judgment, and it can be tested. <code>nested.ttf</code> has one contextual rule in <code>ccmp</code> that applies twenty single substitutions to the same glyph, one after another, <code>a</code> → <code>s1</code> → <code>s2</code> … → <code>s20</code>. Its feature file (<code>fonts/subsetting/nested.fea</code>) defines the twenty lookups <code>L19</code> down to <code>L0</code>, and then:</p>
+<pre><code>feature ccmp {
+  sub a' lookup L0 lookup L1 lookup L2 … lookup L19;
+} ccmp;
+</code></pre>
+<p id="ix-82">Shaping applies all twenty. The closure applies the first nested lookup to <code>a</code>, but the output of <code>L0</code> isn’t flushed until the outer lookup ends, so <code>L1</code> doesn’t see <code>s1</code> until the next pass, and each pass adds one glyph. After 14 passes the closure stops, with <code>s14</code>:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">nested.ttf</td><td class="opt">--show-glyph-count</td><td class="out"><pre><code>Glyph count: 22</code></pre></td></tr><tr><td class="font">nested-a.ttf</td><td class="opt">--show-glyph-count</td><td class="out"><pre><code>Glyph count: 16</code></pre></td></tr></tbody></table></div>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">nested.ttf</td><td class="in"><span class="txt">a</span><span class="cps">U+0061</span></td><td class="opt"></td><td class="out"><code>[s20=0+500]</code></td></tr><tr><td class="font">nested-a.ttf</td><td class="in"><span class="txt">a</span><span class="cps">U+0061</span></td><td class="opt"></td><td class="out"><code>[s14=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-83">The subset shapes differently from the original. The bound also leaves less margin than its comment asks for: the Indic shaper’s <code>collect_features_indic</code> calls <code>add_gsub_pause</code> 14 times (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc#L249"><code>hb-ot-shaper-indic.cc:249</code></a>–<code>265</code>), more than the 12 the comment allows, though only a chain running backwards through the lookup list across most of those stages would notice.</p>
+<blockquote>
+<p id="ix-84">Since 15.1.0: partly fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/0209ec2865b55e892897966e95dfb8915a1309e9"><code>0209ec2</code></a> (17 November 2026): <code>HB_CLOSURE_MAX_STAGES</code> is 16, more than the Indic shaper’s 14 pauses; the closure still cuts long chains, and <code>nested-a.ttf</code> cut by main shapes <code>a</code> as <code>s18</code>.</p>
+</blockquote>
+<p id="ix-85">The order between tables misses something too. MATH is subset against the snapshots taken before GSUB ran: its glyph variants and assemblies against <code>_glyphset_cmaped</code>, its italics corrections, accent positions and kerning against <code>_glyphset_mathed</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-math-table.hh#L232"><code>hb-ot-math-table.hh:232</code></a>, <code>:1064</code>). A glyph that only GSUB produces keeps its outline and loses its MATH data. <code>math.ttf</code> has an integral, a display-size variant of it, and an <code>rtlm</code> feature (a default one) that replaces both with mirrored forms for right-to-left math. All four glyphs have italics corrections, and both integrals have a list of sizes. Cut for ∫, the subset keeps all four glyphs and shapes as the original does:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">math-integral.ttf</td><td class="opt">--list-glyphs</td><td class="out"><pre><code>Glyph-set information:
+
+GlyphID	Glyph name
+------------------
+0	.notdef
+1	integral
+2	integral.size1
+3	integral.rtlm
+4	integral.rtlm.size1</code></pre></td></tr></tbody></table></div>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">math.ttf</td><td class="in"><span class="txt">∫</span><span class="cps">U+222B</span></td><td class="opt">--direction=rtl</td><td class="out"><code>[integral.rtlm=0+500]</code></td></tr><tr><td class="font">math-integral.ttf</td><td class="in"><span class="txt">∫</span><span class="cps">U+222B</span></td><td class="opt">--direction=rtl</td><td class="out"><code>[integral.rtlm=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-86">But its MATH table has lost the mirrored integral’s sizes and both mirrored glyphs’ italics corrections. No HarfBuzz tool prints a MATH table, so here is fontTools reading the original, the subset, and a third subset that also asked for <code>integral.rtlm</code> by name (<code>fonts/subsetting/math-summary.txt</code>, written by <code>build.sh</code>):</p>
+<pre><code>math.ttf
+  italics correction: integral, integral.size1, integral.rtlm, integral.rtlm.size1
+  vertical variants:
+    integral -&gt; integral, integral.size1
+    integral.rtlm -&gt; integral.rtlm, integral.rtlm.size1
+math-integral.ttf
+  italics correction: integral, integral.size1
+  vertical variants:
+    integral -&gt; integral, integral.size1
+math-rtlm.ttf
+  italics correction: integral, integral.size1, integral.rtlm, integral.rtlm.size1
+  vertical variants:
+    integral -&gt; integral, integral.size1
+    integral.rtlm -&gt; integral.rtlm, integral.rtlm.size1
+</code></pre>
+<p id="ix-87">A math engine laying out right-to-left display math with the subset would find no larger integral; <code>ssty</code> glyphs, if kept, would lose their italics corrections and kerning the same way. The third subset shows a workaround: requested glyphs count as part of the <code>cmap</code> stage. The hb-depend documentation calls MATH single-pass on purpose for the glyphs MATH itself adds (“Math layout engines do not recursively stretch assembly parts”); nothing explains the loss for glyphs GSUB adds, and it looks like a bug.</p>
+<blockquote>
+<p id="ix-88">For programmers: if a subset must work with features or engines beyond plain shaping, check it the way this page does: shape the same text with both fonts, with the same features. <code>hb-shape --verify</code> checks a font against itself; only a comparison checks a subset.</p>
+</blockquote>
+<h2 id="the-glyph-map">The glyph map</h2>
+<p id="ix-89"><code>_create_old_gid_to_new_gid_map</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan.cc#L575"><code>hb-subset-plan.cc:575</code></a>) numbers the kept glyphs, in one of three ways:</p>
+<ul>
+<li id="ix-90">By default, the kept glyphs are numbered from 0 in their old order, so <code>.notdef</code> stays 0 and nothing else keeps its number.</li>
+<li id="ix-91">With <code>RETAIN_GIDS</code>, every glyph keeps its number, and the font has as many glyphs as the highest one kept, plus one. The gaps are empty glyphs. This is for glyph IDs that are stored outside the font, or that must match across several subsets of one font: NEWS for 8.0.1 speaks of “retain-gid (used for IFT)”, incremental font transfer.</li>
+<li id="ix-92">With a glyph map from the input, the mapped glyphs get the IDs asked for and the rest follow the highest of them. The map must be one-to-one, can’t be combined with <code>RETAIN_GIDS</code>, and since 15.1.0 can’t give glyph 0 to anything but <code>.notdef</code>.</li>
+</ul>
+<p id="ix-93">The same “fi” subset with <code>--retain-gids</code> keeps <code>f</code>, <code>i</code> and <code>f_i</code> at 6, 7 and 12. The <code>post</code> table names the empty glyphs <code>.notdef</code>:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">fi-retain.ttf</td><td class="opt">--list-glyphs</td><td class="out"><pre><code>Glyph-set information:
+
+GlyphID	Glyph name
+------------------
+0	.notdef
+1	.notdef
+2	.notdef
+3	.notdef
+4	.notdef
+5	.notdef
+6	f
+7	i
+8	.notdef
+9	.notdef
+10	.notdef
+11	.notdef
+12	f_i</code></pre></td></tr></tbody></table></div>
+<p id="ix-94">The documentation of <code>hb_subset_input_old_to_new_glyph_mapping</code> allows a map that changes the order of glyphs, but much of the layout subsetting assumes it doesn’t. A typical <code>subset</code> method walks its table in old glyph order, maps each glyph and writes the results in that order, which is new glyph order only if the map keeps the order, as the default one does (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan.cc#L651"><code>hb-subset-plan.cc:651</code></a>). The Coverage serializer notices and sorts (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/Common/CoverageFormat2.hh#L117"><code>CoverageFormat2.hh:117</code></a>). A kerning pair set doesn’t (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/PairSet.hh#L255"><code>PairSet.hh:255</code></a>), though its records must be sorted by second glyph, because shaping finds them by binary search. <code>kern.ttf</code> kerns A against eight glyphs, each by its own amount; <code>kern-map.ttf</code> was cut with a <code>--gid-map</code> numbering those eight backwards:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">kern-map.ttf</td><td class="opt">--list-glyphs</td><td class="out"><pre><code>Glyph-set information:
+
+GlyphID	Glyph name
+------------------
+0	.notdef
+1	A
+2	Y
+3	W
+4	V
+5	T
+6	Q
+7	O
+8	G
+9	C</code></pre></td></tr></tbody></table></div>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">kern.ttf</td><td class="in"><span class="txt">ACAGAOAQATAVAWAY</span><span class="cps">U+0041 U+0043 U+0041 U+0047 U+0041 U+004F U+0041 U+0051 U+0041 U+0054 U+0041 U+0056 U+0041 U+0057 U+0041 U+0059</span></td><td class="opt"></td><td class="out"><code>[A=0+490|C=1+500|A=2+480|G=3+500|A=4+470|O=5+500|A=6+460|Q=7+500|A=8+450|T=9+500|A=10+440|V=11+500|A=12+430|W=13+500|A=14+420|Y=15+500]</code></td></tr><tr><td class="font">kern-map.ttf</td><td class="in"><span class="txt">ACAGAOAQATAVAWAY</span><span class="cps">U+0041 U+0043 U+0041 U+0047 U+0041 U+004F U+0041 U+0051 U+0041 U+0054 U+0041 U+0056 U+0041 U+0057 U+0041 U+0059</span></td><td class="opt"></td><td class="out"><code>[A=0+500|C=1+500|A=2+500|G=3+500|A=4+500|O=5+500|A=6+460|Q=7+500|A=8+500|T=9+500|A=10+500|V=11+500|A=12+500|W=13+500|A=14+500|Y=15+500]</code></td></tr></tbody></table></div>
+<p id="ix-95">Of the eight pairs, only the one the binary search reaches first survives. Class definitions are written the same way (<code>ClassDef_remap_and_serialize</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L1500"><code>hb-ot-layout-common.hh:1500</code></a>), and a font kerned by classes loses most of its classes (tested, not shown). This looks like a bug; meanwhile a custom map is safe only if it keeps the old order.</p>
+<h2 id="writing-the-tables">Writing the tables</h2>
+<p id="ix-96"><code>hb_subset_plan_execute_or_fail</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.cc#L439"><code>hb-subset.cc:439</code></a>) lists the source font’s tables and asks of each whether it is dropped, in <code>_should_drop_table</code> (<code>:219</code>):</p>
+<ul>
+<li>any table in the input’s drop set;</li>
+<li id="ix-97">the hinting tables <code>cvt </code>, <code>fpgm</code>, <code>prep</code>, <code>hdmx</code> and <code>VDMX</code> with <code>NO_HINTING</code>, and <code>cvar</code> with <code>NO_HINTING</code> or when every axis is pinned;</li>
+<li id="ix-98"><code>avar</code>, <code>fvar</code>, <code>gvar</code>, <code>HVAR</code>, <code>VVAR</code> and <code>MVAR</code> when every axis is pinned, because the font is no longer variable;</li>
+<li id="ix-99">in a build with <code>HB_NO_SUBSET_LAYOUT</code>, GDEF, GSUB, GPOS, <code>kern</code> and the AAT layout tables.</li>
+</ul>
+<p id="ix-100">The rest go into a set of pending tables, and a loop subsets each table whose dependencies are met (<code>_dependencies_satisfied</code>, <code>:265</code>), until none is left. A table waits for what another table’s subsetting computes: when instancing, <code>hmtx</code>, <code>vmtx</code>, <code>maxp</code> and <code>OS/2</code> wait for <code>glyf</code>, whose instanced outlines give new metrics; GSUB and GPOS wait for GDEF unless every axis is pinned; and with <code>avar</code> version 2, the variation tables wait for <code>avar</code>. A round that makes no progress fails the subset. Within a round, tables go in tag order as numbers, so capitalized tags (<code>COLR</code>, <code>GSUB</code>, <code>OS/2</code>) come before lower-case ones (<code>cmap</code>, <code>glyf</code>).</p>
+<p>For each table, <code>_subset_table</code> (<code>:307</code>) chooses:</p>
+<ul>
+<li><strong>Passed through.</strong> A table in the no-subset set is copied unchanged.</li>
+<li id="ix-101"><strong>Subset.</strong> A table HarfBuzz knows is subset by its own <code>subset</code> method, through one of five families of dispatchers (<code>hb-subset-table-{layout,var,cff,color,other}.cc</code>). Some tables are written by others: <code>loca</code> and <code>head</code> by <code>glyf</code> (<code>head</code> by itself when there is no <code>glyf</code>), <code>hhea</code> by <code>hmtx</code>, <code>vhea</code> by <code>vmtx</code>, <code>CBDT</code> by <code>CBLC</code>. <code>fvar</code>, <code>avar</code>, <code>STAT</code>, <code>cvar</code> and <code>MVAR</code> are copied unless axes are being instanced, and <code>cvt </code> unless <code>cvar</code> deltas must be applied to it.</li>
+<li><strong>Dropped.</strong> Anything else is dropped, unless <code>PASSTHROUGH_UNRECOGNIZED</code> is set.</li>
+</ul>
+<p id="ix-102">AAT and Graphite tables aren’t subset; <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.cc"><code>hb-subset.cc</code></a> advises such fonts to “use the retain glyph ids option and configure the subset to pass through the layout tables untouched”.</p>
+<p id="ix-103">A table whose <code>subset</code> returns false, meaning nothing of it is left, is left out of the font. The demo font loses <code>COLR</code> and <code>CPAL</code> when ★ isn’t asked for, and <code>fpgm</code> and <code>prep</code>, which are passed through by default, go with <code>--no-hinting</code>:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">demo.ttf</td><td class="opt">--list-tables</td><td class="out"><pre><code>Table information:
+
+Tag	Size
+------------
+COLR       28 bytes
+CPAL       22 bytes
+GDEF       46 bytes
+GPOS      156 bytes
+GSUB      142 bytes
+OS/2       96 bytes
+cmap      140 bytes
+fpgm        3 bytes
+glyf      552 bytes
+head       54 bytes
+hhea       36 bytes
+hmtx       84 bytes
+loca       44 bytes
+maxp       32 bytes
+name      129 bytes
+post      127 bytes
+prep        3 bytes</code></pre></td></tr><tr><td class="font">if.ttf</td><td class="opt">--list-tables</td><td class="out"><pre><code>Table information:
+
+Tag	Size
+------------
+GDEF       24 bytes
+GPOS       30 bytes
+GSUB       86 bytes
+OS/2       96 bytes
+cmap       60 bytes
+fpgm        3 bytes
+glyf       78 bytes
+head       54 bytes
+hhea       36 bytes
+hmtx       16 bytes
+loca       10 bytes
+maxp       32 bytes
+name       80 bytes
+post       46 bytes
+prep        3 bytes</code></pre></td></tr><tr><td class="font">if-nohint.ttf</td><td class="opt">--list-tables</td><td class="out"><pre><code>Table information:
+
+Tag	Size
+------------
+GDEF       24 bytes
+GPOS       30 bytes
+GSUB       86 bytes
+OS/2       96 bytes
+cmap       60 bytes
+glyf       78 bytes
+head       54 bytes
+hhea       36 bytes
+hmtx       16 bytes
+loca       10 bytes
+maxp       32 bytes
+name       80 bytes
+post       46 bytes</code></pre></td></tr></tbody></table></div>
+<p id="ix-104">Each table is serialized into a buffer of a guessed size (<code>_hb_subset_estimate_table_size</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-table.hh#L75"><code>hb-subset-table.hh:75</code></a>): 8 KiB plus the source table’s size times the square root of the fraction of glyphs kept, or plus the whole size for GSUB, GPOS, GDEF and <code>name</code>. If it runs out of room, the buffer is doubled and the table subset again, up to 256 times the source table’s size; if an offset overflows, the repacker rearranges the table’s objects. <a href="writing-tables.html">Writing tables</a> is about both.</p>
+<p id="ix-105">A face made with <code>hb_face_create_for_tables</code> may be unable to list its tables. The subsetter then asks it for each tag in its own list of known tables (<code>known_tables</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.cc#L72"><code>hb-subset.cc:72</code></a>) and in the no-subset set, so an unknown table in such a face is lost even with <code>PASSTHROUGH_UNRECOGNIZED</code>.</p>
+<p id="ix-106">The source tables are read through the plan’s <code>source_table</code>, which sanitizes each one once and caches it. It uses a plain sanitizer, without the <code>lazy_some_gpos</code> flag that shaping uses, so a GPOS that shaping tolerates can be rejected here (<a href="trust-nothing-the-sanitizer.html">Trust nothing</a> has the details).</p>
+<p id="ix-107">The result is the builder face holding the new tables, or <code>NULL</code>: a subset fails if the source font has no glyphs (since 10.0.0), if the plan fails, if a table fails to subset or repack, or if table dependencies can’t be met.</p>
+<h2 id="table-by-table">Table by table</h2>
+<p id="ix-108">Each table’s <code>subset</code> keeps what refers to kept glyphs, characters, lookups or <code>name</code> IDs, renumbers it, and rewrites the fields that depend on the numbering. Fields that summarize the whole font, such as <code>head</code>’s bounding box, the maxima in <code>maxp</code> and <code>hhea</code>, and <code>OS/2</code>’s <code>xAvgCharWidth</code>, are recomputed only when instancing; on a plain subset most stay true, as bounds that are no longer tight (inferred).</p>
+<table>
+<thead>
+<tr>
+<th>Table</th>
+<th>What its subset does</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-109"><code>cmap</code></td>
+<td id="ix-110">keeps the Unicode subtables, (0, 3), (0, 4), (3, 1), (3, 10), and format 14; drops a format 12 that would map nothing beyond its format 4 sibling; if format 4 overflows, falls back to format 12 alone</td>
+<td id="ix-111"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cmap-table.hh"><code>hb-ot-cmap-table.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-112"><code>glyf</code>, <code>loca</code>, <code>head</code></td>
+<td id="ix-113">copies the kept glyphs, trims their padding, drops instructions with <code>NO_HINTING</code>, empties <code>.notdef</code>; chooses short <code>loca</code> offsets when the glyphs total less than 0x1FFFF bytes and sets <code>head.indexToLocFormat</code></td>
+<td id="ix-114"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh"><code>OT/glyf/glyf.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-115"><code>hmtx</code>, <code>hhea</code> (and vertical)</td>
+<td id="ix-116">metrics of the kept glyphs; trailing glyphs with the same advance as the last long metric are written short</td>
+<td id="ix-117"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-hmtx-table.hh"><code>hb-ot-hmtx-table.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-118"><code>maxp</code></td>
+<td><code>numGlyphs</code>; resets the hinting maxima with <code>NO_HINTING</code></td>
+<td id="ix-119"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-maxp-table.hh"><code>hb-ot-maxp-table.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-120"><code>OS/2</code></td>
+<td id="ix-121"><code>usFirstCharIndex</code> and <code>usLastCharIndex</code> from the kept characters; clears Unicode range bits no kept character needs, never sets one</td>
+<td id="ix-122"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-os2-table.hh"><code>hb-ot-os2-table.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-123"><code>post</code></td>
+<td>version 3, without names, unless <code>GLYPH_NAMES</code></td>
+<td id="ix-124"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-post-table.hh"><code>hb-ot-post-table.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-125"><code>name</code></td>
+<td id="ix-126">records with kept IDs and languages; only Unicode and Windows ones unless <code>NAME_LEGACY</code></td>
+<td id="ix-127"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/name/name.hh"><code>OT/name/name.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-128"><code>hdmx</code>, <code>VORG</code></td>
+<td id="ix-129">rows or entries for the kept glyphs</td>
+<td id="ix-130"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-hdmx-table.hh"><code>hb-ot-hdmx-table.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-vorg-table.hh"><code>hb-ot-vorg-table.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-131">GDEF</td>
+<td id="ix-132">classes, attachment points and carets of <code>_glyphset_gsub</code>; only the mark glyph sets still used, renumbered; the lowest version that holds what is left</td>
+<td id="ix-133"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GDEF/GDEF.hh"><code>OT/Layout/GDEF/GDEF.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-134">BASE</td>
+<td id="ix-135">records of kept scripts; reference glyphs renumbered</td>
+<td id="ix-136"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-base-table.hh"><code>hb-ot-layout-base-table.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-137">MATH</td>
+<td>against the early snapshots, as above</td>
+<td id="ix-138"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-math-table.hh"><code>hb-ot-math-table.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-139">COLR, CPAL</td>
+<td id="ix-140">records, layers and paints of kept glyphs; every palette, but only the color entries still used, renumbered</td>
+<td id="ix-141"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh"><code>OT/Color/COLR/COLR.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/CPAL/CPAL.hh"><code>OT/Color/CPAL/CPAL.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-142">CBLC, CBDT, <code>sbix</code></td>
+<td id="ix-143">each strike’s bitmaps for the kept glyphs</td>
+<td id="ix-144"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/CBDT/CBDT.hh"><code>OT/Color/CBDT/CBDT.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/sbix/sbix.hh"><code>OT/Color/sbix/sbix.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-145">CFF, CFF2</td>
+<td id="ix-146">charstrings of the kept glyphs; the subroutines they still call, renumbered, or none with <code>DESUBROUTINIZE</code>; hints dropped with <code>NO_HINTING</code></td>
+<td id="ix-147"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-cff1.cc"><code>hb-subset-cff1.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-cff2.cc"><code>hb-subset-cff2.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-cff-common.hh"><code>hb-subset-cff-common.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-148">VARC</td>
+<td id="ix-149">records of kept glyphs with the conditions, axis lists and variation data they use</td>
+<td id="ix-150"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC-subset.hh"><code>OT/Var/VARC/VARC-subset.hh</code></a></td>
+</tr>
+<tr>
+<td id="ix-151"><code>gvar</code>, HVAR, VVAR</td>
+<td id="ix-152">variation data of the kept glyphs (<a href="instancing.html">Instancing</a> has the rest)</td>
+<td id="ix-153"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-gvar-table.hh"><code>hb-ot-var-gvar-table.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-hvar-table.hh"><code>hb-ot-var-hvar-table.hh</code></a></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-154">Two rows hold surprises. The first is <code>cmap</code>’s list of subtables (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cmap-table.hh#L2502"><code>hb-ot-cmap-table.hh:2502</code></a>): a symbol font’s (3, 0) isn’t on it, and when that is a font’s only subtable, the subset has no <code>cmap</code> at all. fontTools’ subsetter drops (3, 0) by default too, but has <code>--symbol-cmap</code> to keep it; HarfBuzz has no such option. <code>symbol.ttf</code> maps U+F061, which shaping also finds for “a” (<code>_hb_symbol_pua_map</code>). The legacy Arabic fonts of <a href="joining-scripts.html#legacy-encodings">Joining scripts</a> are symbol fonts too. Cut for “a”, the subset keeps the glyph and loses the way to it:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">symbol-a.ttf</td><td class="opt">--list-tables</td><td class="out"><pre><code>Table information:
+
+Tag	Size
+------------
+OS/2       96 bytes
+glyf       26 bytes
+head       54 bytes
+hhea       36 bytes
+hmtx        6 bytes
+loca        6 bytes
+maxp       32 bytes
+name       84 bytes
+post       38 bytes</code></pre></td></tr></tbody></table></div>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">symbol.ttf</td><td class="in"><span class="txt">a</span><span class="cps">U+0061</span></td><td class="opt"></td><td class="out"><code>[a=0+500]</code></td></tr><tr><td class="font">symbol-a.ttf</td><td class="in"><span class="txt">a</span><span class="cps">U+0061</span></td><td class="opt"></td><td class="out"><code>[.notdef=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-155">The second is <code>.notdef</code>. <code>NOTDEF_OUTLINE</code> is read only by the glyf and <code>gvar</code> code, so a CFF <code>.notdef</code> keeps its outline either way, while fontTools’ subsetter empties both (<code>fontTools/subset/cff.py</code>). Here are <code>if.ttf</code> and a CFF subset, each shaping a character it lacks:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">if.ttf</td><td class="in"><span class="txt">Z</span><span class="cps">U+005A</span></td><td class="opt">--show-extents</td><td class="out"><code>[.notdef=0+500&lt;0,0,0,0&gt;]</code></td></tr><tr><td class="font">cff-o.otf</td><td class="in"><span class="txt">Z</span><span class="cps">U+005A</span></td><td class="opt">--show-extents</td><td class="out"><code>[.notdef=0+500&lt;50,700,400,-700&gt;]</code></td></tr></tbody></table></div>
+<p>Neither is documented, and the first leaves no way to subset a symbol font with HarfBuzz; both look like bugs.</p>
+<h2 id="preprocessing">Preprocessing</h2>
+<p id="ix-156">A server that cuts many subsets from one font can do part of the work once. <code>hb_subset_preprocess</code> (6.0.0) is itself a subset, with <code>keep_everything</code> and a flag that attaches an <strong>accelerator</strong> (<code>hb_subset_accelerator_t</code>) to the new face: the <code>cmap</code> maps, the sanitized tables, the parsed CFF and whether it uses <code>seac</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-accelerator.hh"><code>hb-subset-accelerator.hh</code></a>). It also writes <code>glyf</code> with long offsets and no padding, so that later subsets can skip trimming (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-input.cc#L1138"><code>hb-subset-input.cc:1138</code></a>). Later subsets of that face use the accelerator. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/subset-preprocessing.md"><code>docs/subset-preprocessing.md</code></a> says the result “should be identical”, and that CFF fonts gain most.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.h"><code>src/hb-subset.h</code></a></td>
+<td>the public API: flags, sets, plan functions</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-input.cc"><code>src/hb-subset-input.cc</code></a></td>
+<td>the input, its defaults, <code>keep_everything</code>, axis settings, <code>hb_subset_preprocess</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan.cc"><code>src/hb-subset-plan.cc</code></a></td>
+<td>the plan: characters, the glyph closure stages, the glyph map</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan-layout.cc"><code>src/hb-subset-plan-layout.cc</code></a></td>
+<td>which GSUB and GPOS features and lookups survive</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan-member-list.hh"><code>src/hb-subset-plan-member-list.hh</code></a></td>
+<td>everything the plan holds</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>src/hb-ot-layout.cc</code></a></td>
+<td><code>hb_ot_layout_lookups_substitute_closure</code>, the pass loop</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh"><code>src/hb-ot-layout-gsubgpos.hh</code></a></td>
+<td>the closure contexts, contextual closure, <code>prune_features</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/SubstLookup.hh"><code>src/OT/Layout/GSUB/SubstLookup.hh</code></a></td>
+<td>where nested lookups aren’t flushed</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>src/hb-limits.hh</code></a></td>
+<td><code>HB_CLOSURE_MAX_STAGES</code> and the glyf budgets</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.cc"><code>src/hb-subset.cc</code></a></td>
+<td>table order, dropping, passing through, the execute loop</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-table.hh"><code>src/hb-subset-table.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-subset-table-*.cc</code></a></td>
+<td>one table’s subset: buffer, retry, repack; the dispatch by tag</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cmap-table.hh"><code>src/hb-ot-cmap-table.hh</code></a></td>
+<td><code>cmap</code>’s subset and the subtables it keeps</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh"><code>src/OT/glyf/glyf.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-cff1.cc"><code>src/hb-subset-cff1.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-cff-common.hh"><code>src/hb-subset-cff-common.hh</code></a></td>
+<td>outlines, <code>.notdef</code>, subroutines</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/PairSet.hh"><code>src/OT/Layout/GPOS/PairSet.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh"><code>src/hb-ot-layout-common.hh</code></a></td>
+<td>pair sets and class definitions, written in old glyph order</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-accelerator.hh"><code>src/hb-subset-accelerator.hh</code></a></td>
+<td>what preprocessing caches</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/subset-preprocessing.md"><code>docs/subset-preprocessing.md</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/depend-for-closure.md"><code>docs/depend-for-closure.md</code></a></td>
+<td>preprocessing; how hb-depend’s closure compares</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A subset is planned, then written. The plan decides the characters, the glyphs, their new IDs, and the features and lookups that survive.</li>
+<li>Characters gain their bidi mirrors, but not their decompositions or compositions, so text in another normalization form can shape differently.</li>
+<li>The glyph closure runs in a fixed order, once each: <code>cmap</code>, MATH, GSUB, COLR, VARC, glyf and CFF components. Later stages add glyphs that are drawn, not shaped, and GSUB, GPOS and GDEF are subset against the set taken after GSUB.</li>
+<li>The GSUB closure works on sets, not strings, for at most 14 passes. A long enough chain of nested lookups goes beyond that.</li>
+<li>MATH data for glyphs only GSUB produces, such as <code>rtlm</code> forms, is dropped.</li>
+<li>Default subsets keep only the features shaping turns on by itself.</li>
+<li>A custom glyph map that reorders glyphs breaks pair kerning and class definitions.</li>
+<li>Tables are dropped, passed through or subset; each subset renumbers what it keeps. A symbol <code>cmap</code> is dropped, and a CFF <code>.notdef</code> keeps its outline.</li>
+</ul>
+<blockquote>
+<p>Since 15.1.0: changed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/0209ec2865b55e892897966e95dfb8915a1309e9"><code>0209ec2</code></a> (17 November 2026): the closure runs at most 18 passes (the item on the GSUB closure).</p>
+</blockquote>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="hb-gpu.html">← hb-gpu: rendering on the GPU</a><a rel="next" href="writing-tables.html">Writing tables →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

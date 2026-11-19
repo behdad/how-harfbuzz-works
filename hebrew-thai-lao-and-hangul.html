@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hebrew, Thai, Lao and Hangul · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part VI · Scripts</p>
+<h1 id="hebrew-thai-lao-and-hangul">24. Hebrew, Thai, Lao and Hangul</h1>
+<p id="ix-1">Hebrew, Thai, Lao and Korean need no syllable machine and no reordering of letters. A font’s own GSUB and GPOS can do nearly everything their text needs, and HarfBuzz’s shapers for them are small: three files, none of them 500 lines long, license included. Each exists for a job the font can’t do on its own, either because it has to be done to the characters before they become glyphs, or because it depends on what the font has.</p>
+<table>
+<thead>
+<tr>
+<th>Shaper</th>
+<th id="ix-2">Scripts</th>
+<th>Hooks it fills</th>
+<th>Its job</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hebrew</td>
+<td>Hebrew</td>
+<td><code>compose</code>, <code>reorder_marks</code>, <code>gpos_tag</code></td>
+<td id="ix-3">puts one sequence of points in a better order; makes presentation forms for old fonts</td>
+</tr>
+<tr>
+<td>Thai</td>
+<td>Thai, Lao</td>
+<td><code>preprocess_text</code></td>
+<td id="ix-4">splits SARA AM; for old Thai fonts, swaps marks for the font’s private-use glyphs</td>
+</tr>
+<tr>
+<td>Hangul</td>
+<td>Hangul</td>
+<td><code>collect_features</code>, <code>override_features</code>, <code>data_create</code>, <code>preprocess_text</code>, <code>setup_masks</code></td>
+<td id="ix-5">decides, from the font, whether a syllable is one glyph or several jamo</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-6">How a script gets one of these shapers is in <a href="choosing-a-script-shaper.html">Choosing a script shaper</a>, and where each hook runs is in <a href="pipeline-step-by-step.html#where-the-shapers-hooks-run">The pipeline, step by step</a>. The examples use test fonts in <code>fonts/hebrew-thai-lao-and-hangul/</code>, built by <code>build-fonts.py</code> there from three small feature files. Most glyphs are boxes, named after their characters. The Thai ones are drawn so that a mark’s different forms can be told apart. Every result on this page was produced by HarfBuzz 15.1.0 when the page was built.</p>
+<h2 id="hebrew">Hebrew</h2>
+<h3 id="one-sequence-of-points">One sequence of points</h3>
+<p id="ix-7">Normalization sorts each run of marks by HarfBuzz’s modified combining classes, which for Hebrew follow the order of the SBL Hebrew manual rather than Unicode’s (<a href="unicode-inside-harfbuzz.html#modified-combining-classes">Unicode inside HarfBuzz</a>). Then it gives the shaper’s <code>reorder_marks</code> hook the sorted run (<a href="normalization.html">Normalization</a>). The Hebrew shaper’s is short (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-hebrew.cc#L166"><code>hb-ot-shaper-hebrew.cc:166</code></a>, trimmed):</p>
+<pre><code class="language-c++">for (unsigned i = start + 2; i &lt; end; i++)
+{
+  unsigned c0 = info_cc (info[i - 2]);
+  unsigned c1 = info_cc (info[i - 1]);
+  unsigned c2 = info_cc (info[i - 0]);
+
+  if ((c0 == CCC17 || c0 == CCC18) /* patach or qamats */ &amp;&amp;
+      (c1 == CCC10 || c1 == CCC14) /* sheva or hiriq */ &amp;&amp;
+      (c2 == CCC22 || c2 == BELOW) /* meteg or below */)
+  {
+    buffer-&gt;merge_clusters (i - 1, i + 1);
+    hb_swap (info[i - 1], info[i]);
+    break;
+  }
+}
+</code></pre>
+<p id="ix-8">In the sorted order, patah and qamats (modified classes 20 and 21) come just before sheva and hiriq (22 and 23), and those come before meteg (25) and the cantillation marks below, such as etnahta (220). Where all three are there in a row, the second and third swap, so the meteg or accent comes straight after the patah or qamats. It happens once in a run, at the first place it matches:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hebrew-mark.ttf</td><td class="in"><span class="txt">לִַֽ</span><span class="cps">U+05DC U+05B7 U+05B4 U+05BD</span></td><td class="opt">--language=he --no-positions</td><td class="out"><code>[hiriq=0|meteg=0|patah=0|lamed=0]</code></td></tr><tr><td class="font">hebrew-mark.ttf</td><td class="in"><span class="txt">לִַֽ</span><span class="cps">U+05DC U+05BD U+05B4 U+05B7</span></td><td class="opt">--language=he --no-positions</td><td class="out"><code>[hiriq=0|meteg=0|patah=0|lamed=0]</code></td></tr><tr><td class="font">hebrew-mark.ttf</td><td class="in"><span class="txt">לְָ֑</span><span class="cps">U+05DC U+05B8 U+05B0 U+0591</span></td><td class="opt">--language=he --no-positions</td><td class="out"><code>[sheva=0|etnahta=0|qamats=0|lamed=0]</code></td></tr><tr><td class="font">hebrew-mark.ttf</td><td class="in"><span class="txt">לִֽ</span><span class="cps">U+05DC U+05B4 U+05BD</span></td><td class="opt">--language=he --no-positions</td><td class="out"><code>[meteg=0|hiriq=0|lamed=0]</code></td></tr><tr><td class="font">hebrew-mark.ttf</td><td class="in"><span class="txt">לִַ◌͏ֽ</span><span class="cps">U+05DC U+05B7 U+05B4 U+034F U+05BD</span></td><td class="opt">--language=he --no-positions</td><td class="out"><code>[meteg=0|space=0|hiriq=0|patah=0|lamed=0]</code></td></tr></tbody></table></div>
+<p id="ix-9">The output is in visual order, so read it from the right: <code>lamed</code>, <code>patah</code>, <code>meteg</code>, <code>hiriq</code>, whichever order the points were typed in. A qamats, sheva and etnahta swap the same way. Without a patah or qamats, hiriq and meteg keep their sorted order. A combining grapheme joiner between the hiriq and the meteg puts them in different runs, and nothing moves (the joiner is the <code>space</code> glyph: <a href="gsub.html#joiners">GSUB</a>).</p>
+<p>The source gives no reason beyond the names in its comment, and the swap’s history is no clearer: <code>NEWS</code> for 5.0.0 says only “Improve multiple mark interactions in Hebrew”. The pattern is the one in the traditional spelling of Jerusalem, יְרוּשָׁלִַם, whose lamed carries both a patah and a hiriq, and the swap keeps a meteg or accent next to the first of the two vowels (inferred).</p>
+<h3 id="presentation-forms-for-old-fonts">Presentation forms for old fonts</h3>
+<p id="ix-10">Unicode’s Alphabetic Presentation Forms block has Hebrew <strong>presentation forms</strong> from U+FB1D to U+FB4F, most of them letters with their points, such as SHIN WITH SHIN DOT (U+FB2A) or VAV WITH HOLAM (U+FB4B). They have canonical decompositions, but they are excluded from composition, so normalization never makes one from its parts. Old fonts, with no GPOS to place the points, drew these forms instead and mapped them in their <code>cmap</code>.</p>
+<p id="ix-11">The Hebrew shaper’s <code>compose</code> hook makes them anyway, for those fonts. When Unicode’s composition finds nothing, and the plan has no <code>mark</code> feature, it composes about three dozen pairs into presentation forms: a dagesh with each letter that has a dagesh form, shin and sin dots with SHIN, rafe with BET, KAF and PE, and five more with particular vowels (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-hebrew.cc#L81"><code>hb-ot-shaper-hebrew.cc:81</code></a>). Normalization’s last round calls the hook, and as with any composition, only uses the result if the font has a glyph for it (<a href="normalization.html#round-three-recompose">Normalization</a>). A composed form can compose again, so SHIN, dagesh and shin dot become U+FB2C in two steps.</p>
+<p id="ix-12"><code>hebrew-old.ttf</code> has the letters, the points and seven presentation forms, and no layout tables at all. <code>hebrew-mark.ttf</code> adds a GPOS with a <code>mark</code> feature under <code>hebr</code>, and <code>hebrew-mark-DFLT.ttf</code> has the same GPOS under <code>DFLT</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hebrew-old.ttf</td><td class="in"><span class="txt">שׁ</span><span class="cps">U+05E9 U+05C1</span></td><td class="opt">--language=he</td><td class="out"><code>[shin_shindot=0+700]</code></td></tr><tr><td class="font">hebrew-old.ttf</td><td class="in"><span class="txt">שּׁ</span><span class="cps">U+05E9 U+05BC U+05C1</span></td><td class="opt">--language=he</td><td class="out"><code>[shin_dagesh_shindot=0+700]</code></td></tr><tr><td class="font">hebrew-old.ttf</td><td class="in"><span class="txt">וֹ</span><span class="cps">U+05D5 U+05B9</span></td><td class="opt">--language=he</td><td class="out"><code>[vav_holam=0+300]</code></td></tr><tr><td class="font">hebrew-old.ttf</td><td class="in"><span class="txt">חּ</span><span class="cps">U+05D7 U+05BC</span></td><td class="opt">--language=he</td><td class="out"><code>[dagesh=0@600,0+0|het=0+600]</code></td></tr><tr><td class="font">hebrew-mark.ttf</td><td class="in"><span class="txt">שּׁ</span><span class="cps">U+05E9 U+05BC U+05C1</span></td><td class="opt">--language=he</td><td class="out"><code>[dagesh=0@300,250+0|shindot=0@300,650+0|shin=0+700]</code></td></tr><tr><td class="font">hebrew-mark.ttf</td><td class="in"><span class="txt">שּׁ</span><span class="cps">U+05E9 U+05BC U+05C1</span></td><td class="opt">--language=he --features=-mark</td><td class="out"><code>[shin_dagesh_shindot=0+700]</code></td></tr><tr><td class="font">hebrew-mark-DFLT.ttf</td><td class="in"><span class="txt">שּׁ</span><span class="cps">U+05E9 U+05BC U+05C1</span></td><td class="opt">--language=he</td><td class="out"><code>[dagesh=0@650,0+0|shindot=0@750,-44+0|shin=0+700]</code></td></tr></tbody></table></div>
+<p id="ix-13">The old font gets its single glyphs. HET has no dagesh form in Unicode, so its dagesh stays a mark, placed by HarfBuzz’s <a href="fallbacks.html#hebrew-and-arabic">fallback</a> positioner. With a <code>mark</code> feature, the letters and points stay apart for GPOS to place, unless the feature is turned off, which takes it out of the plan.</p>
+<p id="ix-14">The last line is the odd one. The test is whether the plan has a <code>mark</code> feature (<code>has_gpos_mark</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L196"><code>hb-ot-shape.cc:196</code></a>), and planning finds the <code>DFLT</code> one. But the Hebrew shaper’s <code>gpos_tag</code> says that GPOS is only used if the script it chose is <code>hebr</code> (<a href="choosing-a-script-shaper.html#hebrew-and-its-gpos-tag">Choosing a script shaper</a>). So that font’s GPOS is ignored, and its presentation forms aren’t used either: the points are placed by the fallback positioner, though the font has glyphs that would do better. The two checks look at different things (read from the code, and shown live here).</p>
+<blockquote>
+<p id="ix-15">For type designers: a Hebrew font gets presentation forms only if it has no <code>mark</code> feature at all, in any script, and gets its GPOS only if GPOS has a <code>hebr</code> script. A font that has both kinds of data should put its GPOS under <code>hebr</code>.</p>
+</blockquote>
+<p id="ix-16"><code>HB_NO_OT_SHAPER_HEBREW_FALLBACK</code> leaves the presentation forms out, and <code>HB_NO_OT_SHAPE_FALLBACK</code> implies it.</p>
+<h2 id="thai-and-lao">Thai and Lao</h2>
+<h3 id="sara-am">SARA AM</h3>
+<p id="ix-17"><strong>SARA AM</strong>, U+0E33 ำ, is a vowel written as a small circle over the consonant and a spacing SARA AA after it. Unicode gives it a compatibility decomposition to NIKHAHIT (U+0E4D) and SARA AA (U+0E32), but a compatibility decomposition is not one that normalization applies. When a tone mark goes on the same consonant, it is typed before SARA AM but drawn above the circle.</p>
+<p id="ix-18">The Thai shaper splits every SARA AM, and moves the NIKHAHIT back over any above-base marks before it. A long comment in <code>preprocess_text_thai</code> says this isn’t in Microsoft’s Thai specification, but is what Uniscribe and other engines do, and gives Eric Muller’s example: <code>&lt;0E14, 0E4B, 0E33&gt;</code> becomes <code>&lt;0E14, 0E4D, 0E4B, 0E32&gt;</code>. The loop, trimmed (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-thai.cc#L324"><code>hb-ot-shaper-thai.cc:324</code></a>):</p>
+<pre><code class="language-c++">if (!IS_SARA_AM (u)) { buffer-&gt;next_glyph (); continue; }
+
+/* Is SARA AM. Decompose and reorder. */
+buffer-&gt;output_glyph (NIKHAHIT_FROM_SARA_AM (u));
+_hb_glyph_info_set_continuation (&amp;buffer-&gt;prev(), buffer);
+buffer-&gt;replace_glyph (SARA_AA_FROM_SARA_AM (u));
+
+/* Make Nikhahit be recognized as a ccc=0 mark when zeroing widths. */
+unsigned int end = buffer-&gt;out_len;
+_hb_glyph_info_set_general_category (&amp;buffer-&gt;out_info[end - 2],
+                                     HB_UNICODE_GENERAL_CATEGORY_NON_SPACING_MARK);
+
+unsigned int start = end - 2;
+while (start &gt; 0 &amp;&amp; IS_ABOVE_BASE_MARK (buffer-&gt;out_info[start - 1].codepoint))
+  start--;
+/* ...move the NIKHAHIT from end - 2 to start, and merge clusters... */
+</code></pre>
+<p id="ix-19">The two new characters are copies of SARA AM, so the NIKHAHIT is given the general category of a non-spacing mark, which the copy lacked. Then it moves back over the run of above-base marks: MAI HAN-AKAT, the upper vowels SARA I to SARA UEE, and MAITAIKHU to YAMAKKAN, which includes the tone marks. The clusters from the first of those to the SARA AA are merged, and then merged with the consonant’s cluster too.</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">thai.ttf</td><td class="in"><span class="txt">กำ</span><span class="cps">U+0E01 U+0E33</span></td><td class="opt">--language=th</td><td class="out"><code>[kokai=0+500|nikhahit=0+0|saraaa=0+300]</code></td></tr><tr><td class="font">thai.ttf</td><td class="in"><span class="txt">ด๋ำ</span><span class="cps">U+0E14 U+0E4B U+0E33</span></td><td class="opt">--language=th</td><td class="out"><code>[dodek=0+500|nikhahit=0+0|maichattawa=0+0|saraaa=0+300]</code></td></tr><tr><td class="font">thai.ttf</td><td class="in"><span class="txt">ดิ๋ำ</span><span class="cps">U+0E14 U+0E34 U+0E4B U+0E33</span></td><td class="opt">--language=th</td><td class="out"><code>[dodek=0+500|nikhahit=0+0|sarai=0+0|maichattawa=0+0|saraaa=0+300]</code></td></tr><tr><td class="font">thai.ttf</td><td class="in"><span class="txt">ด๋ํา</span><span class="cps">U+0E14 U+0E4B U+0E4D U+0E32</span></td><td class="opt">--language=th</td><td class="out"><code>[dodek=0+500|maichattawa=0+0|nikhahit=0+0|saraaa=3+300]</code></td></tr></tbody></table></div>
+<p id="ix-20">In the second line the NIKHAHIT now comes before MAI CHATTAWA, so a font sees the order it sees for a consonant with an upper vowel and a tone mark, and can stack them the same way. In the third it goes back over SARA I as well. The fourth line types NIKHAHIT and SARA AA separately, after the tone mark. They aren’t moved: the comment says the reordering “is legit only when the NIKHAHIT comes from a SARA AM”. They aren’t merged into the consonant’s cluster either, as SARA AA’s cluster number, 3, shows.</p>
+<p id="ix-21">The trace shows the change in the characters, before normalization or the <code>cmap</code> sees them:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape thai.ttf "ด๋ำ" --language=th --trace</code></div><table><tbody><tr><td class="what">start preprocess-text</td><td class="buf"><code>&lt;U+0E14=0|U+0E4B=0|U+0E33=2&gt;</code></td></tr><tr><td class="what">end preprocess-text</td><td class="buf"><code>&lt;U+0E14=0|U+0E4D=0|U+0E4B=0|U+0E32=0&gt;</code></td></tr></tbody></table></div>
+<p id="ix-22">This happens whether or not the font has Thai layout tables, and the font’s own glyph for SARA AM is never used. <code>thai-am-only.ttf</code> has one, and no glyphs for NIKHAHIT or SARA AA:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">thai-am-only.ttf</td><td class="in"><span class="txt">กำ</span><span class="cps">U+0E01 U+0E33</span></td><td class="opt">--language=th</td><td class="out"><code>[kokai=0+500|.notdef=0@-500,0+0|.notdef=0+500]</code></td></tr></tbody></table></div>
+<blockquote>
+<p id="ix-23">For type designers: a Thai font needs glyphs for NIKHAHIT and SARA AA, and a Lao font for their Lao counterparts. A glyph for SARA AM is never reached in HarfBuzz.</p>
+</blockquote>
+<h3 id="old-fonts-and-the-private-use-area">Old fonts and the private use area</h3>
+<p id="ix-24">Before OpenType, Thai fonts for Windows and the Mac had no GPOS to move a mark out of the way of another, or of a consonant’s ascender or descender. They drew the moved forms as extra glyphs, mapped in the <code>cmap</code> to code points in Unicode’s private use area (PUA): a tone mark drawn lower, for when there’s no vowel above, or further left, to clear PO PLA’s ascender; YO YING without its descender, for when a vowel goes below it. Windows fonts put them at U+F700 to U+F71A, Mac fonts at U+F884 to U+F89E. The software chose the form.</p>
+<p id="ix-25">HarfBuzz chooses them too, if the text is Thai and GSUB didn’t find the <code>thai</code> script, which includes fonts with no GSUB at all (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-thai.cc#L368"><code>hb-ot-shaper-thai.cc:368</code></a>). The rules follow Theppitak Karoonboonyanan’s description of Thai shaping, which the source cites (<code>linux.thai.net/~thep/th-otf/shaping.html</code>). <code>do_thai_pua_shaping</code> walks the text with two small state machines, one for the space above the consonant and one for the space below, both reset at each character that isn’t a Thai mark. A consonant sets their starting states by its shape:</p>
+<table>
+<thead>
+<tr>
+<th>Consonants</th>
+<th>Kind</th>
+<th>Above</th>
+<th>Below</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PO PLA, FO FA, FO FAN</td>
+<td>ascender (AC)</td>
+<td>starts in T1</td>
+<td>B0</td>
+</tr>
+<tr>
+<td>YO YING, THO THAN</td>
+<td>removable descender (RC)</td>
+<td>T0</td>
+<td>B1</td>
+</tr>
+<tr>
+<td>DO CHADA, TO PATAK</td>
+<td>strict descender (DC)</td>
+<td>T0</td>
+<td>B2</td>
+</tr>
+<tr>
+<td>the other consonants, U+0E01 to U+0E2E</td>
+<td>normal (NC)</td>
+<td>T0</td>
+<td>B0</td>
+</tr>
+<tr>
+<td>anything else</td>
+<td></td>
+<td>T3</td>
+<td>B2</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-26">Each mark is an upper vowel or sign (MAI HAN-AKAT, SARA I to SARA UEE, MAITAIKHU, NIKHAHIT, YAMAKKAN), a lower vowel (SARA U, SARA UU, PHINTHU) or a tone mark (MAI EK to THANTHAKHAT), and moves both machines on. The transitions that do something are:</p>
+<table>
+<thead>
+<tr>
+<th>Where</th>
+<th>Mark</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T0: nothing above yet</td>
+<td id="ix-27">tone mark</td>
+<td>shift down</td>
+</tr>
+<tr>
+<td>T1: an ascender, nothing above yet</td>
+<td>upper vowel</td>
+<td>shift left</td>
+</tr>
+<tr>
+<td>T1</td>
+<td id="ix-28">tone mark</td>
+<td>shift down and left</td>
+</tr>
+<tr>
+<td>T2: an ascender and a shifted upper vowel</td>
+<td id="ix-29">tone mark</td>
+<td>shift left</td>
+</tr>
+<tr>
+<td>B1: a removable descender</td>
+<td>lower vowel</td>
+<td>take the descender off the consonant</td>
+</tr>
+<tr>
+<td>B2: a strict descender, or a lower vowel already</td>
+<td>lower vowel</td>
+<td>shift down</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-30">Any other mark changes nothing, and once a tone mark or a plain upper vowel has been placed, the state above is T3, where nothing changes again. An action is carried out by looking the character up in one of four small tables, which give its Windows and Mac PUA code points. If the font maps the Windows one, the character becomes that; if not, the Mac one; if neither, it stays as it was (<code>thai_pua_shape</code>, <code>:98</code>). “Take the descender off” changes the consonant, not the mark.</p>
+<p id="ix-31"><code>thai-pua.ttf</code> has the same glyphs as <code>thai.ttf</code> and no layout tables, and maps the moved forms at the Windows code points. <code>thai-pua-mac.ttf</code> maps them at the Mac ones. <code>thai.ttf</code> has a GSUB under <code>thai</code>, whose one lookup removes YO YING’s descender before SARA U, as a modern font’s <code>ccmp</code> might:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">thai.ttf</td><td class="in"><span class="txt">ก่␣ป่␣ปิ่␣ญุ␣ฎุ</span><span class="cps">U+0E01 U+0E48 U+0020 U+0E1B U+0E48 U+0020 U+0E1B U+0E34 U+0E48 U+0020 U+0E0D U+0E38 U+0020 U+0E0E U+0E38</span></td><td class="opt">--language=th</td><td class="out"><code>[kokai=0+500|maiek=0+0|space=2+250|popla=3+500|maiek=3+0|space=5+250|popla=6+500|sarai=6+0|maiek=6+0|space=9+250|yoying.nodesc=10+500|sarau=10+0|space=12+250|dochada=13+500|sarau=13+0]</code></td></tr><tr><td class="font">thai-pua.ttf</td><td class="in"><span class="txt">ก่␣ป่␣ปิ่␣ญุ␣ฎุ</span><span class="cps">U+0E01 U+0E48 U+0020 U+0E1B U+0E48 U+0020 U+0E1B U+0E34 U+0E48 U+0020 U+0E0D U+0E38 U+0020 U+0E0E U+0E38</span></td><td class="opt">--language=th</td><td class="out"><code>[kokai=0+500|maiek.low=0+0|space=2+250|popla=3+500|maiek.lowleft=3+0|space=5+250|popla=6+500|sarai.left=6+0|maiek.left=6+0|space=9+250|yoying.nodesc=10+500|sarau=10+0|space=12+250|dochada=13+500|sarau.low=13+0]</code></td></tr><tr><td class="font">thai-pua-mac.ttf</td><td class="in"><span class="txt">ก่␣ป่␣ปิ่␣ญุ␣ฎุ</span><span class="cps">U+0E01 U+0E48 U+0020 U+0E1B U+0E48 U+0020 U+0E1B U+0E34 U+0E48 U+0020 U+0E0D U+0E38 U+0020 U+0E0E U+0E38</span></td><td class="opt">--language=th</td><td class="out"><code>[kokai=0+500|maiek.low=0+0|space=2+250|popla=3+500|maiek.lowleft=3+0|space=5+250|popla=6+500|sarai.left=6+0|maiek.left=6+0|space=9+250|yoying.nodesc=10+500|sarau=10+0|space=12+250|dochada=13+500|sarau.low=13+0]</code></td></tr><tr><td class="font">thai-pua.ttf</td><td class="in"><span class="txt">กิ่␣ก่ำ</span><span class="cps">U+0E01 U+0E34 U+0E48 U+0020 U+0E01 U+0E48 U+0E33</span></td><td class="opt">--language=th</td><td class="out"><code>[kokai=0+500|sarai=0+0|maiek=0+0|space=3+250|kokai=4+500|nikhahit=4+0|maiek=4+0|saraaa=4+300]</code></td></tr></tbody></table></div>
+<p id="ix-32">In the PUA fonts, MAI EK on KO KAI comes down into the space a vowel would have used, and on PO PLA it also moves left. With SARA I before it on PO PLA, both move left and the tone mark stays high. YO YING loses its descender and DO CHADA’s SARA U goes lower. The Windows and Mac fonts get the same glyphs. In the last line nothing is shifted: an upper vowel is already there, and so is a NIKHAHIT from SARA AM, moved before the tone mark, which counts as one. Drawn, with <code>thai-pua.ttf</code> first and <code>thai.ttf</code>, which has no GPOS to move anything, second:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 3580 1430" role="img" aria-label="ก่␣ป่␣ปิ่␣ญุ␣ฎุ at default">
+<g transform="scale(1,-1)">
+<path d="M50,0L50,500L450,500L450,0L50,0Z" fill="currentColor"/>
+<path d="M325,550L325,700L425,700L425,550L325,550Z" fill="currentColor"/>
+<path d="M800,0L800,500L1200,500L1200,0L800,0ZM1150,500L1150,800L1200,800L1200,500L1150,500Z" fill="currentColor"/>
+<path d="M875,550L875,700L975,700L975,550L875,550Z" fill="currentColor"/>
+<path d="M1550,0L1550,500L1950,500L1950,0L1550,0ZM1900,500L1900,800L1950,800L1950,500L1900,500Z" fill="currentColor"/>
+<path d="M1400,550L1400,650L1775,650L1775,550L1400,550Z" fill="currentColor"/>
+<path d="M1625,700L1625,850L1725,850L1725,700L1625,700Z" fill="currentColor"/>
+<path d="M2300,0L2300,500L2700,500L2700,0L2300,0Z" fill="currentColor"/>
+<path d="M2600,-175L2600,-50L2650,-50L2650,-175L2600,-175Z" fill="currentColor"/>
+<path d="M3050,0L3050,500L3450,500L3450,0L3050,0ZM3050,-200L3050,-150L3450,-150L3450,-200L3050,-200Z" fill="currentColor"/>
+<path d="M3350,-425L3350,-300L3400,-300L3400,-425L3350,-425Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[kokai=0+500|maiek.low=0+0|space=2+250|popla=3+500|maiek.lowleft=3+0|space=5+250|popla=6+500|sarai.left=6+0|maiek.left=6+0|space=9+250|yoying.nodesc=10+500|sarau=10+0|space=12+250|dochada=13+500|sarau.low=13+0]</code></div></div><figcaption><code>hb-vector thai-pua.ttf "ก่␣ป่␣ปิ่␣ญุ␣ฎุ" --language=th</code></figcaption></figure>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 3580 1430" role="img" aria-label="ก่␣ป่␣ปิ่␣ญุ␣ฎุ at default">
+<g transform="scale(1,-1)">
+<path d="M50,0L50,500L450,500L450,0L50,0Z" fill="currentColor"/>
+<path d="M325,700L325,850L425,850L425,700L325,700Z" fill="currentColor"/>
+<path d="M800,0L800,500L1200,500L1200,0L800,0ZM1150,500L1150,800L1200,800L1200,500L1150,500Z" fill="currentColor"/>
+<path d="M1075,700L1075,850L1175,850L1175,700L1075,700Z" fill="currentColor"/>
+<path d="M1550,0L1550,500L1950,500L1950,0L1550,0ZM1900,500L1900,800L1950,800L1950,500L1900,500Z" fill="currentColor"/>
+<path d="M1550,550L1550,650L1925,650L1925,550L1550,550Z" fill="currentColor"/>
+<path d="M1825,700L1825,850L1925,850L1925,700L1825,700Z" fill="currentColor"/>
+<path d="M2300,0L2300,500L2700,500L2700,0L2300,0Z" fill="currentColor"/>
+<path d="M2600,-175L2600,-50L2650,-50L2650,-175L2600,-175Z" fill="currentColor"/>
+<path d="M3050,0L3050,500L3450,500L3450,0L3050,0ZM3050,-200L3050,-150L3450,-150L3450,-200L3050,-200Z" fill="currentColor"/>
+<path d="M3350,-175L3350,-50L3400,-50L3400,-175L3350,-175Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[kokai=0+500|maiek=0+0|space=2+250|popla=3+500|maiek=3+0|space=5+250|popla=6+500|sarai=6+0|maiek=6+0|space=9+250|yoying.nodesc=10+500|sarau=10+0|space=12+250|dochada=13+500|sarau=13+0]</code></div></div><figcaption><code>hb-vector thai.ttf "ก่␣ป่␣ปิ่␣ญุ␣ฎุ" --language=th</code></figcaption></figure>
+<p id="ix-33">In the second drawing, the tone marks on PO PLA run into its ascender and SARA U on DO CHADA runs into its descender. A modern font would move them with GPOS.</p>
+<p id="ix-34">The new code points replace the characters in the buffer, before normalization, so the <code>cmap</code> is asked for them in the ordinary way:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape thai-pua.ttf "ปิ่" --language=th --trace</code></div><table><tbody><tr><td class="what">start preprocess-text</td><td class="buf"><code>&lt;U+0E1B=0|U+0E34=0|U+0E48=0&gt;</code></td></tr><tr><td class="what">end preprocess-text</td><td class="buf"><code>&lt;U+0E1B=0|U+F701=0|U+F713=0&gt;</code></td></tr></tbody></table></div>
+<p id="ix-35">Only the code point changes. The Unicode properties were set before this step, so the PUA character keeps the general category and combining class of the mark it replaced: it is still zeroed as a mark, and still sorted with the other marks (read from the code: the hook writes only <code>codepoint</code>). Each mark the machines look at also marks the text from its consonant to it as unsafe to break.</p>
+<p id="ix-36"><code>HB_NO_OT_SHAPER_THAI_FALLBACK</code> (implied by <code>HB_NO_OT_SHAPE_FALLBACK</code>) leaves the PUA shaping out, but not SARA AM’s.</p>
+<h3 id="why-lao-shares-the-shaper">Why Lao shares the shaper</h3>
+<p id="ix-37">The Lao block was laid out after the Thai one, and the characters the shaper cares about are at the same places, 0x80 higher. The comment in <code>preprocess_text_thai</code> puts it as “Note how the Lao versions are the same as Thai + 0x80”, and the code tests characters with that bit masked off:</p>
+<pre><code class="language-c++">#define IS_SARA_AM(x) (((x) &amp; ~0x0080u) == 0x0E33u)
+</code></pre>
+<p id="ix-38">So Lao’s SARA AM, U+0EB3, is split and its NIKHAHIT moved the same way:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">thai.ttf</td><td class="in"><span class="txt">ກ່ຳ</span><span class="cps">U+0E81 U+0EC8 U+0EB3</span></td><td class="opt">--language=lo</td><td class="out"><code>[lko=0+500|lnikhahit=0+0|lmaiek=0+0|lsaraaa=0+300]</code></td></tr></tbody></table></div>
+<p id="ix-39">The PUA fallback is Thai only: its tables hold only Thai code points, and the test is for <code>HB_SCRIPT_THAI</code>. The modified combining class that puts SARA U and SARA UU before PHINTHU is Thai only too, since “Lao does NOT have a U+0E3A equivalent” (<code>:297</code>). Neither script gets fallback mark positioning or a legacy <code>kern</code> table, as <a href="fallbacks.html#who-decides">Fallbacks</a> and <a href="legacy-kern.html">Legacy kern</a> explain: the Thai shaper’s <code>fallback_position</code> is false.</p>
+<h2 id="hangul">Hangul</h2>
+<h3 id="syllables-and-jamo">Syllables and jamo</h3>
+<p id="ix-40">A Korean syllable is written as a block of two or three letters, <strong>jamo</strong>: a leading consonant (L), a vowel (V) and an optional trailing consonant (T). Unicode encodes the jamo, U+1100 to U+11FF and two extension blocks, and also 11,172 <strong>precomposed syllables</strong>, U+AC00 to U+D7A3, one for each combination of the 19 modern leading consonants, 21 vowels and 28 trailing choices (27 consonants or none). The syllables decompose to jamo by arithmetic, and the jamo compose back. The other jamo, in U+1100 to U+11FF and the extension blocks U+A960 and U+D7B0, are for <strong>Old Hangul</strong>, Korean as written before the twentieth century, whose syllables have no precomposed characters. A font shows an Old Hangul syllable by combining jamo glyphs, chosen by the features <code>ljmo</code>, <code>vjmo</code> and <code>tjmo</code>.</p>
+<p id="ix-41">So one syllable can come as a precomposed character <code>&lt;LV&gt;</code> or <code>&lt;LVT&gt;</code>, as jamo <code>&lt;L,V&gt;</code> or <code>&lt;L,V,T&gt;</code>, or as <code>&lt;LV,T&gt;</code>, and a font may have a glyph for the precomposed syllable, or jamo that combine, or both. Fonts, a comment in normalization says, “are not designed to mix-and-match pre-composed syllables and Jamo” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc#L440"><code>hb-ot-shape-normalize.cc:440</code></a>). The Hangul shaper’s job is to pick one for each syllable, from what the font has.</p>
+<h3 id="composing-and-decomposing-with-the-font-in-mind">Composing and decomposing, with the font in mind</h3>
+<p id="ix-42">It uses normalization mode <code>NONE</code>, so that normalization neither composes nor decomposes (<a href="normalization.html">Normalization</a>), and does both itself in <code>preprocess_text_hangul</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-hangul.cc#L144"><code>hb-ot-shaper-hangul.cc:144</code></a>). Its comment states the aim:</p>
+<blockquote>
+<ul>
+<li>If the whole syllable can be precomposed, do that,</li>
+<li id="ix-43">Otherwise, fully decompose and apply ljmo/vjmo/tjmo features.</li>
+</ul>
+</blockquote>
+<p id="ix-44">In more detail, the loop looks at each character in turn:</p>
+<ul>
+<li id="ix-45"><strong><code>&lt;L,V&gt;</code> or <code>&lt;L,V,T&gt;</code>.</strong> If all are modern jamo that compose, and the font has the precomposed syllable, they become that one character. Otherwise they stay jamo, marked for the three features.</li>
+<li id="ix-46"><strong><code>&lt;LV&gt;</code> or <code>&lt;LVT&gt;</code>.</strong> If the next character is a T that composes and the font has the result, they become that. Otherwise, if the font lacks the syllable, or the next character is a T that can’t compose with it, the syllable is decomposed into jamo, if the font has all of them, and marked for the features. A T that followed is taken into the syllable.</li>
+</ul>
+<p id="ix-47">“Compose” here means only the modern jamo: L from U+1100 to U+1112, V from U+1161 to U+1175, T from U+11A8 to U+11C2. And “the whole syllable” means it: if the font has GA but not GAK, then GA followed by the trailing KIYEOK is decomposed into three jamo, not left as GA and one jamo. <code>hangul.ttf</code> has the syllables GA (가) and GAK (각) and the jamo they’re made of. <code>hangul-no-gak.ttf</code> is the same without GAK. Each line spells GA or GAK one of the possible ways:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">가</span><span class="cps">U+AC00</span></td><td class="opt">--language=ko</td><td class="out"><code>[ga=0+1000]</code></td></tr><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">가</span><span class="cps">U+1100 U+1161</span></td><td class="opt">--language=ko</td><td class="out"><code>[ga=0+1000]</code></td></tr><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">각</span><span class="cps">U+AC01</span></td><td class="opt">--language=ko</td><td class="out"><code>[gak=0+1000]</code></td></tr><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">각</span><span class="cps">U+1100 U+1161 U+11A8</span></td><td class="opt">--language=ko</td><td class="out"><code>[gak=0+1000]</code></td></tr><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">각</span><span class="cps">U+AC00 U+11A8</span></td><td class="opt">--language=ko</td><td class="out"><code>[gak=0+1000]</code></td></tr><tr><td class="font">hangul-no-gak.ttf</td><td class="in"><span class="txt">가</span><span class="cps">U+1100 U+1161</span></td><td class="opt">--language=ko</td><td class="out"><code>[ga=0+1000]</code></td></tr><tr><td class="font">hangul-no-gak.ttf</td><td class="in"><span class="txt">각</span><span class="cps">U+AC01</span></td><td class="opt">--language=ko</td><td class="out"><code>[kiyeok.ljmo=0+500|a.vjmo=0+500|kiyeokT.tjmo=0+500]</code></td></tr><tr><td class="font">hangul-no-gak.ttf</td><td class="in"><span class="txt">각</span><span class="cps">U+1100 U+1161 U+11A8</span></td><td class="opt">--language=ko</td><td class="out"><code>[kiyeok.ljmo=0+500|a.vjmo=0+500|kiyeokT.tjmo=0+500]</code></td></tr><tr><td class="font">hangul-no-gak.ttf</td><td class="in"><span class="txt">각</span><span class="cps">U+AC00 U+11A8</span></td><td class="opt">--language=ko</td><td class="out"><code>[kiyeok.ljmo=0+500|a.vjmo=0+500|kiyeokT.tjmo=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-48">Each spelling of a syllable gives the same glyphs in the same font: GAK where the font has it, and otherwise the three jamo in their <code>ljmo</code>, <code>vjmo</code> and <code>tjmo</code> forms. The trace shows the decomposition in the characters:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape hangul-no-gak.ttf "각" --language=ko --trace</code></div><table><tbody><tr><td class="what">start preprocess-text</td><td class="buf"><code>&lt;U+AC01=0&gt;</code></td></tr><tr><td class="what">end preprocess-text</td><td class="buf"><code>&lt;U+1100=0|U+1161=0|U+11A8=0&gt;</code></td></tr></tbody></table></div>
+<p id="ix-49">An Old Hangul syllable never composes. Neither does a modern one with an Old Hangul trailing consonant, such as U+11EB PANSIOS, even where the font has the syllable before it:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">ᄒᆞᆫ</span><span class="cps">U+1112 U+119E U+11AB</span></td><td class="opt">--language=ko</td><td class="out"><code>[hieuh.ljmo=0+500|araea.vjmo=0+500|nieunT.tjmo=0+500]</code></td></tr><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">가ᇫ</span><span class="cps">U+AC00 U+11EB</span></td><td class="opt">--language=ko</td><td class="out"><code>[kiyeok.ljmo=0+500|a.vjmo=0+500|pansiosT.tjmo=0+500]</code></td></tr></tbody></table></div>
+<h3 id="the-jamo-features">The jamo features</h3>
+<p id="ix-50"><code>collect_features_hangul</code> adds <code>ljmo</code>, <code>vjmo</code> and <code>tjmo</code> to the plan. They aren’t global: each gets its own mask bit (<a href="from-features-to-lookups.html#mask-bits">From features to lookups</a>). While it composes and decomposes, the shaper writes into a spare byte of each jamo it leaves (<code>hangul_shaping_feature</code>, a buffer variable that <a href="buffers.html">Buffers</a> lists) which of the three it should get, and <code>setup_masks_hangul</code> turns that into the feature’s mask bit (<code>:408</code>). So a font’s <code>ljmo</code> lookup only touches an L that begins a syllable of jamo. A leading consonant on its own isn’t one:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">ᄀ</span><span class="cps">U+1100</span></td><td class="opt">--language=ko</td><td class="out"><code>[kiyeok=0+500]</code></td></tr><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">가ᇫ</span><span class="cps">U+1100 U+1161 U+11EB</span></td><td class="opt">--language=ko</td><td class="out"><code>[kiyeok.ljmo=0+500|a.vjmo=0+500|pansiosT.tjmo=0+500]</code></td></tr></tbody></table></div>
+<h3 id="calt-kept-off-jamo"><code>calt</code>, kept off jamo</h3>
+<p id="ix-51">Uniscribe doesn’t apply <code>calt</code> to Hangul, and some fonts, Noto Sans CJK and Source Han Sans among them, put all their jamo lookups in <code>calt</code>, where they aren’t wanted (the comment at <code>:69</code>, citing HarfBuzz discussion #4853; <a href="why-shaping-exists.html">Why shaping exists</a> has more on Uniscribe’s influence). Until 14.3.0 HarfBuzz turned <code>calt</code> off for the whole run. Now <code>override_features_hangul</code> asks for <code>calt</code> once more, which gives it a mask bit of its own (<a href="from-features-to-lookups.html">From features to lookups</a>), and <code>setup_masks_hangul</code> clears that bit on every jamo character, L, V or T. Everything else in the run, syllables included, keeps <code>calt</code>. The test font’s <code>calt</code> changes the first of two KIYEOKs, and the first of two GAs:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">ᄀᄀ</span><span class="cps">U+1100 U+1100</span></td><td class="opt">--language=ko</td><td class="out"><code>[kiyeok=0+500|kiyeok=1+500]</code></td></tr><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">가가</span><span class="cps">U+AC00 U+AC00</span></td><td class="opt">--language=ko</td><td class="out"><code>[ga.calt=0+1000|ga=1+1000]</code></td></tr><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">가가</span><span class="cps">U+1100 U+1161 U+1100 U+1161</span></td><td class="opt">--language=ko</td><td class="out"><code>[ga.calt=0+1000|ga=2+1000]</code></td></tr></tbody></table></div>
+<p id="ix-52">The two jamo are left alone. The syllables, including the ones composed from jamo, get the rule. Since the check is on the character, jamo still count as context for other glyphs’ <code>calt</code> rules: a context needn’t have the lookup’s mask (<a href="gsub.html#context-and-chained-context">GSUB</a>).</p>
+<h3 id="tone-marks">Tone marks</h3>
+<p id="ix-53">Middle Korean marked pitch with dots beside the syllable, encoded as U+302E HANGUL SINGLE DOT TONE MARK and U+302F HANGUL DOUBLE DOT TONE MARK. They follow the syllable in the text but are written before it, to its left. The shaper moves a <strong>tone mark</strong> that follows a syllable it has just recognized to the front of it, and merges their clusters, unless the font gives the tone mark zero advance, in which case “we leave it untouched, assuming it’s designed to overstrike” (<code>:174</code>). In <code>hangul.ttf</code> the single dot has an advance and the double dot doesn’t:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">가〮</span><span class="cps">U+AC00 U+302E</span></td><td class="opt">--language=ko</td><td class="out"><code>[singledot=0+200|ga=0+1000]</code></td></tr><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">ᄒᆞᆫ〮</span><span class="cps">U+1112 U+119E U+11AB U+302E</span></td><td class="opt">--language=ko</td><td class="out"><code>[singledot=0+200|hieuh.ljmo=0+500|araea.vjmo=0+500|nieunT.tjmo=0+500]</code></td></tr><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">가〯</span><span class="cps">U+AC00 U+302F</span></td><td class="opt">--language=ko</td><td class="out"><code>[ga=0+1000|doubledot=0@-400,0+0]</code></td></tr></tbody></table></div>
+<p id="ix-54">The double dot stays where it was typed, and since the font has no GPOS, HarfBuzz’s fallback positioner centers it over the syllable, as it does any mark of its class (<a href="fallbacks.html#what-it-doesnt-take-into-account">Fallbacks</a>).</p>
+<p id="ix-55">A tone mark that doesn’t follow a recognized syllable gets a dotted circle, unless the buffer says not to or the font has none. It is the Hangul shaper’s own way of inserting one, one of four in HarfBuzz (<a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a>). A tone mark with an advance goes before the circle, and a zero-width one after it. Two things about it look like bugs:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">〮</span><span class="cps">U+302E</span></td><td class="opt">--language=ko</td><td class="out"><code>[singledot=0+200|dottedcircle=0+500]</code></td></tr><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">ᄀ〮</span><span class="cps">U+1100 U+302E</span></td><td class="opt">--language=ko</td><td class="out"><code>[kiyeok=0+500|singledot=0@-350,0+0|dottedcircle=0@-500,0+0]</code></td></tr><tr><td class="font">hangul.ttf</td><td class="in"><span class="txt">〮</span><span class="cps">U+302E</span></td><td class="opt">--language=ko --bot</td><td class="out"><code>[dottedcircle=0+500|singledot=0@-350,0+0|dottedcircle=0@-500,0+0]</code></td></tr></tbody></table></div>
+<p id="ix-56">The dotted circle is made by <code>replace_glyphs</code>, which copies the tone mark’s buffer entry, Unicode properties and all (<code>:245</code>). So the circle is a spacing mark too, and when it follows a base, as it does after a lone KIYEOK in the second line, the fallback positioner treats it as one: it loses its advance and is placed over the KIYEOK. The generic dotted circle, inserted at the start of text, gets the properties of U+25CC instead (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L567"><code>hb-ot-shape.cc:567</code></a>). And that generic circle comes first: at the beginning of text (<code>--bot</code>), HarfBuzz has already put a dotted circle before the tone mark, but to the Hangul shaper that circle isn’t a syllable, so it adds a second.</p>
+<blockquote>
+<p id="ix-57">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/2831a8a45c77c180373987312958d31b3575a72c"><code>2831a8a</code></a> and <a href="https://github.com/harfbuzz/harfbuzz/commit/59fa8f0c28df047b6786a60febf2c8b53a694e05"><code>59fa8f0</code></a> (17 November 2026), so main gives the circle U+25CC’s own properties, and it keeps its advance; with <code>--bot</code>, the circle already there serves as the tone mark’s base, and there is one.</p>
+</blockquote>
+<h3 id="old-hangul-and-koh">Old Hangul and <code>KOH</code></h3>
+<p id="ix-58">The shaper never looks at the language. OpenType has a language system tag for Old Hangul, <code>KOH</code>, and HarfBuzz maps the language <code>ko</code> to <code>KOR</code> and then <code>KOH</code>, and <code>okm</code>, Middle Korean, to <code>KOH</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-tag-table.hh#L113"><code>hb-ot-tag-table.hh:113</code></a>, <code>:933</code>; <a href="choosing-a-script-shaper.html#from-a-language-to-language-system-tags">Choosing a script shaper</a>). So a font that keeps its jamo features under <code>KOH</code> alone still gets them for Korean text, unless it also has a <code>KOR</code> language system. <code>hangul-koh.ttf</code> registers <code>ljmo</code>, <code>vjmo</code> and <code>tjmo</code> only under <code>KOH</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hangul-koh.ttf</td><td class="in"><span class="txt">ᄒᆞᆫ</span><span class="cps">U+1112 U+119E U+11AB</span></td><td class="opt">--language=ko</td><td class="out"><code>[hieuh.ljmo=0+500|araea.vjmo=0+500|nieunT.tjmo=0+500]</code></td></tr><tr><td class="font">hangul-koh.ttf</td><td class="in"><span class="txt">ᄒᆞᆫ</span><span class="cps">U+1112 U+119E U+11AB</span></td><td class="opt">--language=okm</td><td class="out"><code>[hieuh.ljmo=0+500|araea.vjmo=0+500|nieunT.tjmo=0+500]</code></td></tr><tr><td class="font">hangul-koh.ttf</td><td class="in"><span class="txt">ᄒᆞᆫ</span><span class="cps">U+1112 U+119E U+11AB</span></td><td class="opt">--language=en</td><td class="out"><code>[hieuh=0+500|araea=0+500|nieunT=0+500]</code></td></tr></tbody></table></div>
+<blockquote>
+<p id="ix-59">For type designers: the Hangul shaper uses a precomposed syllable whenever the font has it, and decomposes it whenever the font lacks it and has all its jamo. A font with jamo features for Old Hangul still gets precomposed glyphs for modern syllables. Put jamo lookups in <code>ljmo</code>, <code>vjmo</code> and <code>tjmo</code>, not <code>calt</code>, and don’t rely on <code>calt</code> reaching jamo.</p>
+</blockquote>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-hebrew.cc"><code>src/hb-ot-shaper-hebrew.cc</code></a></td>
+<td><code>compose_hebrew</code> (presentation forms), <code>reorder_marks_hebrew</code>, the <code>gpos_tag</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-thai.cc"><code>src/hb-ot-shaper-thai.cc</code></a></td>
+<td><code>preprocess_text_thai</code> (SARA AM), <code>do_thai_pua_shaping</code> and <code>thai_pua_shape</code> (the PUA fallback)</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-hangul.cc"><code>src/hb-ot-shaper-hangul.cc</code></a></td>
+<td><code>preprocess_text_hangul</code> (composing, decomposing, tone marks), the jamo features and <code>calt</code> masks</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh"><code>src/hb-unicode.hh</code></a></td>
+<td>the modified combining classes for Hebrew, Thai and Lao</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc"><code>src/hb-ot-shape-normalize.cc</code></a></td>
+<td>where <code>compose</code> and <code>reorder_marks</code> are called, and mode <code>NONE</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>src/hb-ot-shape.cc</code></a></td>
+<td><code>has_gpos_mark</code> and the <code>gpos_tag</code> test, in the planner</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-tag-table.hh"><code>src/hb-ot-tag-table.hh</code></a></td>
+<td><code>ko</code> to <code>KOR</code> and <code>KOH</code>, generated by <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-tag-table.py"><code>gen-tag-table.py</code></a></td>
+</tr>
+</tbody>
+</table>
+<p>None of this chapter’s tables is generated: the Hebrew presentation forms, the Thai state machines and PUA mappings, and the Hangul constants are written out in the shaper files.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Hebrew: after normalization sorts the points, one sequence is swapped so that a meteg or accent below follows a patah or qamats. Old fonts with no <code>mark</code> feature get Hebrew presentation forms, composed from letters and points. A <code>mark</code> feature under <code>DFLT</code> stops that, though the GPOS it is in is ignored.</li>
+<li>Thai and Lao: SARA AM is always split into NIKHAHIT and SARA AA, and the NIKHAHIT moved back before any tone mark, so the font needs those two glyphs.</li>
+<li>Thai fonts without a <code>thai</code> GSUB script get marks and consonants swapped for the Windows or Mac private-use glyphs that old fonts used, chosen by two small state machines.</li>
+<li>Lao shares the Thai shaper because its block mirrors Thai’s, 0x80 higher; the PUA fallback is Thai only.</li>
+<li>Hangul: each syllable becomes a precomposed glyph if the font has the whole of it, and jamo with <code>ljmo</code>, <code>vjmo</code> and <code>tjmo</code> otherwise. <code>calt</code> is kept off jamo only.</li>
+<li>Hangul tone marks move before their syllable unless they have zero width. The dotted circle the shaper adds for a stray tone mark is given the tone mark’s properties, which looks like a bug.</li>
+</ul>
+<blockquote>
+<p>Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/2831a8a45c77c180373987312958d31b3575a72c"><code>2831a8a</code></a> (17 November 2026), so main gives the tone mark’s dotted circle U+25CC’s own properties (the item on Hangul tone marks).</p>
+</blockquote>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="joining-scripts.html">← Joining scripts</a><a rel="next" href="indic-model.html">The Indic model →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

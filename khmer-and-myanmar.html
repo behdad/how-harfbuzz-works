@@ -1,0 +1,733 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Khmer and Myanmar · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part VI · Scripts</p>
+<h1 id="khmer-and-myanmar">26. Khmer and Myanmar</h1>
+<p id="ix-1">Khmer and Myanmar are written with scripts of the Brahmi family, like the nine of <a href="indic-model.html">the Indic model</a>, and each has a shaper of its own. Both began inside the Indic shaper: <code>NEWS</code> for 0.9.2 announces a “New Indic shaper, supporting main Indic scripts, Sinhala, and Khmer”, 0.9.13 a “New Win8-style Myanmar shaper”, and 1.7.5 says “Separate Khmer shaper from Indic.” What they kept is the machinery: the generated table of categories, a Ragel scanner over them, the <code>syllable</code> byte, <code>foreach_syllable</code>, a stable sort by position, and dotted circles for broken clusters.</p>
+<p id="ix-2">What they dropped is most of the Indic shaper’s cleverness. Neither asks the font which consonant is the base, neither has a final reordering, and neither sets more than a handful of mask bits. Each reorders a syllable once, before its basic features, in the order Microsoft’s specification for the script gives, and then lets the font’s lookups do the rest. The two differ from each other in one way that matters to fonts: Khmer’s basic features run together, Myanmar’s one at a time.</p>
+<p id="ix-3">The examples use four test fonts with plain boxes for glyphs, built by <code>fonts/khmer-and-myanmar/build-fonts.py</code>. <code>khmer.ttf</code> has lookups under <code>khmr</code> for <code>pref</code>, <code>blwf</code>, <code>abvf</code>, <code>pstf</code>, <code>cfar</code> and <code>psts</code>; <code>khmer-no-pref.ttf</code> leaves out <code>pref</code>, and <code>khmer-late.ttf</code> puts <code>cfar</code>’s lookup first in the LookupList. <code>myanmar.ttf</code> has lookups under <code>mym2</code> for <code>rphf</code>, <code>pref</code> and <code>blwf</code>. Every result and trace on this page was produced by running HarfBuzz 15.1.0 on them when the page was built.</p>
+<h2 id="side-by-side">Side by side</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Indic</th>
+<th>Khmer</th>
+<th>Myanmar</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>categories</td>
+<td>the shared table</td>
+<td>the shared table, Khmer’s own overrides</td>
+<td>the shared table, Myanmar’s own overrides</td>
+</tr>
+<tr>
+<td id="ix-4">positions</td>
+<td>from the table, then from the font</td>
+<td>none</td>
+<td>assigned while reordering</td>
+</tr>
+<tr>
+<td>syllable types</td>
+<td>six</td>
+<td>three</td>
+<td>three</td>
+</tr>
+<tr>
+<td id="ix-5"><code>locl</code> and <code>ccmp</code></td>
+<td>before reordering</td>
+<td id="ix-6">after reordering, with the basic features</td>
+<td>before reordering</td>
+</tr>
+<tr>
+<td>reorderings</td>
+<td id="ix-7">initial and final</td>
+<td>one</td>
+<td>one</td>
+</tr>
+<tr>
+<td>asks the font</td>
+<td id="ix-8"><code>rphf</code>, <code>pref</code>, <code>blwf</code>, <code>pstf</code>, <code>vatu</code></td>
+<td>never</td>
+<td>never</td>
+</tr>
+<tr>
+<td id="ix-9">basic features</td>
+<td id="ix-10">one stage each</td>
+<td id="ix-11">one stage for all</td>
+<td id="ix-12">one stage each</td>
+</tr>
+<tr>
+<td id="ix-13">masks</td>
+<td id="ix-14">most basic features</td>
+<td id="ix-15"><code>pref</code>, <code>blwf</code>, <code>abvf</code>, <code>pstf</code>, <code>cfar</code></td>
+<td>none</td>
+</tr>
+<tr>
+<td id="ix-16">presentation features</td>
+<td>within the syllable</td>
+<td>across syllables</td>
+<td>across syllables</td>
+</tr>
+<tr>
+<td>zero-width marks</td>
+<td>none</td>
+<td>none</td>
+<td id="ix-17">by GDEF, before GPOS</td>
+</tr>
+<tr>
+<td id="ix-18"><code>liga</code></td>
+<td>off</td>
+<td id="ix-19">off, and <code>clig</code> on</td>
+<td>on</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-20">The rest of the chapter goes through the rows, script by script.</p>
+<h2 id="khmer">Khmer</h2>
+<p id="ix-21">The shaper is <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-khmer.cc"><code>hb-ot-shaper-khmer.cc</code></a> (381 lines), about a quarter of the Indic shaper’s size, and its grammar <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-khmer-machine.rl"><code>hb-ot-shaper-khmer-machine.rl</code></a>. Unlike Myanmar and the Indic scripts, Khmer gets its shaper whatever script tag the font’s GSUB was found under, <code>DFLT</code> included (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh#L247"><code>hb-ot-shaper.hh:247</code></a>).</p>
+<h3 id="categories">Categories</h3>
+<p id="ix-22"><code>setup_masks_khmer</code> (<code>:174</code>) looks each character up with <code>hb_indic_get_categories</code>, the same function as the Indic shaper, and keeps only the low byte, the category, in the scratch byte <code>khmer_category</code> (<a href="buffers.html#eight-bytes-of-scratch-space">Buffers</a>). The position in the high byte is thrown away: Khmer has no use for it.</p>
+<p id="ix-23">The generator gives Khmer and Myanmar vowel signs a category made from their position (<code>position_to_category</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py#L434"><code>gen-indic-table.py:434</code></a>, applied at <code>:473</code>): a left one is <code>VPre</code>, a top one <code>VAbv</code>, a bottom one <code>VBlw</code>, a right one <code>VPst</code>. A two-part vowel sign has the position of its last part, so U+17BE KHMER VOWEL SIGN OE, top and left, is <code>VAbv</code>, and U+17C4 KHMER VOWEL SIGN OO, left and right, is <code>VPst</code>. Then come Khmer’s overrides (<code>:312</code>):</p>
+<table>
+<thead>
+<tr>
+<th id="ix-24">Category</th>
+<th id="ix-25">Characters</th>
+<th>What they are</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Ra</code></td>
+<td>U+179A</td>
+<td id="ix-26">RO, so that the reordering can find COENG + RO</td>
+</tr>
+<tr>
+<td><code>Robatic</code></td>
+<td>U+17C9, U+17CA, U+17CC</td>
+<td>the two register shifters, and ROBAT</td>
+</tr>
+<tr>
+<td><code>Xgroup</code></td>
+<td>U+17C6, U+17CB, U+17CD–U+17D1</td>
+<td>signs above the base, such as NIKAHIT</td>
+</tr>
+<tr>
+<td><code>Ygroup</code></td>
+<td>U+17C7, U+17C8, U+17DD, U+17D3</td>
+<td>signs after it, such as REAHMUK; for U+17D3, “Just guessing. Uniscribe doesn’t categorize it.”</td>
+</tr>
+<tr>
+<td><code>PLACEHOLDER</code></td>
+<td>U+17D9</td>
+<td>issue #2384</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-27">The rest come from Unicode through the shared mapping. U+17D2 KHMER SIGN <strong>COENG</strong>, which makes the consonant after it a <strong>subscript</strong>, written below or beside the base, is an <code>Invisible_Stacker</code>, and so <code>H</code>: “We use category H for spec category Coeng” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-khmer-machine.rl#L58"><code>hb-ot-shaper-khmer-machine.rl:58</code></a>). The consonants are <code>C</code>, the independent vowels <code>V</code>. The machine exports the categories it uses with the same numbers as the Indic machine’s (<code>C = 1</code>, <code>H = 4</code>, <code>Ra = 15</code> and so on), since the table holds one number per character for all three shapers, and adds 20 to 27 for its own. The table checks only that Khmer’s and Myanmar’s four vowel categories agree (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic-table.cc#L61"><code>hb-ot-shaper-indic-table.cc:61</code></a>); the shared numbers are kept equal by hand.</p>
+<h3 id="syllables">Syllables</h3>
+<p id="ix-28">The grammar (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-khmer-machine.rl#L79"><code>hb-ot-shaper-khmer-machine.rl:79</code></a>), “experimentally extracted from what Uniscribe allows”:</p>
+<pre><code>c = (C | Ra | V);
+cn = c.((ZWJ|ZWNJ)?.Robatic)?;
+joiner = (ZWJ | ZWNJ);
+xgroup = (joiner*.Xgroup)*;
+ygroup = Ygroup*;
+
+matra_group = VPre? xgroup VBlw? xgroup (joiner?.VAbv)? xgroup VPst?;
+syllable_tail = xgroup matra_group xgroup (H.c)? ygroup;
+
+broken_cluster =	Robatic? (H.cn)* (H | syllable_tail);
+consonant_syllable =	(cn|PLACEHOLDER|DOTTEDCIRCLE) broken_cluster;
+other =			any;
+</code></pre>
+<p id="ix-29">A <strong>Khmer consonant syllable</strong> is a consonant or independent vowel, any number of subscripts (COENG + consonant), at most one vowel sign of each position, with the above signs between them, and the signs after. Compared with the Indic grammar there is no reph, no nukta and no half form; a vowel is just another consonant, so there are no vowel syllables; joiners appear only before above signs, an above vowel sign, the register shifters and ROBAT; and the syllable may end with a lone COENG, where Indic would need virama + ZWNJ. Two details go beyond the specification: one more COENG + consonant may follow the vowel signs, and a pre-base and a post-base vowel sign may stand together, which the specification forbids but which the split vowel signs need once they are decomposed. There are three syllable types: consonant syllables, broken clusters (marks with nothing to attach to, which get a dotted circle as in <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a>) and <strong>non-Khmer clusters</strong>, of one character each.</p>
+<h3 id="features-and-stages">Features and stages</h3>
+<p><code>collect_features_khmer</code> (<code>:101</code>):</p>
+<pre><code class="language-c++">map-&gt;add_gsub_pause (setup_syllables_khmer);
+map-&gt;add_gsub_pause (reorder_khmer);
+
+/* Testing suggests that Uniscribe does NOT pause between basic
+ * features.  Test with KhmerUI.ttf and the following three
+ * sequences:
+ ...
+ * https://github.com/harfbuzz/harfbuzz/issues/974
+ */
+map-&gt;enable_feature (HB_TAG('l','o','c','l'), F_PER_SYLLABLE);
+map-&gt;enable_feature (HB_TAG('c','c','m','p'), F_PER_SYLLABLE);
+
+unsigned int i = 0;
+for (; i &lt; KHMER_BASIC_FEATURES; i++)
+  map-&gt;add_feature (khmer_features[i]);
+
+/* https://github.com/harfbuzz/harfbuzz/issues/3531 */
+map-&gt;add_gsub_pause (hb_syllabic_clear_var);
+
+for (; i &lt; KHMER_NUM_FEATURES; i++)
+  map-&gt;add_feature (khmer_features[i]);
+</code></pre>
+<p id="ix-30">(trimmed). The syllables are found and reordered in two pauses before any of the shaper’s lookups. Then <code>locl</code>, <code>ccmp</code> and the five basic features, <code>pref</code>, <code>blwf</code>, <code>abvf</code>, <code>pstf</code> and <code>cfar</code>, share one stage, confined to the syllable. The syllable byte is cleared, and the presentation features <code>pres</code>, <code>abvs</code>, <code>blws</code> and <code>psts</code> follow, global, with the common and horizontal features. <code>override_features_khmer</code> (<code>:135</code>) turns <code>liga</code> off and <code>clig</code> on, since the “Khmer spec has ‘clig’ as part of required shaping features”. All the features have both manual-joiner flags (<a href="gsub.html#joiners">Joiners</a>). <a href="feature-order.html#khmer">Feature order</a> lists these stages beside the other shapers’.</p>
+<p id="ix-31">Three things differ from the Indic stages. <code>locl</code> and <code>ccmp</code> come after the reordering, not before, so they see the reordered syllable. The basic features have no pauses between them, so their lookups run in the order of the font’s LookupList, not in the order of the features (<a href="from-features-to-lookups.html#sorting-and-lookups-shared-by-features">Sorting, and lookups shared by features</a>). <a href="why-shaping-exists.html">Why shaping exists</a> quoted the reason: Uniscribe was found to work that way. And with the syllable byte gone, the presentation features see across syllables, where the Indic shaper keeps its presentation features within one. The comment above the array still says the basic features “are applied all at once, before reordering”; they run after it.</p>
+<p id="ix-32">The basic features have mask bits, and the reordering sets them. <code>cfar</code>, “Conjunct Form After Ro”, is the one feature here the Indic shaper doesn’t have.</p>
+<h3 id="reordering">Reordering</h3>
+<p id="ix-33"><code>reorder_khmer</code> (<code>:302</code>) inserts dotted circles, then calls <code>reorder_consonant_syllable</code> (<code>:206</code>) on every consonant syllable and broken cluster. Its comment cites Microsoft’s Devanagari specification, but the steps quoted inside are the Khmer specification’s. It does three things.</p>
+<p id="ix-34"><strong>Masks.</strong> Every glyph after the first gets <code>blwf</code>, <code>abvf</code> and <code>pstf</code>. The specification gives each subscript one of the three, by its subscript type; HarfBuzz lets the font’s lookups choose, by which glyphs they match.</p>
+<p id="ix-35"><strong>COENG + RO.</strong> A COENG followed by RO is moved, with the RO, to the start of the syllable, and the two get the <code>pref</code> mask (<code>:239</code>):</p>
+<pre><code class="language-c++">if (info[i].khmer_category() == K_Cat(H) &amp;&amp; num_coengs &lt;= 2 &amp;&amp; i + 1 &lt; end)
+{
+  num_coengs++;
+
+  if (info[i + 1].khmer_category() == K_Cat(Ra))
+  {
+    for (unsigned int j = 0; j &lt; 2; j++)
+      info[i + j].mask |= khmer_plan-&gt;mask_array[KHMER_PREF];
+
+    /* Move the Coeng,Ro sequence to the start. */
+    buffer-&gt;merge_clusters (start, i + 2);
+    ...
+    if (khmer_plan-&gt;mask_array[KHMER_CFAR])
+      for (unsigned int j = i + 2; j &lt; end; j++)
+        info[j].mask |= khmer_plan-&gt;mask_array[KHMER_CFAR];
+
+    num_coengs = 2; /* Done. */
+  }
+}
+</code></pre>
+<p id="ix-36">(trimmed). Everything typed after the COENG + RO gets the <code>cfar</code> mask, which “allows distinguishing the following cases with MS Khmer fonts”: a subscript after the subscript RO, and one before it.</p>
+<p id="ix-37"><strong>Pre-base vowel signs.</strong> A <code>VPre</code> is moved to the start, ahead of a COENG + RO moved there before it.</p>
+<p id="ix-38">Each move merges clusters from the start of the syllable to the glyph moved. There is no probe: the shaper never asks whether the font’s <code>pref</code> would substitute COENG + RO. It moves the pair in every font, and the <code>pref</code> mask only tells the font’s lookups where to act. Here are KA + COENG + RO, the same with vowel sign OO, and both in the font with no <code>pref</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">khmer.ttf</td><td class="in"><span class="txt">ក្រ</span><span class="cps">U+1780 U+17D2 U+179A</span></td><td class="opt">--language=km</td><td class="out"><code>[ro.pref=0+300|ka=0+600]</code></td></tr><tr><td class="font">khmer.ttf</td><td class="in"><span class="txt">ក្រោ</span><span class="cps">U+1780 U+17D2 U+179A U+17C4</span></td><td class="opt">--language=km</td><td class="out"><code>[e=0+300|ro.pref=0+300|ka=0+600|oo.pst=0+250]</code></td></tr><tr><td class="font">khmer-no-pref.ttf</td><td class="in"><span class="txt">ក្រ</span><span class="cps">U+1780 U+17D2 U+179A</span></td><td class="opt">--language=km</td><td class="out"><code>[coeng=0+0|ro=0+500|ka=0+600]</code></td></tr><tr><td class="font">khmer-no-pref.ttf</td><td class="in"><span class="txt">ក្រោ</span><span class="cps">U+1780 U+17D2 U+179A U+17C4</span></td><td class="opt">--language=km</td><td class="out"><code>[e=0+300|coeng=0+0|ro=0+500|ka=0+600|oo.pst=0+250]</code></td></tr></tbody></table></div>
+<p id="ix-39">Without <code>pref</code>, the COENG and RO still stand before KA: a zero-width COENG and a full RO, in front of the consonant they belong under. A Khmer font needs its <code>pref</code> lookup.</p>
+<p id="ix-40">The trace of NGO, COENG, RO, COENG, KO and vowel sign OO, from the reordering to the end of GSUB:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape khmer.ttf "ង្រ្គោ" --language=km --trace</code></div><table><tbody><tr><td class="what">start reordering khmer</td><td class="buf"><code>[ngo=0|coeng=0|ro=2|coeng=2|ko=4|e=4|oo=4]</code></td></tr><tr><td class="what">skipped inserting dotted-circles because there is no broken syllables</td><td class="buf"><code>[ngo=0|coeng=0|ro=2|coeng=2|ko=4|e=4|oo=4]</code></td></tr><tr><td class="what">end reordering khmer</td><td class="buf"><code>[e=0|coeng=0|ro=0|ngo=0|coeng=0|ko=0|oo=0]</code></td></tr><tr><td class="what">start lookup 0 feature &#x27;pref&#x27;</td><td class="buf"><code>[e=0|coeng=0|ro=0|ngo=0|coeng=0|ko=0|oo=0]</code></td></tr><tr><td class="what">ligating glyphs at 1,2</td><td class="buf"><code>[e=0|coeng=0|ro=0|ngo=0|coeng=0|ko=0|oo=0]</code></td></tr><tr><td class="what">ligated glyph at 1</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|coeng=0|ko=0|oo=0]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;pref&#x27;</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|coeng=0|ko=0|oo=0]</code></td></tr><tr><td class="what">start lookup 1 feature &#x27;blwf&#x27;</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|coeng=0|ko=0|oo=0]</code></td></tr><tr><td class="what">ligating glyphs at 3,4</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|coeng=0|ko=0|oo=0]</code></td></tr><tr><td class="what">ligated glyph at 3</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|ko.sub=0|oo=0]</code></td></tr><tr><td class="what">end lookup 1 feature &#x27;blwf&#x27;</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|ko.sub=0|oo=0]</code></td></tr><tr><td class="what">start lookup 3 feature &#x27;pstf&#x27;</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|ko.sub=0|oo=0]</code></td></tr><tr><td class="what">replacing glyph at 4 (single substitution)</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|ko.sub=0|oo=0]</code></td></tr><tr><td class="what">replaced glyph at 4 (single substitution)</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|ko.sub=0|oo.pst=0]</code></td></tr><tr><td class="what">end lookup 3 feature &#x27;pstf&#x27;</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|ko.sub=0|oo.pst=0]</code></td></tr><tr><td class="what">start lookup 4 feature &#x27;cfar&#x27;</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|ko.sub=0|oo.pst=0]</code></td></tr><tr><td class="what">replacing glyph at 3 (single substitution)</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|ko.sub=0|oo.pst=0]</code></td></tr><tr><td class="what">replaced glyph at 3 (single substitution)</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|ko.sub.cfar=0|oo.pst=0]</code></td></tr><tr><td class="what">end lookup 4 feature &#x27;cfar&#x27;</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|ko.sub.cfar=0|oo.pst=0]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;khmr&#x27;</td><td class="buf"><code>[e=0|ro.pref=0|ngo=0|ko.sub.cfar=0|oo.pst=0]</code></td></tr></tbody></table></div>
+<p id="ix-41">The reordering puts the first part of OO, then COENG + RO, before NGO, and merges the syllable into one cluster. Then the lookups run in LookupList order with no pause between them: <code>pref</code> makes RO’s pre-base form, <code>blwf</code> KO’s subscript, <code>pstf</code> the second part of OO, and <code>cfar</code> changes KO’s subscript, because it was typed after the COENG + RO. With the subscripts the other way round, it isn’t:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">khmer.ttf</td><td class="in"><span class="txt">ង្រ្គ</span><span class="cps">U+1784 U+17D2 U+179A U+17D2 U+1782</span></td><td class="opt">--language=km</td><td class="out"><code>[ro.pref=0+300|ngo=0+600|ko.sub.cfar=0+0]</code></td></tr><tr><td class="font">khmer.ttf</td><td class="in"><span class="txt">ង្គ្រ</span><span class="cps">U+1784 U+17D2 U+1782 U+17D2 U+179A</span></td><td class="opt">--language=km</td><td class="out"><code>[ro.pref=0+300|ngo=0+600|ko.sub=0+0]</code></td></tr><tr><td class="font">khmer-late.ttf</td><td class="in"><span class="txt">ង្រ្គ</span><span class="cps">U+1784 U+17D2 U+179A U+17D2 U+1782</span></td><td class="opt">--language=km</td><td class="out"><code>[ro.pref=0+300|ngo=0+600|ko.sub=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-42"><code>khmer-late.ttf</code> has the same lookups, with <code>cfar</code>’s first in the LookupList. Running first, it finds COENG and KO where it expects KO’s subscript, and does nothing. With a stage for each basic feature, as the Indic and Myanmar shapers have, <code>cfar</code>’s lookup would have run after <code>blwf</code>’s, wherever it was in the list.</p>
+<blockquote>
+<p id="ix-43">For type designers: in a Khmer font, the order of the LookupList is the order the basic features’ lookups run in, whatever features they belong to, and <code>locl</code> and <code>ccmp</code> lookups are in the same stage. A lookup that needs another’s output must come after it in the list. COENG + RO is always moved before the base, so <code>pref</code> must turn it into a glyph that looks right there.</p>
+</blockquote>
+<h3 id="split-vowels">Split vowels</h3>
+<p id="ix-44">Five vowel signs, U+17BE, U+17BF, U+17C0, U+17C4 and U+17C5, are written in two parts, the first like U+17C1 KHMER VOWEL SIGN E, before the consonant. Unicode doesn’t decompose them. HarfBuzz’s <code>decompose_khmer</code> (<code>:326</code>) does, into U+17C1 followed by the sign itself, and <code>compose_khmer</code> won’t put them back together (<a href="normalization.html#the-shapers-compose-and-decompose">The shapers’ compose and decompose</a>). U+17C1 is a <code>VPre</code>, so the reordering moves it; the sign that is left stands for its own second part, and a font’s <code>abvf</code> or <code>pstf</code> replaces the whole sign’s glyph with that part, as the Khmer specification says:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">khmer.ttf</td><td class="in"><span class="txt">កើ</span><span class="cps">U+1780 U+17BE</span></td><td class="opt">--language=km</td><td class="out"><code>[e=0+300|ka=0+600|oe.abv=0+0]</code></td></tr><tr><td class="font">khmer.ttf</td><td class="in"><span class="txt">កោ</span><span class="cps">U+1780 U+17C4</span></td><td class="opt">--language=km</td><td class="out"><code>[e=0+300|ka=0+600|oo.pst=0+250]</code></td></tr><tr><td class="font">khmer.ttf</td><td class="in"><span class="txt">ោ</span><span class="cps">U+17C4</span></td><td class="opt">--language=km</td><td class="out"><code>[e=0+300|dottedcircle=0+500|oo.pst=0+250]</code></td></tr></tbody></table></div>
+<p id="ix-45">KA with OE gets <code>abvf</code>’s above part, KA with OO <code>pstf</code>’s right part. Alone, OO is a broken cluster, and its first part goes before the dotted circle. The decomposition is HarfBuzz’s, not the font’s. With the shaper’s normalization mode, <code>COMPOSED_DIACRITICS_NO_SHORT_CIRCUIT</code>, it is used whenever the font has glyphs for U+17C1 and the sign, though the font has a glyph for the whole sign too (<a href="normalization.html#the-modes">The modes</a>).</p>
+<h3 id="across-syllables">Across syllables</h3>
+<p id="ix-46">The presentation features run after the syllables are cleared. <code>khmer.ttf</code>’s <code>psts</code> has one contextual rule, which shortens OO’s second part before a KA:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">khmer.ttf</td><td class="in"><span class="txt">កោ</span><span class="cps">U+1780 U+17C4</span></td><td class="opt">--language=km</td><td class="out"><code>[e=0+300|ka=0+600|oo.pst=0+250]</code></td></tr><tr><td class="font">khmer.ttf</td><td class="in"><span class="txt">កោក</span><span class="cps">U+1780 U+17C4 U+1780</span></td><td class="opt">--language=km</td><td class="out"><code>[e=0+300|ka=0+600|oo.pst.short=0+150|ka=2+600]</code></td></tr><tr><td class="font">khmer.ttf</td><td class="in"><span class="txt">កោក</span><span class="cps">U+1780 U+17C4 U+1780</span></td><td class="opt">--language=km --show-flags</td><td class="out"><code>[e=0+300|ka=0+600|oo.pst.short=0+150|ka=2+600#1]</code></td></tr></tbody></table></div>
+<p id="ix-47">The KA is in the next syllable, and the rule still matches. In the Indic shaper, whose presentation features are per syllable, it wouldn’t (<a href="gsub.html#skipping-step-by-step">GSUB</a>). The second KA is marked unsafe to break (<code>#1</code>), as any glyph is whose shaping depended on its neighbor. The comment above the pause gives only an issue number, #3531; <code>NEWS</code> for 4.2.1 records “Reinstate a pause after basic features in Khmer shaper, fixing a regression introduced in previous release.” That the two are the same change is inferred.</p>
+<h3 id="the-subscript-count">The subscript count</h3>
+<p id="ix-48">The test <code>num_coengs &lt;= 2</code> is meant to apply the specification’s rule, quoted in the comment above it: a COENG is handled “(and subscript count is less than two)”. But the counter starts at zero and is checked before it is incremented, so a third COENG passes too. And after a COENG + RO the code sets the counter to 2, “Done”, which the next COENG still passes. So a second COENG + RO in one syllable is moved as well, in front of the first:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">khmer.ttf</td><td class="in"><span class="txt">ក្រ្រ</span><span class="cps">U+1780 U+17D2 U+179A U+17D2 U+179A</span></td><td class="opt">--language=km</td><td class="out"><code>[ro.pref=0+300|ro.pref=0+300|ka=0+600]</code></td></tr><tr><td class="font">khmer.ttf</td><td class="in"><span class="txt">ក្ក្ក្រ</span><span class="cps">U+1780 U+17D2 U+1780 U+17D2 U+1780 U+17D2 U+179A</span></td><td class="opt">--language=km</td><td class="out"><code>[ro.pref=0+300|ka=0+600|ka.sub=0+0|ka.sub=0+0]</code></td></tr><tr><td class="font">khmer.ttf</td><td class="in"><span class="txt">ក្ក្ក្ក្រ</span><span class="cps">U+1780 U+17D2 U+1780 U+17D2 U+1780 U+17D2 U+1780 U+17D2 U+179A</span></td><td class="opt">--language=km</td><td class="out"><code>[ka=0+600|ka.sub=0+0|ka.sub=0+0|ka.sub=0+0|coeng=0+0|ro=8+500]</code></td></tr></tbody></table></div>
+<p id="ix-49">Two subscript ROs are not good Khmer, and the grammar allows any number of subscripts where the specification allows two, so this only matters for text that is wrong already. Whether Uniscribe did the same isn’t recorded; the comment “Done” suggests the loop was meant to stop (inferred). In the last line the fourth COENG + RO is neither moved nor given <code>pref</code>, and is left as COENG and a full RO.</p>
+<h2 id="myanmar">Myanmar</h2>
+<p id="ix-50">The shaper is <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-myanmar.cc"><code>hb-ot-shaper-myanmar.cc</code></a> (390 lines, Zawgyi included) and its grammar <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-myanmar-machine.rl"><code>hb-ot-shaper-myanmar-machine.rl</code></a>. A font needs lookups under <code>mym2</code> to get it (<a href="choosing-a-script-shaper.html#myanmar-and-zawgyi">Myanmar and Zawgyi</a>).</p>
+<h3 id="categories_1">Categories</h3>
+<p id="ix-51"><code>setup_masks_myanmar</code> (<code>:138</code>) keeps the category in <code>myanmar_category</code>, and reserves <code>myanmar_position</code>, but like Khmer it discards the table’s position: the reordering assigns positions itself. The vowel signs get <code>VPre</code>, <code>VAbv</code>, <code>VBlw</code> and <code>VPst</code> from their positions, as in Khmer, and Myanmar’s overrides (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py#L336"><code>gen-indic-table.py:336</code></a>), taken from Microsoft’s specification, use those and categories of Myanmar’s own, numbered from 32 up:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-52">Category</th>
+<th id="ix-53">Characters</th>
+<th>What they are</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Ra</code></td>
+<td>U+1004, U+101B, U+105A</td>
+<td id="ix-54">NGA, RA and MON NGA, which begin a kinzi</td>
+</tr>
+<tr>
+<td><code>As</code></td>
+<td>U+103A</td>
+<td>ASAT</td>
+</tr>
+<tr>
+<td><code>MY</code>, <code>MR</code>, <code>MW</code>, <code>MH</code>, <code>ML</code></td>
+<td>U+103B and two Mon medials; U+103C; U+103D, U+1082; U+103E; U+1060</td>
+<td>the medial consonants: YA, RA, WA, HA, MON LA</td>
+</tr>
+<tr>
+<td><code>A</code></td>
+<td>U+1032, U+1036</td>
+<td>AI and ANUSVARA</td>
+</tr>
+<tr>
+<td><code>PT</code></td>
+<td>U+1063, U+1064, U+1069–U+106D, U+AA7B</td>
+<td>Pwo and other tones</td>
+</tr>
+<tr>
+<td><code>SM</code></td>
+<td>U+1038 and Shan tones</td>
+<td>VISARGA</td>
+</tr>
+<tr>
+<td><code>VS</code></td>
+<td>U+FE00–U+FE0F</td>
+<td id="ix-55">variation selectors, “not Myanmar-specific”</td>
+</tr>
+<tr>
+<td><code>C</code></td>
+<td>U+104E</td>
+<td id="ix-56">“The spec says C, IndicSyllableCategory says Consonant_Placeholder”</td>
+</tr>
+<tr>
+<td><code>GB</code></td>
+<td>U+104A, U+2015, U+2022, U+25FB–U+25FE, and the shared placeholders such as NO-BREAK SPACE</td>
+<td>placeholders: <code>PLACEHOLDER</code> under another name</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-57">U+1039 MYANMAR SIGN VIRAMA, which makes stacked consonants, is <code>H</code>; U+1037 DOT BELOW, a <code>Nukta</code> in Unicode, is <code>DB</code>, the same number as Indic’s <code>N</code>. The grammar notes that the specification’s digits <code>D</code> are folded into <code>GB</code>, and its digit zero <code>D0</code> into <code>D</code>, because <code>D0</code> “is not implemented by Uniscribe”, and its punctuation <code>P</code> into <code>GB</code> too (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-myanmar-machine.rl#L60"><code>hb-ot-shaper-myanmar-machine.rl:60</code></a>).</p>
+<h3 id="syllables_1">Syllables</h3>
+<p>The grammar (<code>:93</code>):</p>
+<pre><code>j = ZWJ|ZWNJ;			# Joiners
+k = (Ra As H);			# Kinzi
+sm = SM | SMPst;
+c = C|Ra;			# is_consonant
+
+medial_group = MY? As? MR? ((MW MH? ML? | MH ML? | ML) As?)?;
+main_vowel_group = (VPre.VS?)* VAbv* VBlw* A* (DB As?)?;
+post_vowel_group = VPst MH? ML? As* VAbv* A* (DB As?)?;
+tone_group = sm | PT A* DB? As?;
+
+complex_syllable_tail = As* medial_group main_vowel_group post_vowel_group* tone_group* j?;
+syllable_tail = (H (c|IV).VS?)* (H | complex_syllable_tail);
+
+consonant_syllable =	(k|CS)? (c|IV|GB|DOTTEDCIRCLE).VS? syllable_tail;
+broken_cluster =	k? VS? syllable_tail;
+other =			any;
+
+main := |*
+	consonant_syllable	=&gt; { found_syllable (myanmar_consonant_syllable); };
+	j | SMPst		=&gt; { found_syllable (myanmar_non_myanmar_cluster); };
+	broken_cluster		=&gt; { found_syllable (myanmar_broken_cluster); ... };
+	other			=&gt; { found_syllable (myanmar_non_myanmar_cluster); };
+*|;
+</code></pre>
+<p id="ix-58">A <strong>kinzi</strong> is NGA (or RA, or MON NGA) + ASAT + VIRAMA before a consonant, which writes the first consonant as a small mark above the second: it is Myanmar’s counterpart of the reph. A <strong>Myanmar consonant syllable</strong> is an optional kinzi, a consonant, independent vowel or placeholder, any number of stacked consonants (VIRAMA + consonant), then ASATs, the medials in their Unicode order, the vowel signs, the anusvaras and dot below, any number of post-base vowel groups and tone groups, and a joiner at the end. The tone groups repeat since 10.2.0, which <code>NEWS</code> records as “Allow all Myanmar tone marks (including visarga) in any order.” The pattern follows the specification’s cluster rule nearly term for term, without its limit of 31 characters to a sequence; HarfBuzz’s own limit, 64 glyphs to a syllable, applies here as in the Indic shaper (<a href="indic-model.html#a-limit-on-syllable-length">A limit on syllable length</a>). A joiner, or a post-base syllable modifier, alone is a <strong>non-Myanmar cluster</strong>, not a broken one: it comes before <code>broken_cluster</code> in the scanner, and the two match the same length.</p>
+<h3 id="features-and-stages_1">Features and stages</h3>
+<p id="ix-59"><code>collect_features_myanmar</code> (<code>:111</code>) is close to the Indic shaper’s: find syllables; <code>locl</code> and <code>ccmp</code>, per syllable (“The Indic specs do not require ccmp, but we apply it here since if there is a use of it, it’s typically at the beginning”); reorder; then <code>rphf</code>, <code>pref</code>, <code>blwf</code> and <code>pstf</code>, each with a pause after it, “applied in order, one at a time”; clear the syllables; then <code>pres</code>, <code>abvs</code>, <code>blws</code> and <code>psts</code>, “all at once”, outside the syllable. <a href="feature-order.html#myanmar">Feature order</a> lists these stages beside the other shapers’. The basic features are per syllable but global: none has a mask bit, so every glyph of the syllable may take every one of them, and a font’s lookups must say by their own rules which glyphs they apply to. The features have manual ZWJ but not manual ZWNJ, so a ZWNJ in a rule’s context is passed over. There is no <code>override_features</code>, so <code>liga</code> stays on: <code>NEWS</code> for 2.7.3 says “Don’t disable liga feature in myanmar shaper, to match Uniscribe.” Marks are zeroed by their GDEF class before GPOS (<code>HB_OT_SHAPE_ZERO_WIDTH_MARKS_BY_GDEF_EARLY</code>, <code>:361</code>, <a href="fallbacks.html#zeroing-marks">Zeroing marks</a>), where Khmer and Indic zero nothing; the specification too says “mark glyphs have their width set to zero by OTLS”.</p>
+<h3 id="reordering_1">Reordering</h3>
+<p><code>initial_reordering_consonant_syllable</code> (<code>:179</code>) is the only reordering. Its comment cites Microsoft’s Myanmar specification, whose rules are four:</p>
+<blockquote>
+<ul>
+<li id="ix-60">Kinzi sequences (K) are reordered directly after the cluster base</li>
+<li>The medial ra (MR) is reordered before the base consonant</li>
+<li id="ix-61">Pre-base vowels (VPre) are reordered to the start of the syllable cluster. A sequence of multiple prebase vowels is permitted. Such sequences are moved as a block to the beginning of the cluster</li>
+<li>Anusvara (A) coming immediately after one or more below-base vowels (VBlw) will reorder immediately before them</li>
+</ul>
+</blockquote>
+<p id="ix-62">First the kinzi and the base. If the syllable starts with <code>Ra</code>, <code>As</code>, <code>H</code>, those three are a kinzi: no font is asked, as the Indic shaper asks <code>rphf</code> about a reph. The base is the <em>first</em> consonant after it (<code>:203</code>), where the Indic base search takes the last that has no below-base or post-base form. Myanmar’s stacked consonants always go below the first, so there is nothing to decide.</p>
+<p id="ix-63">Then every glyph gets a position from the Indic list (<a href="indic-model.html#categories-and-positions">Categories and positions</a>), in a loop that “may be ugly, but it implements all of Myanmar reordering!” (<code>:213</code>):</p>
+<table>
+<thead>
+<tr>
+<th id="ix-64">Glyphs</th>
+<th id="ix-65">Position</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-66">a vowel sign E or other <code>VPre</code></td>
+<td><code>POS_PRE_M</code></td>
+</tr>
+<tr>
+<td>anything before the base, and medial RA</td>
+<td><code>POS_PRE_C</code></td>
+</tr>
+<tr>
+<td>the base</td>
+<td><code>POS_BASE_C</code></td>
+</tr>
+<tr>
+<td id="ix-67">the kinzi, and what follows the base until a below-base vowel sign</td>
+<td><code>POS_AFTER_MAIN</code></td>
+</tr>
+<tr>
+<td>below-base vowel signs</td>
+<td><code>POS_BELOW_C</code></td>
+</tr>
+<tr>
+<td>an anusvara after a below-base vowel sign</td>
+<td><code>POS_BEFORE_SUB</code></td>
+</tr>
+<tr>
+<td>everything after that</td>
+<td><code>POS_AFTER_SUB</code></td>
+</tr>
+<tr>
+<td>a variation selector</td>
+<td id="ix-68">the position of the glyph before it</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-69">A stable sort by position follows (<code>:273</code>), “Sit tight, rock ’n roll!”, and moving glyphs merges their clusters. Since the kinzi is the first glyph at <code>POS_AFTER_MAIN</code>, it lands just after the base, ahead of the stacked consonants. Last, a run of several pre-base vowel signs is reversed, each with its variation selector, as in the Indic shaper (issue #3863).</p>
+<p id="ix-70">Here are GA with a kinzi, KA with medial RA, the same with vowel sign E, and the three together:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">myanmar.ttf</td><td class="in"><span class="txt">င်္ဂ</span><span class="cps">U+1004 U+103A U+1039 U+1002</span></td><td class="opt">--language=my</td><td class="out"><code>[ga=0+600|kinzi=0+0]</code></td></tr><tr><td class="font">myanmar.ttf</td><td class="in"><span class="txt">ကြ</span><span class="cps">U+1000 U+103C</span></td><td class="opt">--language=my</td><td class="out"><code>[medialra.wide=0+400|ka=0+600]</code></td></tr><tr><td class="font">myanmar.ttf</td><td class="in"><span class="txt">ကြေ</span><span class="cps">U+1000 U+103C U+1031</span></td><td class="opt">--language=my</td><td class="out"><code>[e=0+300|medialra.wide=0+400|ka=0+600]</code></td></tr><tr><td class="font">myanmar.ttf</td><td class="in"><span class="txt">င်္ကြေ</span><span class="cps">U+1004 U+103A U+1039 U+1000 U+103C U+1031</span></td><td class="opt">--language=my</td><td class="out"><code>[e=0+300|medialra.wide=0+400|ka=0+600|kinzi=0+0]</code></td></tr></tbody></table></div>
+<p>The trace of the last:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape myanmar.ttf "င်္ကြေ" --language=my --trace</code></div><table><tbody><tr><td class="what">start reordering myanmar</td><td class="buf"><code>[nga=0|asat=0|virama=0|ka=3|medialra=3|e=3]</code></td></tr><tr><td class="what">skipped inserting dotted-circles because there is no broken syllables</td><td class="buf"><code>[nga=0|asat=0|virama=0|ka=3|medialra=3|e=3]</code></td></tr><tr><td class="what">end reordering myanmar</td><td class="buf"><code>[e=0|medialra=0|ka=0|nga=0|asat=0|virama=0]</code></td></tr><tr><td class="what">start lookup 0 feature &#x27;rphf&#x27;</td><td class="buf"><code>[e=0|medialra=0|ka=0|nga=0|asat=0|virama=0]</code></td></tr><tr><td class="what">ligating glyphs at 3,4,5</td><td class="buf"><code>[e=0|medialra=0|ka=0|nga=0|asat=0|virama=0]</code></td></tr><tr><td class="what">ligated glyph at 3</td><td class="buf"><code>[e=0|medialra=0|ka=0|kinzi=0]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;rphf&#x27;</td><td class="buf"><code>[e=0|medialra=0|ka=0|kinzi=0]</code></td></tr><tr><td class="what">start lookup 1 feature &#x27;pref&#x27;</td><td class="buf"><code>[e=0|medialra=0|ka=0|kinzi=0]</code></td></tr><tr><td class="what">start recursing to lookup 2 at 1</td><td class="buf"><code>[e=0|medialra=0|ka=0|kinzi=0]</code></td></tr><tr><td class="what">replacing glyph at 1 (single substitution)</td><td class="buf"><code>[e=0|medialra=0|ka=0|kinzi=0]</code></td></tr><tr><td class="what">replaced glyph at 1 (single substitution)</td><td class="buf"><code>[e=0|medialra.wide=0|ka=0|kinzi=0]</code></td></tr><tr><td class="what">end recursing to lookup 2</td><td class="buf"><code>[e=0|medialra.wide=0|ka=0|kinzi=0]</code></td></tr><tr><td class="what">end lookup 1 feature &#x27;pref&#x27;</td><td class="buf"><code>[e=0|medialra.wide=0|ka=0|kinzi=0]</code></td></tr><tr><td class="what">start lookup 3 feature &#x27;blwf&#x27;</td><td class="buf"><code>[e=0|medialra.wide=0|ka=0|kinzi=0]</code></td></tr><tr><td class="what">end lookup 3 feature &#x27;blwf&#x27;</td><td class="buf"><code>[e=0|medialra.wide=0|ka=0|kinzi=0]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;mym2&#x27;</td><td class="buf"><code>[e=0|medialra.wide=0|ka=0|kinzi=0]</code></td></tr></tbody></table></div>
+<p id="ix-71">The reordering puts E first, medial RA before KA, and the kinzi’s three characters after KA, in one cluster. Then the basic features run, each in its own stage. <code>rphf</code> finds NGA, ASAT and VIRAMA after the base and ligates them into the kinzi glyph. <code>myanmar.ttf</code>’s <code>pref</code> is a contextual rule, as the specification says Microsoft’s Myanmar Text font uses it, choosing a wide medial RA when a consonant follows. It matches because the medial RA now stands before KA; in the text it came after it.</p>
+<p id="ix-72">The kinzi moves before <code>rphf</code> runs, where the Indic reph moves after it, and only if <code>rphf</code> made one. So a Myanmar font’s <code>rphf</code> lookup must match NGA + ASAT + VIRAMA after the base, and if it has none, the three glyphs stay there unformed. The stacked consonant and the anusvara:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">myanmar.ttf</td><td class="in"><span class="txt">က္က</span><span class="cps">U+1000 U+1039 U+1000</span></td><td class="opt">--language=my</td><td class="out"><code>[ka=0+600|ka.sub=0+0]</code></td></tr><tr><td class="font">myanmar.ttf</td><td class="in"><span class="txt">ကုံ</span><span class="cps">U+1000 U+102F U+1036</span></td><td class="opt">--language=my</td><td class="out"><code>[ka=0+600|anusvara=0+0|u=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-73">The first KA is the base and the second, after VIRAMA, becomes <code>blwf</code>’s subscript. Anusvara, typed after vowel sign U, is put before it.</p>
+<blockquote>
+<p id="ix-74">For type designers: write a Myanmar font’s lookups for the reordered syllable: E, medial RA, the base, the kinzi, then stacked consonants and the rest. The basic features have no masks, so a lookup for <code>pref</code> or <code>blwf</code> applies wherever its rule matches in the syllable; give it context if it shouldn’t.</p>
+</blockquote>
+<h3 id="the-microsoft-specification">The Microsoft specification</h3>
+<p id="ix-75">Of the shapers in this part of the book, Myanmar follows its Microsoft specification most closely. The categories and the grammar are the specification’s, with the folding of <code>D</code>, <code>D0</code> and <code>P</code> and with Myanmar Text’s and Uniscribe’s behavior where they differ; the four reordering rules are its four; the features are its features, in its order. The specification ends its reordering section with a “pathological” syllable, which <code>myanmar.ttf</code> has glyphs for:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">myanmar.ttf</td><td class="in"><span class="txt">င်္က္ကျြွေေိုံာံ</span><span class="cps">U+1004 U+103A U+1039 U+1000 U+1039 U+1000 U+103B U+103C U+103D U+1031 U+1031 U+102D U+102F U+1036 U+102C U+1036</span></td><td class="opt">--language=my</td><td class="out"><code>[e=0+300|e=0+300|medialra.wide=0+400|ka=0+600|kinzi=0+0|ka.sub=0+0|medialya=0+250|medialwa=0+0|i=0+0|anusvara=0+0|u=0+0|aa=0+300|anusvara=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-76">The specification gives the reordered sequence as U+1031 U+1031 U+103C U+1000 U+1004 U+103A U+1039 U+1039 U+1000 U+103B U+103D U+102D U+1036 U+102F U+102C U+1036. HarfBuzz’s result is in the same order, once <code>rphf</code> has made the kinzi’s three glyphs one and <code>blwf</code> has made VIRAMA + KA a subscript. HarfBuzz adds <code>ccmp</code>, which the specification doesn’t list, and zeroes marks, as the specification says OTLS, Microsoft’s layout library, does. The specification inserts a dotted circle for a kinzi with no base, and so does HarfBuzz:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">myanmar.ttf</td><td class="in"><span class="txt">င်္</span><span class="cps">U+1004 U+103A U+1039</span></td><td class="opt">--language=my</td><td class="out"><code>[dottedcircle=0+500|kinzi=0+0]</code></td></tr><tr><td class="font">myanmar.ttf</td><td class="in"><span class="txt">ေ</span><span class="cps">U+1031</span></td><td class="opt">--language=my</td><td class="out"><code>[e=0+300|dottedcircle=0+500]</code></td></tr></tbody></table></div>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-khmer.cc"><code>src/hb-ot-shaper-khmer.cc</code></a></td>
+<td>Khmer’s features and stages, the masks, the COENG + RO and pre-base vowel moves, and the split vowels’ <code>decompose</code> and <code>compose</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-khmer-machine.rl"><code>src/hb-ot-shaper-khmer-machine.rl</code></a></td>
+<td>Khmer’s categories and syllable grammar, in Ragel</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-myanmar.cc"><code>src/hb-ot-shaper-myanmar.cc</code></a></td>
+<td>Myanmar’s features and stages, the reordering, and the Zawgyi shaper</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-myanmar-machine.rl"><code>src/hb-ot-shaper-myanmar-machine.rl</code></a></td>
+<td>Myanmar’s categories and syllable grammar</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-khmer-machine.hh"><code>src/hb-ot-shaper-khmer-machine.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-myanmar-machine.hh"><code>src/hb-ot-shaper-myanmar-machine.hh</code></a></td>
+<td>the machines Ragel generated, committed</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-indic-table.py"><code>src/gen-indic-table.py</code></a></td>
+<td>the category overrides for Khmer and Myanmar, and <code>position_to_category</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic-table.cc"><code>src/hb-ot-shaper-indic-table.cc</code></a></td>
+<td>the generated table all three shapers share</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper.hh"><code>src/hb-ot-shaper.hh</code></a></td>
+<td>which script gets which shaper</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/test/shape/data/in-house/tests"><code>test/shape/data/in-house/tests/khmer-*.tests</code></a>, <code>myanmar-*.tests</code></td>
+<td>HarfBuzz’s own shaping tests for the two</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Khmer and Myanmar share the Indic shaper’s category table, Ragel scanner, syllable byte and sort, but not its font probes or its final reordering. Each reorders a syllable once, before its basic features, as Microsoft’s specification for the script says.</li>
+<li>Khmer moves COENG + RO and the pre-base vowel signs to the start of the syllable in every font, marks the pair for <code>pref</code> and what follows it for <code>cfar</code>, and leaves the rest to the font’s lookups. Its split vowels are decomposed by HarfBuzz into vowel sign E and the sign itself.</li>
+<li>Khmer’s <code>locl</code>, <code>ccmp</code> and five basic features share one stage, so their lookups run in LookupList order, because Uniscribe was found to do that. Its presentation features see across syllables.</li>
+<li>Myanmar takes a kinzi from the start of the syllable without asking the font, makes the first consonant the base, and sorts E, medial RA, the base and the kinzi into the specification’s order. Its basic features run one at a time, with no masks.</li>
+<li>The Khmer shaper lets a second COENG + RO and a third subscript through the specification’s limit of two, which only text that is wrong already shows.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="indic-model.html">← The Indic model</a><a rel="next" href="universal-shaping-engine.html">The Universal Shaping Engine →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

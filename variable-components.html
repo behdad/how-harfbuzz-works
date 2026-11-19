@@ -1,0 +1,883 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>VARC: variable components · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part VIII · Variations</p>
+<h1 id="varc-variable-components">34. VARC: variable components</h1>
+<p id="ix-1">A CJK font has tens of thousands of glyphs, but far fewer distinct parts: the same radicals and strokes appear again and again, in different sizes and positions, and often slightly reshaped to fit. A TrueType composite glyph can reuse a part, but only as it is, moved and perhaps scaled. <strong>VARC</strong>, the variable composites table, lets a glyph be built from components that are each placed with a full transform, rotation and skew included, and each drawn at <em>its own</em> position in the design space. A component can be bolder, narrower, or bent differently from the glyph it’s part of, and it can have axes of its own that no user ever sees.</p>
+<p id="ix-2">VARC came out of the “boring expansion” work on OpenType, and HarfBuzz’s code still points there: <code>VARC -- Variable Composites</code> / <code>https://github.com/harfbuzz/boring-expansion-spec/blob/main/VARC.md</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.hh#L19"><code>OT/Var/VARC/VARC.hh:19</code></a>). It is now part of the 2026 ISO standard, in clause 7.3.10, but not of Microsoft’s OpenType 1.9.1. HarfBuzz 6.0.0 had an experimental first form of it, “Variable Composites” inside <code>glyf</code>, with a Hangul test font that NEWS says came out “over 90% smaller” than its ordinary OpenType equivalent. 9.0.0 replaced that with VARC, still experimental, and 12.0.0 turned it on by default. It can be turned off with <code>HB_NO_VAR_COMPOSITES</code>.</p>
+<p id="ix-3">The examples use test fonts from HarfBuzz’s own test suite. The drawings and shaping results are HarfBuzz’s; the decoded tables are not, but come from <code>fonts/variable-components/varc-dump.py</code>, which reads the bytes in HarfBuzz’s order, with help from fontTools.</p>
+<h2 id="why-not-composite-glyphs">Why not composite glyphs?</h2>
+<p id="ix-4">A TrueType <a href="drawing-outlines.html#composite-glyphs">composite glyph</a> is a list of other glyphs, each with an offset and, optionally, a scale or a 2×2 matrix. That is enough for an accent over a letter. For the parts of a CJK character it falls short in two ways:</p>
+<ul>
+<li id="ix-5"><strong>Only the offset can vary.</strong> Under gvar, each component of a composite counts as one point, its offset (<a href="varying-outlines.html#composites">Varying outlines</a>). Nothing varies its scale or matrix, so a part can’t get wider, or turn further, as the weight changes.</li>
+<li id="ix-6"><strong>The component is drawn where the composite is.</strong> At weight 600, a composite’s components are at weight 600 too. The ㄱ of 가 shares its width with ㅏ; the ㄱ of 고 has the whole width. To composites, those are two glyphs, and the font must store both, and every other shape of ㄱ it needs.</li>
+</ul>
+<p id="ix-7">VARC removes both limits. A component’s transform is stored as separate numbers (translation, rotation, scales, skews and a center), each of which can vary. And each component sets some axes to values of its own, which can vary too, to say where in the design space its glyph is drawn. So a font stores each part once, as a small variable glyph whose axes are the ways it can change, and each glyph that uses it says where on those axes to draw it.</p>
+<blockquote>
+<p id="ix-8">For type designers: HarfBuzz’s NEWS for 12.0.0 compares VARC to the “smart components” some font editors offer. Without VARC, a compiled font can hold them only as plain outlines or composites.</p>
+</blockquote>
+<h2 id="a-glyph-made-of-variable-parts">A glyph made of variable parts</h2>
+<p id="ix-9"><code>varc-ac00-ac01.ttf</code> has two Hangul syllables, 가 and 각, built from components. Its <code>fvar</code> has eight axes: the weight and optical size that a user sees, and six more, <code>0000</code> to <code>0005</code>, which exist only for the components to use.</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">hb:test/api/fonts/varc-ac00-ac01.ttf</td><td class="opt">--list-variations</td><td class="out"><pre><code>Variations information:
+
+Varitation axes:
+
+Tag	Minimum	Default	Maximum	Name
+------------------------------------
+wght	356.5	356.5	840.3	Weight
+opsz	0	0	1	OpticalSize
+0000	-1	0	1	0000
+0001	-1	0	1	0001
+0002	-1	0	1	0002
+0003	-1	0	1	0003
+0004	-1	0	1	0004
+0005	-1	0	1	0005</code></pre></td></tr></tbody></table></div>
+<figure class="draw slider"><div class="frames"><div class="frame print" data-value="356.5"><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=356.5">
+<g transform="scale(1,-1)">
+<path d="M83.45,118.5Q186.08,148.14 265.18,198.36Q344.27,248.59 398.25,318.95Q452.23,389.31 480.07,479.28Q507.91,569.25 507.91,678.17L507.91,722L80,722L80,652L463.43,652L428.29,664Q428.05,575.16 404.72,499.38Q381.39,423.61 334.68,362.23Q287.98,300.85 216.95,254.48Q145.93,208.12 50.21,177.42L83.45,118.5ZM702,400L887,400L887,470L702,470L702,400ZM666,-82L742,-82L742,803L666,803L666,-82Z" fill="currentColor"/>
+<path d="M1005.86,284.12Q1111.24,304.99 1190.31,341.96Q1269.37,378.92 1322.13,432.04Q1374.88,485.16 1401.39,554.48Q1427.9,623.79 1427.9,709.05L1427.9,746L1000,746L1000,676L1383.82,676L1346.44,688Q1345.94,625 1323.09,571.44Q1300.24,517.89 1254.68,474.9Q1209.13,431.9 1140.17,399.75Q1071.2,367.6 978.78,346.97L1005.86,284.12ZM1629,508.01L1814,508.01L1814,578.01L1629,578.01L1629,508.01ZM1593,285.74L1669,285.74L1669,803L1593,803L1593,285.74ZM1669.14,-93.48L1669.14,186L1669.14,236L1116,236L1116,166L1632.14,166L1594.69,182L1594.69,-93.48L1669.14,-93.48Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=356.5</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="380.69" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=380.69">
+<g transform="scale(1,-1)">
+<path d="M83.32,117.51Q186.26,147.15 265.56,197.45Q344.86,247.76 398.98,318.25Q453.1,388.74 481.01,478.89Q508.91,569.03 508.91,678.18L508.91,723L79.37,723L79.37,649.8L462.73,649.8L425.78,663.61Q425.55,575.14 402.29,499.73Q379.03,424.31 332.45,363.23Q285.86,302.16 215,255.96Q144.15,209.77 48.6,179.08L83.32,117.51ZM702,398.5L888,398.5L888,471.5L702,471.5L702,398.5ZM663.5,-83L743,-83L743,804L663.5,804L663.5,-83Z" fill="currentColor"/>
+<path d="M1005.52,283.58Q1111.27,304.44 1190.59,341.44Q1269.91,378.44 1322.83,431.64Q1375.74,484.84 1402.32,554.25Q1428.9,623.67 1428.9,709.09L1428.9,747L999.23,747L999.23,674.05L1383.39,674.05L1343.93,687.95Q1343.44,625.37 1320.67,572.2Q1297.89,519.04 1252.48,476.35Q1207.07,433.66 1138.32,401.72Q1069.57,369.77 977.39,349.22L1005.52,283.58ZM1629,507L1815,507L1815,580L1629,580L1629,507ZM1590.5,286.08L1670,286.08L1670,804L1590.5,804L1590.5,286.08ZM1670.14,-94.47L1670.14,185.5L1670.14,236.5L1115,236.5L1115,163.7L1629.93,163.7L1592.2,179.4L1592.2,-94.47L1670.14,-94.47Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=380.69</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="404.88" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=404.88">
+<g transform="scale(1,-1)">
+<path d="M83.17,116.51Q186.42,146.17 265.93,196.54Q345.44,246.92 399.71,317.55Q453.97,388.17 481.94,478.49Q509.91,568.81 509.91,678.18L509.91,724L78.73,724L78.73,647.6L462.02,647.6L423.28,663.22Q423.05,575.13 399.86,500.07Q376.67,425.02 330.2,364.24Q283.73,303.47 213.04,257.45Q142.35,211.43 46.97,180.75L83.17,116.51ZM702,397L889,397L889,473L702,473L702,397ZM661,-84L744,-84L744,805L661,805L661,-84Z" fill="currentColor"/>
+<path d="M1005.16,283.05Q1111.29,303.9 1190.86,340.92Q1270.44,377.95 1323.52,431.23Q1376.6,484.51 1403.25,554.03Q1429.91,623.56 1429.91,709.12L1429.91,748L998.46,748L998.46,672.1L1382.96,672.1L1341.41,687.9Q1340.94,625.75 1318.24,572.97Q1295.54,520.19 1250.28,477.81Q1205.01,435.43 1136.47,403.7Q1067.92,371.96 975.98,351.48L1005.16,283.05ZM1629,506.01L1816,506.01L1816,582.02L1629,582.02L1629,506.01ZM1588,286.42L1671,286.42L1671,805L1588,805L1588,286.42ZM1671.14,-95.43L1671.14,185L1671.14,237L1114,237L1114,161.4L1627.71,161.4L1589.7,176.8L1589.7,-95.43L1671.14,-95.43Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=404.88</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="429.07" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=429.07">
+<g transform="scale(1,-1)">
+<path d="M83.04,115.51Q186.6,145.19 266.32,195.64Q346.04,246.09 400.44,316.85Q454.84,387.6 482.88,478.1Q510.91,568.6 510.91,678.19L510.91,725L78.1,725L78.1,645.4L461.31,645.4L420.78,662.83Q420.56,575.11 397.44,500.42Q374.32,425.73 327.97,365.25Q281.62,304.78 211.09,258.94Q140.57,213.09 45.36,182.42L83.04,115.51ZM702,395.5L890,395.5L890,474.5L702,474.5L702,395.5ZM658.5,-85L745,-85L745,806L658.5,806L658.5,-85Z" fill="currentColor"/>
+<path d="M1004.81,282.48Q1111.32,303.32 1191.15,340.38Q1270.97,377.44 1324.21,430.8Q1377.45,484.16 1404.18,553.8Q1430.91,623.43 1430.91,709.16L1430.91,749L997.68,749L997.68,670.15L1382.53,670.15L1338.9,687.86Q1338.44,626.13 1315.82,573.73Q1293.2,521.32 1248.08,479.25Q1202.96,437.18 1134.62,405.65Q1066.29,374.12 974.59,353.71L1004.81,282.48ZM1629,505.01L1817,505.01L1817,584.01L1629,584.01L1629,505.01ZM1585.5,286.79L1672,286.79L1672,806L1585.5,806L1585.5,286.79ZM1672.14,-96.43L1672.14,184.5L1672.14,237.5L1113,237.5L1113,159.1L1625.5,159.1L1587.2,174.2L1587.2,-96.43L1672.14,-96.43Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=429.07</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="453.26" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=453.26">
+<g transform="scale(1,-1)">
+<path d="M82.92,114.52Q186.77,144.2 266.7,194.73Q346.63,245.26 401.17,316.15Q455.71,387.03 483.81,477.71Q511.91,568.38 511.91,678.2L511.91,726L77.47,726L77.47,643.2L460.6,643.2L418.28,662.44Q418.06,575.1 395.01,500.77Q371.96,426.44 325.73,366.27Q279.5,306.1 209.15,260.43Q138.8,214.76 43.76,184.1L82.92,114.52ZM702,394L891,394L891,476L702,476L702,394ZM656,-86L746,-86L746,807L656,807L656,-86Z" fill="currentColor"/>
+<path d="M1004.47,281.95Q1111.35,302.77 1191.43,339.86Q1271.51,376.96 1324.91,430.39Q1378.31,483.83 1405.11,553.57Q1431.91,623.31 1431.91,709.19L1431.91,750L996.91,750L996.91,668.2L1382.1,668.2L1336.4,687.82Q1335.94,626.52 1313.4,574.5Q1290.85,522.48 1245.88,480.72Q1200.91,438.96 1132.79,407.64Q1064.66,376.32 973.21,355.98L1004.47,281.95ZM1629,504L1818,504L1818,586L1629,586L1629,504ZM1583,287.13L1673,287.13L1673,807L1583,807L1583,287.13ZM1673.14,-97.39L1673.14,184L1673.14,238L1112,238L1112,156.8L1623.28,156.8L1584.7,171.6L1584.7,-97.39L1673.14,-97.39Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=453.26</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="477.45" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=477.45">
+<g transform="scale(1,-1)">
+<path d="M82.76,113.52Q186.93,143.22 267.07,193.82Q347.21,244.43 401.89,315.44Q456.58,386.46 484.74,477.31Q512.91,568.16 512.91,678.2L512.91,727L76.83,727L76.83,641L459.88,641L415.77,662.05Q415.57,575.09 392.59,501.12Q369.6,427.16 323.49,367.29Q277.38,307.42 207.19,261.93Q137.01,216.44 42.14,185.78L82.76,113.52ZM702,392.5L892,392.5L892,477.5L702,477.5L702,392.5ZM653.5,-87L747,-87L747,808L653.5,808L653.5,-87Z" fill="currentColor"/>
+<path d="M1004.09,281.42Q1111.35,302.22 1191.69,339.35Q1272.03,376.47 1325.6,429.99Q1379.16,483.5 1406.03,553.35Q1432.91,623.2 1432.91,709.23L1432.91,751L996.14,751L996.14,666.25L1381.67,666.25L1333.89,687.77Q1333.44,626.9 1310.98,575.28Q1288.51,523.65 1243.68,482.19Q1198.86,440.74 1130.94,409.63Q1063.03,378.53 971.82,358.26L1004.09,281.42ZM1629,503.02L1819,503.02L1819,588.02L1629,588.02L1629,503.02ZM1580.5,287.46L1674,287.46L1674,808L1580.5,808L1580.5,287.46ZM1674.14,-98.38L1674.14,183.5L1674.14,238.5L1111,238.5L1111,154.5L1621.05,154.5L1582.2,169L1582.2,-98.38L1674.14,-98.38Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=477.45</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="501.64" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=501.64">
+<g transform="scale(1,-1)">
+<path d="M82.63,112.52Q187.1,142.24 267.45,192.91Q347.8,243.59 402.62,314.75Q457.45,385.9 485.68,476.92Q513.91,567.94 513.91,678.21L513.91,728L76.2,728L76.2,638.8L459.17,638.8L413.27,661.66Q413.07,575.07 390.16,501.48Q367.25,427.88 321.26,368.31Q275.26,308.75 205.25,263.43Q135.23,218.12 40.55,187.47L82.63,112.52ZM702,391L893,391L893,479L702,479L702,391ZM651,-88L748,-88L748,809L651,809L651,-88Z" fill="currentColor"/>
+<path d="M1003.74,280.85Q1111.38,301.65 1191.97,338.8Q1272.57,375.96 1326.29,429.56Q1380.02,483.16 1406.96,553.12Q1433.91,623.07 1433.91,709.26L1433.91,752L995.36,752L995.36,664.3L1381.24,664.3L1331.38,687.74Q1330.94,627.29 1308.56,576.05Q1286.17,524.8 1241.49,483.65Q1196.81,442.51 1129.11,411.61Q1061.4,380.71 970.44,360.51L1003.74,280.85ZM1629,502.01L1820,502.01L1820,590.01L1629,590.01L1629,502.01ZM1578,287.8L1675,287.8L1675,809L1578,809L1578,287.8ZM1675.14,-99.37L1675.14,183L1675.14,239L1110,239L1110,152.2L1618.83,152.2L1579.71,166.4L1579.71,-99.37L1675.14,-99.37Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=501.64</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="525.83" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=525.83">
+<g transform="scale(1,-1)">
+<path d="M82.5,111.53Q187.27,141.25 267.83,192.01Q348.39,242.76 403.35,314.04Q458.32,385.33 486.62,476.53Q514.91,567.72 514.91,678.22L514.91,729L75.57,729L75.57,636.6L458.46,636.6L410.77,661.27Q410.57,575.06 387.73,501.83Q364.89,428.6 319.02,369.34Q273.15,310.08 203.31,264.94Q133.46,219.8 38.95,189.17L82.5,111.53ZM702,389.5L894,389.5L894,480.5L702,480.5L702,389.5ZM648.5,-89L749,-89L749,810L648.5,810L648.5,-89Z" fill="currentColor"/>
+<path d="M1003.38,280.32Q1111.4,301.1 1192.25,338.29Q1273.1,375.47 1326.99,429.15Q1380.87,482.83 1407.89,552.89Q1434.91,622.96 1434.91,709.3L1434.91,753L994.59,753L994.59,662.35L1380.81,662.35L1328.86,687.69Q1328.44,627.68 1306.13,576.83Q1283.82,525.97 1239.29,485.14Q1194.76,444.31 1127.27,413.62Q1059.79,382.93 969.07,362.81L1003.38,280.32ZM1629,501L1821,501L1821,592L1629,592L1629,501ZM1575.5,288.14L1676,288.14L1676,810L1575.5,810L1575.5,288.14ZM1676.14,-100.33L1676.14,182.5L1676.14,239.5L1109,239.5L1109,149.9L1616.6,149.9L1577.21,163.8L1577.21,-100.33L1676.14,-100.33Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=525.83</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="550.02" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=550.02">
+<g transform="scale(1,-1)">
+<path d="M82.34,110.53Q187.42,140.27 268.19,191.1Q348.96,241.93 404.07,313.34Q459.19,384.76 487.55,476.13Q515.91,567.5 515.91,678.22L515.91,730L74.94,730L74.94,634.4L457.74,634.4L408.27,660.88Q408.08,575.06 385.31,502.19Q362.54,429.33 316.78,370.37Q271.03,311.41 201.35,266.45Q131.68,221.49 37.34,190.87L82.34,110.53ZM702,388L895,388L895,482L702,482L702,388ZM646,-90L750,-90L750,811L646,811L646,-90Z" fill="currentColor"/>
+<path d="M1003,279.79Q1111.4,300.55 1192.51,337.77Q1273.62,374.99 1327.67,428.74Q1381.72,482.5 1408.82,552.67Q1435.91,622.84 1435.91,709.34L1435.91,754L993.82,754L993.82,660.4L1380.39,660.4L1326.35,687.66Q1325.95,628.08 1303.71,577.62Q1281.48,527.15 1237.09,486.63Q1192.71,446.11 1125.43,415.64Q1058.16,385.16 967.69,365.11L1003,279.79ZM1629,499.99L1822,499.99L1822,593.99L1629,593.99L1629,499.99ZM1573,288.51L1677,288.51L1677,811L1573,811L1573,288.51ZM1677.14,-101.32L1677.14,182L1677.14,240L1108,240L1108,147.6L1614.37,147.6L1574.71,161.2L1574.71,-101.32L1677.14,-101.32Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=550.02</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="574.21" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=574.21">
+<g transform="scale(1,-1)">
+<path d="M82.2,109.53Q187.6,139.28 268.57,190.19Q349.55,241.09 404.8,312.64Q460.06,384.19 488.48,475.74Q516.91,567.29 516.91,678.23L516.91,731L74.32,731L74.32,632.2L457.03,632.2L405.76,660.5Q405.58,575.05 382.88,502.55Q360.19,430.06 314.55,371.41Q268.92,312.75 199.42,267.97Q129.92,223.19 35.75,192.57L82.2,109.53ZM702,386.5L896,386.5L896,483.5L702,483.5L702,386.5ZM643.5,-91L751,-91L751,812L643.5,812L643.5,-91Z" fill="currentColor"/>
+<path d="M1002.64,279.25Q1111.41,300 1192.78,337.25Q1274.15,374.5 1328.36,428.33Q1382.58,482.17 1409.74,552.44Q1436.91,622.72 1436.91,709.37L1436.91,755L993.04,755L993.04,658.45L1379.97,658.45L1323.84,687.62Q1323.45,628.48 1301.29,578.41Q1279.13,528.34 1234.9,488.13Q1190.67,447.92 1123.61,417.66Q1056.55,387.39 966.33,367.42L1002.64,279.25ZM1629,499.01L1823,499.01L1823,596.01L1629,596.01L1629,499.01ZM1570.5,288.85L1678,288.85L1678,812L1570.5,812L1570.5,288.85ZM1678.14,-102.28L1678.14,181.5L1678.14,240.5L1107,240.5L1107,145.3L1612.14,145.3L1572.21,158.6L1572.21,-102.28L1678.14,-102.28Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=574.21</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame print" data-value="598.4" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=598.4">
+<g transform="scale(1,-1)">
+<path d="M82.07,108.54Q187.76,138.3 268.95,189.28Q350.14,240.26 405.53,311.94Q460.93,383.62 489.42,475.34Q517.91,567.07 517.91,678.24L517.91,732L73.69,732L73.69,630L456.31,630L403.26,660.11Q403.08,575.04 380.46,502.92Q357.83,430.79 312.32,372.44Q266.81,314.1 197.48,269.49Q128.15,224.89 34.17,194.28L82.07,108.54ZM702,385L897,385L897,485L702,485L702,385ZM641,-92L752,-92L752,813L641,813L641,-92Z" fill="currentColor"/>
+<path d="M1002.27,278.72Q1111.43,299.46 1193.05,336.73Q1274.68,374.01 1329.06,427.93Q1383.43,481.84 1410.67,552.22Q1437.91,622.6 1437.91,709.41L1437.91,756L992.27,756L992.27,656.5L1379.54,656.5L1321.34,687.58Q1320.95,628.89 1298.87,579.21Q1276.79,529.53 1232.71,489.63Q1188.63,449.74 1121.79,419.69Q1054.94,389.63 964.98,369.73L1002.27,278.72ZM1629,498L1824,498L1824,598L1629,598L1629,498ZM1568,289.19L1679,289.19L1679,813L1568,813L1568,289.19ZM1679.14,-103.27L1679.14,181L1679.14,241L1106,241L1106,143L1609.91,143L1569.71,156L1569.71,-103.27L1679.14,-103.27Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=598.4</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="622.59" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=622.59">
+<g transform="scale(1,-1)">
+<path d="M81.9,107.54Q187.91,137.31 269.31,188.37Q350.72,239.43 406.25,311.24Q461.79,383.05 490.35,474.95Q518.91,566.85 518.91,678.24L518.91,733L73.06,733L73.06,627.8L455.6,627.8L400.76,659.72Q400.59,575.04 378.03,503.28Q355.48,431.53 310.09,373.49Q264.69,315.45 195.53,271.02Q126.38,226.59 32.56,196L81.9,107.54ZM702,383.5L898,383.5L898,486.5L702,486.5L702,383.5ZM638.5,-93L753,-93L753,814L638.5,814L638.5,-93Z" fill="currentColor"/>
+<path d="M1001.87,278.16Q1111.42,298.88 1193.31,336.19Q1275.19,373.5 1329.74,427.5Q1384.28,481.49 1411.6,551.99Q1438.91,622.48 1438.91,709.44L1438.91,757L991.49,757L991.49,654.55L1379.12,654.55L1318.83,687.55Q1318.45,629.29 1296.45,580Q1274.45,530.7 1230.52,491.12Q1186.58,451.54 1119.95,421.7Q1053.32,391.86 963.6,372.03L1001.87,278.16ZM1629,496.99L1825,496.99L1825,599.99L1629,599.99L1629,496.99ZM1565.5,289.53L1680,289.53L1680,814L1565.5,814L1565.5,289.53ZM1680.14,-104.27L1680.14,180.5L1680.14,241.5L1105,241.5L1105,140.7L1607.67,140.7L1567.22,153.4L1567.22,-104.27L1680.14,-104.27Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=622.59</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="646.78" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=646.78">
+<g transform="scale(1,-1)">
+<path d="M81.76,106.54Q188.08,136.33 269.69,187.46Q351.3,238.59 406.98,310.54Q462.66,382.48 491.29,474.56Q519.91,566.63 519.91,678.25L519.91,734L72.43,734L72.43,625.6L454.88,625.6L398.26,659.33Q398.09,575.04 375.61,503.65Q353.12,432.27 307.85,374.54Q262.59,316.8 193.6,272.55Q124.62,228.31 30.98,197.72L81.76,106.54ZM702,382L899,382L899,488L702,488L702,382ZM636,-94L754,-94L754,815L636,815L636,-94Z" fill="currentColor"/>
+<path d="M1001.5,277.62Q1111.43,298.33 1193.57,335.67Q1275.72,373.01 1330.43,427.09Q1385.14,481.16 1412.52,551.76Q1439.91,622.36 1439.91,709.48L1439.91,758L990.71,758L990.71,652.6L1378.7,652.6L1316.31,687.52Q1315.95,629.7 1294.03,580.8Q1272.11,531.91 1228.32,492.64Q1184.54,453.37 1118.13,423.74Q1051.72,394.12 962.25,374.36L1001.5,277.62ZM1629,496.01L1826,496.01L1826,602.01L1629,602.01L1629,496.01ZM1563,289.86L1681,289.86L1681,815L1563,815L1563,289.86ZM1681.14,-105.23L1681.14,180L1681.14,242L1104,242L1104,138.4L1605.43,138.4L1564.72,150.8L1564.72,-105.23L1681.14,-105.23Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=646.78</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="670.97" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=670.97">
+<g transform="scale(1,-1)">
+<path d="M81.6,105.55Q188.23,135.34 270.05,186.55Q351.88,237.76 407.7,309.83Q463.53,381.91 492.22,474.16Q520.91,566.41 520.91,678.26L520.91,735L71.81,735L71.81,623.4L454.16,623.4L395.76,658.95Q395.59,575.04 373.18,504.02Q350.77,433.01 305.62,375.59Q260.47,318.16 191.66,274.09Q122.84,230.02 29.38,199.44L81.6,105.55ZM702,380.5L900,380.5L900,489.5L702,489.5L702,380.5ZM633.5,-95L755,-95L755,816L633.5,816L633.5,-95Z" fill="currentColor"/>
+<path d="M1001.1,277.09Q1111.41,297.78 1193.82,335.15Q1276.24,372.52 1331.11,426.68Q1385.99,480.83 1413.45,551.54Q1440.91,622.25 1440.91,709.52L1440.91,759L989.94,759L989.94,650.65L1378.29,650.65L1313.8,687.49Q1313.45,630.11 1291.61,581.61Q1269.76,533.11 1226.13,494.16Q1182.5,455.21 1116.3,425.79Q1050.1,396.38 960.89,376.71L1001.1,277.09ZM1629,495L1827,495L1827,604L1629,604L1629,495ZM1560.5,290.23L1682,290.23L1682,816L1560.5,816L1560.5,290.23ZM1682.14,-106.22L1682.14,179.5L1682.14,242.5L1103,242.5L1103,136.1L1603.18,136.1L1562.22,148.2L1562.22,-106.22L1682.14,-106.22Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=670.97</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="695.16" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=695.16">
+<g transform="scale(1,-1)">
+<path d="M81.45,104.55Q188.39,134.36 270.43,185.64Q352.46,236.92 408.43,309.13Q464.4,381.34 493.15,473.77Q521.91,566.19 521.91,678.26L521.91,736L71.19,736L71.19,621.2L453.44,621.2L393.25,658.56Q393.1,575.04 370.76,504.4Q348.42,433.76 303.39,376.64Q258.37,319.52 189.73,275.63Q121.09,231.74 27.81,201.17L81.45,104.55ZM702,379L901,379L901,491L702,491L702,379ZM631,-96L756,-96L756,817L631,817L631,-96Z" fill="currentColor"/>
+<path d="M1000.72,276.56Q1111.42,297.23 1194.09,334.63Q1276.76,372.03 1331.8,426.27Q1386.84,480.5 1414.37,551.31Q1441.91,622.13 1441.91,709.55L1441.91,760L989.16,760L989.16,648.7L1377.87,648.7L1311.29,687.46Q1310.96,630.52 1289.19,582.42Q1267.43,534.32 1223.95,495.68Q1180.47,457.05 1114.49,427.85Q1048.51,398.65 959.55,379.06L1000.72,276.56ZM1629,493.99L1828,493.99L1828,605.99L1629,605.99L1629,493.99ZM1558,290.57L1683,290.57L1683,817L1558,817L1558,290.57ZM1683.14,-107.18L1683.14,179L1683.14,243L1102,243L1102,133.8L1600.94,133.8L1559.72,145.6L1559.72,-107.18L1683.14,-107.18Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=695.16</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="719.35" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=719.35">
+<g transform="scale(1,-1)">
+<path d="M81.31,103.55Q188.56,133.38 270.8,184.73Q353.05,236.09 409.16,308.43Q465.27,380.77 494.09,473.37Q522.91,565.98 522.91,678.27L522.91,737L70.56,737L70.56,619L452.72,619L390.75,658.17Q390.6,575.04 368.34,504.77Q346.07,434.5 301.17,377.7Q256.26,320.89 187.8,277.18Q119.34,233.47 26.24,202.91L81.31,103.55ZM702,377.5L902,377.5L902,492.5L702,492.5L702,377.5ZM628.5,-97L757,-97L757,818L628.5,818L628.5,-97Z" fill="currentColor"/>
+<path d="M1000.34,275.99Q1111.42,296.65 1194.35,334.09Q1277.28,371.52 1332.49,425.84Q1387.69,480.15 1415.3,551.08Q1442.91,622.01 1442.91,709.59L1442.91,761L988.38,761L988.38,646.75L1377.45,646.75L1308.78,687.43Q1308.46,630.94 1286.77,583.23Q1265.09,535.52 1221.76,497.19Q1178.43,458.87 1112.67,429.89Q1046.91,400.9 958.21,381.38L1000.34,275.99ZM1629,493.01L1829,493.01L1829,608.01L1629,608.01L1629,493.01ZM1555.5,290.91L1684,290.91L1684,818L1555.5,818L1555.5,290.91ZM1684.14,-108.17L1684.14,178.5L1684.14,243.5L1101,243.5L1101,131.5L1598.69,131.5L1557.22,143L1557.22,-108.17L1684.14,-108.17Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=719.35</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="743.54" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=743.54">
+<g transform="scale(1,-1)">
+<path d="M81.14,102.56Q188.7,132.39 271.16,183.82Q353.62,235.25 409.88,307.72Q466.13,380.2 495.02,472.98Q523.91,565.76 523.91,678.28L523.91,738L69.94,738L69.94,616.8L452,616.8L388.25,657.78Q388.11,575.04 365.91,505.15Q343.72,435.26 298.93,378.76Q254.15,322.26 185.86,278.73Q117.57,235.2 24.65,204.65L81.14,102.56ZM702,376L903,376L903,494L702,494L702,376ZM626,-98L758,-98L758,819L626,819L626,-98Z" fill="currentColor"/>
+<path d="M999.92,275.46Q1111.4,296.11 1194.59,333.57Q1277.79,371.03 1333.17,425.43Q1388.54,479.82 1416.22,550.85Q1443.91,621.89 1443.91,709.62L1443.91,762L987.6,762L987.6,644.8L1377.04,644.8L1306.28,687.41Q1305.96,631.36 1284.35,584.05Q1262.75,536.74 1219.57,498.73Q1176.39,460.73 1110.85,431.96Q1045.31,403.19 956.86,383.74L999.92,275.46ZM1629,492L1830,492L1830,610L1629,610L1629,492ZM1553,291.25L1685,291.25L1685,819L1553,819L1553,291.25ZM1685.14,-109.16L1685.14,178L1685.14,244L1100,244L1100,129.2L1596.44,129.2L1554.73,140.4L1554.73,-109.16L1685.14,-109.16Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=743.54</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="767.73" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=767.73">
+<g transform="scale(1,-1)">
+<path d="M80.99,101.56Q188.86,131.4 271.54,182.91Q354.21,234.42 410.6,307.02Q467,379.63 495.96,472.58Q524.91,565.54 524.91,678.28L524.91,739L69.32,739L69.32,614.6L451.28,614.6L385.75,657.4Q385.61,575.05 363.49,505.53Q341.37,436.01 296.71,379.83Q252.05,323.64 183.93,280.29Q115.82,236.94 23.08,206.4L80.99,101.56ZM702,374.5L904,374.5L904,495.5L702,495.5L702,374.5ZM623.5,-99L759,-99L759,820L623.5,820L623.5,-99Z" fill="currentColor"/>
+<path d="M999.53,274.93Q1111.39,295.56 1194.85,333.05Q1278.31,370.54 1333.85,425.02Q1389.39,479.49 1417.15,550.63Q1444.91,621.77 1444.91,709.66L1444.91,763L986.82,763L986.82,642.85L1376.63,642.85L1303.76,687.38Q1303.46,631.78 1281.93,584.87Q1260.41,537.96 1217.38,500.28Q1174.36,462.59 1109.04,434.04Q1043.72,405.49 955.53,386.12L999.53,274.93ZM1629,490.99L1831,490.99L1831,611.99L1629,611.99L1629,490.99ZM1550.5,291.59L1686,291.59L1686,820L1550.5,820L1550.5,291.59ZM1686.14,-110.13L1686.14,177.5L1686.14,244.5L1099,244.5L1099,126.9L1594.19,126.9L1552.23,137.8L1552.23,-110.13L1686.14,-110.13Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=767.73</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="791.92" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=791.92">
+<g transform="scale(1,-1)">
+<path d="M80.84,100.56Q189.03,130.42 271.91,182Q354.79,233.58 411.33,306.32Q467.87,379.06 496.89,472.19Q525.91,565.32 525.91,678.29L525.91,740L68.69,740L68.69,612.4L450.56,612.4L383.24,657.01Q383.11,575.05 361.06,505.91Q339.02,436.77 294.48,380.9Q249.95,325.02 182.01,281.85Q114.07,238.68 21.52,208.15L80.84,100.56ZM702,373L905,373L905,497L702,497L702,373ZM621,-100L760,-100L760,821L621,821L621,-100Z" fill="currentColor"/>
+<path d="M999.14,274.39Q1111.39,295.01 1195.11,332.53Q1278.83,370.05 1334.54,424.61Q1390.25,479.16 1418.08,550.41Q1445.91,621.65 1445.91,709.7L1445.91,764L986.04,764L986.04,640.9L1376.22,640.9L1301.25,687.36Q1300.96,632.21 1279.52,585.7Q1258.07,539.19 1215.2,501.83Q1172.33,464.46 1107.24,436.12Q1042.14,407.79 954.21,388.49L999.14,274.39ZM1629,489.98L1832,489.98L1832,613.99L1629,613.99L1629,489.98ZM1548,291.95L1687,291.95L1687,821L1548,821L1548,291.95ZM1687.14,-111.12L1687.14,177L1687.14,245L1098,245L1098,124.6L1591.93,124.6L1549.73,135.2L1549.73,-111.12L1687.14,-111.12Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=791.92</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame" data-value="816.11" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=816.11">
+<g transform="scale(1,-1)">
+<path d="M80.67,99.56Q189.16,129.43 272.26,181.09Q355.36,232.74 412.05,305.61Q468.73,378.49 497.82,471.79Q526.91,565.1 526.91,678.29L526.91,741L68.07,741L68.07,610.2L449.84,610.2L380.74,656.63Q380.62,575.06 358.64,506.3Q336.66,437.53 292.25,381.97Q247.84,326.41 180.08,283.42Q112.31,240.43 19.93,209.91L80.67,99.56ZM702,371.5L906,371.5L906,498.5L702,498.5L702,371.5ZM618.5,-101L761,-101L761,822L618.5,822L618.5,-101Z" fill="currentColor"/>
+<path d="M998.71,273.83Q1111.36,294.43 1195.35,331.98Q1279.34,369.54 1335.22,424.17Q1391.09,478.81 1419,550.17Q1446.91,621.53 1446.91,709.73L1446.91,765L985.27,765L985.27,638.95L1375.81,638.95L1298.74,687.33Q1298.47,632.63 1277.1,586.52Q1255.73,540.41 1213.01,503.36Q1170.3,466.31 1105.42,438.19Q1040.54,410.07 952.87,390.85L998.71,273.83ZM1629,489L1833,489L1833,616L1629,616L1629,489ZM1545.5,292.29L1688,292.29L1688,822L1545.5,822L1545.5,292.29ZM1688.14,-112.08L1688.14,176.5L1688.14,245.5L1097,245.5L1097,122.3L1589.67,122.3L1547.23,132.6L1547.23,-112.08L1688.14,-112.08Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=816.11</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div><div class="frame print" data-value="840.3" hidden><svg viewBox="-40 -863 1920 1103" role="img" aria-label="가각 at wght=840.3">
+<g transform="scale(1,-1)">
+<path d="M80.52,98.57Q189.32,128.45 272.64,180.18Q355.95,231.91 412.77,304.91Q469.6,377.92 498.76,471.4Q527.91,564.88 527.91,678.3L527.91,742L67.45,742L67.45,608L449.12,608L378.24,656.24Q378.12,575.07 356.22,506.68Q334.32,438.3 290.03,383.05Q245.74,327.8 178.16,284.99Q110.57,242.18 18.37,211.67L80.52,98.57ZM702,370L907,370L907,500L702,500L702,370ZM616,-102L762,-102L762,823L616,823L616,-102Z" fill="currentColor"/>
+<path d="M998.31,273.3Q1111.35,293.88 1195.6,331.46Q1279.86,369.05 1335.9,423.76Q1391.94,478.48 1419.93,549.95Q1447.91,621.41 1447.91,709.77L1447.91,766L984.49,766L984.49,637L1375.4,637L1296.23,687.31Q1295.97,633.07 1274.68,587.36Q1253.39,541.65 1210.83,504.92Q1168.27,468.19 1103.62,440.29Q1038.96,412.38 951.55,393.24L998.31,273.3ZM1629,487.99L1834,487.99L1834,617.99L1629,617.99L1629,487.99ZM1543,292.63L1689,292.63L1689,823L1543,823L1543,292.63ZM1689.14,-113.07L1689.14,176L1689.14,246L1096,246L1096,120L1587.41,120L1544.73,130L1544.73,-113.07L1689.14,-113.07Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=840.3</div><code class="frame-shape">[gid1=0+920|gid2=1+920]</code></div></div><label class="control"><span>wght</span><input type="range" min="356.5" max="840.3" step="24.19" value="356.5"><output>356.5</output></label><figcaption><code>hb-vector hb:test/api/fonts/varc-ac00-ac01.ttf "가각" --variations=wght=…</code>, drawn at every 24.19 from 356.5 to 840.3</figcaption></figure>
+<p id="ix-10">As the weight changes, the components move and reshape: each is drawn at its own coordinates, which VARC works out from the glyph’s.</p>
+<h3 id="inside">Inside 가</h3>
+<p id="ix-11">가 is glyph 1. Here is what VARC says about it at weight 598.4, normalized 0.5, as <code>varc-dump.py</code> works it out:</p>
+<pre><code>glyph 1, at: wght 0.5
+  component 0: glyph 3
+    glyph 3, at: wght 0.5
+      component 0: glyph 4
+        axis-value deltas, region 0 (wght 0…1…1), scalar 0.5: [0, -327, 0]
+        axis values (2.14): 0000 -4227, 0001 819 - 163.5 = 655.5 → 656, 0002 -8484
+        transform: translateX -10, translateY 24
+        leaf: glyph 4, drawn from glyf at: wght 0.5, 0000 -0.258, 0001 0.04004, 0002 -0.5178
+              through the matrix (1, 0, 0, 1) and offset (-10, 24)
+  component 1: glyph 5
+    glyph 5, at: wght 0.5
+      component 0: glyph 6
+        axis values (2.14): 0002 3537
+        transform: translateX -13
+        leaf: glyph 6, drawn from glyf at: wght 0.5, 0002 0.2159
+              through the matrix (1, 0, 0, 1) and offset (-13, 0)
+</code></pre>
+<p id="ix-12">가’s components, glyphs 3 and 5, are the jamo ㄱ and ㅏ. They set nothing themselves: they are VARC glyphs too, and their own components draw glyphs 4 and 6, plain <code>glyf</code> outlines with gvar variations, with axes set and small offsets. Here are the jamo on their own, then 가:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -853 2840 1093" role="img" aria-label="gid3|gid5|gid1 at wght=598.4">
+<g transform="scale(1,-1)">
+<path d="M82.07,108.54Q187.76,138.3 268.95,189.28Q350.14,240.26 405.53,311.94Q460.93,383.62 489.42,475.34Q517.91,567.07 517.91,678.24L517.91,732L73.69,732L73.69,630L456.31,630L403.26,660.11Q403.08,575.04 380.46,502.92Q357.83,430.79 312.32,372.44Q266.81,314.1 197.48,269.49Q128.15,224.89 34.17,194.28L82.07,108.54Z" fill="currentColor"/>
+<path d="M1622,385L1817,385L1817,485L1622,485L1622,385ZM1561,-92L1672,-92L1672,813L1561,813L1561,-92Z" fill="currentColor"/>
+<path d="M1922.07,108.54Q2027.77,138.3 2108.95,189.28Q2190.14,240.26 2245.53,311.94Q2300.93,383.62 2329.42,475.34Q2357.91,567.07 2357.91,678.24L2357.91,732L1913.69,732L1913.69,630L2296.31,630L2243.26,660.11Q2243.08,575.04 2220.46,502.92Q2197.83,430.79 2152.32,372.44Q2106.81,314.1 2037.48,269.49Q1968.15,224.89 1874.17,194.28L1922.07,108.54ZM2542,385L2737,385L2737,485L2542,485L2542,385ZM2481,-92L2592,-92L2592,813L2481,813L2481,-92Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=598.4</div><code class="frame-shape">[gid3=0+920|gid5=0+920|gid1=0+920]</code></div></div><figcaption><code>hb-vector hb:test/api/fonts/varc-ac00-ac01.ttf "gid3|gid5|gid1" --glyphs --variations=wght=598.4</code></figcaption></figure>
+<p id="ix-13">Glyph 4 is a ㄱ designed to be reshaped. With its axes at their defaults it is wide; at the coordinates 가’s component gives it, it is 가’s narrower ㄱ:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-47 -840 1007 1080" role="img" aria-label="gid4 at wght=598.4">
+<g transform="scale(1,-1)">
+<path d="M10,-45Q206.5,-21.5 362,36.25Q517.5,94 626.5,182.75Q735.5,271.5 792.75,388.75Q850,506 850,648L850,708L80,708L80,606L786,606L737,640Q737,529.5 691.5,435.25Q646,341 554,266.75Q462,192.5 322.25,140.75Q182.5,89 -7,62L10,-45Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=598.4</div><code class="frame-shape">[gid4=0+920]</code></div><div class="frame"><svg viewBox="-47 -840 1007 1080" role="img" aria-label="gid4 at wght=598.4,0000=-0.258,0001=0.04004,0002=-0.5178">
+<g transform="scale(1,-1)">
+<path d="M92.07,84.54Q197.76,114.3 278.95,165.28Q360.14,216.26 415.53,287.94Q470.93,359.62 499.42,451.34Q527.91,543.07 527.91,654.24L527.91,708L83.69,708L83.69,606L466.31,606L413.26,636.11Q413.08,551.04 390.46,478.92Q367.83,406.79 322.32,348.44Q276.81,290.1 207.48,245.49Q138.15,200.89 44.17,170.28L92.07,84.54Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=598.4,0000=-0.258,0001=0.04004,0002=-0.5178</div><code class="frame-shape">[gid4=0+920]</code></div></div><figcaption><code>hb-vector hb:test/api/fonts/varc-ac00-ac01.ttf "gid4" --glyphs</code></figcaption></figure>
+<p>Its axes are the ways it can change. Here it is at the font’s defaults, then with each of the three axes 가 sets pushed to its end:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-47 -840 1007 1080" role="img" aria-label="gid4 at 0000=0">
+<g transform="scale(1,-1)">
+<path d="M5,-35Q200,-12 354.5,45Q509,102 617.5,189.5Q726,277 783,392.5Q840,508 840,648L840,698L90,698L90,628L796,628L762,640Q762,525 715,426.5Q668,328 573,250.5Q478,173 333.5,119Q189,65 -7,37L5,-35Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">0000=0</div><code class="frame-shape">[gid4=0+920]</code></div><div class="frame"><svg viewBox="-47 -840 1007 1080" role="img" aria-label="gid4 at 0002=-1">
+<g transform="scale(1,-1)">
+<path d="M120,-35Q144,12 162.5,78Q181,144 193,229.5Q205,315 211.5,419.5Q218,524 218,648L218,698L90,698L90,628L174,628L140,640Q140,529 135,434.5Q130,340 120.5,261.5Q111,183 96,120.5Q81,58 61,11L120,-35Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">0002=-1</div><code class="frame-shape">[gid4=0+920]</code></div><div class="frame"><svg viewBox="-47 -840 1007 1080" role="img" aria-label="gid4 at 0000=-1">
+<g transform="scale(1,-1)">
+<path d="M90,465Q287,470 429,484.5Q571,499 662,524Q753,549 796.5,585Q840,621 840,668L840,698L90,698L90,628L798,628L748,640Q746,620 703.5,602.5Q661,585 577.5,571.5Q494,558 370.5,548.5Q247,539 84,536L90,465Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">0000=-1</div><code class="frame-shape">[gid4=0+920]</code></div><div class="frame"><svg viewBox="-47 -840 1007 1080" role="img" aria-label="gid4 at 0001=1">
+<g transform="scale(1,-1)">
+<path d="M839,-35Q839,40 839,114Q839,188 839,268.5Q839,349 839,442.5Q839,536 839,648L839,698L90,698L90,628L780,628L762,640Q762,535 762,445Q762,355 762,274.5Q762,194 762,119Q762,44 762,-30L839,-35Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">0001=1</div><code class="frame-shape">[gid4=0+920]</code></div></div><figcaption><code>hb-vector hb:test/api/fonts/varc-ac00-ac01.ttf "gid4" --glyphs</code></figcaption></figure>
+<p id="ix-14"><code>0002</code> narrows the ㄱ, <code>0000</code> shortens its downstroke, and <code>0001</code> straightens it. 가 asks for half the narrowing and a quarter of the shortening; 각, which needs room for a final ㄱ underneath, sets <code>0000</code> to −0.54. One outline serves both.</p>
+<blockquote>
+<p id="ix-15">For type designers: this font’s part axes are ordinary <code>fvar</code> axes, with no hidden flag, so an application could offer them to users, and setting <code>0003</code>, which 가’s ㄱ doesn’t set, changes 가. A font needn’t expose them; see <a href="#hidden-axes">Hidden axes</a>.</p>
+</blockquote>
+<h2 id="how-harfbuzz-draws-a-varc-glyph">How HarfBuzz draws a VARC glyph</h2>
+<p id="ix-16">VARC comes first. When HarfBuzz’s font functions draw a glyph, they try VARC before any outline format (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L919"><code>hb-ot-font.cc:919</code></a>):</p>
+<pre><code class="language-c++">#ifndef HB_NO_VAR_COMPOSITES
+  if (font-&gt;face-&gt;table.VARC-&gt;get_path (font, glyph, draw_session)) return true;
+#endif
+  // Keep the following in synch with VARC::get_path_at()
+  if (font-&gt;face-&gt;table.glyf-&gt;get_path (font, glyph, draw_session, gvar_cache,
+                                       &amp;draw_session.get_budget ())) return true;
+</code></pre>
+<p id="ix-17">A glyph that VARC covers is drawn from VARC, whatever <code>glyf</code> or CFF has for it. A glyph it doesn’t cover falls through to the usual formats. Extents are worked out the same way, after the color and bitmap tables.</p>
+<p id="ix-18">A VARC glyph is a list of <strong>components</strong>. Each is a packed record (<code>VarComponent::decompile_record</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc#L31"><code>OT/Var/VARC/VARC.cc:31</code></a>): flags, a glyph ID, and only the fields the flags say are there:</p>
+<ul>
+<li id="ix-19">a <strong>condition</strong>, which decides whether the component is drawn at all;</li>
+<li id="ix-20"><strong>axis values</strong>: settings for some of the axes, to draw the component at;</li>
+<li id="ix-21">indices into VARC’s own variation store, for variations of those values and of the transform;</li>
+<li id="ix-22">a <strong>transform</strong>: translation, rotation, scale, skew, and a center for rotating and scaling around.</li>
+</ul>
+<p id="ix-23"><code>VarComponent::get_path_at</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc#L343"><code>VARC.cc:343</code></a>) takes a component through six steps. Here they are for glyph 3’s component, 가’s ㄱ, at weight 598.4.</p>
+<h3 id="step-1-the-parents-coordinates">Step 1: the parent’s coordinates</h3>
+<p id="ix-24"><code>get_path_at</code> is handed <code>coords</code>, the normalized position of the glyph the component belongs to, its <strong>parent</strong>: the font’s position for a glyph in the text, or whatever the level above worked out. 가 sets no axes for glyph 3, so glyph 3 is where 가 is: weight 0.5, everything else 0. The condition and all the deltas are evaluated there.</p>
+<h3 id="step-2-the-condition">Step 2: the condition</h3>
+<p id="ix-25">A condition is a small expression over the coordinates: an axis in a range, or a value from the variation store above zero, combined with <em>and</em>, <em>or</em> and <em>not</em>. It is evaluated at the parent’s coordinates (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc#L376"><code>VARC.cc:376</code></a>), and a component whose condition is false isn’t drawn, so a glyph can change its structure, as a heavy weight might drop a stroke.</p>
+<p id="ix-26">Glyph 3’s component has no condition. In <code>varc-ac01-conditional.ttf</code>, 각’s middle component is drawn only above a certain weight:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -853 1000 1093" role="img" aria-label="각 at wght=590">
+<g transform="scale(1,-1)">
+<path d="M82.38,278.88Q191.41,299.62 272.95,336.89Q354.49,374.16 408.81,428.05Q463.13,481.94 490.35,552.29Q517.56,622.64 517.56,709.39L517.56,755.65L72.53,755.65L72.53,657.18L459.69,657.18L402.21,687.6Q401.82,628.74 379.71,578.92Q357.6,529.1 313.47,489.1Q269.33,449.09 202.41,418.96Q135.49,388.84 45.43,368.91L82.38,278.88ZM758.79,-102.94L758.79,181.17L758.79,240.83L186.35,240.83L186.35,143.8L690.68,143.8L650.58,156.9L650.58,-102.94L758.79,-102.94Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=590</div><code class="frame-shape">[gid1=0+920]</code></div><div class="frame"><svg viewBox="-40 -853 1000 1093" role="img" aria-label="각 at wght=610">
+<g transform="scale(1,-1)">
+<path d="M82.09,278.46Q191.43,299.19 273.18,336.48Q354.93,373.77 409.38,427.72Q463.84,481.68 491.11,552.11Q518.39,622.55 518.39,709.43L518.39,756.48L71.89,756.48L71.89,655.56L459.34,655.56L400.13,687.57Q399.75,629.08 377.71,579.59Q355.67,530.1 311.66,490.35Q267.65,450.61 200.91,420.66Q134.17,390.71 44.32,370.84L82.09,278.46ZM709,497.53L904.48,497.53L904.48,598.97L709,598.97L709,497.53ZM646.8,289.35L759.48,289.35L759.48,813.48L646.8,813.48L646.8,289.35ZM759.62,-103.74L759.62,180.76L759.62,241.24L185.52,241.24L185.52,141.9L688.83,141.9L648.51,154.75L648.51,-103.74L759.62,-103.74Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=610</div><code class="frame-shape">[gid1=0+920]</code></div></div><figcaption><code>hb-vector hb:test/api/fonts/varc-ac01-conditional.ttf "각"</code></figcaption></figure>
+<p id="ix-27">Between weight 590 and 610, the glyph goes from two contours to four.</p>
+<h3 id="step-3-the-axis-values-and-their-deltas">Step 3: the axis values and their deltas</h3>
+<p id="ix-28">The component sets <code>0000</code>, <code>0001</code> and <code>0002</code> to −4227, 819 and −8484 in 2.14 units: −0.258, 0.05 and −0.5178. Its flags say these vary, and give index 0 into the variation store, where the item has three numbers for each region (decoded by <code>varc-dump.py</code>, with fontTools reading the store):</p>
+<pre><code>── item 0:0 (VarIdx 0): 3 numbers for each of 3 regions
+region 0 (wght 0…1…1): [0, -327, 0]
+region 1 (opsz 0…1…1): [1704, 0, 0]
+(and 1 more region, all 0)
+</code></pre>
+<p id="ix-29">Regions work as in <a href="deltas.html#regions-and-scalars">Deltas</a>. At the parent’s weight of 0.5, the weight region counts by half and the others not at all, so <code>0001</code> becomes 819 − 0.5 × 327 = 655.5. The code is one call, with the parent’s <code>coords</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc#L381"><code>VARC.cc:381</code></a>, trimmed):</p>
+<pre><code class="language-c++">// Apply variations if any
+if ((flags &amp; (unsigned) flags_t::AXIS_VALUES_HAVE_VARIATION) &amp;&amp;
+    show &amp;&amp; !axisValues.in_error ())
+{
+  ...
+  varStore.get_delta (component.axis_values_var_idx, coords,
+                      axisValues.as_array (), cache);
+}
+</code></pre>
+<p id="ix-30">One index gives deltas for all three values; <a href="#the-multiple-item-variation-store">the multiple item variation store</a> explains how.</p>
+<h3 id="step-4-the-components-coordinates">Step 4: the component’s coordinates</h3>
+<p id="ix-31">Now the coordinates to draw the component at (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc#L392"><code>VARC.cc:392</code></a>, trimmed):</p>
+<pre><code class="language-c++">auto component_coords = coords;
+/* Copying coords is expensive; so we have put an arbitrary
+ * limit on the max number of coords for now. */
+if ((flags &amp; (unsigned) flags_t::RESET_UNSPECIFIED_AXES) ||
+    coords.length &gt; HB_VAR_COMPOSITE_MAX_AXES)
+  component_coords = hb_array (c.font-&gt;coords, c.font-&gt;num_coords);
+...
+coord_setter_t coord_setter (axisIndices ? component_coords : hb_array&lt;int&gt; ());
+for (unsigned i = 0; i &lt; axisIndices.length; i++)
+  coord_setter[axisIndices[i]] = hb_clamp_to&lt;int&gt; (round (axisValues[i]));
+</code></pre>
+<p id="ix-32">A component starts from its parent’s coordinates, or, with the <code>RESET_UNSPECIFIED_AXES</code> flag, from the font’s, as the user set them. Then it sets the axes it names, each rounded to a whole 2.14 unit. The ㄱ starts from weight 0.5 and will be drawn at weight 0.5, <code>0000</code> −0.258, <code>0001</code> 0.04004 (655.5 rounded to 656) and <code>0002</code> −0.5178. The weight passes through, so glyph 4’s own weight variations apply.</p>
+<p>Three more things about this step:</p>
+<ul>
+<li id="ix-33"><strong>Axes beyond fvar.</strong> <code>coord_setter_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/coord-setter.hh"><code>OT/Var/VARC/coord-setter.hh</code></a>) grows its array when an axis past the end is set, and fills the gap with zeros. A component can set axis 17 in a font whose fvar has two, and its outline’s variations, in gvar or CFF2, can depend on that axis. Indices go up to 4095: <code>HB_VAR_COMPOSITE_MAX_AXES</code> is 4096 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>hb-limits.hh</code></a>), and the setter ignores any index past it.</li>
+<li id="ix-34"><strong>No clamping.</strong> Axis values are rounded but not clamped to ±1, so a component can be drawn outside the design space the font declares.</li>
+<li><strong>An undocumented limit.</strong> Above 4096 incoming coordinates, the component resets to the font’s coordinates as if the flag were set. The comment presents it as a shortcut, to avoid copying, but it changes what is drawn.</li>
+</ul>
+<h3 id="step-5-the-transform">Step 5: the transform</h3>
+<p id="ix-35">The transform is stored as separate values, in fixed-point formats suited to each: translations in font units, rotation and skew in half-turns as 4.12 numbers, scales as 6.10. The ㄱ stores only a translation, (−10, 24), whose deltas are (0, 0) for weight and (0, 16) for optical size: it moves up with optical size, not weight.</p>
+<p id="ix-36">With the deltas added and the values converted, the parts are put together in this order (<code>hb_transform_decomposed_t::to_transform</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-geometry.hh#L406"><code>hb-geometry.hh:406</code></a>):</p>
+<pre><code class="language-c++">t.translate (translateX + tCenterX, translateY + tCenterY);
+t.rotate (rotation);
+t.scale (scaleX, scaleY);
+t.skew (-skewX, skewY);
+t.translate (-tCenterX, -tCenterY);
+</code></pre>
+<p id="ix-37">That is the standard’s pseudo-code exactly, negated horizontal skew included. Read upwards, it is what happens to a point: move the center to the origin, skew, scale, rotate, move back and translate. A missing field is 0, or 1 for a scale, except that a horizontal scale with no vertical one is used for both (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc#L444"><code>VARC.cc:444</code></a>). The result is multiplied onto the levels above (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc#L451"><code>VARC.cc:451</code></a>); for the ㄱ, it is simply a move by (−10, 24).</p>
+<p id="ix-38"><code>varc-6868.ttf</code>, a single Chinese character, 桨, uses much more: components rotated by 52°, 90° and −231°, scaled unevenly, transformed about a center, and three levels deep, with 31 axes, 29 of them private:</p>
+<figure class="draw slider"><div class="frames"><div class="frame print" data-value="400"><svg viewBox="-40 -903.06 1080 1143.06" role="img" aria-label="桨 at wght=400">
+<g transform="scale(1,-1)">
+<path d="M454.69,574.65Q477.5,585.59 499.77,598.23Q522.04,610.87 543.26,625.17Q564.47,639.48 584.49,655.3Q604.52,671.11 623.04,688.39Q641.57,705.66 658.34,724.41Q675.12,743.16 689.88,763.22Q704.64,783.28 716.99,804.58L653.68,831.59Q642.74,812.66 629.52,794.89Q616.31,777.11 601.23,760.71Q586.15,744.31 569.28,729.06Q552.41,713.8 534.03,699.93Q515.65,686.06 496.08,673.74Q476.52,661.43 455.8,650.53Q435.08,639.64 413.47,630.45L454.69,574.65ZM629.06,761.77L605.1,701.25L867.39,701.25L870.21,701.25L865.27,713.1Q854.48,684.81 832.95,653.06Q811.42,621.31 775.73,590.5Q740.05,559.69 688.17,531.21Q636.28,502.74 566.33,480.81Q496.38,458.89 405.56,445.45L433.34,379.76Q530.82,396.4 607.07,424.44Q683.33,452.48 741.17,487.04Q799,521.59 839.03,560.48Q879.06,599.37 903.44,635.24Q927.82,671.1 938.26,702.21L938.26,761.77L629.06,761.77ZM744.21,540.62Q733.73,549.48 722.81,558.04Q711.9,566.61 700.6,574.77Q689.3,582.94 677.65,590.71Q665.99,598.48 654.03,605.88Q642.08,613.27 629.76,620.21Q617.45,627.14 604.84,633.65Q592.23,640.17 579.36,646.12L540.13,598.17Q552.61,592.59 564.85,586.44Q577.08,580.29 588.93,573.66Q600.77,567.02 612.32,559.9Q623.88,552.77 635.04,545.17Q646.21,537.58 656.93,529.57Q667.65,521.56 677.98,513.09Q688.31,504.62 698.09,495.76L744.21,540.62ZM373.5,378.03L373.5,830.98L303.2,830.98L303.2,378.03L373.5,378.03ZM87.24,392.05Q107.55,399.75 127.6,408.46Q147.64,417.17 167.14,426.96Q186.63,436.75 205.58,447.53Q224.52,458.32 242.88,470.04Q261.24,481.75 278.87,494.56Q296.5,507.36 313.44,521.07Q330.38,534.78 346.33,549.5L313.6,600.78Q297.18,587.42 279.89,574.92Q262.59,562.42 244.61,550.85Q226.64,539.29 208.03,528.56Q189.42,517.84 170.26,508.01Q151.1,498.17 131.47,489.23Q111.83,480.28 91.77,472.17Q71.7,464.06 51.36,456.92L87.24,392.05ZM281.45,645.89Q272.16,657.4 262.35,668.62Q252.53,679.84 242.26,690.65Q231.98,701.46 221.25,711.86Q210.53,722.26 199.36,732.21Q188.19,742.15 176.57,751.63Q164.95,761.1 152.89,770.06Q140.82,779.02 128.4,787.38L79.14,735.35Q91.33,727.34 103.23,718.81Q115.13,710.28 126.63,701.33Q138.13,692.38 149.27,682.99Q160.41,673.59 171.13,663.77Q181.85,653.95 192.09,643.72Q202.33,633.49 212.14,622.83Q221.95,612.17 231.18,601.14L281.45,645.89ZM918.08,-57.26L947.92,8.64Q914.84,20.84 882.33,35.19Q849.81,49.55 818.15,65.73Q786.48,81.91 755.79,100.03Q725.11,118.15 695.61,138.07Q666.12,157.99 638.04,179.58Q609.96,201.17 583.4,224.52Q556.85,247.86 532.2,272.79L517.57,269.08Q509.44,253.09 505.66,239.58Q501.88,226.06 500.93,216.35Q499.98,206.63 501.1,200.81L523.51,203.08Q579.4,144.29 642.32,95.6Q705.24,46.91 774.13,8.69Q843.02,-29.53 918.08,-57.26ZM479.99,261.88L464.09,269.85Q439.37,245.57 412.84,222.88Q386.3,200.19 358.34,179.2Q330.38,158.21 301.06,138.92Q271.73,119.63 241.25,102.14Q210.77,84.66 179.4,69.01Q148.04,53.36 115.79,39.63Q83.54,25.9 50.72,14.32L82.21,-51.36Q154.46,-25.1 222.65,12.44Q290.84,49.98 353.71,96.29Q416.57,142.61 472.46,198.25L491.28,193.68Q493.29,199.92 492.92,209.65Q492.54,219.39 489.13,232.43Q485.72,245.48 479.99,261.88ZM465.46,238.87L536.89,238.87L536.89,371.96L465.46,371.96L465.46,238.87ZM60.99,227.08L940.7,227.08L940.7,291.73L60.99,291.73L60.99,227.08ZM465.44,-71.21L536.87,-71.21L536.87,-71.21L536.87,255.37L465.44,255.37L465.44,-71.21L465.44,-71.21Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=400</div><code class="frame-shape">[gid1=0+1000]</code></div><div class="frame" data-value="425" hidden><svg viewBox="-40 -903.06 1080 1143.06" role="img" aria-label="桨 at wght=425">
+<g transform="scale(1,-1)">
+<path d="M455.19,573.34Q477.96,584.35 500.19,597.03Q522.42,609.72 543.61,624.05Q564.8,638.39 584.8,654.23Q604.81,670.07 623.34,687.35Q641.88,704.63 658.67,723.38Q675.46,742.13 690.27,762.17Q705.07,782.22 717.48,803.5L650.74,832.15Q639.8,813.35 626.63,795.71Q613.45,778.06 598.44,761.77Q583.42,745.49 566.64,730.33Q549.86,715.17 531.58,701.37Q513.31,687.58 493.88,675.32Q474.44,663.07 453.88,652.21Q433.31,641.36 411.88,632.18L455.19,573.34ZM627.53,762.48L603.29,698.98L862.98,698.98L865.8,698.98L860.87,710.79Q849.99,683.2 828.51,652.24Q807.04,621.28 771.66,591.24Q736.27,561.2 685.01,533.44Q633.75,505.68 564.81,484.3Q495.87,462.91 406.53,449.81L436.02,380.38Q532.63,397.1 608.36,424.95Q684.09,452.8 741.66,487.04Q799.23,521.27 839.18,559.78Q879.13,598.28 903.55,633.78Q927.97,669.27 938.49,700.14L938.49,762.48L627.53,762.48ZM741.7,542.3Q731.3,551.11 720.47,559.64Q709.64,568.16 698.44,576.29Q687.24,584.42 675.69,592.17Q664.14,599.92 652.3,607.31Q640.45,614.7 628.26,621.63Q616.07,628.56 603.59,635.09Q591.11,641.62 578.38,647.61L536.69,596.98Q549.03,591.39 561.12,585.24Q573.22,579.09 584.93,572.47Q596.64,565.84 608.06,558.74Q619.48,551.64 630.53,544.07Q641.58,536.51 652.18,528.55Q662.79,520.59 673.02,512.17Q683.25,503.76 692.94,494.97L741.7,542.3ZM375.22,377.63L375.22,830.9L301.41,830.9L301.41,377.63L375.22,377.63ZM88.28,390.82Q108.59,398.52 128.61,407.23Q148.64,415.93 168.1,425.72Q187.57,435.51 206.48,446.3Q225.38,457.08 243.7,468.79Q262.02,480.5 279.6,493.29Q297.19,506.09 314.08,519.79Q330.97,533.48 346.87,548.2L312.78,601.92Q296.4,588.59 279.14,576.13Q261.87,563.66 243.93,552.13Q225.99,540.59 207.42,529.9Q188.84,519.2 169.71,509.39Q150.58,499.57 130.98,490.65Q111.39,481.73 91.35,473.63Q71.32,465.54 51.01,458.41L88.28,390.82ZM282.52,646.78Q273.22,658.28 263.4,669.5Q253.58,680.72 243.29,691.53Q233.01,702.34 222.27,712.74Q211.54,723.14 200.36,733.09Q189.18,743.03 177.55,752.51Q165.92,761.98 153.84,770.94Q141.76,779.9 129.32,788.27L77.87,734.27Q90.08,726.25 101.99,717.72Q113.9,709.19 125.41,700.23Q136.93,691.28 148.08,681.89Q159.23,672.49 169.96,662.67Q180.69,652.85 190.94,642.62Q201.2,632.39 211.01,621.73Q220.83,611.07 230.07,600.05L282.52,646.78ZM917.5,-57.16L948.56,11.34Q915.4,23.38 882.84,37.59Q850.28,51.81 818.6,67.9Q786.93,83.98 756.25,102.04Q725.58,120.1 696.14,140.01Q666.7,159.91 638.69,181.53Q610.68,203.15 584.23,226.57Q557.78,249.99 533.27,275.06L518.11,271.26Q509.61,254.86 505.53,241.03Q501.44,227.21 500.26,217.3Q499.07,207.39 500.02,201.49L522.54,203.91Q578.18,144.56 641.06,95.6Q703.94,46.64 773,8.45Q842.06,-29.74 917.5,-57.16ZM479.12,263.5L462.46,271.78Q437.91,247.41 411.52,224.67Q385.13,201.94 357.3,180.96Q329.46,159.98 300.24,140.73Q271.01,121.49 240.61,104.09Q210.2,86.69 178.88,71.15Q147.57,55.62 115.33,42.04Q83.09,28.46 50.26,17.06L83.01,-51.5Q155.47,-25.53 223.67,11.97Q291.88,49.48 354.59,95.99Q417.3,142.51 472.83,198.62L492.14,194.01Q493.94,200.33 493.31,210.23Q492.67,220.12 488.95,233.43Q485.22,246.74 479.12,263.5ZM463.5,240.31L538.58,240.31L538.58,372.81L463.5,372.81L463.5,240.31ZM61.93,225.59L939.62,225.59L939.62,293.44L61.93,293.44L61.93,225.59ZM463.48,-71.14L538.56,-71.14L538.56,-71.14L538.56,256.82L463.48,256.82L463.48,-71.14L463.48,-71.14Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=425</div><code class="frame-shape">[gid1=0+1000]</code></div><div class="frame" data-value="450" hidden><svg viewBox="-40 -903.06 1080 1143.06" role="img" aria-label="桨 at wght=450">
+<g transform="scale(1,-1)">
+<path d="M455.75,572.09Q478.46,583.15 500.65,595.88Q522.84,608.61 544.01,622.98Q565.17,637.34 585.16,653.2Q605.15,669.06 623.69,686.34Q642.23,703.62 659.04,722.37Q675.85,741.11 690.7,761.15Q705.54,781.18 718.01,802.44L647.89,832.7Q636.96,814.04 623.82,796.52Q610.68,779 595.73,762.83Q580.78,746.66 564.09,731.6Q547.39,716.54 529.23,702.83Q511.07,689.11 491.77,676.92Q472.48,664.72 452.06,653.91Q431.65,643.1 410.39,633.94L455.75,572.09ZM625.97,763.13L601.46,696.67L858.51,696.67L861.31,696.67L856.4,708.43Q845.43,681.55 824.01,651.38Q802.6,621.22 767.52,591.95Q732.44,562.68 681.81,535.63Q631.17,508.58 563.24,487.74Q495.31,466.9 407.47,454.12L438.64,381Q534.39,397.8 609.58,425.46Q684.77,453.12 742.07,487.03Q799.36,520.95 839.23,559.06Q879.1,597.17 903.55,632.28Q927.99,667.4 938.6,698.03L938.6,763.13L625.97,763.13ZM739.16,544.03Q728.84,552.78 718.1,561.26Q707.36,569.73 696.26,577.83Q685.16,585.93 673.72,593.65Q662.28,601.38 650.55,608.75Q638.83,616.12 626.76,623.06Q614.69,629.99 602.35,636.53Q590.01,643.08 577.42,649.09L533.3,595.85Q545.49,590.25 557.44,584.1Q569.39,577.95 580.96,571.34Q592.53,564.73 603.82,557.65Q615.11,550.57 626.04,543.05Q636.96,535.53 647.45,527.61Q657.94,519.7 668.06,511.34Q678.19,502.99 687.79,494.26L739.16,544.03ZM376.94,377.24L376.94,830.8L299.61,830.8L299.61,377.24L376.94,377.24ZM89.32,389.6Q109.62,397.31 129.63,406.01Q149.64,414.71 169.08,424.5Q188.51,434.29 207.38,445.07Q226.25,455.85 244.53,467.55Q262.8,479.25 280.34,492.04Q297.87,504.83 314.72,518.51Q331.57,532.19 347.41,546.9L311.95,603.05Q295.61,589.76 278.38,577.33Q261.15,564.9 243.24,553.4Q225.34,541.89 206.8,531.22Q188.26,520.56 169.16,510.76Q150.06,500.97 130.5,492.07Q110.94,483.16 90.93,475.08Q70.93,467 50.66,459.88L89.32,389.6ZM283.59,647.65Q274.28,659.16 264.46,670.37Q254.63,681.59 244.33,692.4Q234.04,703.21 223.3,713.61Q212.55,724.01 201.36,733.95Q190.17,743.9 178.52,753.37Q166.88,762.85 154.79,771.81Q142.7,780.77 130.24,789.14L76.6,733.18Q88.82,725.17 100.75,716.63Q112.67,708.09 124.2,699.14Q135.73,690.19 146.89,680.79Q158.05,671.39 168.79,661.57Q179.53,651.75 189.8,641.52Q200.06,631.29 209.88,620.64Q219.71,609.98 228.95,598.96L283.59,647.65ZM916.9,-57.11L949.18,14Q915.95,25.87 883.35,39.96Q850.75,54.05 819.06,70.04Q787.37,86.03 756.72,104.03Q726.06,122.03 696.66,141.92Q667.27,161.81 639.33,183.45Q611.4,205.09 585.05,228.59Q558.7,252.08 534.32,277.28L518.64,273.38Q509.78,256.58 505.39,242.45Q501,228.33 499.59,218.23Q498.17,208.13 498.95,202.13L521.55,204.68Q576.94,144.79 639.78,95.57Q702.62,46.35 771.85,8.18Q841.08,-29.99 916.9,-57.11ZM478.28,265.07L460.84,273.64Q436.46,249.19 410.22,226.42Q383.98,203.66 356.26,182.69Q328.55,161.72 299.43,142.53Q270.3,123.33 239.97,106.02Q209.64,88.71 178.38,73.29Q147.11,57.87 114.89,44.44Q82.68,31.01 49.84,19.78L83.84,-51.67Q156.5,-25.99 224.71,11.48Q292.92,48.96 355.47,95.67Q418.02,142.38 473.21,198.94L492.98,194.32Q494.58,200.71 493.69,210.77Q492.8,220.82 488.76,234.39Q484.73,247.96 478.28,265.07ZM461.54,241.72L540.27,241.72L540.27,373.63L461.54,373.63L461.54,241.72ZM62.86,224.07L938.54,224.07L938.54,295.13L62.86,295.13L62.86,224.07ZM461.51,-71.08L540.25,-71.08L540.25,-71.08L540.25,258.24L461.51,258.24L461.51,-71.08L461.51,-71.08Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=450</div><code class="frame-shape">[gid1=0+1000]</code></div><div class="frame" data-value="475" hidden><svg viewBox="-40 -903.06 1080 1143.06" role="img" aria-label="桨 at wght=475">
+<g transform="scale(1,-1)">
+<path d="M456.34,570.86Q479,581.98 501.14,594.75Q523.29,607.52 544.42,621.91Q565.55,636.3 585.52,652.18Q605.48,668.06 624.02,685.34Q642.56,702.62 659.39,721.35Q676.22,740.09 691.1,760.1Q705.98,780.12 718.51,801.35L645.04,833.2Q634.13,814.69 621.03,797.3Q607.93,779.91 593.05,763.86Q578.17,747.81 561.57,732.85Q544.96,717.89 526.92,704.26Q508.87,690.63 489.71,678.5Q470.56,666.37 450.31,655.6Q430.05,644.82 408.97,635.68L456.34,570.86ZM624.34,763.66L599.57,694.32L853.96,694.32L856.76,694.32L851.87,706.02Q840.8,679.85 819.45,650.48Q798.1,621.12 763.34,592.62Q728.57,564.13 678.58,537.8Q628.58,511.47 561.68,491.18Q494.78,470.89 408.45,458.45L441.29,381.69Q536.14,398.55 610.77,426.01Q685.4,453.46 742.4,487.05Q799.41,520.63 839.18,558.33Q878.95,596.03 903.42,630.76Q927.89,665.5 938.58,695.88L938.58,763.66L624.34,763.66ZM736.57,545.76Q726.32,554.46 715.68,562.88Q705.03,571.31 694.04,579.37Q683.04,587.43 671.71,595.13Q660.38,602.82 648.78,610.18Q637.17,617.54 625.23,624.47Q613.3,631.4 601.09,637.95Q588.89,644.5 576.44,650.54L529.92,594.74Q541.95,589.13 553.76,582.99Q565.56,576.84 576.99,570.25Q588.42,563.66 599.58,556.61Q610.74,549.56 621.54,542.07Q632.34,534.59 642.71,526.73Q653.08,518.86 663.1,510.57Q673.11,502.27 682.62,493.62L736.57,545.76ZM378.66,376.85L378.66,830.71L297.81,830.71L297.81,376.85L378.66,376.85ZM90.37,388.4Q110.66,396.11 130.65,404.81Q150.64,413.5 170.05,423.29Q189.46,433.08 208.28,443.86Q227.11,454.64 245.35,466.33Q263.59,478.01 281.07,490.8Q298.56,503.59 315.36,517.25Q332.16,530.92 347.96,545.62L311.12,604.17Q294.81,590.92 277.62,578.52Q260.43,566.13 242.55,554.65Q224.68,543.18 206.18,532.54Q187.67,521.9 168.61,512.13Q149.54,502.36 130.01,493.48Q110.48,484.6 90.51,476.53Q70.54,468.47 50.3,461.36L90.37,388.4ZM284.65,648.52Q275.34,660.02 265.51,671.23Q255.68,682.44 245.37,693.25Q235.06,704.06 224.31,714.46Q213.56,724.85 202.36,734.8Q191.15,744.75 179.5,754.22Q167.84,763.7 155.74,772.66Q143.63,781.63 131.16,790L75.34,732.12Q87.58,724.1 99.52,715.56Q111.45,707.01 122.99,698.06Q134.53,689.1 145.71,679.71Q156.88,670.31 167.63,660.49Q178.38,650.66 188.65,640.44Q198.93,630.21 208.76,619.56Q218.59,608.9 227.84,597.89L284.65,648.52ZM916.29,-57.07L949.81,16.66Q916.5,28.38 883.86,42.34Q851.22,56.31 819.52,72.21Q787.82,88.1 757.18,106.04Q726.54,123.99 697.19,143.86Q667.84,163.73 639.98,185.39Q612.12,207.05 585.87,230.62Q559.62,254.19 535.36,279.5L519.16,275.51Q509.94,258.32 505.25,243.89Q500.56,229.47 498.92,219.19Q497.27,208.9 497.87,202.81L520.54,205.47Q575.7,145.04 638.5,95.55Q701.3,46.07 770.69,7.92Q840.09,-30.23 916.29,-57.07ZM477.46,266.62L459.26,275.51Q435.04,250.98 408.93,228.18Q382.82,205.39 355.23,184.44Q327.64,163.49 298.61,144.34Q269.58,125.19 239.32,107.97Q209.07,90.74 177.85,75.43Q146.64,60.13 114.45,46.84Q82.25,33.54 49.4,22.48L84.69,-51.87Q157.54,-26.46 225.75,10.99Q293.96,48.45 356.36,95.35Q418.75,142.26 473.6,199.27L493.82,194.66Q495.22,201.12 494.08,211.33Q492.94,221.54 488.59,235.36Q484.25,249.18 477.46,266.62ZM459.58,243.16L541.96,243.16L541.96,374.49L459.58,374.49L459.58,243.16ZM63.76,222.59L937.5,222.59L937.5,296.83L63.76,296.83L63.76,222.59ZM459.55,-71.02L541.93,-71.02L541.93,-71.02L541.93,259.69L459.55,259.69L459.55,-71.02L459.55,-71.02Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=475</div><code class="frame-shape">[gid1=0+1000]</code></div><div class="frame" data-value="500" hidden><svg viewBox="-40 -903.06 1080 1143.06" role="img" aria-label="桨 at wght=500">
+<g transform="scale(1,-1)">
+<path d="M456.95,569.67Q479.55,580.85 501.65,593.66Q523.74,606.48 544.84,620.89Q565.94,635.3 585.88,651.19Q605.83,667.08 624.37,684.36Q642.9,701.64 659.74,720.37Q676.58,739.09 691.5,759.08Q706.42,779.07 719.01,800.28L642.25,833.68Q631.35,815.32 618.29,798.06Q605.24,780.81 590.43,764.88Q575.63,748.96 559.11,734.1Q542.6,719.24 524.67,705.69Q506.74,692.14 487.73,680.08Q468.72,668.02 448.62,657.29Q428.53,646.55 407.63,637.43L456.95,569.67ZM622.72,764.11L597.69,691.92L849.36,691.92L852.15,691.92L847.28,703.57Q836.13,678.11 814.85,649.54Q793.57,620.97 759.12,593.25Q724.67,565.53 675.31,539.91Q625.96,514.3 560.09,494.55Q494.22,474.81 409.39,462.7L443.89,382.37Q537.83,399.29 611.89,426.54Q685.96,453.79 742.67,487.04Q799.38,520.28 839.05,557.58Q878.71,594.87 903.2,629.21Q927.69,663.55 938.46,693.68L938.46,764.11L622.72,764.11ZM733.94,547.5Q723.78,556.14 713.23,564.52Q702.68,572.9 691.79,580.92Q680.89,588.94 669.68,596.6Q658.46,604.27 646.98,611.6Q635.5,618.94 623.69,625.87Q611.88,632.79 599.82,639.35Q587.75,645.91 575.45,651.96L526.56,593.67Q538.45,588.06 550.1,581.92Q561.76,575.78 573.05,569.21Q584.33,562.64 595.36,555.62Q606.38,548.6 617.05,541.16Q627.72,533.71 637.98,525.9Q648.23,518.1 658.14,509.86Q668.04,501.63 677.45,493.06L733.94,547.5ZM380.37,376.47L380.37,830.6L296.02,830.6L296.02,376.47L380.37,376.47ZM91.42,387.21Q111.7,394.92 131.68,403.61Q151.65,412.31 171.03,422.09Q190.4,431.87 209.19,442.66Q227.98,453.44 246.18,465.11Q264.38,476.79 281.81,489.57Q299.25,502.35 316.01,516Q332.76,529.65 348.5,544.34L310.29,605.28Q294.02,592.07 276.86,579.71Q259.7,567.34 241.86,555.9Q224.03,544.46 205.55,533.85Q187.08,523.23 168.05,513.49Q149.02,503.74 129.52,494.88Q110.03,486.02 90.09,477.97Q70.15,469.92 49.94,462.82L91.42,387.21ZM285.72,649.37Q276.41,660.87 266.57,672.08Q256.72,683.29 246.41,694.1Q236.1,704.9 225.34,715.3Q214.57,725.7 203.36,735.64Q192.14,745.59 180.47,755.06Q168.81,764.54 156.69,773.51Q144.57,782.47 132.09,790.85L74.07,731.04Q86.32,723.02 98.27,714.48Q110.22,705.93 121.78,696.98Q133.33,688.02 144.52,678.62Q155.7,669.22 166.46,659.4Q177.22,649.58 187.5,639.35Q197.78,629.13 207.62,618.47Q217.46,607.82 226.72,596.81L285.72,649.37ZM915.65,-57.05L950.41,19.29Q917.03,30.87 884.35,44.71Q851.68,58.56 819.97,74.36Q788.26,90.17 757.64,108.06Q727.03,125.94 697.72,145.79Q668.41,165.64 640.62,187.32Q612.83,209 586.67,232.63Q560.52,256.26 536.38,281.69L519.66,277.62Q510.09,260.04 505.1,245.32Q500.12,230.61 498.24,220.14Q496.36,209.67 496.8,203.49L519.52,206.24Q574.44,145.27 637.2,95.53Q699.97,45.79 769.52,7.65Q839.08,-30.49 915.65,-57.05ZM476.67,268.14L457.69,277.34Q433.62,252.75 407.65,229.93Q381.67,207.12 354.2,186.18Q326.72,165.25 297.79,146.16Q268.86,127.06 238.67,109.92Q208.49,92.77 177.33,77.57Q146.18,62.38 114.01,49.22Q81.84,36.05 48.99,25.14L85.56,-52.1Q158.6,-26.95 226.8,10.49Q295.01,47.93 357.25,95.04Q419.48,142.14 474,199.59L494.67,195Q495.87,201.53 494.47,211.89Q493.08,222.25 488.43,236.31Q483.79,250.37 476.67,268.14ZM457.62,244.59L543.65,244.59L543.65,375.34L457.62,375.34L457.62,244.59ZM64.69,221.1L936.42,221.1L936.42,298.54L64.69,298.54L64.69,221.1ZM457.58,-70.99L543.62,-70.99L543.62,-70.99L543.62,261.14L457.58,261.14L457.58,-70.99L457.58,-70.99Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=500</div><code class="frame-shape">[gid1=0+1000]</code></div><div class="frame" data-value="525" hidden><svg viewBox="-40 -903.06 1080 1143.06" role="img" aria-label="桨 at wght=525">
+<g transform="scale(1,-1)">
+<path d="M457.63,568.55Q480.17,579.77 502.21,592.62Q524.26,605.47 545.32,619.91Q566.37,634.34 586.29,650.24Q606.21,666.14 624.74,683.41Q643.27,700.67 660.12,719.38Q676.97,738.09 691.92,758.05Q706.88,778.01 719.52,799.18L639.53,834.11Q628.64,815.9 615.63,798.78Q602.62,781.67 587.89,765.87Q573.16,750.07 556.75,735.32Q540.33,720.57 522.52,707.11Q504.71,693.65 485.85,681.66Q466.99,669.67 447.06,658.99Q427.13,648.3 406.42,639.19L457.63,568.55ZM621.02,764.47L595.74,689.48L844.68,689.48L847.45,689.48L842.6,701.07Q831.37,676.33 810.16,648.57Q788.95,620.81 754.83,593.87Q720.7,566.94 672,542.05Q623.3,517.15 558.47,497.97Q493.64,478.78 410.34,467.01L446.46,383.16Q539.47,400.14 612.95,427.17Q686.43,454.2 742.83,487.09Q799.23,519.98 838.78,556.84Q878.34,593.71 902.84,627.64Q927.35,661.57 938.18,691.43L938.18,764.47L621.02,764.47ZM731.27,549.29Q721.19,557.87 710.74,566.19Q700.29,574.51 689.51,582.49Q678.72,590.46 667.62,598.09Q656.53,605.73 645.17,613.04Q633.82,620.36 622.15,627.27Q610.48,634.18 598.56,640.74Q586.63,647.31 574.48,653.38L523.26,592.67Q534.99,587.05 546.49,580.92Q557.99,574.79 569.13,568.24Q580.28,561.69 591.16,554.71Q602.05,547.72 612.59,540.33Q623.13,532.93 633.26,525.18Q643.39,517.43 653.18,509.26Q662.98,501.1 672.28,492.6L731.27,549.29ZM382.08,376.09L382.08,830.49L294.23,830.49L294.23,376.09L382.08,376.09ZM92.47,386.04Q112.74,393.74 132.7,402.43Q152.66,411.12 172,420.9Q191.35,430.69 210.1,441.47Q228.85,452.25 247.01,463.91Q265.17,475.57 282.55,488.35Q299.94,501.12 316.65,514.76Q333.36,528.39 349.05,543.07L309.45,606.38Q293.21,593.21 276.09,580.88Q258.97,568.55 241.17,557.14Q223.37,545.73 204.93,535.14Q186.49,524.56 167.49,514.83Q148.49,505.11 129.03,496.27Q109.57,487.43 89.66,479.4Q69.76,471.37 49.57,464.28L92.47,386.04ZM286.8,650.23Q277.48,661.72 267.63,672.93Q257.78,684.13 247.46,694.94Q237.14,705.74 226.37,716.13Q215.6,726.53 204.37,736.48Q193.14,746.42 181.46,755.9Q169.78,765.38 157.65,774.34Q145.52,783.31 133.03,791.69L72.8,729.97Q85.06,721.94 97.03,713.4Q108.99,704.85 120.56,695.89Q132.12,686.93 143.32,677.54Q154.51,668.14 165.28,658.32Q176.05,648.49 186.35,638.27Q196.64,628.05 206.49,617.4Q216.33,606.75 225.6,595.74L286.8,650.23ZM914.99,-57.05L951.01,21.93Q917.57,33.35 884.86,47.08Q852.14,60.81 820.43,76.53Q788.71,92.24 758.11,110.07Q727.51,127.9 698.25,147.73Q668.98,167.56 641.26,189.26Q613.54,210.95 587.47,234.64Q561.41,258.33 537.39,283.87L520.16,279.71Q510.23,261.76 504.95,246.75Q499.67,231.75 497.57,221.1Q495.46,210.45 495.72,204.18L518.49,207Q573.18,145.5 635.9,95.5Q698.63,45.5 768.35,7.37Q838.06,-30.76 914.99,-57.05ZM475.9,269.61L456.15,279.13Q432.22,254.48 406.38,231.65Q380.54,208.83 353.17,187.92Q325.81,167.02 296.97,147.98Q268.14,128.94 238.03,111.88Q207.93,94.81 176.82,79.72Q145.72,64.63 113.59,51.6Q81.45,38.56 48.6,27.79L86.48,-52.37Q159.68,-27.46 227.88,9.98Q296.08,47.42 358.15,94.72Q420.23,142.01 474.42,199.9L495.52,195.34Q496.51,201.95 494.87,212.45Q493.22,222.95 488.29,237.24Q483.35,251.53 475.9,269.61ZM455.66,246.03L545.34,246.03L545.34,376.2L455.66,376.2L455.66,246.03ZM65.62,219.61L935.34,219.61L935.34,300.25L65.62,300.25L65.62,219.61ZM455.62,-70.92L545.31,-70.92L545.31,-70.92L545.31,262.59L455.62,262.59L455.62,-70.92L455.62,-70.92Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=525</div><code class="frame-shape">[gid1=0+1000]</code></div><div class="frame print" data-value="550" hidden><svg viewBox="-40 -903.06 1080 1143.06" role="img" aria-label="桨 at wght=550">
+<g transform="scale(1,-1)">
+<path d="M458.34,567.45Q480.81,578.73 502.8,591.62Q524.79,604.5 545.8,618.95Q566.82,633.4 586.7,649.31Q606.59,665.21 625.11,682.47Q643.63,699.72 660.49,718.41Q677.35,737.1 692.33,757.03Q707.31,776.96 720,798.09L636.84,834.5Q625.98,816.45 613.01,799.47Q600.05,782.5 585.4,766.83Q570.75,751.16 554.44,736.52Q538.12,721.88 520.43,708.51Q502.74,695.14 484.04,683.22Q465.33,671.3 445.56,660.67Q425.8,650.03 405.28,640.95L458.34,567.45ZM619.34,764.71L593.81,686.99L839.92,686.99L842.68,686.99L837.86,698.52Q826.55,674.49 805.42,647.53Q784.3,620.57 750.5,594.42Q716.71,568.26 668.67,544.09Q620.63,519.91 556.86,501.28Q493.09,482.64 411.33,471.21L449.04,383.91Q541.11,400.93 613.98,427.74Q686.85,454.55 742.93,487.09Q799,519.63 838.43,556.06Q877.86,592.5 902.36,626.02Q926.87,659.54 937.77,689.13L937.77,764.71L619.34,764.71ZM728.54,551.08Q718.55,559.6 708.2,567.86Q697.85,576.12 687.18,584.05Q676.51,591.98 665.53,599.57Q654.55,607.17 643.33,614.46Q632.11,621.75 620.58,628.65Q609.04,635.55 597.27,642.11Q585.49,648.67 573.5,654.76L519.98,591.69Q531.55,586.08 542.9,579.96Q554.24,573.84 565.23,567.32Q576.22,560.79 586.97,553.84Q597.71,546.89 608.12,539.55Q618.53,532.2 628.53,524.51Q638.54,516.82 648.22,508.72Q657.9,500.63 667.1,492.21L728.54,551.08ZM383.79,375.74L383.79,830.36L292.44,830.36L292.44,375.74L383.79,375.74ZM93.52,384.88Q113.8,392.59 133.73,401.27Q153.67,409.96 172.99,419.74Q192.3,429.51 211.01,440.29Q229.73,451.07 247.84,462.72Q265.96,474.37 283.3,487.14Q300.63,499.91 317.3,513.52Q333.96,527.14 349.6,541.81L308.62,607.47Q292.41,594.34 275.32,582.04Q258.23,569.75 240.47,558.37Q222.71,547 204.3,536.44Q185.9,525.88 166.93,516.18Q147.97,506.48 128.54,497.66Q109.11,488.84 89.24,480.82Q69.37,472.81 49.22,465.74L93.52,384.88ZM287.86,651.05Q278.54,662.54 268.68,673.74Q258.83,684.94 248.5,695.74Q238.17,706.54 227.39,716.94Q216.61,727.33 205.37,737.27Q194.14,747.22 182.45,756.69Q170.76,766.17 158.61,775.14Q146.47,784.11 133.96,792.48L71.55,728.89Q83.83,720.86 95.8,712.31Q107.78,703.77 119.35,694.81Q130.93,685.85 142.13,676.45Q153.34,667.06 164.12,657.24Q174.9,647.42 185.2,637.2Q195.5,626.97 205.35,616.33Q215.21,605.69 224.48,594.69L287.86,651.05ZM914.29,-57.09L951.56,24.52Q918.07,35.81 885.33,49.43Q852.59,63.05 820.87,78.67Q789.15,94.3 758.57,112.07Q727.98,129.84 698.76,149.65Q669.54,169.45 641.89,191.16Q614.23,212.86 588.26,236.6Q562.28,260.34 538.37,285.97L520.63,281.74Q510.36,263.41 504.79,248.13Q499.23,232.85 496.89,222.03Q494.55,211.2 494.64,204.83L517.44,207.7Q571.9,145.69 634.58,95.44Q697.27,45.18 767.14,7.06Q837.01,-31.06 914.29,-57.09ZM475.16,271.02L454.63,280.86Q430.84,256.17 405.12,233.34Q379.41,210.5 352.15,189.63Q324.9,168.76 296.16,149.78Q267.42,130.8 237.39,113.82Q207.36,96.84 176.32,81.85Q145.28,66.87 113.17,53.95Q81.07,41.04 48.23,30.41L87.42,-52.67Q160.79,-27.99 228.97,9.45Q297.16,46.89 359.07,94.37Q420.99,141.86 474.86,200.16L496.38,195.65Q497.17,202.33 495.28,212.97Q493.39,223.62 488.16,238.13Q482.93,252.64 475.16,271.02ZM453.7,247.43L547.03,247.43L547.03,376.98L453.7,376.98L453.7,247.43ZM66.58,218.09L934.24,218.09L934.24,301.92L66.58,301.92L66.58,218.09ZM453.66,-70.84L546.99,-70.84L546.99,-70.84L546.99,264L453.66,264L453.66,-70.84L453.66,-70.84Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=550</div><code class="frame-shape">[gid1=0+1000]</code></div><div class="frame" data-value="575" hidden><svg viewBox="-40 -903.06 1080 1143.06" role="img" aria-label="桨 at wght=575">
+<g transform="scale(1,-1)">
+<path d="M459.06,566.38Q481.47,577.71 503.4,590.63Q525.33,603.55 546.3,618.02Q567.28,632.49 587.13,648.4Q606.99,664.31 625.5,681.55Q644.01,698.8 660.88,717.47Q677.74,736.13 692.75,756.03Q707.77,775.92 720.51,797.01L634.24,834.88Q623.39,816.98 610.47,800.15Q597.55,783.31 582.98,767.78Q568.41,752.24 552.2,737.7Q535.98,723.17 518.42,709.89Q500.85,696.61 482.3,684.76Q463.74,672.92 444.14,662.33Q424.55,651.74 404.21,642.67L459.06,566.38ZM617.61,764.85L591.86,684.45L835.1,684.45L837.84,684.45L833.04,695.91Q821.66,672.6 800.62,646.45Q779.59,620.3 746.13,594.93Q712.68,569.55 665.31,546.1Q617.94,522.66 555.23,504.58Q492.52,486.5 412.31,475.4L451.6,384.73Q542.7,401.79 614.95,428.36Q687.21,454.94 742.94,487.11Q798.67,519.28 837.96,555.27Q877.25,591.27 901.76,624.37Q926.26,657.47 937.22,686.78L937.22,764.85L617.61,764.85ZM725.76,552.89Q715.87,561.33 705.62,569.54Q695.37,577.74 684.82,585.62Q674.26,593.5 663.41,601.05Q652.55,608.6 641.46,615.86Q630.37,623.13 618.98,630.01Q607.59,636.89 595.97,643.45Q584.34,650.01 572.5,656.11L516.73,590.76Q528.14,585.14 539.32,579.04Q550.51,572.94 561.35,566.44Q572.19,559.95 582.79,553.04Q593.39,546.13 603.67,538.83Q613.94,531.53 623.82,523.9Q633.7,516.28 643.26,508.26Q652.82,500.23 661.92,491.9L725.76,552.89ZM385.5,375.38L385.5,830.23L290.66,830.23L290.66,375.38L385.5,375.38ZM94.58,383.73Q114.85,391.44 134.76,400.12Q154.68,408.8 173.97,418.57Q193.26,428.35 211.93,439.12Q230.6,449.9 248.68,461.54Q266.76,473.18 284.04,485.94Q301.33,498.7 317.95,512.3Q334.57,525.9 350.15,540.56L307.78,608.55Q291.61,595.45 274.55,583.19Q257.5,570.94 239.77,559.59Q222.04,548.25 203.67,537.71Q185.3,527.18 166.37,517.5Q147.43,507.83 128.04,499.03Q108.65,490.23 88.81,482.23Q68.97,474.23 48.85,467.18L94.58,383.73ZM288.94,651.88Q279.61,663.36 269.74,674.56Q259.88,685.76 249.55,696.56Q239.21,707.35 228.42,717.74Q217.63,728.13 206.38,738.08Q195.14,748.02 183.43,757.5Q171.73,766.97 159.57,775.94Q147.42,784.91 134.89,793.3L70.28,727.83Q82.57,719.8 94.56,711.25Q106.55,702.7 118.14,693.74Q129.72,684.78 140.94,675.38Q152.16,665.99 162.95,656.17Q173.74,646.35 184.04,636.13Q194.35,625.91 204.22,615.27Q214.08,604.63 223.35,593.64L288.94,651.88ZM913.61,-57.16L952.15,27.1Q918.6,38.26 885.83,51.77Q853.05,65.28 821.33,80.82Q789.6,96.37 759.04,114.08Q728.48,131.8 699.3,151.58Q670.12,171.36 642.52,193.07Q614.93,214.79 589.04,238.58Q563.15,262.37 539.35,288.09L521.09,283.79Q510.48,265.11 504.63,249.55Q498.77,233.99 496.21,222.99Q493.64,211.98 493.56,205.52L516.37,208.41Q570.61,145.9 633.26,95.38Q695.92,44.87 765.95,6.75Q835.98,-31.37 913.61,-57.16ZM474.44,272.43L453.13,282.58Q429.48,257.86 403.88,235.03Q378.29,212.19 351.14,191.35Q323.99,170.51 295.34,151.59Q266.69,132.67 236.74,115.77Q206.78,98.88 175.8,83.99Q144.81,69.1 112.75,56.3Q80.68,43.5 47.85,33L88.38,-53.02Q161.9,-28.54 230.06,8.91Q298.23,46.36 359.99,94.04Q421.75,141.71 475.3,200.42L497.23,195.99Q497.82,202.75 495.68,213.52Q493.55,224.3 488.04,239.03Q482.52,253.76 474.44,272.43ZM451.74,248.87L548.72,248.87L548.72,377.83L451.74,377.83L451.74,248.87ZM67.51,216.6L933.16,216.6L933.16,303.63L67.51,303.63L67.51,216.6ZM451.69,-70.78L548.68,-70.78L548.68,-70.78L548.68,265.45L451.69,265.45L451.69,-70.78L451.69,-70.78Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=575</div><code class="frame-shape">[gid1=0+1000]</code></div><div class="frame" data-value="600" hidden><svg viewBox="-40 -903.06 1080 1143.06" role="img" aria-label="桨 at wght=600">
+<g transform="scale(1,-1)">
+<path d="M459.87,565.39Q482.2,576.77 504.06,589.72Q525.93,602.67 546.85,617.15Q567.77,631.63 587.59,647.54Q607.41,663.45 625.91,680.67Q644.41,697.89 661.27,716.53Q678.13,735.17 693.17,755.02Q708.22,774.87 721.01,795.91L631.68,835.2Q620.85,817.46 607.99,800.78Q595.12,784.09 580.64,768.69Q566.15,753.3 550.04,738.88Q533.93,724.46 516.5,711.27Q499.06,698.09 480.67,686.32Q462.27,674.55 442.85,664.01Q423.43,653.47 403.29,644.44L459.87,565.39ZM615.8,764.9L589.83,681.87L830.21,681.87L832.94,681.87L828.16,693.27Q816.71,670.67 795.77,645.33Q774.82,619.99 741.71,595.4Q708.6,570.81 661.91,548.08Q615.22,525.36 553.58,507.84Q491.94,490.31 413.28,479.55L454.12,385.57Q544.23,402.66 615.85,429Q687.48,455.34 742.86,487.14Q798.24,518.93 837.38,554.48Q876.53,590.02 901.02,622.7Q925.51,655.37 936.53,684.39L936.53,764.9L615.8,764.9ZM722.93,554.73Q713.14,563.1 703,571.24Q692.86,579.38 682.42,587.21Q671.98,595.03 661.26,602.54Q650.53,610.05 639.58,617.28Q628.63,624.51 617.38,631.37Q606.14,638.24 594.66,644.79Q583.19,651.34 571.51,657.45L513.54,589.89Q524.77,584.28 535.8,578.19Q546.83,572.11 557.52,565.65Q568.2,559.18 578.65,552.31Q589.11,545.45 599.24,538.2Q609.37,530.96 619.12,523.4Q628.87,515.84 638.32,507.89Q647.76,499.95 656.75,491.7L722.93,554.73ZM387.2,375.03L387.2,830.1L288.87,830.1L288.87,375.03L387.2,375.03ZM95.64,382.59Q115.9,390.29 135.8,398.97Q155.7,407.64 174.96,417.42Q194.21,427.19 212.85,437.96Q231.48,448.74 249.52,460.36Q267.56,471.99 284.79,484.75Q302.03,497.5 318.6,511.08Q335.18,524.67 350.7,539.32L306.93,609.63Q290.79,596.57 273.77,584.35Q256.75,572.12 239.06,560.81Q221.37,549.5 203.03,538.99Q184.7,528.48 165.8,518.83Q146.9,509.18 127.54,500.4Q108.18,491.62 88.37,483.64Q68.56,475.66 48.47,468.62L95.64,382.59ZM290.01,652.69Q280.67,664.17 270.81,675.36Q260.94,686.56 250.59,697.35Q240.25,708.15 229.45,718.54Q218.65,728.93 207.39,738.87Q196.13,748.81 184.42,758.29Q172.7,767.76 160.53,776.73Q148.36,785.7 135.83,794.09L69.01,726.77Q81.31,718.74 93.31,710.19Q105.32,701.64 116.92,692.68Q128.52,683.72 139.74,674.32Q150.97,664.92 161.77,655.11Q172.57,645.29 182.89,635.07Q193.2,624.86 203.07,614.22Q212.94,603.58 222.23,592.59L290.01,652.69ZM912.9,-57.23L952.72,29.68Q919.11,40.71 886.31,54.12Q853.51,67.52 821.78,82.98Q790.06,98.44 759.51,116.1Q728.97,133.76 699.83,153.52Q670.69,173.27 643.16,194.99Q615.63,216.71 589.82,240.55Q564.02,264.39 540.32,290.2L521.55,285.83Q510.6,266.79 504.46,250.96Q498.32,235.13 495.53,223.95Q492.74,212.77 492.48,206.22L515.29,209.12Q569.32,146.1 631.94,95.33Q694.55,44.57 764.74,6.44Q834.92,-31.68 912.9,-57.23ZM473.74,273.8L451.65,284.28Q428.12,259.53 402.64,236.7Q377.17,213.88 350.12,193.08Q323.08,172.28 294.52,153.42Q265.97,134.56 236.09,117.74Q206.21,100.93 175.29,86.14Q144.36,71.34 112.34,58.66Q80.31,45.97 47.51,35.59L89.37,-53.38Q163.03,-29.09 231.17,8.37Q299.32,45.84 360.92,93.7Q422.52,141.57 475.76,200.68L498.08,196.34Q498.46,203.17 496.09,214.08Q493.71,224.99 487.92,239.92Q482.13,254.86 473.74,273.8ZM449.78,250.31L550.41,250.31L550.41,378.69L449.78,378.69L449.78,250.31ZM68.44,215.12L932.08,215.12L932.08,305.34L68.44,305.34L68.44,215.12ZM449.73,-70.71L550.37,-70.71L550.37,-70.71L550.37,266.9L449.73,266.9L449.73,-70.71L449.73,-70.71Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=600</div><code class="frame-shape">[gid1=0+1000]</code></div><div class="frame" data-value="625" hidden><svg viewBox="-40 -903.06 1080 1143.06" role="img" aria-label="桨 at wght=625">
+<g transform="scale(1,-1)">
+<path d="M460.68,564.44Q482.94,575.86 504.74,588.84Q526.53,601.81 547.4,616.3Q568.27,630.79 588.05,646.7Q607.82,662.61 626.31,679.81Q644.79,697.01 661.65,715.62Q678.51,734.22 693.58,754.03Q708.64,773.84 721.48,794.82L629.15,835.49Q618.35,817.92 605.54,801.38Q592.73,784.85 578.33,769.59Q563.94,754.33 547.94,740.03Q531.93,725.72 514.63,712.64Q497.33,699.55 479.09,687.86Q460.85,676.17 441.61,665.69Q422.37,655.2 402.42,646.19L460.68,564.44ZM613.99,764.82L587.81,679.25L825.24,679.25L827.96,679.25L823.2,690.57Q811.69,668.68 790.84,644.15Q769.99,619.61 737.23,595.8Q704.47,571.99 658.46,549.98Q612.45,527.98 551.88,511.01Q491.32,494.03 414.21,483.61L456.57,386.4Q545.7,403.52 616.67,429.62Q687.65,455.71 742.67,487.13Q797.69,518.55 836.68,553.64Q875.67,588.73 900.14,620.97Q924.62,653.22 935.7,681.95L935.7,764.82L613.99,764.82ZM720.05,556.57Q710.36,564.86 700.33,572.94Q690.3,581.01 679.98,588.78Q669.66,596.55 659.07,604.01Q648.47,611.47 637.66,618.67Q626.84,625.87 615.75,632.71Q604.65,639.55 593.33,646.09Q582.02,652.63 570.5,658.74L510.36,589.04Q521.43,583.44 532.29,577.38Q543.16,571.32 553.69,564.89Q564.22,558.46 574.52,551.63Q584.83,544.81 594.82,537.63Q604.81,530.44 614.43,522.95Q624.05,515.45 633.37,507.59Q642.69,499.72 651.56,491.56L720.05,556.57ZM388.9,374.68L388.9,829.96L287.09,829.96L287.09,374.68L388.9,374.68ZM96.7,381.46Q116.95,389.17 136.84,397.84Q156.72,406.51 175.95,416.28Q195.17,426.05 213.76,436.82Q232.36,447.59 250.36,459.2Q268.35,470.82 285.54,483.57Q302.72,496.31 319.25,509.88Q335.78,523.44 351.26,538.08L306.09,610.68Q289.98,597.67 273,585.48Q256.01,573.29 238.36,562.01Q220.7,550.73 202.4,540.25Q184.09,529.77 165.23,520.14Q146.36,510.51 127.04,501.76Q107.71,493 87.94,485.03Q68.16,477.07 48.1,470.04L96.7,381.46ZM291.08,653.49Q281.74,664.97 271.87,676.16Q261.99,687.35 251.64,698.14Q241.29,708.93 230.48,719.32Q219.67,729.71 208.4,739.65Q197.14,749.59 185.41,759.06Q173.68,768.54 161.5,777.51Q149.31,786.48 136.76,794.86L67.74,725.72Q80.05,717.68 92.07,709.13Q104.08,700.58 115.7,691.62Q127.31,682.66 138.55,673.26Q149.78,663.86 160.59,654.05Q171.4,644.23 181.73,634.02Q192.05,623.8 201.93,613.17Q211.81,602.53 221.1,591.55L291.08,653.49ZM912.16,-57.34L953.27,32.23Q919.62,43.15 886.79,56.45Q853.97,69.76 822.24,85.14Q790.51,100.52 759.99,118.13Q729.46,135.73 700.36,155.46Q671.26,175.18 643.79,196.9Q616.32,218.62 590.59,242.5Q564.87,266.38 541.27,292.26L521.98,287.83Q510.71,268.45 504.28,252.35Q497.86,236.26 494.84,224.91Q491.83,213.56 491.4,206.92L514.2,209.8Q568.01,146.29 630.6,95.27Q693.18,44.26 763.51,6.12Q833.85,-32.02 912.16,-57.34ZM473.07,275.13L450.2,285.94Q426.79,261.18 401.42,238.36Q376.05,215.55 349.11,194.8Q322.16,174.04 293.7,155.24Q265.23,136.44 235.43,119.71Q205.62,102.98 174.76,88.27Q143.9,73.57 111.92,60.99Q79.94,48.4 47.15,38.13L90.38,-53.79Q164.17,-29.68 232.28,7.82Q300.4,45.31 361.84,93.36Q423.29,141.42 476.22,200.92L498.93,196.68Q499.11,203.58 496.5,214.62Q493.89,225.66 487.82,240.79Q481.75,255.93 473.07,275.13ZM447.82,251.74L552.11,251.74L552.11,379.54L447.82,379.54L447.82,251.74ZM69.34,213.63L931.03,213.63L931.03,307.05L69.34,307.05L69.34,213.63ZM447.77,-70.65L552.06,-70.65L552.06,-70.65L552.06,268.35L447.77,268.35L447.77,-70.65L447.77,-70.65Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=625</div><code class="frame-shape">[gid1=0+1000]</code></div><div class="frame" data-value="650" hidden><svg viewBox="-40 -903.06 1080 1143.06" role="img" aria-label="桨 at wght=650">
+<g transform="scale(1,-1)">
+<path d="M461.52,563.53Q483.7,575 505.43,588Q527.15,601.01 547.97,615.5Q568.78,630 588.52,645.9Q608.25,661.8 626.71,678.98Q645.17,696.16 662.03,714.73Q678.89,733.31 693.98,753.06Q709.07,772.82 721.95,793.75L626.69,835.75Q615.92,818.35 603.16,801.97Q590.41,785.59 576.1,770.47Q561.8,755.35 545.9,741.16Q530.01,726.98 512.84,713.99Q495.67,701 477.59,689.39Q459.52,677.78 440.45,667.35Q421.39,656.91 401.64,647.93L461.52,563.53ZM612.14,764.64L585.76,676.59L820.22,676.59L822.92,676.59L818.2,687.83Q806.63,666.66 785.88,642.93Q765.13,619.2 732.73,596.17Q700.32,573.14 655,551.86Q609.67,530.57 550.19,514.15Q490.7,497.73 415.15,487.64L459,387.29Q547.12,404.43 617.44,430.27Q687.76,456.12 742.41,487.15Q797.05,518.18 835.88,552.8Q874.71,587.43 899.16,619.23Q923.6,651.04 934.74,679.46L934.74,764.64L612.14,764.64ZM717.12,558.42Q707.53,566.64 697.62,574.64Q687.7,582.65 677.51,590.36Q667.31,598.07 656.85,605.48Q646.38,612.9 635.71,620.05Q625.04,627.21 614.09,634.03Q603.14,640.84 591.99,647.37Q580.83,653.9 569.48,660.02L507.22,588.25Q518.12,582.66 528.82,576.62Q539.52,570.58 549.89,564.19Q560.26,557.8 570.41,551.02Q580.57,544.25 590.42,537.12Q600.27,529.99 609.75,522.57Q619.24,515.15 628.43,507.36Q637.63,499.57 646.4,491.5L717.12,558.42ZM390.61,374.34L390.61,829.82L285.31,829.82L285.31,374.34L390.61,374.34ZM97.76,380.35Q118.01,388.06 137.87,396.72Q157.74,405.38 176.93,415.15Q196.13,424.91 214.69,435.68Q233.24,446.45 251.2,458.05Q269.15,469.66 286.29,482.39Q303.43,495.13 319.91,508.68Q336.39,522.23 351.81,536.86L305.23,611.73Q289.17,598.76 272.22,586.6Q255.27,574.45 237.65,563.2Q220.03,551.95 201.76,541.5Q183.49,531.05 164.66,521.44Q145.82,511.84 126.53,503.1Q107.24,494.37 87.5,486.42Q67.75,478.47 47.73,471.46L97.76,380.35ZM292.16,654.29Q282.81,665.76 272.93,676.94Q263.05,688.13 252.69,698.92Q242.33,709.71 231.51,720.09Q220.69,730.47 209.42,740.41Q198.14,750.35 186.4,759.83Q174.66,769.3 162.46,778.28Q150.27,787.25 137.7,795.63L66.46,724.67Q78.79,716.63 90.82,708.08Q102.85,699.53 114.47,690.57Q126.1,681.6 137.35,672.21Q148.6,662.81 159.42,653Q170.23,643.18 180.57,632.97Q190.9,622.76 200.79,612.13Q210.67,601.5 219.97,590.52L292.16,654.29ZM911.41,-57.47L953.82,34.76Q920.12,45.57 887.27,58.78Q854.43,71.99 822.7,87.29Q790.97,102.6 760.46,120.15Q729.95,137.69 700.9,157.39Q671.84,177.09 644.42,198.81Q617,220.53 591.36,244.44Q565.71,268.36 542.2,294.32L522.41,289.82Q510.81,270.1 504.1,253.75Q497.4,237.39 494.16,225.87Q490.92,214.35 490.31,207.62L513.09,210.46Q566.7,146.47 629.25,95.21Q691.8,43.94 762.28,5.79Q832.77,-32.35 911.41,-57.47ZM472.42,276.43L448.76,287.57Q425.47,262.8 400.21,240.01Q374.94,217.22 348.1,196.51Q321.25,175.8 292.87,157.06Q264.49,138.33 234.76,121.67Q205.03,105.02 174.24,90.41Q143.44,75.79 111.51,63.31Q79.57,50.82 46.82,40.65L91.41,-54.23Q165.32,-30.27 233.41,7.25Q301.49,44.78 362.78,93.02Q424.08,141.27 476.71,201.15L499.79,197.04Q499.77,204.01 496.92,215.17Q494.07,226.33 487.73,241.65Q481.39,256.98 472.42,276.43ZM445.86,253.18L553.8,253.18L553.8,380.4L445.86,380.4L445.86,253.18ZM70.28,212.14L929.95,212.14L929.95,308.76L70.28,308.76L70.28,212.14ZM445.8,-70.62L553.74,-70.62L553.74,-70.62L553.74,269.8L445.8,269.8L445.8,-70.62L445.8,-70.62Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=650</div><code class="frame-shape">[gid1=0+1000]</code></div><div class="frame" data-value="675" hidden><svg viewBox="-40 -903.06 1080 1143.06" role="img" aria-label="桨 at wght=675">
+<g transform="scale(1,-1)">
+<path d="M462.43,562.7Q484.52,574.2 506.18,587.23Q527.83,600.26 548.59,614.76Q569.34,629.26 589.03,645.15Q608.72,661.05 627.16,678.2Q645.6,695.34 662.45,713.88Q679.3,732.41 694.41,752.12Q709.52,771.82 722.44,792.69L624.33,835.98Q613.58,818.75 600.89,802.53Q588.19,786.3 573.98,771.32Q559.76,756.35 543.98,742.28Q528.2,728.22 511.17,715.33Q494.14,702.44 476.23,690.92Q458.31,679.39 439.43,669.01Q420.55,658.64 401,649.68L462.43,562.7ZM610.21,764.36L583.64,673.87L815.12,673.87L817.8,673.87L813.11,685.04Q801.48,664.59 780.83,641.66Q760.19,618.73 728.14,596.48Q696.1,574.23 651.47,553.67Q606.83,533.11 548.43,517.25Q490.03,501.38 416.05,491.63L461.37,388.21Q548.46,405.36 618.11,430.95Q687.75,456.53 742.01,487.16Q796.27,517.8 834.93,551.95Q873.58,586.1 898,617.46Q922.42,648.82 933.61,676.93L933.61,764.36L610.21,764.36ZM714.14,560.3Q704.66,568.44 694.86,576.37Q685.06,584.3 674.99,591.95Q664.92,599.6 654.6,606.96Q644.27,614.32 633.74,621.44Q623.21,628.55 612.42,635.34Q601.63,642.12 590.64,648.64Q579.64,655.15 568.46,661.26L504.14,587.51Q514.86,581.94 525.39,575.93Q535.92,569.92 546.13,563.56Q556.34,557.21 566.34,550.49Q576.34,543.77 586.05,536.7Q595.75,529.64 605.1,522.29Q614.45,514.94 623.52,507.24Q632.59,499.53 641.24,491.56L714.14,560.3ZM392.3,374L392.3,829.67L283.53,829.67L283.53,374L392.3,374ZM98.83,379.25Q119.07,386.95 138.91,395.61Q158.76,404.27 177.93,414.03Q197.09,423.79 215.61,434.56Q234.12,445.33 252.04,456.92Q269.96,468.5 287.04,481.23Q304.13,493.96 320.57,507.49Q337,521.02 352.37,535.64L304.39,612.77Q288.35,599.83 271.44,587.71Q254.52,575.59 236.94,564.38Q219.36,553.16 201.12,542.74Q182.88,532.31 164.08,522.73Q145.28,513.15 126.03,504.44Q106.77,495.73 87.06,487.8Q67.35,479.87 47.35,472.86L98.83,379.25ZM293.23,655.07Q283.88,666.53 274,677.71Q264.11,688.9 253.74,699.68Q243.37,710.47 232.55,720.85Q221.72,731.23 210.43,741.17Q199.14,751.11 187.39,760.58Q175.64,770.05 163.43,779.03Q151.22,788 138.64,796.38L65.19,723.62Q77.53,715.58 89.57,707.03Q101.61,698.48 113.25,689.52Q124.89,680.56 136.15,671.16Q147.41,661.76 158.24,651.95Q169.06,642.14 179.41,631.93Q189.75,621.72 199.64,611.1Q209.53,600.47 218.84,589.49L293.23,655.07ZM910.63,-57.64L954.35,37.27Q920.61,47.97 887.75,61.09Q854.88,74.2 823.15,89.43Q791.43,104.66 760.94,122.15Q730.45,139.65 701.43,159.31Q672.41,178.98 645.05,200.7Q617.68,222.41 592.11,246.35Q566.53,270.29 543.11,296.32L522.82,291.76Q510.89,271.71 503.91,255.1Q496.94,238.5 493.48,226.81Q490.02,215.12 489.23,208.3L511.97,211.09Q565.38,146.62 627.89,95.11Q690.41,43.6 761.04,5.43Q831.67,-32.73 910.63,-57.64ZM471.79,277.66L447.34,289.15Q424.15,264.38 399,241.61Q373.84,218.85 347.09,198.2Q320.34,177.54 292.04,158.88Q263.75,140.21 234.1,123.64Q204.45,107.06 173.72,92.54Q142.99,78.01 111.11,65.62Q79.23,53.22 46.51,43.15L92.47,-54.71Q166.5,-30.89 234.55,6.67Q302.59,44.23 363.73,92.66Q424.86,141.09 477.2,201.33L500.64,197.36Q500.42,204.41 497.34,215.69Q494.26,226.96 487.65,242.47Q481.05,257.98 471.79,277.66ZM443.9,254.59L555.49,254.59L555.49,381.21L443.9,381.21L443.9,254.59ZM71.21,210.63L928.87,210.63L928.87,310.45L71.21,310.45L71.21,210.63ZM443.84,-70.56L555.43,-70.56L555.43,-70.56L555.43,271.22L443.84,271.22L443.84,-70.56L443.84,-70.56Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=675</div><code class="frame-shape">[gid1=0+1000]</code></div><div class="frame print" data-value="700" hidden><svg viewBox="-40 -903.06 1080 1143.06" role="img" aria-label="桨 at wght=700">
+<g transform="scale(1,-1)">
+<path d="M463.34,561.9Q485.35,573.44 506.93,586.49Q528.5,599.54 549.2,614.04Q569.89,628.54 589.52,644.42Q609.16,660.3 627.57,677.42Q645.99,694.53 662.83,713.03Q679.67,731.52 694.8,751.16Q709.92,770.81 722.89,791.61L621.99,836.15Q611.28,819.1 598.64,803.03Q586.01,786.96 571.89,772.13Q557.77,757.3 542.1,743.36Q526.44,729.42 509.55,716.64Q492.66,703.85 474.91,692.41Q457.17,680.97 438.47,670.65Q419.78,660.33 400.44,651.41L463.34,561.9ZM608.27,763.93L581.53,671.11L809.94,671.11L812.61,671.11L807.94,682.19Q796.26,662.45 775.73,640.33Q755.2,618.2 723.53,596.73Q691.85,575.27 647.92,555.43Q603.99,535.59 546.68,520.27Q489.38,504.96 416.97,495.54L463.71,389.15Q549.76,406.3 618.72,431.62Q687.68,456.94 741.53,487.17Q795.39,517.4 833.86,551.07Q872.33,584.74 896.71,615.64Q921.09,646.54 932.32,674.34L932.32,763.93L608.27,763.93ZM711.09,562.18Q701.72,570.23 692.04,578.09Q682.36,585.95 672.42,593.53Q662.48,601.11 652.29,608.41Q642.1,615.72 631.73,622.79Q621.35,629.86 610.71,636.62Q600.08,643.37 589.24,649.86Q578.41,656.36 567.4,662.46L501.08,586.81Q511.62,581.26 521.99,575.28Q532.35,569.3 542.39,562.99Q552.44,556.68 562.28,550.01Q572.13,543.34 581.68,536.34Q591.24,529.34 600.45,522.07Q609.66,514.8 618.6,507.18Q627.54,499.57 636.07,491.69L711.09,562.18ZM394,373.68L394,829.51L281.76,829.51L281.76,373.68L394,373.68ZM99.9,378.16Q120.13,385.86 139.96,394.52Q159.78,403.17 178.92,412.93Q198.06,422.69 216.53,433.45Q235.01,444.21 252.88,455.79Q270.76,467.36 287.8,480.08Q304.83,492.8 321.22,506.31Q337.62,519.83 352.93,534.43L303.53,613.8Q287.54,600.9 270.66,588.81Q253.77,576.73 236.23,565.55Q218.68,554.36 200.48,543.97Q182.27,533.57 163.5,524.02Q144.74,514.46 125.52,505.77Q106.3,497.08 86.62,489.16Q66.94,481.25 46.97,474.26L99.9,378.16ZM294.32,655.84Q284.96,667.3 275.07,678.48Q265.17,689.66 254.79,700.44Q244.42,711.22 233.58,721.6Q222.75,731.97 211.45,741.91Q200.15,751.85 188.39,761.32Q176.62,770.79 164.4,779.77Q152.18,788.74 139.59,797.13L63.92,722.59Q76.28,714.54 88.33,705.99Q100.38,697.43 112.03,688.47Q123.68,679.51 134.95,670.12Q146.22,660.72 157.06,650.91Q167.89,641.1 178.25,630.9Q188.6,620.69 198.5,610.07Q208.4,599.45 217.71,588.48L294.32,655.84ZM909.84,-57.81L954.87,39.77Q921.09,50.37 888.21,63.4Q855.33,76.43 823.61,91.59Q791.88,106.74 761.42,124.18Q730.95,141.62 701.97,161.25Q672.98,180.89 645.67,202.6Q618.37,224.3 592.86,248.27Q567.36,272.23 544.03,298.32L523.22,293.71Q510.98,273.34 503.72,256.48Q496.47,239.63 492.79,227.77Q489.11,215.92 488.15,209.01L510.83,211.72Q564.04,146.79 626.53,95.03Q689.02,43.27 759.79,5.09Q830.56,-33.1 909.84,-57.81ZM471.19,278.89L445.95,290.71Q422.87,265.95 397.81,243.23Q372.75,220.5 346.08,199.9Q319.42,179.3 291.22,160.7Q263.01,142.1 233.43,125.61Q203.86,109.12 173.2,94.67Q142.53,80.23 110.7,67.92Q78.87,55.61 46.19,45.62L93.56,-55.21Q167.68,-31.52 235.69,6.08Q303.7,43.68 364.68,92.3Q425.65,140.91 477.7,201.52L501.49,197.71Q501.07,204.83 497.76,216.22Q494.45,227.61 487.58,243.3Q480.72,258.98 471.19,278.89ZM441.93,256.03L557.18,256.03L557.18,382.07L441.93,382.07L441.93,256.03ZM72.14,209.14L927.79,209.14L927.79,312.15L72.14,312.15L72.14,209.14ZM441.87,-70.49L557.12,-70.49L557.12,-70.49L557.12,272.67L441.87,272.67L441.87,-70.49L441.87,-70.49Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=700</div><code class="frame-shape">[gid1=0+1000]</code></div></div><label class="control"><span>wght</span><input type="range" min="400" max="700" step="25" value="400"><output>400</output></label><figcaption><code>hb-vector hb:test/api/fonts/varc-6868.ttf "桨" --variations=wght=…</code>, drawn at every 25 from 400 to 700</figcaption></figure>
+<h3 id="step-6-the-leaf">Step 6: the leaf</h3>
+<p id="ix-39">Last, <code>VARC::get_path_at</code> is called for glyph 4, with the component’s coordinates and transform. VARC doesn’t cover glyph 4, so it is a <strong>leaf</strong>, drawn by <code>glyf</code>, CFF2 or CFF, in that order, through a pen that transforms every point. Drawn by <code>hb-vector</code> at step 4’s coordinates and moved by (−10, 24), glyph 4 lands on the ㄱ of <code>hb-vector</code>’s 가 to within a hundredth of a unit.</p>
+<p id="ix-40">A leaf needn’t be a different glyph. <code>VARC::get_path_at</code> won’t recurse into the glyph it’s already drawing (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc#L475"><code>VARC.cc:475</code></a>):</p>
+<pre><code class="language-c++">// Don't recurse on the same glyph.
+unsigned idx = glyph == parent_glyph ?
+               NOT_COVERED :
+               (this+coverage).get_coverage (glyph);
+</code></pre>
+<p id="ix-41">so a component that names its own glyph is drawn from <code>glyf</code> or CFF, as a leaf, and a VARC glyph can add components to its own outline, or draw it elsewhere in the design space. <code>varc-static-gvar.ttf</code> has no fvar at all, but its gvar has one axis. Its glyph <code>a</code> is a VARC glyph with one component: itself, with axis 0 set to 0.5. The <code>glyf</code> outline is a triangle from x = 0 to 400, which gvar moves 100 units right at axis 0 = 1. So VARC draws it 50 units right, while <code>b</code>, the same triangle without VARC, stays put:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -840 1080 1080" role="img" aria-label="ab at default">
+<g transform="scale(1,-1)">
+<path d="M50,0L450,0L250,500L50,0Z" fill="currentColor"/>
+<path d="M500,0L900,0L700,500L500,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[a=0+500|b=1+500]</code></div></div><figcaption><code>hb-vector hb:test/api/fonts/varc-static-gvar.ttf "ab"</code></figcaption></figure>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hb:test/api/fonts/varc-static-gvar.ttf</td><td class="in"><span class="txt">ab</span><span class="cps">U+0061 U+0062</span></td><td class="opt">--show-extents</td><td class="out"><code>[a=0+500&lt;50,500,400,-500&gt;|b=1+500&lt;0,500,400,-500&gt;]</code></td></tr></tbody></table></div>
+<h3 id="two-sets-of-coordinates">Two sets of coordinates</h3>
+<p id="ix-42">The condition and the deltas (steps 2, 3 and 5) are evaluated at the parent’s coordinates; the outline (step 6) is drawn at the component’s. That is on purpose. The deltas say how the parent wants its part placed and shaped as <em>the parent</em> changes; the component’s coordinates describe the part’s own shape, which knows nothing of where it’s used. It also lets a glyph’s components share one cache of region scalars (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc#L546"><code>VARC.cc:546</code></a>).</p>
+<p id="ix-43">In 가 the two agree on everything the store’s regions use, weight and optical size. In 桨 they don’t. 桨’s third component is 木, glyph 7, and 木’s fifth is its stem: glyph 9, a plain 1000-unit square, scaled to a thin upright. At weight 700, <code>varc-dump.py</code> finds:</p>
+<table>
+<thead>
+<tr>
+<th>Axis</th>
+<th id="ix-44">木’s coordinates: the stem’s deltas are evaluated here</th>
+<th>The stem’s coordinates: its outline is drawn here</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-45"><code>wght</code></td>
+<td>1</td>
+<td>1</td>
+</tr>
+<tr>
+<td><code>0000</code></td>
+<td>0.081</td>
+<td>0</td>
+</tr>
+<tr>
+<td><code>0012</code>, <code>0014</code>, <code>0016</code>, <code>0017</code>, <code>0022</code></td>
+<td>0.047, 0.216, 0.139, 0.542, 0.307</td>
+<td>0</td>
+</tr>
+<tr>
+<td><code>0018</code></td>
+<td>0.420</td>
+<td>0</td>
+</tr>
+<tr>
+<td><code>0019</code></td>
+<td>0.514</td>
+<td>0</td>
+</tr>
+<tr>
+<td><code>0020</code></td>
+<td>0.060</td>
+<td>0</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-46">The left column is what 桨 set for 木. On the right, the stem sets its four axes to 0 and, having <code>RESET_UNSPECIFIED_AXES</code>, takes the font’s coordinates for the rest. Its horizontal scale, stored as 72/1024, has deltas read from the left column; the one on <code>0018</code> adds 0.42 × 117, and the stem is 115 units wide, where at weight 400 it is 71. Its outline doesn’t change at all: it gets bolder because 木’s parameters say so.</p>
+<h3 id="recursion-and-its-limits">Recursion, and its limits</h3>
+<p id="ix-47">A component can itself be a VARC glyph, so drawing recurses, with each level’s transform applied after its parent’s. HarfBuzz bounds it in several ways: 64 levels deep, 16,384 component edges in all, a cycle detector, and the shared work budget that every drawing call has (see <a href="drawing-outlines.html">Drawing outlines</a>). All of them fail quietly: drawing simply stops, and what has been drawn so far is the glyph. HarfBuzz never falls back to the glyph’s <code>glyf</code> outline instead.</p>
+<h2 id="hidden-axes">Hidden axes</h2>
+<p id="ix-48">A part has its own parameters. A stroke is curved or straight, tapered or blunt; a radical is tall or squat, its strokes heavy or light. They make sense only for that part, and there may be dozens: a designer doesn’t want them among the font’s axes, as sliders meaning nothing to a user. Each part should have them privately, and each glyph that uses it set them, so that the one 木 the font stores can be full height in one character and squat in another. Axes used this way are VARC’s <strong>hidden axes</strong>.</p>
+<p id="ix-49">桨’s components are glyphs 2, 5 and 7: 夕, 丬 and 木. Each is a VARC glyph made of strokes, and the strokes are leaves, among them a straight bar 1,000 units long (glyphs 3 and 8) and the square (glyph 9). The parts on their own, at the font’s defaults, then 桨:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -1004.11 4080 1244.11" role="img" aria-label="gid2|gid5|gid7|gid1 at default">
+<g transform="scale(1,-1)">
+<path d="M80.63,302.55Q130.89,327.08 178.64,358.54Q226.38,389.99 269.96,427.88Q313.53,465.77 352.71,509Q391.89,552.22 425.32,600.27Q458.75,648.31 485.96,700.57Q513.17,752.84 533.04,808.3Q552.92,863.76 564.55,921.66L499.5,938.38Q488.72,885.53 470.41,834.88Q452.1,784.23 427.16,736.6Q402.21,688.97 371.1,644.52Q339.99,600.07 303.43,559.89Q266.86,519.71 225.58,484.85Q184.29,449.98 138.82,420.57Q93.35,391.16 44.09,368.38L80.63,302.55ZM452.98,689.81L422.99,627L831,627L835,627L828,647Q816.17,577.94 785.84,500.98Q755.5,424.02 699.82,349.41Q644.14,274.79 558.46,205.6Q472.78,136.41 353.1,82.42Q233.41,28.44 73.79,-6L98.33,-77.99Q263.32,-43.23 388.81,17.89Q514.3,79.01 606.15,154.88Q698,230.75 758.57,316.18Q819.15,401.62 853.23,480.6Q887.32,559.59 898.93,627L898.93,689.81L452.98,689.81ZM683.76,267.85Q666.29,284.94 647.82,301.39Q629.35,317.83 609.98,333.35Q590.6,348.86 570.43,363.48Q550.27,378.1 529.31,391.67Q508.35,405.24 486.64,417.71Q464.93,430.17 442.55,441.45Q420.17,452.73 397.25,462.65L362.13,403.62Q384.39,394.05 406.12,383.1Q427.86,372.14 448.86,359.97Q469.87,347.8 490.22,334.45Q510.56,321.11 530.11,306.63Q549.66,292.14 568.3,276.59Q586.95,261.05 604.72,244.43Q622.49,227.81 639.13,210.21L683.76,267.85Z" fill="currentColor"/>
+<path d="M1543,-70L1543,830.39L1483.43,830.39L1483.43,-70L1543,-70ZM1250.24,45.67Q1274.9,62.01 1298.83,79.97Q1322.77,97.93 1345.52,117.5Q1368.27,137.07 1389.84,158.08Q1411.41,179.08 1431.68,201.43Q1451.94,223.77 1470.67,247.56Q1489.4,271.35 1506.58,296.32Q1523.77,321.29 1538.99,347.45L1496.88,374.09Q1481.27,350.67 1464,328.18Q1446.72,305.68 1428.1,284.33Q1409.48,262.99 1389.52,242.65Q1369.55,222.31 1348.41,203.15Q1327.27,183.98 1305.13,166.16Q1282.99,148.34 1259.86,131.7Q1236.73,115.05 1212.82,99.93L1250.24,45.67ZM1457.67,444.62Q1448.99,467.79 1439.25,490.79Q1429.51,513.79 1418.78,536.39Q1408.06,558.99 1396.36,581.13Q1384.66,603.27 1372.01,624.87Q1359.36,646.48 1345.74,667.48Q1332.12,688.48 1317.53,708.78Q1302.95,729.08 1287.51,748.48L1235.51,714.36Q1250.5,695.5 1264.82,675.87Q1279.15,656.24 1292.68,636.06Q1306.22,615.89 1319,595.15Q1331.77,574.4 1343.7,553.17Q1355.64,531.94 1366.64,510.3Q1377.64,488.67 1387.76,466.61Q1397.89,444.55 1406.94,422.26L1457.67,444.62Z" fill="currentColor"/>
+<path d="M2888.47,70.51L2939.57,129.17Q2904.8,155.37 2871.59,184.14Q2838.38,212.9 2806.95,243.72Q2775.52,274.54 2746.1,307.45Q2716.67,340.37 2689.47,375.09Q2662.27,409.81 2637.53,446.04Q2612.79,482.27 2590.68,520.02Q2568.58,557.76 2549.51,596.67L2532.91,600.54Q2516.9,585.19 2507.25,571.09Q2497.6,556.99 2492.9,546.3Q2488.2,535.61 2487.6,528.81L2516.68,524.95Q2562.27,435.31 2619.31,354.55Q2676.34,273.78 2743.57,202.76Q2810.8,131.75 2888.47,70.51ZM2463.76,592.78L2443.8,593.49Q2425.98,554.94 2405.01,517.62Q2384.04,480.29 2360.41,444.5Q2336.78,408.71 2310.52,374.56Q2284.26,340.41 2255.65,308.17Q2227.03,275.93 2196.39,245.81Q2165.74,215.7 2133.06,187.85Q2100.39,160.01 2065.98,134.88L2119.12,79.13Q2192.84,137.03 2257.9,206.45Q2322.96,275.86 2378.75,353.39Q2434.54,430.92 2478.98,516.46L2504.21,516.24Q2504.76,524.22 2500.69,535.65Q2496.61,547.07 2487.21,561.29Q2477.82,575.51 2463.76,592.78ZM2464,570L2534.31,570L2534.31,829.77L2464,829.77L2464,570ZM2074,557L2923.61,557L2923.61,627.31L2074,627.31L2074,557ZM2464,-70.05L2534.31,-70.05L2534.31,-70.05L2534.31,580.34L2464,580.34L2464,-70.05L2464,-70.05Z" fill="currentColor"/>
+<path d="M3454.69,574.65Q3477.5,585.59 3499.77,598.23Q3522.04,610.87 3543.26,625.17Q3564.47,639.48 3584.49,655.3Q3604.52,671.11 3623.04,688.39Q3641.57,705.66 3658.34,724.41Q3675.12,743.16 3689.88,763.22Q3704.64,783.28 3716.99,804.58L3653.68,831.59Q3642.74,812.66 3629.52,794.89Q3616.31,777.11 3601.23,760.71Q3586.15,744.31 3569.28,729.06Q3552.41,713.8 3534.03,699.93Q3515.65,686.06 3496.08,673.74Q3476.52,661.43 3455.8,650.53Q3435.08,639.64 3413.47,630.45L3454.69,574.65ZM3629.06,761.77L3605.1,701.25L3867.39,701.25L3870.21,701.25L3865.27,713.1Q3854.48,684.81 3832.95,653.06Q3811.42,621.31 3775.73,590.5Q3740.05,559.69 3688.17,531.21Q3636.28,502.74 3566.33,480.81Q3496.38,458.89 3405.56,445.45L3433.34,379.76Q3530.82,396.4 3607.07,424.44Q3683.33,452.48 3741.17,487.04Q3799,521.59 3839.03,560.48Q3879.06,599.37 3903.44,635.24Q3927.82,671.1 3938.26,702.21L3938.26,761.77L3629.06,761.77ZM3744.21,540.62Q3733.73,549.48 3722.81,558.04Q3711.9,566.61 3700.6,574.77Q3689.3,582.94 3677.65,590.71Q3665.99,598.48 3654.03,605.88Q3642.08,613.27 3629.76,620.21Q3617.45,627.14 3604.84,633.65Q3592.23,640.17 3579.36,646.12L3540.13,598.17Q3552.61,592.59 3564.85,586.44Q3577.08,580.29 3588.93,573.66Q3600.77,567.02 3612.32,559.9Q3623.88,552.77 3635.04,545.17Q3646.21,537.58 3656.93,529.57Q3667.65,521.56 3677.98,513.09Q3688.31,504.62 3698.09,495.76L3744.21,540.62ZM3373.5,378.03L3373.5,830.98L3303.21,830.98L3303.21,378.03L3373.5,378.03ZM3087.24,392.05Q3107.55,399.75 3127.6,408.46Q3147.64,417.17 3167.14,426.96Q3186.63,436.75 3205.58,447.53Q3224.52,458.32 3242.88,470.04Q3261.24,481.75 3278.87,494.56Q3296.5,507.36 3313.44,521.07Q3330.38,534.78 3346.33,549.5L3313.6,600.78Q3297.18,587.42 3279.89,574.92Q3262.59,562.42 3244.61,550.85Q3226.64,539.29 3208.03,528.56Q3189.42,517.84 3170.26,508.01Q3151.1,498.17 3131.47,489.23Q3111.83,480.28 3091.77,472.17Q3071.7,464.06 3051.36,456.92L3087.24,392.05ZM3281.45,645.89Q3272.16,657.4 3262.35,668.62Q3252.53,679.84 3242.26,690.65Q3231.98,701.46 3221.25,711.86Q3210.53,722.26 3199.36,732.21Q3188.19,742.15 3176.57,751.63Q3164.95,761.1 3152.89,770.06Q3140.82,779.02 3128.4,787.38L3079.14,735.35Q3091.33,727.34 3103.23,718.81Q3115.13,710.28 3126.63,701.33Q3138.13,692.38 3149.27,682.99Q3160.41,673.59 3171.13,663.77Q3181.85,653.95 3192.09,643.72Q3202.33,633.49 3212.14,622.83Q3221.95,612.17 3231.18,601.14L3281.45,645.89ZM3918.08,-57.26L3947.92,8.64Q3914.84,20.84 3882.33,35.19Q3849.81,49.55 3818.15,65.73Q3786.48,81.91 3755.79,100.03Q3725.11,118.15 3695.61,138.07Q3666.12,157.99 3638.04,179.58Q3609.96,201.17 3583.4,224.52Q3556.85,247.86 3532.2,272.79L3517.57,269.08Q3509.44,253.09 3505.66,239.58Q3501.88,226.06 3500.93,216.35Q3499.98,206.63 3501.1,200.81L3523.51,203.08Q3579.4,144.29 3642.32,95.6Q3705.24,46.91 3774.13,8.69Q3843.02,-29.53 3918.08,-57.26ZM3479.99,261.88L3464.09,269.85Q3439.37,245.57 3412.84,222.88Q3386.3,200.19 3358.34,179.2Q3330.38,158.21 3301.06,138.92Q3271.73,119.63 3241.25,102.14Q3210.77,84.66 3179.4,69.01Q3148.04,53.36 3115.79,39.63Q3083.54,25.9 3050.72,14.32L3082.21,-51.36Q3154.46,-25.1 3222.65,12.44Q3290.84,49.98 3353.71,96.29Q3416.57,142.61 3472.46,198.25L3491.28,193.68Q3493.29,199.92 3492.92,209.65Q3492.54,219.39 3489.13,232.43Q3485.72,245.48 3479.99,261.88ZM3465.46,238.87L3536.89,238.87L3536.89,371.96L3465.46,371.96L3465.46,238.87ZM3060.99,227.08L3940.7,227.08L3940.7,291.73L3060.99,291.73L3060.99,227.08ZM3465.44,-71.21L3536.87,-71.21L3536.87,-71.21L3536.87,255.37L3465.44,255.37L3465.44,-71.21L3465.44,-71.21Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[gid2=0+1000|gid5=0+1000|gid7=0+1000|gid1=0+1000]</code></div></div><figcaption><code>hb-vector hb:test/api/fonts/varc-6868.ttf "gid2|gid5|gid7|gid1" --glyphs</code></figcaption></figure>
+<p id="ix-50">In 桨, 木 sits under the other two and is squat, yet its component has no scale: it only moves 木 down 100 units. The squatness is 木’s axis <code>0019</code>, which 桨 sets to 0.494:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -869.77 1080 1109.77" role="img" aria-label="gid7 at 0019=0">
+<g transform="scale(1,-1)">
+<path d="M888.47,70.51L939.57,129.17Q904.8,155.37 871.59,184.14Q838.38,212.9 806.95,243.72Q775.52,274.54 746.1,307.45Q716.67,340.37 689.47,375.09Q662.27,409.81 637.53,446.04Q612.79,482.27 590.68,520.02Q568.58,557.76 549.51,596.67L532.91,600.54Q516.9,585.19 507.25,571.09Q497.6,556.99 492.9,546.3Q488.2,535.61 487.6,528.81L516.68,524.95Q562.27,435.31 619.31,354.55Q676.34,273.78 743.57,202.76Q810.8,131.75 888.47,70.51ZM463.76,592.78L443.8,593.49Q425.97,554.94 405.01,517.62Q384.04,480.29 360.41,444.5Q336.78,408.71 310.52,374.56Q284.26,340.41 255.65,308.17Q227.03,275.93 196.39,245.81Q165.74,215.7 133.06,187.85Q100.39,160.01 65.98,134.88L119.12,79.13Q192.84,137.03 257.9,206.45Q322.96,275.86 378.75,353.39Q434.54,430.92 478.98,516.46L504.21,516.24Q504.76,524.22 500.69,535.65Q496.61,547.07 487.21,561.29Q477.82,575.51 463.76,592.78ZM464,570L534.31,570L534.31,829.77L464,829.77L464,570ZM74,557L923.61,557L923.61,627.31L74,627.31L74,557ZM464,-70.05L534.31,-70.05L534.31,-70.05L534.31,580.34L464,580.34L464,-70.05L464,-70.05Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">0019=0</div><code class="frame-shape">[gid7=0+1000]</code></div><div class="frame"><svg viewBox="-40 -869.77 1080 1109.77" role="img" aria-label="gid7 at 0019=0.25">
+<g transform="scale(1,-1)">
+<path d="M921.5,42.97L961.97,104.64Q926.52,124.58 892.12,146.99Q857.72,169.39 824.63,193.82Q791.54,218.25 759.94,244.79Q728.35,271.32 698.49,299.73Q668.64,328.14 640.75,358.2Q612.87,388.27 587.11,420.01Q561.35,451.76 538.14,484.93L516.75,435.76Q510.7,433.76 506.24,429.52Q501.78,425.29 498.01,421.23Q494.24,417.18 490.91,414.14L518.48,414.67Q572.4,337.78 635.68,270.56Q698.96,203.34 770.35,146.44Q841.75,89.53 921.5,42.97ZM472.69,476.99L454.52,481.34Q431.95,448.81 406.87,417.74Q381.78,386.67 354.64,357.26Q327.5,327.85 298.35,300.18Q269.21,272.51 238.31,246.76Q207.41,221.01 175.08,197.32Q142.74,173.62 108.97,152.11Q75.2,130.6 40.33,111.61L130.51,42.59Q193.05,93.5 253,151.85Q312.94,210.2 368.76,273.66Q424.57,337.12 473.84,406.51L497.23,402.52Q498.79,409.81 496.82,420.69Q494.85,431.56 488.64,445.6Q482.44,459.63 472.69,476.99ZM464.25,454.25L534.07,454.25L534.07,673.98L464.25,673.98L464.25,454.25ZM74,443.25L923.61,443.25L923.61,509.41L74,509.41L74,443.25ZM464.25,-70.04L534.07,-70.04L534.07,-70.04L534.07,467.8L464.25,467.8L464.25,-70.04L464.25,-70.04Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">0019=0.25</div><code class="frame-shape">[gid7=0+1000]</code></div><div class="frame"><svg viewBox="-40 -869.77 1080 1109.77" role="img" aria-label="gid7 at 0019=0.494">
+<g transform="scale(1,-1)">
+<path d="M938.16,16.02L968.42,78.94Q933.28,93.07 898.75,109.49Q864.21,125.91 830.58,144.27Q796.95,162.63 764.38,183.01Q731.8,203.4 700.52,225.65Q669.24,247.9 639.48,271.85Q609.73,295.81 581.63,321.52Q553.53,347.23 527.51,374.51L514.99,279.29Q514.08,290.73 511.69,295.84Q509.3,300.95 504.82,302.51Q500.35,304.06 493.92,303.34L519.42,307.65Q578.93,243.61 645.81,189.67Q712.68,135.73 785.71,92.31Q858.74,48.88 938.16,16.02ZM480.47,362.92L464.58,370.23Q438.81,343.98 411.1,319.28Q383.39,294.57 354.16,271.54Q324.94,248.5 294.25,227.18Q263.57,205.85 231.66,186.36Q199.75,166.88 166.89,149.29Q134.03,131.7 100.23,116.12Q66.43,100.53 32.04,87.21L148.74,-5.46Q201.88,42.04 256.53,92.17Q311.17,142.3 365.21,193.85Q419.24,245.39 470.25,300.1L491.33,292.97Q493.68,299.47 493.49,309.51Q493.29,319.55 489.86,332.89Q486.43,346.22 480.47,362.92ZM464.49,341.27L533.84,341.27L533.84,521.91L464.49,521.91L464.49,341.27ZM74,332.22L923.61,332.22L923.61,394.33L74,394.33L74,332.22ZM464.49,-70.04L533.84,-70.04L533.84,-70.04L533.84,357.95L464.49,357.95L464.49,-70.04L464.49,-70.04Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">0019=0.494</div><code class="frame-shape">[gid7=0+1000]</code></div></div><figcaption><code>hb-vector hb:test/api/fonts/varc-6868.ttf "gid7" --glyphs</code></figcaption></figure>
+<p id="ix-51">The parameter lowers the crossbar and shortens the strokes, but leaves the crossbar and stem as thick as they were, which a vertical scale wouldn’t. Stroke weight is a parameter too: <code>0018</code>, which widened the stem above.</p>
+<p id="ix-52">The leaves have parameters of their own. Glyph 3, the bar, has a dozen. Here it is at its default, then with <code>0000</code>, <code>0002</code> and <code>0012</code> at 1:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -840 1080 1080" role="img" aria-label="gid3 at 0000=0">
+<g transform="scale(1,-1)">
+<path d="M0,0Q71,0 142.5,0Q214,0 285.5,0Q357,0 428.5,0Q500,0 571.5,0Q643,0 714.5,0Q786,0 857.5,0Q929,0 1000,0L1000,75Q929,75 857.5,75Q786,75 714.5,75Q643,75 571.5,75Q500,75 428.5,75Q357,75 285.5,75Q214,75 142.5,75Q71,75 0,75L0,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">0000=0</div><code class="frame-shape">[gid3=0+1000]</code></div><div class="frame"><svg viewBox="-40 -840 1080 1080" role="img" aria-label="gid3 at 0000=1">
+<g transform="scale(1,-1)">
+<path d="M14,180Q72,131 137.5,94.5Q203,58 273.5,36Q344,14 417.5,5.5Q491,-3 565,3.5Q639,10 712,31.5Q785,53 854,90Q923,127 986,180L937,237Q882,191 821.5,158.5Q761,126 697,106.5Q633,87 566.5,80.5Q500,74 433.5,80.5Q367,87 303,107Q239,127 178.5,159.5Q118,192 63,238L14,180Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">0000=1</div><code class="frame-shape">[gid3=0+1000]</code></div><div class="frame"><svg viewBox="-40 -840 1080 1080" role="img" aria-label="gid3 at 0002=1">
+<g transform="scale(1,-1)">
+<path d="M0,0Q71,64 142.5,95Q214,126 285.5,131.5Q357,137 428.5,126Q500,115 571.5,94.5Q643,74 714.5,52Q786,30 857.5,15Q929,0 1000,0L1000,75Q929,75 857.5,90Q786,105 714.5,127Q643,149 571.5,169.5Q500,190 428.5,201Q357,212 285.5,206.5Q214,201 142.5,170Q71,139 0,75L0,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">0002=1</div><code class="frame-shape">[gid3=0+1000]</code></div><div class="frame"><svg viewBox="-40 -840 1080 1080" role="img" aria-label="gid3 at 0012=1">
+<g transform="scale(1,-1)">
+<path d="M0,-150Q71,-150 142.5,-150Q214,-150 285.5,-150Q357,-150 428.5,-150Q500,-150 571.5,-150Q643,-150 714.5,-150Q786,-150 857.5,-150Q929,-150 1000,-150L1000,225Q929,225 857.5,225Q786,225 714.5,225Q643,225 571.5,225Q500,225 428.5,225Q357,225 285.5,225Q214,225 142.5,225Q71,225 0,225L0,-150Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">0012=1</div><code class="frame-shape">[gid3=0+1000]</code></div></div><figcaption><code>hb-vector hb:test/api/fonts/varc-6868.ttf "gid3" --glyphs</code></figcaption></figure>
+<p id="ix-53"><code>0000</code> bends it, <code>0002</code> makes it an S, and <code>0012</code> thickens it. Each part uses the numbers as it likes: <code>0019</code>, 木’s squatness, is also one of the axes 桨 sets on 夕.</p>
+<p>Like <code>varc-ac00-ac01.ttf</code>, this font lists its private axes in fvar, as <code>0000</code> to <code>0028</code>. A font can hide them completely: a component can set any axis index up to 4095, and gvar and CFF2 can vary on it, with no fvar entry. <code>varc-static-gvar.ttf</code> (<a href="#step-6-the-leaf">above</a>) does just that.</p>
+<p id="ix-54">avar version 2 has hidden axes too (<a href="design-space.html#avar-version-2">Design space</a>), but they are fvar axes, usually flagged as hidden, that avar2 sets once for the whole font from the user’s axes: every glyph sees the same value. VARC’s are set per use: at one position, <code>0019</code> can be 0.494 for the 木 in 桨 and 0 for a 木 standing alone. avar2 builds a design space from parameters; VARC builds glyphs from parameterized parts.</p>
+<h3 id="reset_unspecified_axes">RESET_UNSPECIFIED_AXES</h3>
+<p id="ix-55">When the same axis number means different things in different parts, a part mustn’t inherit its parent’s settings. 桨 sets 木’s <code>0019</code> to 0.494; a stroke inside 木 that inherited it, and varied on its own <code>0019</code>, would change shape for no reason of its own. With <code>RESET_UNSPECIFIED_AXES</code>, the component starts from the font’s coordinates instead, and sets its own axes on top. Every component in <code>varc-6868.ttf</code> has the flag. Here is a copy made by <code>fonts/variable-components/no-reset.py</code>, with the flag cleared on the components of the three parts:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-59.92 -935.23 1135.59 1175.23" role="img" aria-label="桨 at wght=400">
+<g transform="scale(1,-1)">
+<path d="M454.69,574.65Q477.5,585.59 499.77,598.23Q522.04,610.87 543.26,625.17Q564.47,639.48 584.49,655.3Q604.52,671.11 623.04,688.39Q641.57,705.66 658.34,724.41Q675.12,743.16 689.88,763.22Q704.64,783.28 716.99,804.58L653.68,831.59Q642.74,812.66 629.52,794.89Q616.31,777.11 601.23,760.71Q586.15,744.31 569.28,729.06Q552.41,713.8 534.03,699.93Q515.65,686.06 496.08,673.74Q476.52,661.43 455.8,650.53Q435.08,639.64 413.47,630.45L454.69,574.65ZM629.06,761.77L605.1,701.25L867.39,701.25L870.21,701.25L865.27,713.1Q854.48,684.81 832.95,653.06Q811.42,621.31 775.73,590.5Q740.05,559.69 688.17,531.21Q636.28,502.74 566.33,480.81Q496.38,458.89 405.56,445.45L433.34,379.76Q530.82,396.4 607.07,424.44Q683.33,452.48 741.17,487.04Q799,521.59 839.03,560.48Q879.06,599.37 903.44,635.24Q927.82,671.1 938.26,702.21L938.26,761.77L629.06,761.77ZM744.21,540.62Q733.58,549.3 722.59,557.78Q711.61,566.25 700.3,574.41Q688.99,582.55 677.36,590.36Q665.73,598.16 653.82,605.61Q641.91,613.07 629.64,620.06Q617.38,627.06 604.8,633.61Q592.23,640.17 579.36,646.12L540.13,598.17Q552.61,592.59 564.81,586.4Q577.01,580.21 588.81,573.51Q600.6,566.81 612.11,559.63Q623.61,552.45 634.75,544.82Q645.89,537.2 656.62,529.2Q667.36,521.21 677.76,512.83Q688.16,504.44 698.09,495.76L744.21,540.62ZM373.5,395.52L373.5,813.49L303.2,813.49L303.2,395.52L373.5,395.52ZM217.9,297.61Q221.15,321.09 226.06,342.8Q230.97,364.52 237.62,384.53Q244.27,404.54 252.66,423.04Q261.05,441.54 271.39,458.36Q281.73,475.18 293.42,490.93Q305.11,506.68 318.39,521.11Q331.68,535.54 346.33,549.5L309.48,598.39Q293.64,585.36 276.72,573.55Q259.79,561.74 242.08,551.03Q224.38,540.32 206.06,530.42Q187.74,520.51 169,511.27Q150.27,502.03 131.3,493.3Q112.34,484.57 93.32,476.08Q74.31,467.6 55.48,459.31L217.9,297.61ZM357.87,782.47Q335.5,774.79 314.97,769.38Q294.45,763.96 275.81,760.97Q257.18,757.99 240.21,757.32Q223.23,756.66 208,758.49Q192.76,760.33 178.88,764.12Q165,767.91 152.53,773.81Q140.06,779.71 128.4,787.38L79.14,735.35Q91.33,727.34 102.89,718.47Q114.45,709.59 125.43,700.12Q136.42,690.64 147.05,680.73Q157.68,670.82 168.06,660.65Q178.44,650.48 188.67,640.24Q198.9,629.99 209.19,619.82Q219.48,609.66 229.85,599.79L357.87,782.47ZM906.5,-74.74L961.45,29.05Q929.69,43.1 898.15,58.78Q866.62,74.45 835.59,91.44Q804.56,108.42 774.17,126.83Q743.77,145.24 714.22,164.92Q684.67,184.61 656.2,205.45Q627.73,226.3 600.45,248.4Q573.17,270.49 547.48,293.7L504.18,156.44Q506.22,171.3 506.11,178.69Q506.01,186.09 503,188.67Q499.99,191.26 494.22,190.44L514.75,189.85Q570.81,131.34 633.49,82.28Q696.17,33.22 764.35,-6.01Q832.54,-45.25 906.5,-74.74ZM492.74,241.88L451.33,289.85Q425.44,267.42 398.07,246.04Q370.7,224.65 342.25,204.43Q313.8,184.21 284.32,165.16Q254.83,146.12 224.54,128.34Q194.24,110.57 163.38,94.13Q132.52,77.69 101.09,62.68Q69.66,47.66 37.97,34.32L177.14,-107.18Q226.44,-60.87 277.7,-12.79Q328.96,35.28 380.1,83.96Q431.23,132.64 479.87,183.73L500,180Q502,186.27 502.05,195.33Q502.11,204.39 499.59,216.01Q497.08,227.64 492.74,241.88ZM465.46,238.87L536.89,238.87L536.89,371.96L465.46,371.96L465.46,238.87ZM60.99,227.08L940.7,227.08L940.7,291.73L60.99,291.73L60.99,227.08ZM465.44,-71.21L536.87,-71.21L536.87,-71.21L536.87,255.37L465.44,255.37L465.44,-71.21L465.44,-71.21Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=400</div><code class="frame-shape">[gid1=0+1000]</code></div><div class="frame"><svg viewBox="-59.92 -935.23 1135.59 1175.23" role="img" aria-label="桨 at wght=700">
+<g transform="scale(1,-1)">
+<path d="M463.34,561.9Q485.35,573.44 506.93,586.49Q528.5,599.54 549.2,614.04Q569.89,628.54 589.52,644.42Q609.16,660.3 627.57,677.42Q645.99,694.53 662.83,713.03Q679.67,731.52 694.8,751.16Q709.92,770.81 722.89,791.61L621.99,836.15Q611.28,819.1 598.64,803.03Q586.01,786.96 571.89,772.13Q557.77,757.3 542.1,743.36Q526.44,729.42 509.55,716.64Q492.66,703.85 474.91,692.41Q457.17,680.97 438.47,670.65Q419.78,660.33 400.44,651.41L463.34,561.9ZM608.27,763.93L581.53,671.11L809.94,671.11L812.61,671.11L807.94,682.19Q796.26,662.45 775.73,640.33Q755.2,618.2 723.53,596.73Q691.85,575.27 647.92,555.43Q603.99,535.59 546.68,520.27Q489.38,504.96 416.97,495.54L463.71,389.15Q549.76,406.3 618.72,431.62Q687.68,456.94 741.53,487.17Q795.39,517.4 833.86,551.07Q872.33,584.74 896.71,615.64Q921.09,646.54 932.32,674.34L932.32,763.93L608.27,763.93ZM711.09,562.18Q701.38,569.84 691.53,577.51Q681.69,585.18 671.72,592.72Q661.76,600.27 651.62,607.64Q641.49,615.02 631.22,622.21Q620.95,629.41 610.44,636.3Q599.92,643.18 589.17,649.77Q578.41,656.36 567.4,662.46L503.77,584.92Q513.94,579.63 523.84,573.83Q533.74,568.03 543.27,561.86Q552.81,555.69 562.16,549.16Q571.52,542.64 580.63,535.84Q589.75,529.04 598.6,522.08Q607.46,515.11 616.18,507.96Q624.89,500.8 633.39,493.58L711.09,562.18ZM394,391.95L394,811.23L281.76,811.23L281.76,391.95L394,391.95ZM226.53,292.41Q222.26,326.31 223.56,352.54Q224.86,378.76 230.86,398.83Q236.86,418.9 246.47,434.64Q256.07,450.38 268.73,462.79Q281.38,475.2 295.39,486.51Q309.4,497.83 324.13,509.18Q338.86,520.54 352.93,534.43L299.28,611.35Q283.88,598.79 265.53,590.14Q247.18,581.5 227.21,575.2Q207.24,568.9 186.81,563.07Q166.38,557.25 146.7,550.3Q127.02,543.36 109.16,533.88Q91.31,524.41 76.53,510.47Q61.75,496.53 51.23,476.71L226.53,292.41ZM368.28,782.01Q335.56,765.51 310.1,756.36Q284.65,747.22 265.26,744.39Q245.87,741.55 230.83,743.48Q215.78,745.4 203.98,751.13Q192.17,756.86 181.91,764.6Q171.64,772.34 161.54,780.87Q151.44,789.4 139.59,797.13L63.92,722.59Q76.28,714.54 85,702.79Q93.73,691.05 100.22,677.13Q106.7,663.21 112.83,648.88Q118.96,634.54 126.17,621.24Q133.37,607.94 143.08,597.12Q152.79,586.3 166.72,579.55Q180.65,572.79 200.14,571.61L368.28,782.01ZM883.4,-97.03L987.17,87.66Q956.76,100.53 932,122.86Q907.23,145.19 885.66,172.48Q864.09,199.76 842.63,227.83Q821.17,255.89 797.34,280.44Q773.51,304.98 745.14,322.19Q716.77,339.4 680.67,344.93Q644.58,350.46 598.61,340.25L470.3,119.78Q501.53,180.48 513.56,207.77Q525.59,235.07 521.91,238.87Q518.23,242.67 503.92,232.4L526.61,235.11Q573.71,161.12 626.83,95.47Q679.94,29.81 742.74,-20.11Q805.53,-70.04 883.4,-97.03ZM502.29,231.03L414.84,338.57Q389.73,316.94 358.2,304.17Q326.66,291.41 291.77,283.47Q256.88,275.54 221.52,267.95Q186.16,260.36 153.21,249.06Q120.25,237.76 92.3,219.15Q64.35,200.53 44.35,170.03Q24.34,139.53 15.09,93.48L230.29,-171.19Q247.74,-76.46 283.33,-4.49Q318.91,67.48 366.08,121.8Q413.25,176.12 463.92,222.74L487.7,218.93Q493.63,216.27 499.96,212.83Q506.29,209.39 507.86,212.08Q509.42,214.77 502.29,231.03ZM441.93,256.03L557.18,256.03L557.18,382.07L441.93,382.07L441.93,256.03ZM72.14,209.14L927.79,209.14L927.79,312.15L72.14,312.15L72.14,209.14ZM441.87,-70.49L557.12,-70.49L557.12,-70.49L557.12,272.67L441.87,272.67L441.87,-70.49L441.87,-70.49Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=700</div><code class="frame-shape">[gid1=0+1000]</code></div></div><figcaption><code>hb-vector varc-6868-no-reset.ttf "桨"</code></figcaption></figure>
+<p>The strokes now take 夕’s, 丬’s and 木’s settings as their own, and bend, swell and twist. Compare <a href="#step-5-the-transform">the slider above</a>.</p>
+<p id="ix-56">The flag resets to the font’s coordinates, not to zero, so the component still follows the weight and any axis the user set; it drops only the parent’s own settings. Leaving it off is right when parent and part share an axis’s meaning, so that a setting should flow down: in <code>varc-ac00-ac01.ttf</code>, glyph 3 only wraps glyph 4, and a syllable that set <code>0003</code> on glyph 3 would reach glyph 4 through it.</p>
+<h2 id="the-multiple-item-variation-store">The multiple item variation store</h2>
+<p id="ix-57">VARC’s deltas come from a <strong>multiple item variation store</strong> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L3858"><code>hb-ot-layout-common.hh:3858</code></a>), a variant of the item variation store of HVAR, MVAR and GDEF (<a href="deltas.html#item-variation-stores">Deltas</a>), with two differences.</p>
+<p id="ix-58"><strong>Items are lists.</strong> In the ordinary store, an item is one number, such as a glyph’s advance. Here it is a list: one for a component’s axis values, another for its transform. They vary together, over the same regions, so each region’s scalar is worked out once for the list. <code>MultiVarData::get_delta</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L3451"><code>hb-ot-layout-common.hh:3451</code></a>, trimmed) walks the regions, and for each either skips its numbers or adds them all in:</p>
+<pre><code class="language-c++">for (unsigned regionIndex = 0; regionIndex &lt; regionCount; regionIndex++)
+{
+  float scalar = regions.evaluate (regionIndices.arrayZ[regionIndex],
+                                   coords, coord_count,
+                                   cache);
+  // We skip lazily. Helps with the tail end.
+  if (scalar == 0.0f)
+    skip += out.length;
+  else
+  {
+    ...
+    values_iter.add_to (out, scalar);
+  }
+}
+</code></pre>
+<p id="ix-59">So the numbers are stored region by region. In an ordinary store, 木’s fourteen axis values would need fourteen items, fourteen indices and fourteen lookups.</p>
+<p id="ix-60"><strong>Regions name only the axes they use.</strong> An ordinary region has an entry for every fvar axis; here a region lists only its own, by index (<code>SparseVarRegionAxis</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L2594"><code>hb-ot-layout-common.hh:2594</code></a>). 桨’s 39 regions each name one or two of its 31 axes. A region that names no axes counts everywhere, with a scalar of 1, even at the default. That lets a static VARC font have “deltas” that are really constants, and it’s why <code>MultiItemVarStoreInstancer</code> applies deltas even when every coordinate is 0 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L4285"><code>hb-ot-layout-common.hh:4285</code></a>), which an ordinary store never does.</p>
+<p id="ix-61">Here is the item for 木’s axis values in 桨, decoded by <code>varc-dump.py</code>. Each region has fourteen numbers, for <code>0000</code>, <code>0003</code>, <code>0005</code>, <code>0007</code>, <code>0011</code>, <code>0012</code>, <code>0014</code>, <code>0016</code>, <code>0017</code>, <code>0018</code>, <code>0019</code>, <code>0020</code>, <code>0022</code> and <code>0023</code>:</p>
+<pre><code>── item 0:4 (VarIdx 4): 14 numbers for each of 3 regions
+region 0 (wght 0…1…1): [-1442, -836, 0, 0, -1081, 98, -491, 1163, 8241, 6504, 327, 721, 1933, -2343]
+region 1 (opsz 0…1…1): [0, 0, 4375, 3375, 0, 0, 0, 0, -639, -213, 0, 0, -2409, 0]
+region 2 (wght 0…1…1 × opsz 0…1…1): [0, 0, -4375, -246, 0, 0, 0, 1491, -2507, -1097, 0, 0, -983, 0]
+</code></pre>
+<p id="ix-62">At weight 700, normalized 1, only the first region counts, in full. <code>0018</code>, tenth, goes from 377 to 377 + 6504 = 6881, 0.023 to 0.42; <code>0017</code>, ninth, from 0.039 to 0.542. Both thicken 木’s strokes (as drawings of 木 at each show), and that is how 桨 gets bold: its leaves have no weight variations. In <code>varc-ac00-ac01.ttf</code> it’s the other way round: the leaves vary with weight, and the components pass the weight through.</p>
+<p id="ix-63">The stem’s transform item, four numbers per region for <code>translateX</code>, <code>translateY</code>, <code>scaleX</code> and <code>scaleY</code>, shows how sparse such data is:</p>
+<pre><code>── item 3:7 (VarIdx 196615): 4 numbers for each of 25 regions
+region 3 (0000 0…1…1): [0, 484, 0, -564]
+region 23 (0018 0…1…1): [-59, 0, 117, 0]
+region 25 (0019 0…1…1): [1, -54, -2, -461]
+region 26 (0020 0…1…1): [19, 304, -35, -533]
+region 27 (0021 0…1…1): [280, 0, -5, 41]
+(and 20 more regions, all 0)
+</code></pre>
+<p id="ix-64">On <code>0018</code>, <code>translateX</code> moves the stem left by half as much as <code>scaleX</code> widens it, keeping it centered; on <code>0019</code>, <code>scaleY</code> shrinks. The numbers are packed in runs, like gvar’s deltas, so empty regions cost little.</p>
+<p id="ix-65">HarfBuzz 14.6.0 changed VARC to “the revised variation-store format. The new format is incompatible with the previous one.” A VARC font made for HarfBuzz before 14.6.0 doesn’t draw correctly in later versions.</p>
+<h2 id="the-compact-encoding">The compact encoding</h2>
+<p id="ix-66">With tens of thousands of glyphs, each of several components, VARC packs its records tightly. Here is the ㄱ’s component record, as <code>varc-dump.py</code> reads it, in <code>decompile_record</code>’s order:</p>
+<pre><code>── glyph 3, component 0 (offsets from the start of VARC)
+00f3  3e              flags = 0x3e: HAVE_AXES, AXIS_VALUES_HAVE_VARIATION, TRANSFORM_HAS_VARIATION, HAVE_TRANSLATE_X, HAVE_TRANSLATE_Y
+00f4  00 04           gid = 4
+00f6  00              axisIndicesIndex = 0 → axes 0000, 0001, 0002
+00f7  42              axisValues: run of 3 words
+00f8  ef 7d 03 33 de dc axisValues: -4227, 819, -8484
+00fe  00              axisValuesVarIndex = 0
+00ff  01              transformVarIndex = 1
+0100  ff f6           translateX = -10
+0102  00 18           translateY = 24
+</code></pre>
+<p id="ix-67">Seventeen bytes, for three varying axes and a varying offset.</p>
+<p id="ix-68"><strong>Variable-length integers.</strong> The flags and indices are each an <code>HBUINT32VAR</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L149"><code>hb-open-type.hh:149</code></a>), one to five bytes. The first byte’s leading 1 bits say how many follow: below <code>0x80</code>, none; <code>10</code>, one; <code>110</code>, two; <code>1110</code>, three; <code>11110000</code>, a plain 32-bit number. Most indices take one byte; in 桨, whose store has four data lists, they carry an outer part and take three (196608, outer 3 and inner 0, is <code>c3 00 00</code>).</p>
+<p id="ix-69"><strong>Flags ordered by frequency.</strong> The commonest flags are the low 7 bits, which fit in one byte: resetting, having axes, the two kinds of variation, translations and rotation (<code>VarComponent::flags_t</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.hh#L51"><code>VARC.hh:51</code></a>). A condition, scales, a center, skews or a 24-bit glyph ID need two: 木’s first stroke’s flags, <code>0xf7f</code>, are <code>8f 7f</code>. For each reserved bit (15 and up) that is set, HarfBuzz skips one more variable-length integer (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc#L139"><code>VARC.cc:139</code></a>), so later fields can be stepped over.</p>
+<p id="ix-70"><strong>Only the fields that are there.</strong> The glyph ID is 16 bits unless <code>GID_IS_24BIT</code> is set; each 16-bit transform field is stored only if flagged. A record doesn’t store its length: decoding it finds the next.</p>
+<p id="ix-71"><strong>Shared, packed lists.</strong> The record doesn’t list its axes: it gives an index into a list of axis lists, where <code>0000, 0001, 0002</code> is stored once for the three records in this font that use it. The values are <code>TupleValues</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L1506"><code>hb-open-type.hh:1506</code></a>), the run encoding of gvar’s deltas: <code>42</code> is <code>0x40</code>, “words”, and a count of 2 + 1. A run of zeros is just its control byte: the stem’s four axis values are <code>83</code>.</p>
+<h2 id="what-varc-doesnt-touch">What VARC doesn’t touch</h2>
+<p id="ix-72">VARC is only about drawing. It doesn’t change advances, which still come from <code>hmtx</code> and HVAR, or from the phantom points of the glyph’s own <code>glyf</code> entry:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">hb:test/api/fonts/varc-ac00-ac01.ttf</td><td class="in"><span class="txt">가각</span><span class="cps">U+AC00 U+AC01</span></td><td class="opt">--variations=wght=356.5 --show-extents</td><td class="out"><code>[gid1=0+920&lt;50,803,837,-885&gt;|gid2=1+920&lt;59,803,835,-896&gt;]</code></td></tr><tr><td class="font">hb:test/api/fonts/varc-ac00-ac01.ttf</td><td class="in"><span class="txt">가각</span><span class="cps">U+AC00 U+AC01</span></td><td class="opt">--variations=wght=840.3 --show-extents</td><td class="out"><code>[gid1=0+920&lt;18,823,889,-925&gt;|gid2=1+920&lt;32,823,882,-936&gt;]</code></td></tr></tbody></table></div>
+<p id="ix-73">The extents change with the weight, but the advances stay at 920. And GSUB and GPOS never see components: shaping works on glyph IDs, and a VARC glyph is one glyph. The subsetter does look inside VARC, so that the components a glyph needs are kept with it, as does <a href="hb-depend.html">hb-depend</a>.</p>
+<p id="ix-74">The extents are a union of each leaf’s box, transformed as a box. For a rotated component, a rotated box is bigger than the outline inside it, so a VARC glyph’s extents can be looser than its outline: for <code>varc-6868.ttf</code>, about 7 units on the left and 9 on the right.</p>
+<h2 id="harfbuzz-and-the-standard">HarfBuzz and the standard</h2>
+<p>In a few places, HarfBuzz doesn’t do what the 2026 ISO standard says.</p>
+<p id="ix-75"><strong>The missing scale.</strong> HarfBuzz uses a lone horizontal scale for both directions (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc#L444"><code>VARC.cc:444</code></a>), as fontTools and the boring-expansion text do; a reader of the ISO standard alone would take the missing value to be 1.</p>
+<p id="ix-76"><strong>Mixed leaves.</strong> The standard says a glyph’s leaves mustn’t mix outline formats. HarfBuzz tries every format for every leaf, so it tolerates fonts that do, and it accepts CFF leaves, which the standard doesn’t list.</p>
+<p id="ix-77"><strong>Side bearings.</strong> The standard says that TrueType’s left-side-bearing shift (<a href="varying-outlines.html#where-the-outline-lands">Varying outlines</a>) doesn’t apply to components loaded by VARC. HarfBuzz’s leaves go through the same <code>glyf</code> code as any glyph, and are shifted. <code>varc-static-gvar-lsb.ttf</code>, made by <code>fonts/variable-components/lsb.py</code>, gives <code>a</code> and <code>b</code> a side bearing of 100 in <code>hmtx</code>, though their outlines still start at 0:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">varc-static-gvar-lsb.ttf</td><td class="in"><span class="txt">ab</span><span class="cps">U+0061 U+0062</span></td><td class="opt">--show-extents</td><td class="out"><code>[a=0+500&lt;150,500,400,-500&gt;|b=1+500&lt;100,500,400,-500&gt;]</code></td></tr></tbody></table></div>
+<p id="ix-78"><code>b</code> moves to 100, as any <code>glyf</code> glyph would. By the standard, <code>a</code> should stay at 50; HarfBuzz draws it at 150. It matters only for fonts whose side bearings differ from their outlines’ left edges.</p>
+<p id="ix-79"><strong>The layout.</strong> In two places HarfBuzz, fontTools and the test fonts agree with each other and not with the standard: the standard’s list of conditions has no count field, and it measures the offsets in a region from the list of regions rather than from the region. Both look like errors in the standard.</p>
+<p id="ix-80">And one bug, which no standard would allow. A leaf’s outline is scaled to the font’s size before the transform is applied, and HarfBuzz scales only the transform’s translation to match (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc#L487"><code>VARC.cc:487</code></a>):</p>
+<pre><code class="language-c++">hb_transform_t&lt;&gt; leaf_transform = transform;
+leaf_transform.x0 *= c.font-&gt;x_multf;
+leaf_transform.y0 *= c.font-&gt;y_multf;
+</code></pre>
+<p>That’s right when the font is scaled equally both ways. Otherwise a component that rotates or skews comes out wrong, rotated after the stretch. Here is 桨 twice as wide as it is high:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -1323.92 2080 1709.67" role="img" aria-label="桨 at default">
+<g transform="scale(1,-1)">
+<path d="M919.84,576.27Q960.53,602.65 1001.37,631.31Q1042.21,659.98 1082.38,690.64Q1122.55,721.31 1161.77,753.7Q1201,786.09 1238.77,819.98Q1276.54,853.86 1312.49,889.17Q1348.45,924.47 1382.09,960.83Q1415.72,997.18 1446.41,1034.3L1365.74,1046.33Q1338.51,1013.34 1308.51,981.07Q1278.5,948.81 1246.43,917.74Q1214.36,886.68 1180.24,856.53Q1146.11,826.38 1110.47,797.61Q1074.83,768.85 1038.27,741.86Q1001.71,714.87 964.2,689.49Q926.7,664.11 888.81,640.87L919.84,576.27ZM1258.11,761.77L1210.2,701.25L1734.78,701.25L1740.42,701.25L1730.54,713.1Q1708.96,684.81 1665.89,653.06Q1622.83,621.31 1551.47,590.5Q1480.11,559.69 1376.34,531.21Q1272.57,502.74 1132.66,480.81Q992.76,458.89 811.12,445.45L866.68,379.76Q1061.63,396.4 1214.15,424.44Q1366.67,452.48 1482.33,487.04Q1598,521.59 1678.06,560.48Q1758.12,599.37 1806.88,635.24Q1855.64,671.1 1876.53,702.21L1876.53,761.77L1258.11,761.77ZM1485.52,541.39Q1463.45,557.75 1440.82,573.91Q1418.19,590.06 1395.14,605.84Q1372.09,621.61 1348.66,637.01Q1325.23,652.41 1301.5,667.43Q1277.77,682.45 1253.7,697Q1229.63,711.55 1205.3,725.65Q1180.97,739.76 1156.52,753.22L1117.36,705.21Q1140.98,692.42 1164.5,678.97Q1188.02,665.51 1211.16,651.56Q1234.29,637.61 1257.2,623.12Q1280.12,608.64 1302.64,593.69Q1325.17,578.73 1347.18,563.41Q1369.19,548.09 1390.8,532.31Q1412.42,516.53 1433.34,500.46L1485.52,541.39ZM747,378.03L747,1283.92L676.7,1283.92L676.7,378.03L747,378.03ZM179.81,392.24Q218.55,410.63 257.29,430.19Q296.03,449.75 334.32,470.45Q372.6,491.14 410.4,512.86Q448.19,534.59 485.4,557.24Q522.6,579.9 559.05,603.63Q595.51,627.35 631.17,651.93Q666.84,676.51 701.26,701.96L668.25,753.07Q633.65,729.15 597.93,705.96Q562.2,682.76 525.72,660.45Q489.24,638.15 452.06,616.65Q414.89,595.15 377.15,574.54Q339.42,553.92 301.29,534.24Q263.15,514.56 224.66,495.76Q186.16,476.95 147.63,459.25L179.81,392.24ZM567.7,645.98Q547.5,667.36 526.65,688.55Q505.8,709.75 484.45,730.57Q463.1,751.38 441.28,771.81Q419.47,792.23 397.21,812.2Q374.94,832.17 352.24,851.66Q329.54,871.15 306.42,890.09Q283.3,909.04 259.95,927.28L211.66,874.38Q234.48,856.77 257.12,838.53Q279.76,820.29 302.01,801.62Q324.27,782.96 346.19,763.81Q368.12,744.67 389.63,725.09Q411.14,705.52 432.13,685.58Q453.13,665.63 473.68,645.26Q494.22,624.89 514.08,604.27L567.7,645.98ZM1856.53,-56.54L1876.76,15.73Q1815.07,46.89 1753.36,80.59Q1691.64,114.29 1630.52,149.99Q1569.4,185.7 1509.05,223.47Q1448.69,261.25 1389.53,300.83Q1330.37,340.42 1272.84,381.52Q1215.3,422.63 1159.54,465.33Q1103.79,508.02 1050.53,551.91L1027.44,553.81Q1021.02,536.68 1020.84,520.78Q1020.66,504.88 1023.52,492.64Q1026.39,480.4 1030.96,472.29L1067.91,464.93Q1189.7,362.47 1318.77,269.94Q1447.83,177.42 1582.19,95.82Q1716.54,14.22 1856.53,-56.54ZM967.17,261.22L943.58,264.28Q890.29,221.78 834.61,180.5Q778.92,139.21 721.57,99.48Q664.22,59.75 605.3,21.58Q546.38,-16.59 486.31,-52.95Q426.23,-89.31 365.48,-123.7Q304.73,-158.1 243.33,-190.42Q181.92,-222.74 120.54,-252.54L144.63,-322.95Q280.14,-256.33 413.82,-177.02Q547.51,-97.71 676.05,-9.5Q804.6,78.71 925.44,175.77L955.57,178.41Q961.84,187.37 965.61,199.75Q969.39,212.13 969.47,227.4Q969.55,242.68 967.17,261.22ZM930.91,238.87L1073.77,238.87L1073.77,371.96L930.91,371.96L930.91,238.87ZM121.99,227.08L1881.4,227.08L1881.4,291.73L121.99,291.73L121.99,227.08ZM930.88,-71.21L1073.74,-71.21L1073.74,-71.21L1073.74,255.37L930.88,255.37L930.88,-71.21L930.88,-71.21Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[gid1=0+2000]</code></div></div><figcaption><code>hb-vector hb:test/api/fonts/varc-6868.ttf "桨" --font-size=2000,1000</code></figcaption></figure>
+<p id="ix-81">丬’s long vertical stroke is a leaf squashed into a flat bar and rotated by 90°, so the horizontal stretch lengthens it instead of thickening it: it should be 453 units tall, and it is 906. Fonts whose components don’t rotate or skew, like <code>varc-ac00-ac01.ttf</code>, are unaffected.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.hh"><code>src/OT/Var/VARC/VARC.hh</code></a></td>
+<td>the table, the component flags, the records</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC.cc"><code>src/OT/Var/VARC/VARC.cc</code></a></td>
+<td>decoding a component, 31; <code>get_path_at</code> for a component, 343, and for a glyph, 467</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/coord-setter.hh"><code>src/OT/Var/VARC/coord-setter.hh</code></a></td>
+<td>coordinates that grow to take hidden axes</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-geometry.hh"><code>src/hb-geometry.hh</code></a></td>
+<td>the transform, 406</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh"><code>src/hb-ot-layout-common.hh</code></a></td>
+<td>sparse regions, 2594; <code>MultiVarData</code>, 3442; the multiple item variation store, 3858</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh"><code>src/hb-open-type.hh</code></a></td>
+<td>variable-length integers (<code>HBUINT32VAR</code>), 149; packed values (<code>TupleValues</code>), 1506</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc"><code>src/hb-ot-font.cc</code></a></td>
+<td>VARC before <code>glyf</code> and CFF, 919</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A VARC glyph is a list of components, each with a condition, its own axis settings and a full transform, all of which can vary.</li>
+<li>A component’s condition and deltas are evaluated at its parent’s coordinates; its outline is drawn at its own.</li>
+<li>Hidden axes, up to 4096 and unclamped, are each part’s private parameters, set per use; <code>RESET_UNSPECIFIED_AXES</code> stops a part inheriting its parent’s.</li>
+<li>The multiple item variation store gives a component one list of deltas for all its values, over regions naming only the axes they use.</li>
+<li>Records are packed tightly. A glyph that names itself as a component is drawn from its own outline.</li>
+<li>VARC changes drawing and extents only, never advances or shaping.</li>
+<li>HarfBuzz differs from the 2026 standard on side bearings, mixed leaf formats and a missing scale default, and it draws rotated components wrongly when the font is scaled unevenly.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="varying-outlines.html">← Varying outlines</a><a rel="next" href="drawing-outlines.html">Drawing outlines →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

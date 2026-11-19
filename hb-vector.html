@@ -1,0 +1,771 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>hb-vector: rendering to SVG and PDF · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part IX · Drawing</p>
+<h1 id="hb-vector-rendering-to-svg-and-pdf">38. hb-vector: rendering to SVG and PDF</h1>
+<p id="ix-1">The draw and paint APIs end at a callback. HarfBuzz walks the font’s data and calls the client: move here, curve to there, push this clip, fill with that gradient. What the client does with the calls was, for most of HarfBuzz’s life, someone else’s business. Since 13.0.0 HarfBuzz has its own answers, in three separate libraries: <a href="hb-raster.html">hb-raster</a>, which turns glyphs into pixels on the CPU; <strong>hb-vector</strong>, which writes them out as SVG or PDF; and <a href="hb-gpu.html">hb-gpu</a>, which encodes them for a fragment shader to draw. Each is a client of the APIs that <a href="drawing-outlines.html">Drawing outlines</a> and <a href="color.html">Color</a> describe, and nothing more: it sees glyphs exactly as an application would, with variations, synthetic bold and slant and the font’s scale already applied, and without hinting.</p>
+<p id="ix-2">hb-vector is the one of the three this book uses throughout. Every drawing in it, from the boxes of the GSUB chapter to the gradients of the Color chapter, is a <code>draw</code> block, and each block runs the <code>hb-vector</code> tool on a test font when the book is built and puts the SVG it writes into the page (<code>tools/build-site.mjs</code>). So what the figures show is hb-vector’s output, including, in places, its limits.</p>
+<p id="ix-3">The chapter has two halves. The first, Outlines, is all that a client drawing ordinary text needs. The second, Color glyphs, covers COLR gradients, compositing, bitmaps and palettes, and assumes the <a href="color.html">Color</a> chapter.</p>
+<h2 id="the-library">The library</h2>
+<p id="ix-4">hb-vector is its own shared library, <code>libharfbuzz-vector</code>, with one header, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector.h"><code>hb-vector.h</code></a>, and a <a href="building-harfbuzz.html#optional-dependencies-and-backends">Meson feature option</a>, <code>vector</code>, enabled by default (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/meson_options.txt#L38"><code>meson_options.txt:38</code></a>). Its history, from <code>NEWS</code>, all in 2026:</p>
+<table>
+<thead>
+<tr>
+<th>Version</th>
+<th>What happened</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>13.0.0</td>
+<td id="ix-5">hb-vector arrives, “experimental”, with SVG output only; color glyphs from COLR, <code>SVG </code>, <code>CBDT</code> and <code>sbix</code>; the <code>hb-vector</code> tool</td>
+</tr>
+<tr>
+<td>13.1.1</td>
+<td id="ix-6">gzip-compressed SVG glyphs, with zlib</td>
+</tr>
+<tr>
+<td>14.2.0</td>
+<td id="ix-7">the API review: PDF output; the SVG id prefix; <code>_clear</code> functions; funcs getters take the context; <code>_glyph</code> functions return nothing, with <code>_or_fail</code> twins; glyph paths no longer shared through <code>&lt;defs&gt;</code> and <code>&lt;use&gt;</code>; SVG glyphs dropped</td>
+</tr>
+<tr>
+<td>14.5.0</td>
+<td id="ix-8">the work budget shared with the font code</td>
+</tr>
+<tr>
+<td>15.0.0</td>
+<td>“no longer considered experimental”: API and ABI stability apply</td>
+</tr>
+<tr>
+<td>15.1.0</td>
+<td id="ix-9">fixes for mirrored path clips in SVG, and for PDF page bounds and misplaced COLR gradients</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-10">It has two contexts. A <strong>draw context</strong>, <code>hb_vector_draw_t</code>, turns outlines into filled paths. A <strong>paint context</strong>, <code>hb_vector_paint_t</code>, turns the paint calls of a color glyph into layers, clips, gradients and images. Both are ordinary reference-counted HarfBuzz objects, made with <code>_create_or_fail</code> and a format, <code>HB_VECTOR_FORMAT_SVG</code> or <code>HB_VECTOR_FORMAT_PDF</code>, which is fixed for the context’s life. Each context’s funcs getter takes the context, and returns the SVG or the PDF funcs according to its format (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.cc#L530"><code>hb-vector-draw.cc:530</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint.cc#L510"><code>hb-vector-paint.cc:510</code></a>).</p>
+<p id="ix-11">A context accumulates many glyphs into one document. The client sets a transform for each glyph, usually a translation to its pen position, and calls <code>hb_vector_draw_glyph</code> or <code>hb_vector_paint_glyph</code>; at the end, <code>_render</code> returns the document as a blob. Here is how the <code>hb-vector</code> tool does it for a shaped line, hand-written from <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/vector-output.hh#L192-L311"><code>util/vector-output.hh:192–311</code></a> and trimmed:</p>
+<pre><code class="language-c">hb_vector_paint_t *paint =
+  hb_vector_paint_create_or_fail (HB_VECTOR_FORMAT_SVG);
+hb_vector_paint_set_scale_factor (paint, 64.f, 64.f); /* font scale: 64 × size */
+hb_vector_paint_set_extents (paint, &amp;extents);        /* of the shaped line */
+for (unsigned i = 0; i &lt; count; i++)
+{
+  hb_vector_paint_set_transform (paint, 1, 0, 0, 1, pen_x[i], pen_y[i]);
+  hb_vector_paint_glyph (paint, font, info[i].codepoint,
+                         HB_VECTOR_EXTENTS_MODE_NONE);
+}
+hb_blob_t *svg = hb_vector_paint_render (paint);
+</code></pre>
+<p id="ix-12">The document’s bounds are its <strong>extents</strong>, which become the SVG <code>viewBox</code> and the PDF media box. The client either sets them, as the tool does, or passes <code>HB_VECTOR_EXTENTS_MODE_EXPAND</code>, which unions each glyph’s ink box, under the transform, into them (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-internal.hh#L185"><code>hb-vector-internal.hh:185</code></a>). A context with no extents renders nothing: <code>_render</code> returns <code>NULL</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.cc#L841"><code>hb-vector-draw.cc:841</code></a>). The <strong>scale factor</strong> divides every coordinate on the way out, so a client can give HarfBuzz a font scale of 64 units per pixel, for precise positions, and still get coordinates in pixels.</p>
+<p id="ix-13">Rendering clears the context, even when it fails (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.cc#L935"><code>hb-vector-draw.cc:935</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint.cc#L768"><code>hb-vector-paint.cc:768</code></a>), so the extents should be read before it if they are wanted. <code>_clear</code> (14.2.0) throws away what has been accumulated and keeps the settings; <code>_reset</code> restores the defaults too. <code>_recycle_blob</code> hands a finished blob back, and the next render writes into its memory. Every context also implements the budget callbacks of <a href="drawing-outlines.html#the-budget">Drawing outlines</a>, and recharges the budget when it is cleared (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.cc#L970"><code>hb-vector-draw.cc:970</code></a>). One budget of 2²⁴ therefore covers a whole document, not one glyph: that chapter’s <code>heavy</code> glyphs show it running out partway along a line.</p>
+<p id="ix-14">The <code>_glyph</code> functions are conveniences. <code>hb_vector_draw_glyph_or_fail (draw, font, glyph, mode)</code> is documented as <code>hb_vector_draw_new_path</code> followed by <code>hb_font_draw_glyph_or_fail</code> with the context’s funcs, after the extents update (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.cc#L563"><code>hb-vector-draw.cc:563</code></a>). A client can drive the funcs itself, to draw shapes of its own into the same document.</p>
+<h2 id="outlines">Outlines</h2>
+<h3 id="the-draw-context">The draw context</h3>
+<p id="ix-15">The draw context writes one path per glyph, filled with its <strong>foreground</strong> color, opaque black unless set. In SVG each draw callback becomes one path command (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.cc#L51-L89"><code>hb-vector-draw.cc:51–89</code></a>): <code>M</code>, <code>L</code>, <code>Q</code>, <code>C</code> or <code>Z</code>. TrueType’s quadratic curves therefore stay quadratic, and CFF’s cubics stay cubic. Here is the book’s variable test font <code>var.ttf</code>, from <a href="design-space.html">Design space</a>, with a different foreground for each glyph; the <code>hb-vector</code> tool changes the context’s foreground before each glyph when given a list of colors (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/vector-output.hh#L280"><code>util/vector-output.hh:280</code></a>):</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -840 1540 1080" role="img" aria-label="HIH at default">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L180,700L180,0L80,0ZM420,0L420,700L520,700L520,0L420,0ZM180,330L180,410L420,410L420,330L180,330Z" fill="#C0392B"/>
+<path d="M680,0L680,700L780,700L780,0L680,0Z" fill="#2E8B57"/>
+<path d="M940,0L940,700L1040,700L1040,0L940,0ZM1280,0L1280,700L1380,700L1380,0L1280,0ZM1040,330L1040,410L1280,410L1280,330L1040,330Z" fill="#1B98E0"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[H=0+600|I=1+260|H=2+600]</code></div></div><figcaption><code>hb-vector variations/var.ttf "HIH" --foreground=C0392B,2E8B57,1B98E0</code></figcaption></figure>
+<p>and here is the SVG it wrote, captured when this chapter was written (trimmed; two paths are cut short):</p>
+<pre><code class="language-xml">&lt;svg xmlns=&quot;http://www.w3.org/2000/svg&quot; viewBox=&quot;-16 -816 1492 1032&quot; width=&quot;1492&quot; height=&quot;1032&quot;&gt;
+&lt;g transform=&quot;scale(1,-1)&quot;&gt;
+&lt;path d=&quot;M80,0L80,700L180,700L180,0L80,0ZM420,0L420,700L520,700…Z&quot; fill=&quot;#C0392B&quot;/&gt;
+&lt;path d=&quot;M680,0L680,700L780,700L780,0L680,0Z&quot; fill=&quot;#2E8B57&quot;/&gt;
+&lt;path d=&quot;M940,0L940,700L1040,700L1040,0L940,0ZM1280,0L1280,700…Z&quot; fill=&quot;#1B98E0&quot;/&gt;
+&lt;/g&gt;
+&lt;/svg&gt;
+</code></pre>
+<p id="ix-16">Three things show. SVG’s y axis points down and a font’s points up, so hb-vector writes coordinates as the font has them and wraps the whole body in one <code>scale(1,-1)</code> group (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.cc#L908"><code>hb-vector-draw.cc:908</code></a>); the <code>viewBox</code> is the flipped extents. The draw context applies its transform to every point itself (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.hh#L146"><code>hb-vector-draw.hh:146</code></a>), so the second <code>H</code> starts at x = 940, its pen position plus its side bearing, and there is no <code>&lt;g&gt;</code> per glyph. And the colors are written as short hex where they can be, with alpha, if any, as a <code>fill-opacity</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-buf.hh#L221"><code>hb-vector-buf.hh:221</code></a>). The path is filled by SVG’s default rule, nonzero, which is what fonts are drawn with.</p>
+<p id="ix-17">Each glyph’s path is separate, and the documentation in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector.cc#L73"><code>hb-vector.cc:73</code></a> warns about the consequence: where glyphs overlap and the foreground is semi-transparent, the overlap is darker, because it is painted twice. A client that feeds the funcs itself starts a new path with <code>hb_vector_draw_new_path</code> (14.2.0), and setting the foreground closes the current one (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.cc#L672"><code>hb-vector-draw.cc:672</code></a>), so that colors can change from glyph to glyph.</p>
+<h3 id="precision">Precision</h3>
+<p id="ix-18">Numbers are written with at most a fixed number of decimal places, the <strong>precision</strong>: 2 by default, at most 12 (<code>hb_vector_draw_set_precision</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-buf.hh#L131"><code>hb-vector-buf.hh:131</code></a>). Trailing zeros are dropped, so a whole number is written as one, and a value that would round to zero is written as <code>0</code>, never <code>-0</code>. The digits are made with integer arithmetic and the decimal point is always a full stop, whatever the locale (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-buf.hh#L147-L152"><code>hb-vector-buf.hh:147–152</code></a>). Transform matrices are written with at least 7 places, whatever the precision, so that a small scale isn’t rounded away (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-buf.hh#L73"><code>hb-vector-buf.hh:73</code></a>).</p>
+<p id="ix-19">Precision counts in the output’s units, which are the font’s scale divided by the scale factor. The <code>hb-vector</code> tool’s are font units at its <code>--font-size</code>, so at a size of 100 per em, precision 0 rounds every point to a hundredth of the em. Here is <code>spiral64</code>, from the <a href="drawing-outlines.html#limits-and-the-shared-budget">Drawing outlines</a> chapter’s <code>limits.ttf</code>, at that size, at precision 0 and then at the default:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-14.91 -102.09 134.91 121.78" role="img" aria-label="1 at default">
+<g transform="scale(1,-1)">
+<path d="M70,30L70,40L80,40L80,30L70,30ZM69,37L67,46L76,48L78,39L69,37ZM67,42L62,50L70,55L75,47L67,42ZM63,47L57,53L63,59L69,53L63,47ZM59,51L52,55L56,62L63,58L59,51ZM54,53L46,55L48,62L56,60L54,53ZM49,53L41,53L41,61L49,61L49,53ZM44,53L37,51L35,58L42,59L44,53ZM40,51L34,48L31,53L36,57L40,51ZM36,48L32,44L27,48L32,53L36,48ZM34,45L31,40L25,43L28,48L34,45ZM32,41L31,36L25,37L27,43L32,41ZM32,38L32,32L26,32L26,38L32,38ZM32,34L33,29L28,28L27,33L32,34ZM33,31L36,27L32,24L29,28L33,31ZM35,28L39,25L35,22L32,25L35,28ZM38,27L42,24L39,21L35,23L38,27ZM40,25L44,24L43,20L39,21L40,25ZM43,25L47,25L47,21L43,21L43,25ZM46,25L49,26L50,23L47,22L46,25ZM48,26L51,28L53,25L50,23L48,26ZM50,28L52,30L55,28L52,25L50,28ZM51,30L53,32L56,31L54,28L51,30ZM52,31L53,34L56,34L55,31L52,31ZM52,33L52,36L55,36L55,33L52,33ZM52,35L51,38L54,39L55,36L52,35ZM51,37L50,39L52,41L54,38L51,37ZM50,38L49,40L50,42L52,40L50,38ZM49,39L47,41L48,43L50,42L49,39ZM48,40L45,41L46,43L48,42L48,40ZM46,40L44,40L44,42L46,42L46,40ZM45,40L43,40L42,42L44,42L45,40ZM43,40L42,39L41,40L43,41L43,40ZM42,39L41,38L40,39L41,40L42,39ZM42,38L41,36L39,37L40,39L42,38ZM41,37L41,35L39,36L40,37L41,37ZM41,36L41,34L40,34L40,36L41,36ZM41,35L42,33L40,33L40,34L41,35ZM42,34L42,33L41,32L40,33L42,34ZM42,33L43,32L42,31L41,32L42,33ZM43,32L44,32L43,31L42,31L43,32ZM44,32L45,32L45,31L43,31L44,32ZM44,32L46,32L46,31L44,31L44,32ZM45,32L46,32L47,31L46,31L45,32ZM46,32L47,33L47,32L46,32L46,32ZM46,33L47,34L48,33L47,32L46,33ZM47,33L47,34L48,34L48,33L47,33ZM47,34L47,35L48,35L48,34L47,34ZM47,35L47,35L48,35L48,35L47,35ZM47,35L47,36L48,36L48,35L47,35ZM47,36L47,36L47,37L48,36L47,36ZM47,36L46,36L47,37L47,36L47,36ZM46,36L46,37L46,37L47,37L46,36ZM46,36L45,37L45,37L46,37L46,36ZM45,36L45,36L45,37L45,37L45,36ZM45,36L44,36L44,37L45,37L45,36ZM45,36L44,36L44,36L44,37L45,36ZM44,36L44,36L44,36L44,36L44,36ZM44,36L44,35L43,36L44,36L44,36ZM44,35L44,35L43,35L43,36L44,35ZM44,35L44,35L43,35L43,35L44,35ZM44,35L44,34L44,34L44,35L44,35ZM44,35L44,34L44,34L44,34L44,35ZM44,34L45,34L44,34L44,34L44,34ZM44,34L45,34L45,34L44,34L44,34Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[spiral64=0+90]</code></div></div><figcaption><code>hb-vector drawing-outlines/limits.ttf "1" --font-size=100 --precision=0 --ink</code></figcaption></figure>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-14.91 -102.09 134.91 121.78" role="img" aria-label="1 at default">
+<g transform="scale(1,-1)">
+<path d="M70,30L70,40L80,40L80,30L70,30ZM69.16,36.54L66.7,45.71L75.87,48.17L78.33,39L69.16,36.54ZM66.78,42.33L62.26,50.14L70.08,54.66L74.59,46.84L66.78,42.33ZM63.17,47.06L57.11,53.12L63.17,59.18L69.23,53.12L63.17,47.06ZM58.69,50.51L51.64,54.58L55.71,61.64L62.77,57.56L58.69,50.51ZM53.74,52.58L46.27,54.58L48.27,62.05L55.74,60.05L53.74,52.58ZM48.68,53.26L41.34,53.26L41.34,60.61L48.69,60.61L48.68,53.26ZM43.88,52.64L37.14,50.83L35.33,57.58L42.07,59.38L43.88,52.64ZM39.62,50.89L33.88,47.57L30.56,53.32L36.31,56.63L39.62,50.89ZM36.15,48.24L31.69,43.78L27.24,48.24L31.69,52.69L36.15,48.24ZM33.61,44.95L30.62,39.77L25.43,42.76L28.43,47.94L33.61,44.95ZM32.09,41.31L30.62,35.82L25.13,37.29L26.6,42.78L32.09,41.31ZM31.59,37.59L31.59,32.19L26.19,32.19L26.19,37.6L31.59,37.59ZM32.04,34.06L33.37,29.11L28.41,27.78L27.09,32.74L32.04,34.06ZM33.33,30.93L35.77,26.71L31.54,24.28L29.11,28.5L33.33,30.93ZM35.28,28.38L38.55,25.1L35.28,21.83L32,25.11L35.28,28.38ZM37.69,26.51L41.5,24.31L39.3,20.5L35.49,22.71L37.69,26.51ZM40.37,25.4L44.41,24.31L43.32,20.28L39.29,21.36L40.37,25.4ZM43.1,25.03L47.07,25.03L47.07,21.06L43.1,21.06L43.1,25.03ZM45.7,25.36L49.34,26.34L50.31,22.69L46.67,21.72L45.7,25.36ZM47.99,26.31L51.1,28.1L52.89,24.99L49.78,23.2L47.99,26.31ZM49.87,27.74L52.28,30.14L54.69,27.74L52.28,25.33L49.87,27.74ZM51.24,29.51L52.86,32.31L55.66,30.7L54.04,27.9L51.24,29.51ZM52.06,31.48L52.86,34.45L55.83,33.65L55.03,30.68L52.06,31.48ZM52.34,33.49L52.34,36.4L55.25,36.4L55.25,33.49L52.34,33.49ZM52.09,35.39L51.37,38.07L54.05,38.79L54.77,36.11L52.09,35.39ZM51.4,37.08L50.08,39.37L52.36,40.68L53.68,38.4L51.4,37.08ZM50.34,38.46L48.58,40.23L50.35,42L52.11,40.23L50.34,38.46ZM49.04,39.47L46.98,40.66L48.17,42.72L50.23,41.53L49.04,39.47ZM47.59,40.08L45.41,40.66L46,42.84L48.18,42.26L47.59,40.08ZM46.12,40.28L43.98,40.28L43.98,42.42L46.12,42.42L46.12,40.28ZM44.72,40.1L42.75,39.57L42.22,41.54L44.19,42.06L44.72,40.1ZM43.48,39.59L41.8,38.62L40.83,40.3L42.51,41.26L43.48,39.59ZM42.46,38.81L41.16,37.51L39.86,38.81L41.16,40.11L42.46,38.81ZM41.72,37.85L40.85,36.34L39.34,37.22L40.21,38.73L41.72,37.85ZM41.28,36.79L40.85,35.19L39.24,35.62L39.68,37.22L41.28,36.79ZM41.13,35.71L41.13,34.13L39.55,34.13L39.55,35.71L41.13,35.71ZM41.26,34.68L41.65,33.23L40.2,32.85L39.82,34.29L41.26,34.68ZM41.64,33.76L42.35,32.53L41.12,31.82L40.41,33.05L41.64,33.76ZM42.21,33.02L43.16,32.06L42.2,31.11L41.25,32.06L42.21,33.02ZM42.91,32.47L44.02,31.83L43.38,30.72L42.27,31.36L42.91,32.47ZM43.69,32.15L44.87,31.83L44.55,30.65L43.37,30.97L43.69,32.15ZM44.49,32.04L45.64,32.04L45.64,30.88L44.49,30.88L44.49,32.04ZM45.24,32.14L46.31,32.42L46.59,31.36L45.53,31.07L45.24,32.14ZM45.91,32.41L46.82,32.93L47.34,32.03L46.44,31.51L45.91,32.41ZM46.46,32.83L47.17,33.53L47.87,32.83L47.16,32.13L46.46,32.83ZM46.86,33.35L47.34,34.16L48.15,33.69L47.68,32.88L46.86,33.35ZM47.1,33.92L47.34,34.79L48.2,34.55L47.97,33.69L47.1,33.92ZM47.18,34.51L47.18,35.36L48.03,35.36L48.03,34.51L47.18,34.51ZM47.11,35.06L46.9,35.84L47.68,36.05L47.89,35.27L47.11,35.06ZM46.91,35.56L46.53,36.22L47.19,36.61L47.57,35.94L46.91,35.56ZM46.6,35.96L46.09,36.48L46.6,36.99L47.12,36.47L46.6,35.96ZM46.22,36.25L45.62,36.6L45.97,37.2L46.57,36.85L46.22,36.25ZM45.8,36.43L45.16,36.6L45.34,37.24L45.97,37.07L45.8,36.43ZM45.37,36.49L44.74,36.49L44.75,37.11L45.37,37.11L45.37,36.49ZM44.96,36.44L44.39,36.28L44.23,36.86L44.81,37.01L44.96,36.44ZM44.6,36.29L44.11,36.01L43.83,36.49L44.32,36.78L44.6,36.29ZM44.3,36.06L43.92,35.68L43.54,36.06L43.92,36.44L44.3,36.06ZM44.09,35.78L43.83,35.34L43.39,35.6L43.65,36.04L44.09,35.78ZM43.96,35.47L43.83,35.01L43.36,35.13L43.49,35.6L43.96,35.47ZM43.91,35.16L43.91,34.7L43.45,34.7L43.45,35.16L43.91,35.16ZM43.95,34.86L44.06,34.43L43.64,34.32L43.53,34.74L43.95,34.86ZM44.06,34.59L44.27,34.23L43.91,34.02L43.7,34.38L44.06,34.59ZM44.23,34.37L44.51,34.09L44.23,33.81L43.95,34.09L44.23,34.37ZM44.43,34.21L44.76,34.03L44.57,33.7L44.24,33.89L44.43,34.21Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[spiral64=0+90]</code></div></div><figcaption><code>hb-vector drawing-outlines/limits.ttf "1" --font-size=100 --ink</code></figcaption></figure>
+<p id="ix-20">At precision 0 the small squares near the middle of the spiral have lost their shape: their corners have been pulled to a 100-unit grid. At the default they are square. Output that will be scaled up after the fact, as this book’s figures are, wants a large font scale or a high precision.</p>
+<h3 id="ids-and-the-prefix">ids and the prefix</h3>
+<p id="ix-21">The draw context’s SVG has no ids at all. Before 14.2.0 hb-vector wrote each distinct glyph once in <code>&lt;defs&gt;</code> and referred to it with <code>&lt;use&gt;</code>; that was removed, and every glyph is now written inline (<code>NEWS</code>). So any number of draw-context documents can be pasted into one HTML page.</p>
+<p id="ix-22">The paint context’s SVG does have ids, for its clips and gradients, and numbers them from zero in every document. Two such documents in one page then fight over the same names. <code>hb_vector_paint_set_svg_prefix</code> (14.2.0) puts a string of the client’s choosing in front of every id and every reference to one (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint.cc#L644"><code>hb-vector-paint.cc:644</code></a>). A client that paints all its text, to have one code path, needs it even for plain glyphs, since a paint context wraps a glyph’s outline in a clip whenever the font’s color data asks for one. This book has the same problem, and since the <code>hb-vector</code> tool has no option for the prefix, the build adds one to each figure’s ids itself (<code>tools/build-site.mjs</code>).</p>
+<h3 id="pdf">PDF</h3>
+<p id="ix-23">The PDF writer (14.2.0) makes a complete one-page PDF 1.4 file, with the extents as its media box (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.cc#L727"><code>hb-vector-draw.cc:727</code></a>). PDF’s y axis points up, as a font’s does, so nothing is flipped. Each glyph is a fill color (<code>rg</code>), its path, and <code>f</code>, PDF’s nonzero fill; a semi-transparent foreground gets an ExtGState with <code>/ca</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.hh#L111"><code>hb-vector-draw.hh:111</code></a>). PDF has no quadratic curve, so the PDF funcs leave <code>quadratic_to</code> unset, and HarfBuzz’s default turns each quadratic into the identical cubic, as <a href="drawing-outlines.html#callbacks-a-client-leaves-out">Drawing outlines</a> describes (“No quadratic_to — null fallback auto-promotes to cubic”, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.cc#L110"><code>hb-vector-draw.cc:110</code></a>).</p>
+<h3 id="limits">Limits</h3>
+<p id="ix-24">Every document is capped at 16 MiB (<code>HB_VECTOR_MAX_DOCUMENT_SIZE</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L181"><code>hb-limits.hh:181</code></a>). Once a buffer would pass it, it stops growing, stays in error until the context is cleared, and tells the outline code to stop by emptying the budget (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-buf.hh#L76"><code>hb-vector-buf.hh:76</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.hh#L74"><code>hb-vector-draw.hh:74</code></a>). The work budget, as above, is per document. A document that hits either limit is cut short, not refused: what was written before is rendered.</p>
+<h2 id="color-glyphs">Color glyphs</h2>
+<h3 id="the-paint-context">The paint context</h3>
+<p id="ix-25">The paint context is a set of paint funcs, one for SVG and one for PDF. <code>hb_vector_paint_glyph</code> pushes the context’s transform, calls <code>hb_font_paint_glyph</code> with the context’s palette index and foreground, and pops the transform (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint.cc#L526"><code>hb-vector-paint.cc:526</code></a>). Since <code>hb_font_paint_glyph</code> falls back to filling the outline with the foreground (<a href="color.html#the-paint-api">Color</a>), the paint context draws plain glyphs too; <code>hb_vector_paint_glyph_or_fail</code> uses <code>hb_font_paint_glyph_or_fail</code> instead and draws nothing for them. The <code>hb-vector</code> tool uses its paint context when the font has COLR, <code>CBDT</code> or <code>sbix</code> data, and its draw context otherwise (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/vector-output.hh#L225"><code>util/vector-output.hh:225</code></a>); <code>--paint</code> and <code>--draw</code> override that.</p>
+<p id="ix-26">Unlike the draw context, the paint context writes transforms as transforms: the glyph’s position is a <code>&lt;g transform=&quot;matrix(…)&quot;&gt;</code> in SVG and a <code>cm</code> in PDF, and an identity transform is skipped in SVG (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-svg.cc#L378"><code>hb-vector-paint-svg.cc:378</code></a>).</p>
+<h3 id="color-glyphs-in-svg">Color glyphs in SVG</h3>
+<p id="ix-27">The SVG paint funcs translate the paint calls one by one into SVG elements, held in two buffers: the body and the <code>&lt;defs&gt;</code> the body refers to (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-svg.cc#L310"><code>hb-vector-paint-svg.cc:310</code></a>).</p>
+<table>
+<thead>
+<tr>
+<th>Callback</th>
+<th>SVG</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>push_transform</code></td>
+<td><code>&lt;g transform=&quot;matrix(…)&quot;&gt;</code></td>
+</tr>
+<tr>
+<td><code>push_clip_glyph</code></td>
+<td>the outline as a <code>&lt;path id=&quot;p…&quot;&gt;</code> and a <code>&lt;clipPath id=&quot;clip-p…&quot;&gt;</code> in <code>&lt;defs&gt;</code>; <code>&lt;g clip-path=&quot;url(#…)&quot;&gt;</code></td>
+</tr>
+<tr>
+<td><code>push_clip_rectangle</code></td>
+<td>a <code>&lt;rect&gt;</code> in a <code>&lt;clipPath id=&quot;c…&quot;&gt;</code></td>
+</tr>
+<tr>
+<td><code>push_clip_path_start</code>, <code>_end</code></td>
+<td>a <code>&lt;path&gt;</code> in a <code>&lt;clipPath id=&quot;cp…&quot;&gt;</code></td>
+</tr>
+<tr>
+<td><code>fill_glyph</code></td>
+<td>a filled <code>&lt;path&gt;</code></td>
+</tr>
+<tr>
+<td><code>color</code></td>
+<td>a filled <code>&lt;rect&gt;</code> 65,534 units square, cut down by the clip</td>
+</tr>
+<tr>
+<td><code>linear_gradient</code>, <code>radial_gradient</code></td>
+<td>a <code>&lt;linearGradient&gt;</code> or <code>&lt;radialGradient id=&quot;gr…&quot;&gt;</code> in <code>&lt;defs&gt;</code>, filling the same rectangle</td>
+</tr>
+<tr>
+<td><code>sweep_gradient</code></td>
+<td>wedges of solid color</td>
+</tr>
+<tr>
+<td><code>image</code></td>
+<td>PNG only: an <code>&lt;image&gt;</code> with the PNG inline, base64 encoded</td>
+</tr>
+<tr>
+<td><code>push_group</code>, <code>pop_group</code></td>
+<td><code>&lt;g style=&quot;mix-blend-mode:…&quot;&gt;</code></td>
+</tr>
+<tr>
+<td><code>custom_palette_color</code></td>
+<td id="ix-28">the context’s overrides</td>
+</tr>
+<tr>
+<td><code>color_glyph</code></td>
+<td>declined</td>
+</tr>
+</tbody>
+</table>
+<p>Here is the start of <code>hb-vector</code>’s output for <code>M</code> in the Color chapter’s <code>colr1.ttf</code>, two discs composited with MULTIPLY, captured when this chapter was written (trimmed; the path data is cut short):</p>
+<pre><code class="language-xml">&lt;defs&gt;
+&lt;clipPath id=&quot;c0&quot;&gt;&lt;rect x=&quot;1.56&quot; y=&quot;0&quot; width=&quot;12.5&quot; height=&quot;12.5&quot;/&gt;&lt;/clipPath&gt;
+&lt;/defs&gt;
+&lt;g transform=&quot;scale(1,-1)&quot;&gt;
+&lt;g transform=&quot;matrix(64,0,0,64,0,0)&quot;&gt;
+&lt;g clip-path=&quot;url(#c0)&quot;&gt;
+&lt;g style=&quot;mix-blend-mode:normal&quot;&gt;
+&lt;g transform=&quot;matrix(0.015625,0,0,0.015625,0,0)&quot;&gt;
+&lt;path d=&quot;M638.5,507Q683,400 638.5,293…Z&quot; fill=&quot;#1B98E0&quot;/&gt;
+&lt;/g&gt;
+&lt;g style=&quot;mix-blend-mode:multiply&quot;&gt;
+&lt;g transform=&quot;matrix(0.015625,0,0,0.015625,0,0)&quot;&gt;
+&lt;path d=&quot;M878.5,507Q923,400 878.5,293…Z&quot; fill=&quot;#D7263D&quot;/&gt;
+</code></pre>
+<p id="ix-29">The structure is the paint graph’s. The ClipBox is a clip rectangle; the PaintComposite is two groups, the source inside the backdrop; and each PaintGlyph of a PaintSolid is one filled path, through <code>fill_glyph</code>. The 64 and 1/64 are the font transform and its inverse around the glyph (<a href="color.html#the-walk">Color</a>). The scale factor divides coordinates, but not the entries of matrices, so the ClipBox’s 100 font units appear as 1.56.</p>
+<h3 id="compositing-modes">Compositing modes</h3>
+<p id="ix-30"><code>pop_group</code> is where SVG runs short. Its <code>mix-blend-mode</code> has the separable and non-separable blend modes of the W3C compositing specification, but none of the Porter–Duff operators, which in SVG would need masks or filters. hb-vector’s answer is a table (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-svg.cc#L75"><code>hb-vector-paint-svg.cc:75</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th id="ix-31">COLR mode</th>
+<th>SVG</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SRC_OVER, and the 15 blend modes from SCREEN to HSL_LUMINOSITY</td>
+<td>themselves (<code>normal</code>, <code>screen</code>, …, <code>luminosity</code>)</td>
+</tr>
+<tr>
+<td>PLUS</td>
+<td><code>screen</code>, “a plausible color-blend analog”</td>
+</tr>
+<tr>
+<td>XOR</td>
+<td><code>difference</code></td>
+</tr>
+<tr>
+<td>CLEAR, SRC, DEST, DEST_OVER, SRC_IN, DEST_IN, SRC_OUT, DEST_OUT, SRC_ATOP, DEST_ATOP</td>
+<td>none: the group is painted source-over</td>
+</tr>
+</tbody>
+</table>
+<p><code>modes.ttf</code>, this chapter’s test font, has the same pair of discs, a blue backdrop and a red source, composited with SRC_OVER, SRC_IN, DEST_OUT, XOR, PLUS, SCREEN and DIFFERENCE, on <code>N</code>, <code>I</code>, <code>O</code>, <code>X</code>, <code>P</code>, <code>S</code> and <code>D</code>:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 7080 1180" role="img" aria-label="NIOXPSD at default">
+<defs>
+<clipPath id="d316-c0"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d316-c1"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d316-c2"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d316-c3"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d316-c4"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d316-c5"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d316-c6"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+</defs>
+<g transform="scale(1,-1)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d316-c0)">
+<g style="mix-blend-mode:normal">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M638.5,507Q683,400 638.5,293Q594,186 487,141.5Q380,97 273,141.5Q166,186 121.5,293Q77,400 121.5,507Q166,614 273,658.5Q380,703 487,658.5Q594,614 638.5,507Z" fill="#1B98E0"/>
+</g>
+<g style="mix-blend-mode:normal">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M878.5,507Q923,400 878.5,293Q834,186 727,141.5Q620,97 513,141.5Q406,186 361.5,293Q317,400 361.5,507Q406,614 513,658.5Q620,703 727,658.5Q834,614 878.5,507Z" fill="#D7263D"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,1000,0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d316-c1)">
+<g style="mix-blend-mode:normal">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M638.5,507Q683,400 638.5,293Q594,186 487,141.5Q380,97 273,141.5Q166,186 121.5,293Q77,400 121.5,507Q166,614 273,658.5Q380,703 487,658.5Q594,614 638.5,507Z" fill="#1B98E0"/>
+</g>
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M878.5,507Q923,400 878.5,293Q834,186 727,141.5Q620,97 513,141.5Q406,186 361.5,293Q317,400 361.5,507Q406,614 513,658.5Q620,703 727,658.5Q834,614 878.5,507Z" fill="#D7263D"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,2000,0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d316-c2)">
+<g style="mix-blend-mode:normal">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M638.5,507Q683,400 638.5,293Q594,186 487,141.5Q380,97 273,141.5Q166,186 121.5,293Q77,400 121.5,507Q166,614 273,658.5Q380,703 487,658.5Q594,614 638.5,507Z" fill="#1B98E0"/>
+</g>
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M878.5,507Q923,400 878.5,293Q834,186 727,141.5Q620,97 513,141.5Q406,186 361.5,293Q317,400 361.5,507Q406,614 513,658.5Q620,703 727,658.5Q834,614 878.5,507Z" fill="#D7263D"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,3000,0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d316-c3)">
+<g style="mix-blend-mode:normal">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M638.5,507Q683,400 638.5,293Q594,186 487,141.5Q380,97 273,141.5Q166,186 121.5,293Q77,400 121.5,507Q166,614 273,658.5Q380,703 487,658.5Q594,614 638.5,507Z" fill="#1B98E0"/>
+</g>
+<g style="mix-blend-mode:difference">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M878.5,507Q923,400 878.5,293Q834,186 727,141.5Q620,97 513,141.5Q406,186 361.5,293Q317,400 361.5,507Q406,614 513,658.5Q620,703 727,658.5Q834,614 878.5,507Z" fill="#D7263D"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,4000,0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d316-c4)">
+<g style="mix-blend-mode:normal">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M638.5,507Q683,400 638.5,293Q594,186 487,141.5Q380,97 273,141.5Q166,186 121.5,293Q77,400 121.5,507Q166,614 273,658.5Q380,703 487,658.5Q594,614 638.5,507Z" fill="#1B98E0"/>
+</g>
+<g style="mix-blend-mode:screen">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M878.5,507Q923,400 878.5,293Q834,186 727,141.5Q620,97 513,141.5Q406,186 361.5,293Q317,400 361.5,507Q406,614 513,658.5Q620,703 727,658.5Q834,614 878.5,507Z" fill="#D7263D"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,5000,0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d316-c5)">
+<g style="mix-blend-mode:normal">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M638.5,507Q683,400 638.5,293Q594,186 487,141.5Q380,97 273,141.5Q166,186 121.5,293Q77,400 121.5,507Q166,614 273,658.5Q380,703 487,658.5Q594,614 638.5,507Z" fill="#1B98E0"/>
+</g>
+<g style="mix-blend-mode:screen">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M878.5,507Q923,400 878.5,293Q834,186 727,141.5Q620,97 513,141.5Q406,186 361.5,293Q317,400 361.5,507Q406,614 513,658.5Q620,703 727,658.5Q834,614 878.5,507Z" fill="#D7263D"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,6000,0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d316-c6)">
+<g style="mix-blend-mode:normal">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M638.5,507Q683,400 638.5,293Q594,186 487,141.5Q380,97 273,141.5Q166,186 121.5,293Q77,400 121.5,507Q166,614 273,658.5Q380,703 487,658.5Q594,614 638.5,507Z" fill="#1B98E0"/>
+</g>
+<g style="mix-blend-mode:difference">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M878.5,507Q923,400 878.5,293Q834,186 727,141.5Q620,97 513,141.5Q406,186 361.5,293Q317,400 361.5,507Q406,614 513,658.5Q620,703 727,658.5Q834,614 878.5,507Z" fill="#D7263D"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[N=0+1000|I=1+1000|O=2+1000|X=3+1000|P=4+1000|S=5+1000|D=6+1000]</code></div></div><figcaption><code>hb-vector modes.ttf "NIOXPSD"</code></figcaption></figure>
+<p id="ix-32"><code>N</code>, <code>I</code> and <code>O</code> are identical, though SRC_IN should leave only the lens where the discs overlap, in red, and DEST_OUT only the blue crescent. <code>X</code> is drawn as DIFFERENCE, the same as <code>D</code>, where XOR should have left the lens empty. <code>P</code> is drawn as SCREEN, the same as <code>S</code>; PLUS would have added the colors, which here comes to nearly the same thing. <a href="hb-raster.html">hb-raster</a> draws all seven as the specification says.</p>
+<p id="ix-33">Every color glyph in these fonts also has an outline, the Color chapter’s cut-cornered square. <code>--draw</code> forces the draw context, which ignores color and draws the outline:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 7080 1180" role="img" aria-label="NIOXPSD at default">
+<g transform="scale(1,-1)">
+<path d="M100,0L100,800L650,800L900,550L900,0L100,0Z" fill="currentColor"/>
+<path d="M1100,0L1100,800L1650,800L1900,550L1900,0L1100,0Z" fill="currentColor"/>
+<path d="M2100,0L2100,800L2650,800L2900,550L2900,0L2100,0Z" fill="currentColor"/>
+<path d="M3100,0L3100,800L3650,800L3900,550L3900,0L3100,0Z" fill="currentColor"/>
+<path d="M4100,0L4100,800L4650,800L4900,550L4900,0L4100,0Z" fill="currentColor"/>
+<path d="M5100,0L5100,800L5650,800L5900,550L5900,0L5100,0Z" fill="currentColor"/>
+<path d="M6100,0L6100,800L6650,800L6900,550L6900,0L6100,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[N=0+1000|I=1+1000|O=2+1000|X=3+1000|P=4+1000|S=5+1000|D=6+1000]</code></div></div><figcaption><code>hb-vector modes.ttf "NIOXPSD" --draw</code></figcaption></figure>
+<h3 id="gradients">Gradients</h3>
+<p id="ix-34">SVG’s gradients take their stops at offsets from 0 to 1, and clamp the rest. COLR’s stops can lie anywhere, so hb-vector sorts and rescales them with <code>hb_paint_normalize_color_line</code> and moves the gradient’s ends to match, so that the colors stay where they were (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-svg.cc#L694"><code>hb-vector-paint-svg.cc:694</code></a>). A linear gradient’s three COLR points are reduced to SVG’s two with <code>hb_paint_reduce_linear_anchors</code>. The extend mode becomes <code>spreadMethod</code>, which has pad, repeat and reflect, so nothing is lost: the Color chapter’s <code>R</code> and <code>F</code> are drawn with their rings (<a href="color.html#gradients-and-color-lines">Color</a>).</p>
+<p id="ix-35">SVG has no conic gradient. A sweep is cut into tiles by <code>hb_paint_sweep_gradient_tiles</code>, which deals with the extend mode, and each tile into wedges no wider than π/16, each a pie slice 32,767 units in radius filled with the color at its middle (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-svg.cc#L174"><code>hb-vector-paint-svg.cc:174</code></a>). So a sweep in SVG is a fan of flat colors: smooth enough at text sizes, banded when enlarged.</p>
+<h3 id="images">Images</h3>
+<p id="ix-36">The <code>image</code> callback accepts PNG and nothing else: the PNG is copied into the SVG unchanged, base64 encoded, scaled to the glyph’s extents (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-svg.cc#L628"><code>hb-vector-paint-svg.cc:628</code></a>). It refuses SVG documents (since 14.2.0) and the raw BGRA images FreeType’s font functions produce. A refusal is part of the protocol: HarfBuzz goes on to the next color table, and finally to the outline, as <a href="color.html#which-picture-gets-painted">Which picture gets painted</a> shows with <code>images.ttf</code>.</p>
+<h3 id="palettes-and-the-foreground">Palettes and the foreground</h3>
+<p id="ix-37">The palette index is the context’s (<code>hb_vector_paint_set_palette</code>, 0 unless set) and is passed to <code>hb_font_paint_glyph</code>. Single entries can be overridden with <code>hb_vector_paint_set_custom_palette_color</code>, which the SVG funcs report through <code>custom_palette_color</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-svg.cc#L292"><code>hb-vector-paint-svg.cc:292</code></a>). The <a href="color.html#palettes-cpal">Color</a> chapter shows both, with <code>hb-vector</code>’s <code>--font-palette</code> and <code>--custom-palette</code>.</p>
+<p id="ix-38">The foreground color (<code>hb_vector_paint_set_foreground</code>) is what HarfBuzz uses for palette entry 0xFFFF, and for plain glyphs painted through the fallback. Here is <code>colr0.ttf</code>, whose bar is in entry 0xFFFF, with a red foreground:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 2080 1180" role="img" aria-label="AB at default">
+<g transform="scale(1,-1)">
+<path d="M100,0L100,800L900,800L900,0L100,0Z" fill="#E8A33D"/>
+<path d="M777.5,515Q825,400 777.5,285Q730,170 615,122.5Q500,75 385,122.5Q270,170 222.5,285Q175,400 222.5,515Q270,630 385,677.5Q500,725 615,677.5Q730,630 777.5,515Z" fill="#2A6FDB"/>
+<path d="M100,330L100,470L900,470L900,330L100,330Z" fill="#C0392B"/>
+<g transform="matrix(1,0,0,1,1000,0)">
+<path d="M777.5,515Q825,400 777.5,285Q730,170 615,122.5Q500,75 385,122.5Q270,170 222.5,285Q175,400 222.5,515Q270,630 385,677.5Q500,725 615,677.5Q730,630 777.5,515Z" fill="#2A6FDB"/>
+<path d="M100,330L100,470L900,470L900,330L100,330Z" fill="#C0392B"/>
+<path d="M100,0L100,800L900,800L900,0L100,0Z" fill="#E8A33D"/>
+</g>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[A=0+1000|B=1+1000]</code></div></div><figcaption><code>hb-vector color/colr0.ttf "AB" --foreground=C0392B</code></figcaption></figure>
+<p id="ix-39">hb-vector writes the color the paint calls give it, and ignores <code>is_foreground</code>, so the foreground is fixed in the document. This book’s build rewrites black fills to <code>currentColor</code> (<code>tools/build-site.mjs</code>), which is why its drawings follow the color of the text, and why that trick only works for the default foreground.</p>
+<h3 id="color-glyphs-in-pdf">Color glyphs in PDF</h3>
+<p id="ix-40">The PDF paint funcs map the same calls onto PDF’s graphics state (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-pdf.cc#L389-L1646"><code>hb-vector-paint-pdf.cc:389–1646</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th>Callback</th>
+<th>PDF</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>push_transform</code></td>
+<td><code>q</code> and a <code>cm</code></td>
+</tr>
+<tr>
+<td><code>push_clip_glyph</code>, <code>_rectangle</code>, <code>_path</code></td>
+<td><code>q</code>, the path or <code>re</code>, then <code>W n</code></td>
+</tr>
+<tr>
+<td><code>color</code>, <code>fill_glyph</code></td>
+<td><code>rg</code> and a fill; alpha by an ExtGState with <code>/ca</code></td>
+</tr>
+<tr>
+<td><code>linear_gradient</code>, <code>radial_gradient</code></td>
+<td>axial and radial shadings (types 2 and 3), with stitched functions for the stops</td>
+</tr>
+<tr>
+<td><code>sweep_gradient</code></td>
+<td>a mesh of Coons patches (shading type 6)</td>
+</tr>
+<tr>
+<td><code>image</code></td>
+<td>an image XObject, <code>Do</code></td>
+</tr>
+<tr>
+<td><code>push_group_for</code>, <code>pop_group</code></td>
+<td><code>q</code>, an ExtGState with <code>/BM</code> for the mode, then <code>Q</code></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-41">Color stops with alpha get a second, gray shading, used as a luminosity soft mask. Groups use <code>push_group_for</code> (14.2.0), which tells the client the compositing mode before the group is painted, since PDF sets the blend mode before painting, not after (<a href="color.html#the-paint-api">Color</a>). The mode table is SVG’s in PDF’s names, with the same approximations for PLUS and XOR (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-pdf.cc#L1556"><code>hb-vector-paint-pdf.cc:1556</code></a>). A sweep is meant to be a closer approximation than SVG’s: each patch interpolates its colors smoothly, so there are no bands. But in 15.1.0 the colors are wrong. Each patch’s colors come from <code>hb_color_lerp</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint.hh#L292"><code>hb-paint.hh:292</code></a>), which assembles its result with the bytes in reverse order, so a red stop comes out as a cyan-blue: <code>colr1.ttf</code>’s <code>S</code> is cyan and purple in both poppler and Ghostscript. The same function also colors the SVG tiles of a sweep that crosses 0° or 360°, so those are wrong in SVG too. (The comment at the top of the file still says sweeps are “approximated via solid fallback”: it is out of date.) Extra objects, shadings, functions, soft masks and images, count against the same 16 MiB cap as the content (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-pdf.cc#L91"><code>hb-vector-paint-pdf.cc:91</code></a>).</p>
+<p><code>NEWS</code> says what the PDF writer is for: color-glyph artwork “that can be embedded directly in PDF documents. Useful for PDF producers such as LibreOffice.” In 15.1.0 it falls short in five ways. The book’s figures can’t show PDF; the results below come from <code>hb-vector -O pdf</code> on the Color chapter’s fonts and this chapter’s, rendered with poppler’s <code>pdftoppm</code> while this chapter was written.</p>
+<ul>
+<li id="ix-42"><strong>Extend modes.</strong> PDF’s axial and radial shadings can stop at their ends or pad beyond them, and nothing else. hb-vector pads when the color line says pad, and otherwise stops (<code>hb-vector-paint-pdf.cc:1098, 1199</code>), so a repeating or reflecting gradient is painted only between its first and last stops. <code>R</code> and <code>F</code> in <code>colr1.ttf</code> become the inner disc alone. Repeating would need the stops written out over the whole visible range.</li>
+<li id="ix-43"><strong>Compositing is not isolated.</strong> The blend mode is set in the graphics state and the group is only a <code>q</code>…<code>Q</code>, not a transparency group, so the source blends with everything already on the page, not only with its backdrop (inferred from the code at <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-pdf.cc#L1607"><code>hb-vector-paint-pdf.cc:1607</code></a>). In <code>modes.ttf</code>, the part of <code>S</code>’s red disc outside the overlap blends with the white page and disappears, and <code>D</code>’s turns cyan. In SVG, in Chrome at least, the same glyphs keep their red, presumably because the ClipBox’s clip group is a stacking context, which isolates what is inside it (inferred).</li>
+<li id="ix-44"><strong>PNG alpha.</strong> PNG images are embedded without being decoded: the compressed image data is copied into the PDF with a matching predictor, which keeps the file small, and only 8-bit PNGs are accepted (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-pdf.cc#L806"><code>hb-vector-paint-pdf.cc:806</code></a>). An indexed PNG with transparency gets a soft mask, built with zlib. But for an RGBA or gray-and-alpha PNG the alpha is ignored (<code>(void) has_alpha</code>, <code>:305</code>): the image is declared as RGB or gray, while its data still has four or two components per pixel. The RGBA PNG of <code>P</code> in <code>images.ttf</code> comes out as stripes, where the SVG shows a green disc. Bitmap color glyphs are nearly always RGBA. <code>NEWS</code> for 14.2.0 promises “PNG images with transparency”, so this is a bug.</li>
+<li id="ix-45"><strong>Custom palettes.</strong> The PDF funcs don’t set <code>custom_palette_color</code> at all (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-pdf.cc#L1650"><code>hb-vector-paint-pdf.cc:1650</code></a>), so <code>hb_vector_paint_set_custom_palette_color</code> has no effect on PDF. <code>colr0.ttf</code> with <code>--custom-palette=1=#2E8B57</code> has a green disc in SVG and a blue one in PDF. This too looks like a bug.</li>
+<li id="ix-46"><strong>Sweeps near their center.</strong> Each Coons patch runs from half a unit to 32,767 units from the center. Both poppler and Ghostscript leave a square hole about 64 units wide at the center of <code>S</code> in <code>colr1.ttf</code>, and the cause is the mesh’s coordinates, not the renderers: they are stored in 16 bits over a range of 65,536 units and painted under a scale of 64, so the grid they snap to is 64 font units, and the patches’ inner ends, half a unit from the center, round to the corners of one unpainted grid square.</li>
+</ul>
+<h3 id="limits-for-color-glyphs">Limits for color glyphs</h3>
+<p id="ix-47">The SVG writer nests transforms at most 64 deep, and ignores further ones, and their pops, until it is back within the limit (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-svg.cc#L372"><code>hb-vector-paint-svg.cc:372</code></a>); the PDF writer has no such limit. Both decline <code>color_glyph</code>, so a PaintColrGlyph is painted inline under COLR’s own guards, instead of starting a fresh walk, with fresh limits, for every reference: a graph that fans out f ways over n levels would otherwise be walked fⁿ times (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-svg.cc#L891"><code>hb-vector-paint-svg.cc:891</code></a>). When the budget is spent, outlines are skipped but the document’s structure is kept, so a glyph clip with no outline clips everything out (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-svg.cc#L474"><code>hb-vector-paint-svg.cc:474</code></a>). Sweep meshes and images, which the budget can’t see, are bounded by the 16 MiB cap.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector.h"><code>src/hb-vector.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector.cc"><code>src/hb-vector.cc</code></a></td>
+<td>the API, its overview documentation, and the locale’s decimal point</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.hh"><code>src/hb-vector-draw.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-draw.cc"><code>src/hb-vector-draw.cc</code></a></td>
+<td>the draw context; SVG and PDF path callbacks; writing the two document formats, 727 and 838</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-path.hh"><code>src/hb-vector-path.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-path.cc"><code>src/hb-vector-path.cc</code></a></td>
+<td>the path sink the paint context draws clips and fills through</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint.hh"><code>src/hb-vector-paint.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint.cc"><code>src/hb-vector-paint.cc</code></a></td>
+<td>the paint context, its settings, the SVG id prefix</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-svg.cc"><code>src/hb-vector-paint-svg.cc</code></a></td>
+<td>SVG paint callbacks: the compositing table, 75; sweep wedges, 174; rendering, 903</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-pdf.cc"><code>src/hb-vector-paint-pdf.cc</code></a></td>
+<td>PDF paint: ExtGStates, shadings, Coons meshes, embedded PNGs; rendering, 1697</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-buf.hh"><code>src/hb-vector-buf.hh</code></a></td>
+<td>the output buffer, its 16 MiB cap, and locale-free numbers</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-internal.hh"><code>src/hb-vector-internal.hh</code></a></td>
+<td>blob recycling, transforms and extents shared by both contexts</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>src/hb-limits.hh</code></a></td>
+<td><code>HB_VECTOR_MAX_DOCUMENT_SIZE</code>, 181, and the budgets</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/hb-vector.cc"><code>util/hb-vector.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/vector-output.hh"><code>util/vector-output.hh</code></a></td>
+<td>the tool, and how it drives its contexts</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>hb-vector is a separate library, from 13.0.0 and stable since 15.0.0, that writes glyphs as SVG or PDF. It draws every figure in this book.</li>
+<li>A draw context writes one filled path per glyph, with the transform applied to the points: quadratics stay quadratic in SVG and become cubics in PDF. Numbers have at most <code>precision</code> decimals, counted in output units, and never a locale’s comma.</li>
+<li>Contexts gather a whole document between renders: one set of extents, one work budget, one 16 MiB cap.</li>
+<li>A paint context writes a color glyph’s paint calls as nested groups, clips, gradients and inline PNGs. Its ids need <code>hb_vector_paint_set_svg_prefix</code> when documents share a page; the draw context’s output has none.</li>
+<li>SVG has the blend modes but no Porter–Duff operators: PLUS and XOR become screen and difference, and the rest source-over. Sweeps become fans of flat wedges.</li>
+<li>PDF keeps sweeps smooth but, in 15.1.0, paints them in the wrong colors with a hole at the center, loses repeat and reflect, composites without isolation, drops the alpha of RGBA PNGs, and ignores custom palette colors.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="hb-raster.html">← hb-raster: rendering to pixels</a><a rel="next" href="hb-gpu.html">hb-gpu: rendering on the GPU →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

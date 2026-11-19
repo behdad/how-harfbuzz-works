@@ -1,0 +1,979 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>GSUB: substituting glyphs · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part V · The pipeline</p>
+<h1 id="gsub-substituting-glyphs">18. GSUB: substituting glyphs</h1>
+<p id="ix-1">By the time HarfBuzz opens a font’s GSUB table, the hard questions about <em>characters</em> have been answered. The text has been segmented, its script and direction are known, and it has been <a href="normalization.html">normalized</a>, which is where every character was mapped to a glyph through <code>cmap</code>. <a href="pipeline-step-by-step.html#substituting">The pipeline, step by step</a> shows where GSUB comes in the whole of shaping. What arrives here is a buffer of glyph IDs, each still carrying the cluster number of the character it came from and a set of Unicode properties.</p>
+<p id="ix-2">GSUB’s job is to change <em>which</em> glyphs are in that buffer. It swaps one glyph for another, splits one into several, joins several into one, and does any of those only in certain surroundings. It never moves anything: positions are GPOS’s job, in the <a href="gpos.html">next chapter</a>. This chapter is about how HarfBuzz reads GSUB and runs it: the order things happen in, which glyphs a lookup can see, and the many small decisions that the OpenType specification leaves open, which HarfBuzz settles in particular ways.</p>
+<p id="ix-3">Every example comes from one small test font, built from the feature file <code>fonts/gsub/ligatures.fea</code> and two variants of it. Its glyphs are plain boxes, since only their names, their <code>cmap</code> and their layout tables matter here. Every shaping result and trace on this page was produced by running HarfBuzz 15.1.0 on those fonts when the page was built.</p>
+<h2 id="the-shape-of-the-table">The shape of the table</h2>
+<p id="ix-4">A GSUB table has three lists, plus an optional fourth:</p>
+<ul>
+<li id="ix-5">the <strong>ScriptList</strong>, which says, for each script and language system, which features apply;</li>
+<li id="ix-6">the <strong>FeatureList</strong>, which says, for each feature, which lookups it uses;</li>
+<li id="ix-7">the <strong>LookupList</strong>, which holds the lookups themselves: the actual rules;</li>
+<li id="ix-8">and (in version 1.1) <strong>FeatureVariations</strong>, which swaps in different lookups for a feature in some regions of a variable font’s design space.</li>
+</ul>
+<p id="ix-9">The first two, together with FeatureVariations, belong to planning. Before shaping starts, HarfBuzz works out from them which lookups this text needs, in what order, and which glyphs each should touch. That is the subject of <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a> and <a href="from-features-to-lookups.html">From features to lookups</a>. This chapter starts where planning ends: with an ordered list of lookups, each tagged with the feature that asked for it, a bit mask, and a few flags.</p>
+<p id="ix-10">A <strong>lookup</strong> is a type, a set of flags, and a list of subtables. All of a lookup’s subtables have the same type. When a lookup runs, HarfBuzz tries its subtables in order at each glyph, and the first one that does something wins. GSUB has eight lookup types:</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Name</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Single</td>
+<td id="ix-11">one glyph → one glyph</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Multiple</td>
+<td id="ix-12">one glyph → a sequence of glyphs</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Alternate</td>
+<td id="ix-13">one glyph → one of a set of alternatives</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Ligature</td>
+<td id="ix-14">a sequence of glyphs → one glyph</td>
+</tr>
+<tr>
+<td>5</td>
+<td id="ix-15">Context</td>
+<td id="ix-16">runs other lookups where an input sequence matches</td>
+</tr>
+<tr>
+<td>6</td>
+<td id="ix-17">Chained context</td>
+<td id="ix-18">the same, also checking the glyphs before and after</td>
+</tr>
+<tr>
+<td>7</td>
+<td>Extension</td>
+<td id="ix-19">a wrapper allowing 32-bit offsets to a subtable of another type</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Reverse chained single</td>
+<td id="ix-20">single substitution in context, run from the end of the text</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-21">Here is the first lookup in the test font, the <code>liga</code> lookup. It is the subject of most of this chapter, so it’s worth getting to know in each of its views<span class="screen-only">, which its tabs offer</span>:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of ligatures.ttf, lookup 0"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button><button type="button" role="tab" data-view="hex">Bytes</button><button type="button" role="tab" data-view="cpp">HarfBuzz C++</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 0: Ligature substitution (type 4)
+  lookupFlag: IgnoreMarks
+  subtable 0: LigatureSubstFormat1
+    coverage: [f]
+    ligatureSet:
+      (f)
+        1. [f i] → f_f_i
+        2. [i] → f_i
+        3. [l] → f_l
+        4. [f] → f_f</code></pre></div><div class="pane print" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature liga {
+  lookupflag IgnoreMarks;
+  sub f i by f_i;
+  sub f f i by f_f_i;
+  sub f l by f_l;
+  sub f f by f_f;
+} liga;</code></pre></div><div class="pane print" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;0&quot;&gt;
+  &lt;LookupType value=&quot;4&quot;/&gt;
+  &lt;LookupFlag value=&quot;8&quot;/&gt;&lt;!-- ignoreMarks --&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;LigatureSubst index=&quot;0&quot;&gt;
+    &lt;LigatureSet glyph=&quot;f&quot;&gt;
+      &lt;Ligature components=&quot;f,i&quot; glyph=&quot;f_f_i&quot;/&gt;
+      &lt;Ligature components=&quot;i&quot; glyph=&quot;f_i&quot;/&gt;
+      &lt;Ligature components=&quot;l&quot; glyph=&quot;f_l&quot;/&gt;
+      &lt;Ligature components=&quot;f&quot; glyph=&quot;f_f&quot;/&gt;
+    &lt;/LigatureSet&gt;
+  &lt;/LigatureSubst&gt;
+&lt;/Lookup&gt;</code></pre></div><div class="pane print" data-view="hex" data-label="Bytes" role="tabpanel"><pre><code>── Lookup 0 (at 0x0042)
+0042  00 04   lookupType
+0044  00 08   lookupFlag (IgnoreMarks)
+0046  00 01   subTableCount
+0048  00 46   subtableOffsets[0] → subtable 0
+── subtable 0: LigatureSubstFormat1 (at 0x0088)
+0088  00 01   substFormat
+008a  00 3e   coverageOffset → Coverage
+008c  00 01   ligatureSetCount
+008e  00 5e   ligatureSetOffsets[0] → LigatureSet 0
+── Coverage (at 0x00c6)
+00c6  00 01   format
+00c8  00 01   glyphCount
+00ca  00 04   glyphArray[0] = f
+── LigatureSet 0 (at 0x00e6)
+00e6  00 04   ligatureCount
+00e8  00 24   ligatureOffsets[0] → Ligature 0.0
+00ea  00 12   ligatureOffsets[1] → Ligature 0.1
+00ec  00 18   ligatureOffsets[2] → Ligature 0.2
+00ee  00 1e   ligatureOffsets[3] → Ligature 0.3
+── Ligature 0.1 (at 0x00f8)
+00f8  00 09   ligatureGlyph = f_i
+00fa  00 02   componentCount (including the first)
+00fc  00 05   componentGlyphIDs[0] = i
+── Ligature 0.2 (at 0x00fe)
+00fe  00 0a   ligatureGlyph = f_l
+0100  00 02   componentCount (including the first)
+0102  00 06   componentGlyphIDs[0] = l
+── Ligature 0.3 (at 0x0104)
+0104  00 0b   ligatureGlyph = f_f
+0106  00 02   componentCount (including the first)
+0108  00 04   componentGlyphIDs[0] = f
+── Ligature 0.0 (at 0x010a)
+010a  00 0c   ligatureGlyph = f_f_i
+010c  00 03   componentCount (including the first)
+010e  00 04   componentGlyphIDs[0] = f
+0110  00 05   componentGlyphIDs[1] = i</code></pre></div><div class="pane print" data-view="cpp" data-label="HarfBuzz C++" role="tabpanel"><pre><code>template &lt;typename Types&gt;
+struct LigatureSubstFormat1_2
+{
+  protected:
+  HBUINT16      format;                 /* Format identifier--format = 1 */
+  typename Types::template LOffsetTo&lt;Coverage&gt;
+                coverage;               /* Offset to Coverage table--from
+                                         * beginning of Substitution table */
+  typename Types::template ArrayOf&lt;typename Types::template OffsetTo&lt;LigatureSet&lt;Types&gt;&gt;&gt;
+                ligatureSet;            /* Array LigatureSet tables
+                                         * ordered by Coverage Index */
+  public:
+  DEFINE_SIZE_ARRAY (2 + Types::LOffset::static_size + Types::HBUINT::static_size, ligatureSet);
+  /* … */
+};</code></pre><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/LigatureSubstFormat1.hh#L11-L23">src/OT/Layout/GSUB/LigatureSubstFormat1.hh:11</a></div><figcaption>ligatures.ttf, lookup 0</figcaption></figure>
+<p id="ix-22">The <strong>spec-like</strong> view is the book’s default. It uses the field names of HarfBuzz’s own structs, which follow the OpenType specification nearly field for field. It leaves out what the bytes need but a reader doesn’t: counts, which are implied by the lists, and offsets, which are shown by nesting. A ligature set is listed under its first glyph, in brackets, because that glyph is never stored in the ligature itself: it is found through the subtable’s coverage table. So <code>(f)</code> followed by <code>[f i] → f_f_i</code> means “f, then f, then i, becomes f_f_i”.</p>
+<p id="ix-23">The <strong>feature file</strong> view is the source the font was compiled from. It’s how most designers write GSUB, but as we’ll see, it hides some things that HarfBuzz depends on. <strong>TTX</strong> is fontTools’ XML dump. <strong>Bytes</strong> shows the lookup as it is stored in the font, offset by offset. <strong>HarfBuzz C++</strong> shows the struct that HarfBuzz lays over those bytes, with a link to it in the source.</p>
+<h3 id="structs-over-bytes">Structs over bytes</h3>
+<p id="ix-24">The C++ view is worth a closer look, because it’s how all of HarfBuzz’s table code works. <code>LigatureSubstFormat1_2</code> is not a class that HarfBuzz fills in by parsing the font. It is a description of the bytes: HarfBuzz points it at the right place in the font’s data and reads the fields where they are. <code>HBUINT16</code> is a big-endian 16-bit integer that converts itself to a native one when read. An <code>OffsetTo&lt;Coverage&gt;</code> is a 16-bit number that knows what it points to, so <code>this+coverage</code> gives the Coverage table. There is no copying and no allocation. <a href="fonts-as-bytes.html">Fonts as bytes</a> explains these types, and <a href="trust-nothing-the-sanitizer.html">the sanitizer</a>, which checks every offset and array once, when the table is loaded, is what makes it safe to trust them.</p>
+<p id="ix-25">The struct is a template on <code>Types</code>, <code>SmallTypes</code> or <code>MediumTypes</code>, so that one piece of code reads both the ordinary 16-bit formats and the wider ones of the “beyond 64k” extension (SingleSubst formats 3 and 4, ChainContext formats 4 and 5, and so on), as <a href="fonts-as-bytes.html#smalltypes-and-mediumtypes">Fonts as bytes</a> explains.</p>
+<p id="ix-26">The names differ a little between the views. For this lookup:</p>
+<table>
+<thead>
+<tr>
+<th>OpenType spec</th>
+<th>HarfBuzz struct</th>
+<th>TTX</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>coverageOffset</code></td>
+<td><code>coverage</code></td>
+<td>(merged into <code>LigatureSet glyph=</code>)</td>
+</tr>
+<tr>
+<td><code>ligatureSetOffsets[]</code></td>
+<td><code>ligatureSet</code></td>
+<td><code>&lt;LigatureSet&gt;</code></td>
+</tr>
+<tr>
+<td><code>ligatureGlyph</code></td>
+<td><code>ligGlyph</code></td>
+<td><code>glyph=</code></td>
+</tr>
+<tr>
+<td><code>componentCount</code>, <code>componentGlyphIDs[]</code></td>
+<td id="ix-27"><code>component</code> (a <code>HeadlessArray16Of</code>)</td>
+<td><code>components=</code></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-28"><code>HeadlessArray16Of</code> is HarfBuzz’s name for an array whose count includes a first element that isn’t stored. That’s exactly what a ligature’s component list is: <code>componentCount</code> counts the first glyph too, but only the second and later glyphs follow it. In the code it’s read as <code>component.lenP1</code>, “length plus one”.</p>
+<h2 id="the-order-lookups-run-in">The order lookups run in</h2>
+<p id="ix-29">Planning hands over the lookups in <strong>stages</strong>, separated by pauses where a script shaper can step in (an Indic shaper, for example, reorders glyphs between stages). Within a stage, HarfBuzz sorts the lookups by their index in the LookupList (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.cc#L389"><code>hb-ot-map.cc:389</code></a>; <a href="from-features-to-lookups.html#stages-and-pauses">From features to lookups</a> covers stages and pauses). It doesn’t sort them by feature, and it doesn’t keep the order in which the features were asked for. <a href="feature-order.html">Feature order</a> gives the stages for every shaper.</p>
+<p id="ix-30">For the default shaper, which handles Latin, nearly every feature is in the same stage. So <code>ccmp</code>, <code>liga</code>, <code>calt</code> and the rest are not applied one feature after another: their lookups are merged into one list and run in lookup order. The test font’s <code>ccmp</code> turns <code>x</code> into <code>f i</code>. It comes after <code>liga</code> in the feature file, so its lookup is lookup 4, after <code>liga</code>’s lookup 0. The font <code>ccmp-first.ttf</code> is the same except that the <code>ccmp</code> block comes first in its feature file:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">ligatures.ttf</td><td class="in"><span class="txt">x</span><span class="cps">U+0078</span></td><td class="opt"></td><td class="out"><code>[f=0+500|i=0+500]</code></td></tr><tr><td class="font">ccmp-first.ttf</td><td class="in"><span class="txt">x</span><span class="cps">U+0078</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900]</code></td></tr></tbody></table></div>
+<p id="ix-31">In <code>ligatures.ttf</code>, <code>liga</code> has already run by the time <code>ccmp</code> makes the <code>f</code> and the <code>i</code>, so they stay apart. Moving the feature block is enough to change the result, because feaLib numbers lookups in the order it meets them. The trace for <code>ligatures.ttf</code> shows the order:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape ligatures.ttf "x"  --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;latn&#x27;</td><td class="buf"><code>[x=0]</code></td></tr><tr><td class="what">start lookup 0 feature &#x27;liga&#x27;</td><td class="buf"><code>[x=0]</code></td></tr><tr><td class="what">skipped lookup 0 feature &#x27;liga&#x27; because no glyph matches</td><td class="buf"><code>[x=0]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;liga&#x27;</td><td class="buf"><code>[x=0]</code></td></tr><tr><td class="what">start lookup 3 feature &#x27;calt&#x27;</td><td class="buf"><code>[x=0]</code></td></tr><tr><td class="what">skipped lookup 3 feature &#x27;calt&#x27; because no glyph matches</td><td class="buf"><code>[x=0]</code></td></tr><tr><td class="what">end lookup 3 feature &#x27;calt&#x27;</td><td class="buf"><code>[x=0]</code></td></tr><tr><td class="what">start lookup 4 feature &#x27;ccmp&#x27;</td><td class="buf"><code>[x=0]</code></td></tr><tr><td class="what">multiplying glyph at 0</td><td class="buf"><code>[x=0]</code></td></tr><tr><td class="what">multiplied glyphs at 0,1</td><td class="buf"><code>[f=0|i=0]</code></td></tr><tr><td class="what">end lookup 4 feature &#x27;ccmp&#x27;</td><td class="buf"><code>[f=0|i=0]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;latn&#x27;</td><td class="buf"><code>[f=0|i=0]</code></td></tr></tbody></table></div>
+<blockquote>
+<p id="ix-32">For type designers: in one stage, the order of lookups in the LookupList is what counts. A lookup whose output another lookup should see must come first in the list, whatever features they belong to. In a feature file, that means writing it first.</p>
+</blockquote>
+<p id="ix-33">The trace also shows HarfBuzz skipping lookups “because no glyph matches”. That’s the first of several shortcuts, which come next.</p>
+<h2 id="running-one-lookup">Running one lookup</h2>
+<p id="ix-34">The loop that runs a lookup over the buffer is short enough to read in full. It’s <code>apply_forward</code> in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>hb-ot-layout.cc</code></a>, and here it is with the caching details left out:</p>
+<pre><code class="language-c++">while (buffer-&gt;successful)
+{
+  /* Skip ahead over glyphs this lookup can't touch. */
+  unsigned j = buffer-&gt;idx;
+  while (j &lt; buffer-&gt;len &amp;&amp;
+         !(accel.digest.may_have (info[j].codepoint) &amp;&amp;
+           (info[j].mask &amp; c-&gt;lookup_mask) &amp;&amp;
+           c-&gt;check_glyph_property (&amp;info[j], c-&gt;lookup_props)))
+    j++;
+  buffer-&gt;next_glyphs (j - buffer-&gt;idx);   /* copy them to the output */
+  if (buffer-&gt;idx &gt;= buffer-&gt;len)
+    break;
+
+  /* Try each subtable here; if none applies, move on one glyph. */
+  if (!accel.apply (c))
+    buffer-&gt;next_glyph ();
+}
+</code></pre>
+<p>Four ideas are packed into it.</p>
+<h3 id="an-input-buffer-and-an-output-buffer">An input buffer and an output buffer</h3>
+<p id="ix-35">A forward GSUB lookup reads from the buffer’s glyphs and writes to a second, <em>output</em> array as it goes. <code>buffer-&gt;idx</code> is the position in the input. <code>next_glyph()</code> copies the current glyph to the output unchanged and moves on. A substitution writes its result to the output instead, and moves <code>idx</code> past whatever it consumed. At the end, <code>buffer-&gt;sync()</code> makes the output the new contents of the buffer. This is why a multiple substitution can grow the text without shuffling the whole array along.</p>
+<p id="ix-36">It also decides what a lookup can see. Glyphs before <code>idx</code> are in the output, so they are <em>already</em> processed by this lookup. Glyphs from <code>idx</code> on are not processed yet. So a lookup never revisits its own output at the same position, but its output does affect matches further on, when a later rule looks <em>backwards</em>. The test font’s <code>calt</code> lookup changes <code>e</code> to <code>e.init</code> after a space or after an <code>e.init</code>:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of ligatures.ttf, lookup 3"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 3: Chained context substitution (type 6)
+  lookupFlag: none
+  subtable 0: ChainContextSubstFormat3
+    backtrack: [space e.init]
+    input:     [e]
+    lookahead: (none)
+    lookupRecord: input[0] → lookup 2</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature calt {
+  sub [space e.init] e&#x27; lookup INIT;
+} calt;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;3&quot;&gt;
+  &lt;LookupType value=&quot;6&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;ChainContextSubst index=&quot;0&quot; Format=&quot;3&quot;&gt;
+    &lt;!-- BacktrackGlyphCount=1 --&gt;
+    &lt;BacktrackCoverage index=&quot;0&quot;&gt;
+      &lt;Glyph value=&quot;space&quot;/&gt;
+      &lt;Glyph value=&quot;e.init&quot;/&gt;
+    &lt;/BacktrackCoverage&gt;
+    &lt;!-- InputGlyphCount=1 --&gt;
+    &lt;InputCoverage index=&quot;0&quot;&gt;
+      &lt;Glyph value=&quot;e&quot;/&gt;
+    &lt;/InputCoverage&gt;
+    &lt;!-- LookAheadGlyphCount=0 --&gt;
+    &lt;!-- SubstCount=1 --&gt;
+    &lt;SubstLookupRecord index=&quot;0&quot;&gt;
+      &lt;SequenceIndex value=&quot;0&quot;/&gt;
+      &lt;LookupListIndex value=&quot;2&quot;/&gt;
+    &lt;/SubstLookupRecord&gt;
+  &lt;/ChainContextSubst&gt;
+&lt;/Lookup&gt;</code></pre></div><figcaption>ligatures.ttf, lookup 3</figcaption></figure>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">ligatures.ttf</td><td class="in"><span class="txt">eee</span><span class="cps">U+0065 U+0065 U+0065</span></td><td class="opt"></td><td class="out"><code>[e=0+500|e=1+500|e=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-37">Each <code>e</code> sees the <code>e.init</code> that the same lookup has just written before it, so the change runs all the way along. If the rule had looked ahead instead, at glyphs not yet processed, it would only ever see the original <code>e</code>s.</p>
+<p id="ix-38">Reverse chained single substitutions (type 8) work the other way. They run from the end of the buffer to the start, in place, with no output buffer, and their rules look ahead at glyphs they have already changed. That direction is the whole reason the type exists: it lets a choice made at the end of a word, as in Nastaliq, depend on the glyphs after it.</p>
+<h3 id="three-filters-before-any-real-work">Three filters before any real work</h3>
+<p id="ix-39">Most lookups don’t apply to most glyphs, so HarfBuzz tries hard not to do the work of finding that out. Each lookup has a <strong>set digest</strong>: a tiny summary, three 64-bit masks, of every glyph its subtables’ coverage tables contain. It’s like a Bloom filter. Asking whether it <em>may</em> contain a glyph costs a few bit operations. “No” is always right, while “maybe” can be wrong, which costs only time. The buffer keeps a digest of its glyphs too, updated as substitutions happen. The digests are checked at three levels:</p>
+<ol>
+<li id="ix-40">Before a lookup runs at all, its digest is compared with the buffer’s. If they have nothing in common, the lookup is skipped: “skipped lookup … because no glyph matches”.</li>
+<li id="ix-41">In the loop above, each glyph is checked against the lookup’s digest, so glyphs it can’t touch are skipped in a tight loop.</li>
+<li>Each subtable has its own digest, checked before its coverage table is searched.</li>
+</ol>
+<p id="ix-42">The digest is fast when a lookup covers a compact range of glyph IDs and useless when it covers glyphs from all over the font, as <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-set-digest.hh"><code>hb-set-digest.hh</code></a> says. Ligature lookups also get a digest of the glyphs that can come <em>second</em> in a ligature, so HarfBuzz can see that an <code>f</code> followed by an <code>o</code> can’t start any ligature without looking at any.</p>
+<h3 id="the-mask">The mask</h3>
+<p id="ix-43">Every glyph in the buffer carries a 32-bit <strong>mask</strong>. During planning, each feature gets one or more bits of it, and each glyph’s mask has those bits set where the feature is on. A feature applied to the whole text, like <code>liga</code>, sets them on every glyph. A feature applied to a range sets them only on the glyphs from those clusters. A lookup runs with its feature’s bits as <code>lookup_mask</code>, and a glyph whose mask doesn’t share any of them isn’t touched. How features get their bits, and what happens when the bits run out, is in <a href="from-features-to-lookups.html#mask-bits">From features to lookups</a>.</p>
+<p id="ix-44">A feature with a value other than 1 gets more than one bit, and the value is stored in them. Alternate substitution reads it to choose which alternative to use: <code>salt=2</code> means the second alternate. A value larger than the number of alternates means no substitution at all.</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of ligatures.ttf, lookup 1"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 1: Alternate substitution (type 3)
+  lookupFlag: none
+  subtable 0: AlternateSubstFormat1
+    coverage: [a]
+    alternateSet:
+      a → [a.alt1 a.alt2 a.alt3]</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature salt {
+  sub a from [a.alt1 a.alt2 a.alt3];
+} salt;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;1&quot;&gt;
+  &lt;LookupType value=&quot;3&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;AlternateSubst index=&quot;0&quot;&gt;
+    &lt;AlternateSet glyph=&quot;a&quot;&gt;
+      &lt;Alternate glyph=&quot;a.alt1&quot;/&gt;
+      &lt;Alternate glyph=&quot;a.alt2&quot;/&gt;
+      &lt;Alternate glyph=&quot;a.alt3&quot;/&gt;
+    &lt;/AlternateSet&gt;
+  &lt;/AlternateSubst&gt;
+&lt;/Lookup&gt;</code></pre></div><figcaption>ligatures.ttf, lookup 1</figcaption></figure>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">ligatures.ttf</td><td class="in"><span class="txt">a</span><span class="cps">U+0061</span></td><td class="opt"></td><td class="out"><code>[a=0+500]</code></td></tr><tr><td class="font">ligatures.ttf</td><td class="in"><span class="txt">a</span><span class="cps">U+0061</span></td><td class="opt">--features=salt</td><td class="out"><code>[a.alt1=0+500]</code></td></tr><tr><td class="font">ligatures.ttf</td><td class="in"><span class="txt">a</span><span class="cps">U+0061</span></td><td class="opt">--features=salt=3</td><td class="out"><code>[a.alt3=0+500]</code></td></tr><tr><td class="font">ligatures.ttf</td><td class="in"><span class="txt">a</span><span class="cps">U+0061</span></td><td class="opt">--features=salt=4</td><td class="out"><code>[a=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-45">The <code>rand</code> feature takes this one step further. HarfBuzz turns it on by default, in every application, with the largest possible value, which Alternate substitution reads as “choose at random”. It picks using a simple pseudo-random generator, <code>minstd_rand</code>, whose state is kept in the buffer and starts at 1, so the same text shaped the same way gives the same “random” result. Applications can set the state with <code>hb_buffer_set_random_state</code>. Each choice moves the state on, so a later choice depends on every earlier one, and HarfBuzz marks the whole buffer unsafe to break: no part of it can be reshaped on its own and be sure of coming out the same. (The test font has no <code>rand</code> lookup.)</p>
+<h3 id="glyph-properties">Glyph properties</h3>
+<p id="ix-46">Last, <code>check_glyph_property</code> asks whether the glyph is one this lookup ignores. That depends on the lookup’s flags and on the glyph’s class, and it’s the subject of the next section.</p>
+<h2 id="which-glyphs-a-lookup-sees">Which glyphs a lookup sees</h2>
+<p id="ix-47">A ligature lookup for <code>f i</code> would be fairly useless if an accent between the two letters stopped it working. OpenType’s answer is the <strong>lookup flag</strong>. A lookup can ignore base glyphs, ligatures or marks, ignore all marks except one attachment class, or ignore all marks except those in one mark-filtering set. Whether a glyph is a base, a ligature or a mark comes from its class in the GDEF table.</p>
+<p id="ix-48">HarfBuzz reads those classes into each glyph’s <em>glyph properties</em> (<code>glyph_props</code>) just before GSUB starts, in <code>_hb_ot_layout_set_glyph_props</code>. A font with no GDEF classes gets classes worked out from Unicode instead (<code>hb_synthesize_glyph_classes</code>): non-spacing marks are marks, and everything else is a base, with one exception. Default-ignorable characters, such as the combining grapheme joiner and the Mongolian variation selectors, are never classed as marks, even though they are non-spacing. A comment in the source explains that some Mongolian fonts without GDEF rely on this.</p>
+<p id="ix-49">When a substitution puts in a new glyph, HarfBuzz looks up that glyph’s GDEF class, and also records how it got there: the property bits <code>SUBSTITUTED</code>, <code>LIGATED</code> and <code>MULTIPLIED</code> stay with the glyph from then on. The Indic and USE shapers use them: if a consonant has been ligated, for example, the Indic shaper stops treating it as a plain consonant (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-indic.cc#L56"><code>hb-ot-shaper-indic.cc:56</code></a>).</p>
+<h3 id="skipping-step-by-step">Skipping, step by step</h3>
+<p id="ix-50">When a lookup matches a sequence, the second glyph onwards is found by a <strong>skipping iterator</strong>, <code>skipping_iterator_t</code> in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh"><code>hb-ot-layout-gsubgpos.hh</code></a>. For each glyph it comes to, it asks two questions, and the answers have three values each, not two.</p>
+<p id="ix-51"><em>May this glyph be skipped?</em> <code>SKIP_YES</code> if the lookup flags say to ignore it. <code>SKIP_MAYBE</code> if it’s a default-ignorable character that this lookup is allowed to pass over (more on which in a moment). <code>SKIP_NO</code> otherwise.</p>
+<p id="ix-52"><em>Does it match?</em> If the rule names glyphs, they’re compared: <code>MATCH_YES</code> or <code>MATCH_NO</code>. If it doesn’t (some fast paths just want “the next glyph”), it’s <code>MATCH_MAYBE</code>. A glyph whose mask lacks the lookup’s bits, or one in a different syllable when the lookup works per syllable, is always <code>MATCH_NO</code>.</p>
+<p>The answers are then combined like this:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>skip: YES</th>
+<th>skip: MAYBE</th>
+<th>skip: NO</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>match: YES</strong></td>
+<td>skip</td>
+<td>match</td>
+<td>match</td>
+</tr>
+<tr>
+<td><strong>match: MAYBE</strong></td>
+<td>skip</td>
+<td>skip</td>
+<td>match</td>
+</tr>
+<tr>
+<td><strong>match: NO</strong></td>
+<td>skip</td>
+<td>skip</td>
+<td>fail</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-53">The middle column is the subtle one. A joiner is passed over, unless the rule actually asks for it, in which case it matches. So a font can have a rule that deliberately uses a zero-width joiner, and still have its other rules work across one.</p>
+<h3 id="joiners">Joiners</h3>
+<p id="ix-54">Which default ignorables can be passed over depends on whether the glyph is part of the input or of the context, and on two flags a feature can be given during planning, “manual ZWJ” and “manual ZWNJ” (<code>F_MANUAL_ZWJ</code> and <code>F_MANUAL_ZWNJ</code> in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.hh"><code>hb-ot-map.hh</code></a>). In GSUB:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>ZWJ</th>
+<th id="ix-55">ZWNJ</th>
+<th id="ix-56">Hidden: CGJ, Mongolian FVS1–4, TAG characters</th>
+<th>Other default ignorables</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>input</td>
+<td id="ix-57">passed over, unless the feature has manual ZWJ</td>
+<td>blocks</td>
+<td>block</td>
+<td>passed over</td>
+</tr>
+<tr>
+<td id="ix-58">context</td>
+<td>passed over</td>
+<td id="ix-59">passed over, unless the feature has manual ZWNJ</td>
+<td>block</td>
+<td>passed over</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-60">So, in the default case, a zero-width joiner doesn’t stop a ligature, and a zero-width non-joiner does. That’s what they are for: ZWNJ asks for <em>no</em> joining. The “hidden” characters are default ignorables too, but they’re there to change the shaping, so GSUB never looks past them. The combining grapheme joiner, for example, is how a writer stops two marks from being reordered or combined (HarfBuzz issue #554). A CGJ that turns out to keep no marks apart loses its hidden bit during normalization, and is then passed over like any other default ignorable, as <a href="unicode-inside-harfbuzz.html#cgj-sometimes">Unicode inside HarfBuzz</a> shows. GPOS has rules of its own, covered in the <a href="gpos.html">next chapter</a>.</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">ligatures.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">ligatures.ttf</td><td class="in"><span class="txt">f⟨ZWJ⟩i</span><span class="cps">U+0066 U+200D U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900|space=0+0]</code></td></tr><tr><td class="font">ligatures.ttf</td><td class="in"><span class="txt">f⟨ZWNJ⟩i</span><span class="cps">U+0066 U+200C U+0069</span></td><td class="opt"></td><td class="out"><code>[f=0+500|space=1+0|i=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-61">The joiners are still in the output. They have no glyph in this font, and late in shaping HarfBuzz replaces default ignorables with an invisible glyph of zero width, here the space glyph. The ZWJ comes after the ligature, in the same cluster. Where glyphs that a ligature passed over end up is the next subject.</p>
+<p id="ix-62">The flags come from planning (<a href="from-features-to-lookups.html#the-flags">From features to lookups</a>). For the default shaper, only <code>mark</code> and <code>mkmk</code> have them. The Arabic shaper gives manual ZWJ to nearly all its features, so that a ZWJ there really does block a ligature, and the Indic shaper gives both flags to its basic forms features (<code>nukt</code>, <code>akhn</code>, <code>rphf</code> and the rest). One further rule only applies to GSUB: in scripts whose shaper splits text into syllables, a lookup can be limited to one syllable at a time, so that no rule can match across a syllable boundary. The matcher checks for that too.</p>
+<h2 id="the-lookup-types-as-harfbuzz-runs-them">The lookup types, as HarfBuzz runs them</h2>
+<p id="ix-63">This section is about how HarfBuzz runs each type. For how to write each one in a feature file, with an example from a real script for most of them, see “Types of Substitution Rule” in Simon Cozens’ <a href="https://simoncozens.github.io/fonts-and-layout/features-2.html#types-of-substitution-rule"><em>Fonts and Layout for Global Scripts</em></a>.</p>
+<h3 id="single-substitution">Single substitution</h3>
+<p id="ix-64">The simplest type. Format 1 stores a single number, <code>deltaGlyphID</code>, which is added to the glyph ID of every glyph in its coverage. Format 2 stores a list of output glyphs, one for each covered glyph.</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of ligatures.ttf, lookup 2"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button><button type="button" role="tab" data-view="cpp">HarfBuzz C++</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 2: Single substitution (type 1)
+  lookupFlag: none
+  subtable 0: SingleSubstFormat1
+    coverage: [e]
+    deltaGlyphID: +13
+    (so: e → e.init)</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>lookup INIT {
+  sub e by e.init;
+} INIT;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;2&quot;&gt;
+  &lt;LookupType value=&quot;1&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;SingleSubst index=&quot;0&quot;&gt;
+    &lt;Substitution in=&quot;e&quot; out=&quot;e.init&quot;/&gt;
+  &lt;/SingleSubst&gt;
+&lt;/Lookup&gt;</code></pre></div><div class="pane" data-view="cpp" data-label="HarfBuzz C++" role="tabpanel"><pre><code>template &lt;typename Types&gt;
+struct SingleSubstFormat1_3
+{
+  protected:
+  HBUINT16      format;                 /* Format identifier--format = 1 */
+  typename Types::template LOffsetTo&lt;Coverage&gt;
+                coverage;               /* Offset to Coverage table--from
+                                         * beginning of Substitution table */
+  typename Types::HBUINT
+                deltaGlyphID;           /* Add to original GlyphID to get
+                                         * substitute GlyphID, modulo 0x10000 */
+
+  public:
+  DEFINE_SIZE_STATIC (2 + Types::LOffset::static_size + Types::HBUINT::static_size);
+  /* … */
+};</code></pre><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/SingleSubstFormat1.hh#L99-L112">src/OT/Layout/GSUB/SingleSubstFormat1.hh:99</a></div><figcaption>ligatures.ttf, lookup 2</figcaption></figure>
+<p id="ix-65">feaLib chose format 1 here because <code>e.init</code> happens to be 13 glyphs after <code>e</code>. HarfBuzz does the addition modulo 2<sup>16</sup> (2<sup>24</sup> for the wide format 3), with <code>(glyph_id + delta) &amp; mask</code>. So a negative delta, or a sum past the end of the range, wraps around. That’s what the specification says, but not every implementation has always done it.</p>
+<h3 id="multiple-substitution">Multiple substitution</h3>
+<p id="ix-66">One glyph becomes several. In the test font, <code>ccmp</code> turns <code>x</code> into <code>f i</code>:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of ligatures.ttf, lookup 4"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 4: Multiple substitution (type 2)
+  lookupFlag: none
+  subtable 0: MultipleSubstFormat1
+    coverage: [x]
+    sequence:
+      x → f i</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature ccmp {
+  sub x by f i;
+} ccmp;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;4&quot;&gt;
+  &lt;LookupType value=&quot;2&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;MultipleSubst index=&quot;0&quot;&gt;
+    &lt;Substitution in=&quot;x&quot; out=&quot;f,i&quot;/&gt;
+  &lt;/MultipleSubst&gt;
+&lt;/Lookup&gt;</code></pre></div><figcaption>ligatures.ttf, lookup 4</figcaption></figure>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">ligatures.ttf</td><td class="in"><span class="txt">x</span><span class="cps">U+0078</span></td><td class="opt"></td><td class="out"><code>[f=0+500|i=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-67">Both output glyphs keep the cluster of the input, 0. Each is marked as a component of the original, with <code>MULTIPLIED</code> and a component number, so that later lookups and GPOS can tell they came from one character. If the font has no GDEF classes to say what the new glyphs are, and the input glyph was a ligature, they are classed as bases.</p>
+<p id="ix-68">Two cases are special. A sequence of just one glyph is treated as a single substitution, in place, and the glyph isn’t marked as multiplied. A sequence of <em>no</em> glyphs deletes the glyph. The specification doesn’t allow that, but Uniscribe does, and fonts rely on it, so HarfBuzz follows Uniscribe (HarfBuzz issue #253).</p>
+<h3 id="alternate-substitution">Alternate substitution</h3>
+<p id="ix-69">Covered above, under “The mask”: the feature’s value picks the alternate, and <code>rand</code> picks one at random.</p>
+<h3 id="ligature-substitution">Ligature substitution</h3>
+<p id="ix-70">Ligatures are where most of GSUB’s subtleties are, and HarfBuzz’s source says so: the comment above <code>match_input</code> calls ligating “perhaps the trickiest part of OpenType”.</p>
+<h4 id="first-match-wins">First match wins</h4>
+<p id="ix-71">A subtable’s coverage finds the ligature set for the first glyph. HarfBuzz then tries the ligatures in the set <em>in the order they are stored</em>, and the first that matches is used. The specification says ligatures should be ordered by preference, but HarfBuzz does no sorting of its own. If <code>f f</code> came before <code>f f i</code>, then <code>ffi</code> would become <code>f_f</code> followed by <code>i</code>.</p>
+<p id="ix-72">You can’t write that font in a feature file. feaLib sorts each set longest first whatever order the rules are written in: the feature file above has <code>sub f i</code> first and <code>sub f f i</code> second, and the compiled lookup has them the other way round. The font <code>shortest-first.ttf</code> was built by reversing the sets after compiling:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of shortest-first.ttf, lookup 0"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="ttx">TTX</button><button type="button" role="tab" data-view="hex">Bytes</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 0: Ligature substitution (type 4)
+  lookupFlag: IgnoreMarks
+  subtable 0: LigatureSubstFormat1
+    coverage: [f]
+    ligatureSet:
+      (f)
+        1. [i] → f_i
+        2. [l] → f_l
+        3. [f] → f_f
+        4. [f i] → f_f_i</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;0&quot;&gt;
+  &lt;LookupType value=&quot;4&quot;/&gt;
+  &lt;LookupFlag value=&quot;8&quot;/&gt;&lt;!-- ignoreMarks --&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;LigatureSubst index=&quot;0&quot;&gt;
+    &lt;LigatureSet glyph=&quot;f&quot;&gt;
+      &lt;Ligature components=&quot;i&quot; glyph=&quot;f_i&quot;/&gt;
+      &lt;Ligature components=&quot;l&quot; glyph=&quot;f_l&quot;/&gt;
+      &lt;Ligature components=&quot;f&quot; glyph=&quot;f_f&quot;/&gt;
+      &lt;Ligature components=&quot;f,i&quot; glyph=&quot;f_f_i&quot;/&gt;
+    &lt;/LigatureSet&gt;
+  &lt;/LigatureSubst&gt;
+&lt;/Lookup&gt;</code></pre></div><div class="pane" data-view="hex" data-label="Bytes" role="tabpanel"><pre><code>── Lookup 0 (at 0x0042)
+0042  00 04   lookupType
+0044  00 08   lookupFlag (IgnoreMarks)
+0046  00 01   subTableCount
+0048  00 46   subtableOffsets[0] → subtable 0
+── subtable 0: LigatureSubstFormat1 (at 0x0088)
+0088  00 01   substFormat
+008a  00 3e   coverageOffset → Coverage
+008c  00 01   ligatureSetCount
+008e  00 5e   ligatureSetOffsets[0] → LigatureSet 0
+── Coverage (at 0x00c6)
+00c6  00 01   format
+00c8  00 01   glyphCount
+00ca  00 04   glyphArray[0] = f
+── LigatureSet 0 (at 0x00e6)
+00e6  00 04   ligatureCount
+00e8  00 12   ligatureOffsets[0] → Ligature 0.0
+00ea  00 18   ligatureOffsets[1] → Ligature 0.1
+00ec  00 1e   ligatureOffsets[2] → Ligature 0.2
+00ee  00 24   ligatureOffsets[3] → Ligature 0.3
+── Ligature 0.0 (at 0x00f8)
+00f8  00 09   ligatureGlyph = f_i
+00fa  00 02   componentCount (including the first)
+00fc  00 05   componentGlyphIDs[0] = i
+── Ligature 0.1 (at 0x00fe)
+00fe  00 0a   ligatureGlyph = f_l
+0100  00 02   componentCount (including the first)
+0102  00 06   componentGlyphIDs[0] = l
+── Ligature 0.2 (at 0x0104)
+0104  00 0b   ligatureGlyph = f_f
+0106  00 02   componentCount (including the first)
+0108  00 04   componentGlyphIDs[0] = f
+── Ligature 0.3 (at 0x010a)
+010a  00 0c   ligatureGlyph = f_f_i
+010c  00 03   componentCount (including the first)
+010e  00 04   componentGlyphIDs[0] = f
+0110  00 05   componentGlyphIDs[1] = i</code></pre></div><figcaption>shortest-first.ttf, lookup 0</figcaption></figure>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">ligatures.ttf</td><td class="in"><span class="txt">ffi</span><span class="cps">U+0066 U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_f_i=0+900]</code></td></tr><tr><td class="font">shortest-first.ttf</td><td class="in"><span class="txt">ffi</span><span class="cps">U+0066 U+0066 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_f=0+900|i=2+500]</code></td></tr></tbody></table></div>
+<blockquote>
+<p id="ix-73">For type designers: the feature file view hides the order HarfBuzz uses. If a font’s ligatures come from somewhere other than feaLib or a tool like it, look at the order in TTX or in the spec-like view.</p>
+</blockquote>
+<h4 id="the-second-glyph-fast-path">The second-glyph fast path</h4>
+<p id="ix-74">Since most ligature sets hold several ligatures and most attempts fail, <code>LigatureSet::apply</code> first finds the glyph after the current one, with skipping, and only tries ligatures whose second component is that glyph. If the next glyph might be skipped (a joiner, say), it falls back to trying every ligature in order. This is purely a speed-up, but it’s why the code has two loops where one would seem enough.</p>
+<h4 id="matching-and-the-marks-in-between">Matching, and the marks in between</h4>
+<p id="ix-75"><code>Ligature::apply</code> calls <code>match_input</code>, which finds each remaining component with the skipping iterator and records where it found it. In the test font, the <code>liga</code> lookup has the flag <code>IgnoreMarks</code>, so a combining acute between <code>f</code> and <code>i</code> is passed over:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape ligatures.ttf "f◌́i"  --trace</code></div><table><tbody><tr><td class="what">start lookup 0 feature &#x27;liga&#x27;</td><td class="buf"><code>[f=0|acutecomb=0|i=2]</code></td></tr><tr><td class="what">ligating glyphs at 0,2</td><td class="buf"><code>[f=0|acutecomb=0|i=2]</code></td></tr><tr><td class="what">ligated glyph at 0</td><td class="buf"><code>[f_i=0|acutecomb=0]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;liga&#x27;</td><td class="buf"><code>[f_i=0|acutecomb=0]</code></td></tr></tbody></table></div>
+<p id="ix-76">The trace says “ligating glyphs at 0,2”: the components were found at positions 0 and 2, with the mark at 1 passed over. <code>ligate_input</code> then does three things:</p>
+<ol>
+<li id="ix-77">It merges the clusters of everything from the first component to the last, so the ligature, and the mark inside it, all belong to cluster 0.</li>
+<li id="ix-78">It writes the ligature glyph in place of the first component and removes the others. The glyphs that were passed over aren’t removed: they are kept, in order, <em>after</em> the ligature.</li>
+<li id="ix-79">It gives the ligature a new <strong>ligature ID</strong>, and records its number of components. Each passed-over mark gets the same ligature ID and the number of the component it followed.</li>
+</ol>
+<p id="ix-80">That last step is what lets a mark find the right part of a ligature later on. GPOS’s mark-to-ligature attachment uses it to choose which of the ligature’s anchors to use. This font has no GPOS, so HarfBuzz positions the mark with its fallback positioner (<a href="fallbacks.html">Fallbacks</a>), which divides the ligature into equal parts, one for each component. Even so, the effect shows (and <a href="gpos.html">GPOS: positioning glyphs</a> shows it with real anchors):</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">ligatures.ttf</td><td class="in"><span class="txt">f◌́i</span><span class="cps">U+0066 U+0301 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900|acutecomb=0@-675,562+0]</code></td></tr><tr><td class="font">ligatures.ttf</td><td class="in"><span class="txt">fi◌́</span><span class="cps">U+0066 U+0069 U+0301</span></td><td class="opt"></td><td class="out"><code>[f_i=0+900|acutecomb=0@-225,562+0]</code></td></tr><tr><td class="font">ligatures.ttf</td><td class="in"><span class="txt">f◌́f◌́i</span><span class="cps">U+0066 U+0301 U+0066 U+0301 U+0069</span></td><td class="opt"></td><td class="out"><code>[f_f_i=0+900|acutecomb=0@-750,562+0|acutecomb=0@-450,562+0]</code></td></tr></tbody></table></div>
+<p id="ix-81">The same ligature glyph, with the same accent, but the accent sits over a different part of it: −675 when it was typed after the <code>f</code>, −225 when it was typed after the <code>i</code>. That’s half the ligature’s 900-unit width apart. With three components, the two accents are a third of the width apart.</p>
+<h4 id="edge-cases-the-code-handles">Edge cases the code handles</h4>
+<p>The comments in <code>match_input</code> and <code>ligate_input</code> are a list of real fonts that broke, and each is a rule HarfBuzz now follows:</p>
+<ul>
+<li id="ix-82"><strong>Marks belong to one ligature.</strong> Glyphs attached to <em>different</em> components of an earlier ligature can’t be ligated together. With LAM, SHADDA, LAM, FATHA, HEH, where LAM-LAM-HEH has already formed a ligature, the SHADDA and FATHA are left belonging to different components of it, and mustn’t then form a ligature of their own. There are two exceptions: a ligature formed with marks that belong to it, which Indic fonts need, and marks whose base ligature this lookup ignores anyway (HarfBuzz issue #545).</li>
+<li id="ix-83"><strong>A base and its marks make a base.</strong> If a base glyph and marks ligate, the result is treated as a base, not a ligature, so later marks can still attach to it (issue #1109).</li>
+<li id="ix-84"><strong>Marks make a mark.</strong> If every component is a mark, the result is a mark ligature. It keeps the ligature ID it had, so it can still attach to the ligature it sat on.</li>
+<li id="ix-85"><strong>Ligatures of ligatures.</strong> When a ligature is formed from components that are themselves ligatures with marks attached, the marks have to be renumbered to the right component of the new, larger ligature, including marks that come after the end of the matched sequence. <code>ligate_input</code> loops forward to find them.</li>
+<li><strong>A ligature of one.</strong> A ligature with one component is a single substitution, done in place, and isn’t marked as ligated.</li>
+</ul>
+<p id="ix-86">A ligature formed from a non-spacing mark has its Unicode general category changed to “other letter”, so that later steps stop treating it as a mark.</p>
+<h3 id="context-and-chained-context">Context and chained context</h3>
+<p id="ix-87">Types 5 and 6 don’t substitute anything themselves. They match a pattern and then run other lookups, the <em>nested</em> lookups, at chosen positions inside it. Type 5 matches only an input sequence. Type 6 matches a backtrack sequence before it and a lookahead sequence after it as well. Each has three formats: rules listed per first glyph (format 1), rules written in glyph classes (format 2), and one rule written as a coverage table per position (format 3). The beyond-64k formats 4 and 5 are 1 and 2 with wider glyph IDs. feaLib wrote the test font’s <code>calt</code> rule as a format 3 subtable:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of ligatures.ttf, lookup 3"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 3: Chained context substitution (type 6)
+  lookupFlag: none
+  subtable 0: ChainContextSubstFormat3
+    backtrack: [space e.init]
+    input:     [e]
+    lookahead: (none)
+    lookupRecord: input[0] → lookup 2</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature calt {
+  sub [space e.init] e&#x27; lookup INIT;
+} calt;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;3&quot;&gt;
+  &lt;LookupType value=&quot;6&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;ChainContextSubst index=&quot;0&quot; Format=&quot;3&quot;&gt;
+    &lt;!-- BacktrackGlyphCount=1 --&gt;
+    &lt;BacktrackCoverage index=&quot;0&quot;&gt;
+      &lt;Glyph value=&quot;space&quot;/&gt;
+      &lt;Glyph value=&quot;e.init&quot;/&gt;
+    &lt;/BacktrackCoverage&gt;
+    &lt;!-- InputGlyphCount=1 --&gt;
+    &lt;InputCoverage index=&quot;0&quot;&gt;
+      &lt;Glyph value=&quot;e&quot;/&gt;
+    &lt;/InputCoverage&gt;
+    &lt;!-- LookAheadGlyphCount=0 --&gt;
+    &lt;!-- SubstCount=1 --&gt;
+    &lt;SubstLookupRecord index=&quot;0&quot;&gt;
+      &lt;SequenceIndex value=&quot;0&quot;/&gt;
+      &lt;LookupListIndex value=&quot;2&quot;/&gt;
+    &lt;/SubstLookupRecord&gt;
+  &lt;/ChainContextSubst&gt;
+&lt;/Lookup&gt;</code></pre></div><figcaption>ligatures.ttf, lookup 3</figcaption></figure>
+<p id="ix-88">Matching uses the same skipping iterator as ligatures, with two differences for the backtrack and lookahead. Their glyphs need not have the lookup’s mask bits, because a context isn’t part of what’s being changed. And ZWJ is always passed over there. As shown earlier, the backtrack is matched against the <em>output</em> buffer, so it sees glyphs this lookup has already changed.</p>
+<p id="ix-89">Once a rule matches, <code>apply_lookup</code> runs each nested lookup in turn, at the position its <code>lookupRecord</code> gives:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape ligatures.ttf "e"  --trace</code></div><table><tbody><tr><td class="what">start lookup 3 feature &#x27;calt&#x27;</td><td class="buf"><code>[e=0]</code></td></tr><tr><td class="what">end lookup 3 feature &#x27;calt&#x27;</td><td class="buf"><code>[e=0]</code></td></tr></tbody></table></div>
+<p id="ix-90">A nested lookup may change the length of the buffer, by ligating or multiplying, and <code>apply_lookup</code> then has to work out where the later positions in the pattern have moved to. It assumes that new glyphs were added straight after the current position, and that removed ones were the positions after it. A long comment in the source explains that this guess is not always right (HarfBuzz discussion #3538) and how it could be improved.</p>
+<p id="ix-91">Nesting is limited. A lookup can nest 64 deep at most (<code>HB_MAX_NESTING_LEVEL</code>); one level deeper and the whole buffer is marked unsuccessful (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L1145"><code>hb-ot-layout-gsubgpos.hh:1145</code></a>), so a single self-recursive rule stops all further shaping. A pattern can be at most 64 glyphs long (<code>HB_MAX_CONTEXT_LENGTH</code>). And the buffer has a budget of operations (<code>max_ops</code>): 4,096 for each glyph, and at least 65,536. A font built to make shaping run for ever just stops when it runs out. These limits are in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>hb-limits.hh</code></a>, and the <a href="limits.html">Limits</a> appendix lists them all.</p>
+<h3 id="extension">Extension</h3>
+<p id="ix-92">An Extension subtable holds a 32-bit offset to a subtable of another type. It exists only because 16-bit offsets can’t reach far enough in large fonts. HarfBuzz follows the offset and carries on as if the subtable were there. Nothing else in this chapter changes for extension lookups.</p>
+<h2 id="what-a-feature-file-compiles-to">What a feature file compiles to</h2>
+<p id="ix-93">HarfBuzz never sees a feature file, only the lookups it was compiled to. Most rules compile to what they look like, but a few don’t, and HarfBuzz follows the lookups. This section shows four, compiled by feaLib from <code>constructs.fea</code>. Adobe’s <em>OpenType Feature File Specification</em> is the reference for the language itself.</p>
+<h3 id="an-ignore-rule">An ignore rule</h3>
+<p id="ix-94">The test font’s <code>calt</code> turns <em>f</em> into <code>a.alt1</code>, except before <em>i</em>:</p>
+<pre><code>feature calt {
+  ignore sub f' i;
+  sub f' by a.alt1;
+} calt;
+</code></pre>
+<p id="ix-95">That isn’t a rule and an exception to it. It is one chained-context lookup with two rules for <em>f</em>. The first has <em>i</em> as its lookahead and no nested lookups. The second calls a lookup that makes the substitution:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of constructs.ttf, lookup 0"><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button></div><div class="pane print" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature calt {
+  ignore sub f&#x27; i;
+  sub f&#x27; by a.alt1;
+} calt;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;0&quot;&gt;
+  &lt;LookupType value=&quot;6&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;ChainContextSubst index=&quot;0&quot; Format=&quot;1&quot;&gt;
+    &lt;Coverage&gt;
+      &lt;Glyph value=&quot;f&quot;/&gt;
+    &lt;/Coverage&gt;
+    &lt;!-- ChainSubRuleSetCount=1 --&gt;
+    &lt;ChainSubRuleSet index=&quot;0&quot;&gt;
+      &lt;!-- ChainSubRuleCount=2 --&gt;
+      &lt;ChainSubRule index=&quot;0&quot;&gt;
+        &lt;!-- BacktrackGlyphCount=0 --&gt;
+        &lt;!-- InputGlyphCount=1 --&gt;
+        &lt;!-- LookAheadGlyphCount=1 --&gt;
+        &lt;LookAhead index=&quot;0&quot; value=&quot;i&quot;/&gt;
+        &lt;!-- SubstCount=0 --&gt;
+      &lt;/ChainSubRule&gt;
+      &lt;ChainSubRule index=&quot;1&quot;&gt;
+        &lt;!-- BacktrackGlyphCount=0 --&gt;
+        &lt;!-- InputGlyphCount=1 --&gt;
+        &lt;!-- LookAheadGlyphCount=0 --&gt;
+        &lt;!-- SubstCount=1 --&gt;
+        &lt;SubstLookupRecord index=&quot;0&quot;&gt;
+          &lt;SequenceIndex value=&quot;0&quot;/&gt;
+          &lt;LookupListIndex value=&quot;1&quot;/&gt;
+        &lt;/SubstLookupRecord&gt;
+      &lt;/ChainSubRule&gt;
+    &lt;/ChainSubRuleSet&gt;
+  &lt;/ChainContextSubst&gt;
+&lt;/Lookup&gt;</code></pre></div><figcaption>constructs.ttf, lookup 0</figcaption></figure>
+<p id="ix-96">The rules for a glyph are tried in order, and the first that matches wins (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L4964"><code>hb-ot-layout-gsubgpos.hh:4964</code></a>). Before <em>i</em>, the first rule matches, applies nothing, and so stops the second being tried. The lookup itself carries on at the next glyph: an <code>ignore</code> rule passes over one position, and doesn’t end the lookup.</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">constructs.ttf</td><td class="in"><span class="txt">fi</span><span class="cps">U+0066 U+0069</span></td><td class="opt">--language=en</td><td class="out"><code>[f_i=0+900]</code></td></tr><tr><td class="font">constructs.ttf</td><td class="in"><span class="txt">fe</span><span class="cps">U+0066 U+0065</span></td><td class="opt">--language=en</td><td class="out"><code>[a.alt1=0+500|e=1+500]</code></td></tr></tbody></table></div>
+<p id="ix-97">The <em>f</em> before <em>i</em> is left for <code>liga</code>, which makes <code>f_i</code>.</p>
+<h3 id="an-inline-contextual-rule">An inline contextual rule</h3>
+<p id="ix-98"><code>sub f' by a.alt1</code> says what to substitute inside the rule. A chained-context rule can’t do that: it can only call another lookup. So feaLib made one, lookup 1, a single substitution that belongs to no feature:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of constructs.ttf, lookup 1"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 1: Single substitution (type 1)
+  lookupFlag: none
+  subtable 0: SingleSubstFormat1
+    coverage: [f]
+    deltaGlyphID: +9
+    (so: f → a.alt1)</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature calt {
+  ignore sub f&#x27; i;
+  sub f&#x27; by a.alt1;
+} calt;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;1&quot;&gt;
+  &lt;LookupType value=&quot;1&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;SingleSubst index=&quot;0&quot;&gt;
+    &lt;Substitution in=&quot;f&quot; out=&quot;a.alt1&quot;/&gt;
+  &lt;/SingleSubst&gt;
+&lt;/Lookup&gt;</code></pre></div><figcaption>constructs.ttf, lookup 1</figcaption></figure>
+<p id="ix-99">It runs only when the chained rule calls it:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape constructs.ttf "fe" --language=en --trace</code></div><table><tbody><tr><td class="what">start lookup 0 feature &#x27;calt&#x27;</td><td class="buf"><code>[f=0|e=1]</code></td></tr><tr><td class="what">start recursing to lookup 1 at 0</td><td class="buf"><code>[f=0|e=1]</code></td></tr><tr><td class="what">replacing glyph at 0 (single substitution)</td><td class="buf"><code>[f=0|e=1]</code></td></tr><tr><td class="what">replaced glyph at 0 (single substitution)</td><td class="buf"><code>[a.alt1=0|e=1]</code></td></tr><tr><td class="what">end recursing to lookup 1</td><td class="buf"><code>[a.alt1=0|e=1]</code></td></tr><tr><td class="what">end lookup 0 feature &#x27;calt&#x27;</td><td class="buf"><code>[a.alt1=0|e=1]</code></td></tr></tbody></table></div>
+<p id="ix-100">feaLib numbered it straight after the chained lookup, so it takes a number among the font’s own: the <code>liga</code> lookups written next are 2 and 3, not 1 and 2.</p>
+<h3 id="rules-of-different-types-in-one-block">Rules of different types in one block</h3>
+<p id="ix-101">A <code>feature</code> block can mix kinds of rule, but a lookup has only one type. feaLib starts a new lookup each time the type changes, and puts runs of rules of one type in the same lookup. The test font’s <code>liga</code> block has a ligature rule and then a single substitution:</p>
+<pre><code>feature liga {
+  sub f i by f_i;
+  sub x by e.init;
+} liga;
+</code></pre>
+<p id="ix-102">So <code>liga</code> has two lookups, 2 and 3. Each runs over the whole buffer before the next starts, so a later rule in the block sees what the earlier ones made, as if they had been written as separate lookups:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape constructs.ttf "fx" --language=en --trace</code></div><table><tbody><tr><td class="what">start lookup 2 feature &#x27;liga&#x27;</td><td class="buf"><code>[a.alt1=0|x=1]</code></td></tr><tr><td class="what">skipped lookup 2 feature &#x27;liga&#x27; because no glyph matches</td><td class="buf"><code>[a.alt1=0|x=1]</code></td></tr><tr><td class="what">end lookup 2 feature &#x27;liga&#x27;</td><td class="buf"><code>[a.alt1=0|x=1]</code></td></tr><tr><td class="what">start lookup 3 feature &#x27;liga&#x27;</td><td class="buf"><code>[a.alt1=0|x=1]</code></td></tr><tr><td class="what">replacing glyph at 1 (single substitution)</td><td class="buf"><code>[a.alt1=0|x=1]</code></td></tr><tr><td class="what">replaced glyph at 1 (single substitution)</td><td class="buf"><code>[a.alt1=0|e.init=1]</code></td></tr><tr><td class="what">end lookup 3 feature &#x27;liga&#x27;</td><td class="buf"><code>[a.alt1=0|e.init=1]</code></td></tr></tbody></table></div>
+<h3 id="rules-before-the-first-script">Rules before the first script</h3>
+<p id="ix-103">A rule before a feature block’s first <code>script</code> or <code>language</code> statement goes to every language system the font declares with <code>languagesystem</code>. A <code>language</code> statement then includes those rules too, unless it says <code>exclude_dflt</code>. The test font’s <code>salt</code> turns <em>a</em> into <code>a.alt2</code> for everyone, and <em>e</em> into <code>e.init</code> only in Turkish, which excludes the rest:</p>
+<pre><code>feature salt {
+  sub a by a.alt2;
+  script latn;
+  language TRK exclude_dflt;
+  sub e by e.init;
+} salt;
+</code></pre>
+<p id="ix-104">feaLib wrote two <code>salt</code> features into the FeatureList, one for the default language systems with lookup 4, and one for <code>TRK</code> with lookup 5 alone. HarfBuzz uses whichever the chosen language system lists (<a href="choosing-a-script-shaper.html#from-a-language-to-language-system-tags">Choosing a script shaper</a>):</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">constructs.ttf</td><td class="in"><span class="txt">ae</span><span class="cps">U+0061 U+0065</span></td><td class="opt">--features=salt --language=en</td><td class="out"><code>[a.alt2=0+500|e=1+500]</code></td></tr><tr><td class="font">constructs.ttf</td><td class="in"><span class="txt">ae</span><span class="cps">U+0061 U+0065</span></td><td class="opt">--features=salt --language=tr</td><td class="out"><code>[a=0+500|e.init=1+500]</code></td></tr></tbody></table></div>
+<blockquote>
+<p id="ix-105">For type designers: when a feature file seems to do something it doesn’t say, look at what it compiled to. <code>ttx -t GSUB</code> shows the lookups and which features use them, and a trace (<code>hb-shape --trace</code>, from a build with detailed traces) shows the order HarfBuzz runs them in.</p>
+</blockquote>
+<h2 id="clusters-and-safe-breaking">Clusters and safe breaking</h2>
+<p id="ix-106">Each substitution that combines glyphs merges their clusters, so every glyph keeps pointing at the text it came from. HarfBuzz also flags places where the text can’t be cut and reshaped in parts without changing the result: <code>unsafe_to_break</code>, and the weaker <code>unsafe_to_concat</code>. Matching records these even when it fails. A ligature that <em>almost</em> matched marks its glyphs as unsafe to join, because different text there might complete it. That’s why the second-glyph fast path takes care to flag what it looked at. <a href="buffers.html#glyph-flags">Buffers</a> explains how the flags are set and combined, and <a href="for-applications.html">For applications</a> what applications do with them.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src/OT/Layout/GSUB"><code>src/OT/Layout/GSUB/*.hh</code></a></td>
+<td>one file per subtable type and format: the structs, and their <code>apply</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh"><code>src/hb-ot-layout-gsubgpos.hh</code></a></td>
+<td>what GSUB and GPOS share: the apply context, the skipping iterator, <code>match_input</code>, <code>ligate_input</code>, contexts, <code>apply_lookup</code>, the lookup accelerator</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout.cc"><code>src/hb-ot-layout.cc</code></a></td>
+<td><code>apply_forward</code>, <code>apply_backward</code>, <code>apply_string</code>, and <code>hb_ot_map_t::apply</code>, which runs a plan’s lookups stage by stage</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-map.cc"><code>src/hb-ot-map.cc</code></a></td>
+<td>turning features into the sorted, staged list of lookups</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-set-digest.hh"><code>src/hb-set-digest.hh</code></a></td>
+<td>the set digests</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>src/hb-limits.hh</code></a></td>
+<td>nesting, length and operation limits</td>
+</tr>
+</tbody>
+</table>
+<p>To watch any of this happen, run <code>hb-shape</code> with <code>--trace</code>. For the more detailed messages shown on this page (“ligating glyphs at 0,2”), HarfBuzz has to be built with <code>HB_BUFFER_MESSAGE_MORE</code> defined, as this book’s <code>tools/build-harfbuzz.sh</code> does.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Within a stage, lookups run in LookupList order, not feature order.</li>
+<li>A forward lookup reads the input and writes the output. Its backtrack sees what it has already written, and its lookahead sees what it hasn’t reached yet.</li>
+<li>Lookup flags and GDEF classes decide what is passed over. Joiners have their own rules: in GSUB input, ZWJ is passed over and ZWNJ blocks.</li>
+<li>Ligatures are tried in the order they’re stored, and the first match wins. Marks that a ligature passed over stay after it, and remember which component they belong to.</li>
+<li>Glyph deletion by an empty multiple substitution is allowed, because Uniscribe allows it.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="normalization.html">← Normalization</a><a rel="next" href="gpos.html">GPOS: positioning glyphs →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

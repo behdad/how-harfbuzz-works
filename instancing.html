@@ -1,0 +1,837 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Instancing · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part X · Writing fonts</p>
+<h1 id="instancing">42. Instancing</h1>
+<p id="ix-1">A variable font holds a whole design space. An application that only ever uses the bold weight carries every other weight with it, and a renderer that can’t read variations can’t use the font at all. An <strong>instance</strong> is a font cut from a variable font at one position, or over a smaller part of its design space. Fixing an axis at one value is <strong>pinning</strong> it: the axis disappears, and its effect is baked into the outlines and metrics. Narrowing an axis’s range, and perhaps moving its default, is <strong>limiting</strong> it: the axis stays, with new limits, and every delta that refers to it has to be rewritten. A <strong>full instance</strong> pins every axis and is an ordinary static font; anything else is a <strong>partial instance</strong>, still variable.</p>
+<p id="ix-2">HarfBuzz instances inside its subsetter. Axis settings are part of the subset input, and each table’s <code>subset</code> method both drops the glyphs the <a href="subsetting.html#the-plan">plan</a> leaves out and rewrites the table’s variation data, in one pass. Pinning arrived in 6.0.0, for TrueType fonts with every axis pinned; partial instancing, CFF2, COLR v1 and the other tables followed, and the API was declared stable in 8.5.0 (NEWS). The algorithms are ports of fontTools’ instancer, <code>fontTools.varLib.instancer</code>, and the source says so file by file.</p>
+<p id="ix-3">The examples are cut from the test fonts of <a href="design-space.html">Design space</a>, and from one more built on them, by HarfBuzz’s <code>hb-subset</code> in <code>fonts/instancing/build.sh</code>. Every block on this page reads those fonts with <code>hb-shape</code>, <code>hb-info</code> and <code>hb-vector</code> from HarfBuzz 15.1.0; the TTX views are fontTools’ dumps of the same files.</p>
+<h2 id="asking-for-an-instance">Asking for an instance</h2>
+<p id="ix-4">Five functions in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.h"><code>hb-subset.h</code></a> set axes on an <code>hb_subset_input_t</code>. Each looks the axis up in the face’s <code>fvar</code> and stores a triple of user coordinates (minimum, default, maximum) under its tag (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-input.cc#L436"><code>hb-subset-input.cc:436</code></a>–<code>562</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Stores</th>
+<th>Since</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-5"><code>hb_subset_input_pin_axis_location</code></td>
+<td>the value, clamped to the axis, three times</td>
+<td>6.0.0</td>
+</tr>
+<tr>
+<td id="ix-6"><code>hb_subset_input_pin_axis_to_default</code></td>
+<td>the axis default, three times</td>
+<td>6.0.0</td>
+</tr>
+<tr>
+<td id="ix-7"><code>hb_subset_input_pin_all_axes_to_default</code></td>
+<td>the same, for every axis</td>
+<td>8.3.1</td>
+</tr>
+<tr>
+<td id="ix-8"><code>hb_subset_input_set_axis_range</code></td>
+<td>a new minimum, default and maximum; NaN keeps the old value</td>
+<td>8.5.0</td>
+</tr>
+<tr>
+<td id="ix-9"><code>hb_subset_input_get_axis_range</code></td>
+<td>reads back what was set</td>
+<td>8.5.0</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-10"><code>set_axis_range</code> clamps the new minimum and maximum to the old ones, and then the default to the new range, so a range that leaves out the old default moves the default to whichever end is nearer. A range that is exactly the axis’s own is forgotten before anything else happens (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan-var.cc#L471"><code>hb-subset-plan-var.cc:471</code></a>).</p>
+<p id="ix-11">The <code>hb-subset</code> tool takes the same settings as <code>--variations</code> (called <code>--instance</code> before 8.3.0): <code>wght=700</code> pins, <code>wght=400:800</code> limits and keeps the default, <code>wght=500:700:900</code> also moves it, an empty part such as <code>wght=:500:</code> keeps that value, and <code>wdth=drop</code> or <code>*=drop</code> pins at the default (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/helper-subset.hh#L38"><code>util/helper-subset.hh:38</code></a>). A pin given this way goes through <code>set_axis_range</code> with three equal values. <code>hb_subset_axis_range_from_string</code> (10.2.0) parses the range syntax for other programs.</p>
+<p id="ix-12">fontTools’ documentation names four levels of instancing: dropping an axis at its default (L1), pinning it elsewhere (L2), restricting its range (L3), and moving its default (L4). HarfBuzz does all four, and they can be mixed in one call.</p>
+<h2 id="pinning-an-axis">Pinning an axis</h2>
+<p id="ix-13"><code>var-wght700.ttf</code> is <code>var.ttf</code> with <code>--variations=wght=700</code>. The weight axis has gone from <code>fvar</code>, the width axis remains, and of the four named instances only Bold, the one at weight 700, survives: an instance is kept only if it sits at the pinned value of every pinned axis and inside the range of every limited one (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-fvar-table.hh#L89"><code>hb-ot-var-fvar-table.hh:89</code></a>). <code>var-static700.ttf</code> pins width too, at its default, and has no variation tables left:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="opt">--list-variations</td><td class="out"><pre><code>Variations information:
+
+Varitation axes:
+
+Tag	Minimum	Default	Maximum	Name
+------------------------------------
+wght	100	400	900	Weight
+wdth	75	100	100	Width
+
+
+Named instances:
+
+Index	Name				Position
+------------------------------------------------
+0	Light                           100, 100, 
+1	Regular                         400, 100, 
+2	Bold                            700, 100, 
+3	Narrow                          400, 75,</code></pre></td></tr><tr><td class="font">var-wght700.ttf</td><td class="opt">--list-variations</td><td class="out"><pre><code>Variations information:
+
+Varitation axes:
+
+Tag	Minimum	Default	Maximum	Name
+------------------------------------
+wdth	75	100	100	Width
+
+
+Named instances:
+
+Index	Name				Position
+------------------------------------------------
+0	Bold                            100,</code></pre></td></tr><tr><td class="font">var-static700.ttf</td><td class="opt">--list-tables</td><td class="out"><pre><code>Table information:
+
+Tag	Size
+------------
+OS/2       96 bytes
+STAT       36 bytes
+cmap       68 bytes
+glyf      106 bytes
+head       54 bytes
+hhea       36 bytes
+hmtx       20 bytes
+loca       12 bytes
+maxp       32 bytes
+name      120 bytes
+post       44 bytes</code></pre></td></tr></tbody></table></div>
+<p id="ix-14">What should come out is the original font as it looks at that position. Here is the original at weight 700, at two widths, and then the pinned font, which has no weight axis to set:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -840 1566 1080" role="img" aria-label="IHV at wdth=75">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L280,700L280,0L80,0Z" fill="currentColor"/>
+<path d="M440,0L440,700L640,700L640,0L440,0ZM598,0L598,700L798,700L798,0L598,0ZM640,330L640,490L598,490L598,330L640,330Z" fill="currentColor"/>
+<path d="M958,0L958,700L1236.01,700L1216.41,525L1197.01,350L1177.61,175L1158,0L958,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wdth=75</div><code class="frame-shape">[I=0+360|H=1+518|V=2+438]</code></div><div class="frame"><svg viewBox="-40 -840 1566 1080" role="img" aria-label="IHV at wdth=100">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L290,700L290,0L80,0Z" fill="currentColor"/>
+<path d="M450,0L450,700L660,700L660,0L450,0ZM748,0L748,700L958,700L958,0L748,0ZM660,330L660,498L748,498L748,330L660,330Z" fill="currentColor"/>
+<path d="M1118,0L1118,700L1406.01,700L1386.41,525L1367.01,350L1347.61,175L1328,0L1118,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wdth=100</div><code class="frame-shape">[I=0+370|H=1+668|V=2+448]</code></div></div><figcaption><code>hb-vector variations/var.ttf "IHV" --variations=wght=700</code></figcaption></figure>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -840 1566 1080" role="img" aria-label="IHV at wdth=75">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L280,700L280,0L80,0Z" fill="currentColor"/>
+<path d="M440,0L440,700L640,700L640,0L440,0ZM598,0L598,700L798,700L798,0L598,0ZM640,330L640,490L598,490L598,330L640,330Z" fill="currentColor"/>
+<path d="M958,0L958,700L1236,700L1216,525L1197,350L1178,175L1158,0L958,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wdth=75</div><code class="frame-shape">[I=0+360|H=1+518|V=2+438]</code></div><div class="frame"><svg viewBox="-40 -840 1566 1080" role="img" aria-label="IHV at wdth=100">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L290,700L290,0L80,0Z" fill="currentColor"/>
+<path d="M450,0L450,700L660,700L660,0L450,0ZM748,0L748,700L958,700L958,0L748,0ZM660,330L660,498L748,498L748,330L660,330Z" fill="currentColor"/>
+<path d="M1118,0L1118,700L1406,700L1386,525L1367,350L1348,175L1328,0L1118,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wdth=100</div><code class="frame-shape">[I=0+370|H=1+668|V=2+448]</code></div></div><figcaption><code>hb-vector var-wght700.ttf "IHV"</code></figcaption></figure>
+<p id="ix-15">The drawings and the advances under them agree, and so do the extents:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=700,wdth=75 --show-extents</td><td class="out"><code>[I=0+360&lt;80,700,200,-700&gt;|H=1+518&lt;80,700,358,-700&gt;|V=2+438&lt;80,700,278,-700&gt;]</code></td></tr><tr><td class="font">var-wght700.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wdth=75 --show-extents</td><td class="out"><code>[I=0+360&lt;80,700,200,-700&gt;|H=1+518&lt;80,700,358,-700&gt;|V=2+438&lt;80,700,278,-700&gt;]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=700 --show-extents</td><td class="out"><code>[I=0+370&lt;80,700,210,-700&gt;|H=1+668&lt;80,700,508,-700&gt;|V=2+448&lt;80,700,288,-700&gt;]</code></td></tr><tr><td class="font">var-static700.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--show-extents</td><td class="out"><code>[I=0+370&lt;80,700,210,-700&gt;|H=1+668&lt;80,700,508,-700&gt;|V=2+448&lt;80,700,288,-700&gt;]</code></td></tr></tbody></table></div>
+<p id="ix-16">They agree up to rounding. <code>hb-vector</code> draws the original’s <code>V</code> at weight 700 with points at fractional positions, such as x = 1386.41, because the <a href="varying-outlines.html#points-that-arent-there-iup">inferred</a> and interpolated deltas are fractional; <code>glyf</code> stores integers, so the instance has 1386. A pinned instance is the original at that position rounded to the font’s grid, and drawings at any ordinary size can’t tell them apart.</p>
+<p id="ix-17">When every axis is pinned, <code>_should_drop_table</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.cc#L219"><code>hb-subset.cc:219</code></a>) drops <code>fvar</code>, <code>avar</code>, <code>gvar</code>, <code>HVAR</code>, <code>VVAR</code>, <code>MVAR</code> and <code>cvar</code> outright. Any other table loses its variation data as it is subset. A table that still has deltas after a partial pin, but none that vary, is dropped too: <code>var-wght700.ttf</code> has no <code>MVAR</code>, because only weight moved the x-height. In <code>OS/2</code>, <code>usWeightClass</code> and <code>usWidthClass</code> are set from the new default (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-os2-table.hh#L273"><code>hb-ot-os2-table.hh:273</code></a>).</p>
+<h2 id="limiting-an-axis">Limiting an axis</h2>
+<p id="ix-18"><code>var-wght400-800.ttf</code> limits weight to 400–800, keeping the default at 400. <code>fvar</code> gets the new limits:</p>
+<figure class="views ttx"><pre><code>&lt;fvar&gt;
+
+  &lt;!-- Weight --&gt;
+  &lt;Axis&gt;
+    &lt;AxisTag&gt;wght&lt;/AxisTag&gt;
+    &lt;Flags&gt;0x0&lt;/Flags&gt;
+    &lt;MinValue&gt;400.0&lt;/MinValue&gt;
+    &lt;DefaultValue&gt;400.0&lt;/DefaultValue&gt;
+    &lt;MaxValue&gt;800.0&lt;/MaxValue&gt;
+    &lt;AxisNameID&gt;256&lt;/AxisNameID&gt;
+  &lt;/Axis&gt;
+
+  &lt;!-- Width --&gt;
+  &lt;Axis&gt;
+    &lt;AxisTag&gt;wdth&lt;/AxisTag&gt;
+    &lt;Flags&gt;0x0&lt;/Flags&gt;
+    &lt;MinValue&gt;75.0&lt;/MinValue&gt;
+    &lt;DefaultValue&gt;100.0&lt;/DefaultValue&gt;
+    &lt;MaxValue&gt;100.0&lt;/MaxValue&gt;
+    &lt;AxisNameID&gt;257&lt;/AxisNameID&gt;
+  &lt;/Axis&gt;
+
+  &lt;!-- Regular --&gt;
+  &lt;NamedInstance flags=&quot;0x0&quot; subfamilyNameID=&quot;2&quot;&gt;
+    &lt;coord axis=&quot;wght&quot; value=&quot;400.0&quot;/&gt;
+    &lt;coord axis=&quot;wdth&quot; value=&quot;100.0&quot;/&gt;
+  &lt;/NamedInstance&gt;
+
+  &lt;!-- Bold --&gt;
+  &lt;NamedInstance flags=&quot;0x0&quot; subfamilyNameID=&quot;259&quot;&gt;
+    &lt;coord axis=&quot;wght&quot; value=&quot;700.0&quot;/&gt;
+    &lt;coord axis=&quot;wdth&quot; value=&quot;100.0&quot;/&gt;
+  &lt;/NamedInstance&gt;
+
+  &lt;!-- Narrow --&gt;
+  &lt;NamedInstance flags=&quot;0x0&quot; subfamilyNameID=&quot;260&quot;&gt;
+    &lt;coord axis=&quot;wght&quot; value=&quot;400.0&quot;/&gt;
+    &lt;coord axis=&quot;wdth&quot; value=&quot;75.0&quot;/&gt;
+  &lt;/NamedInstance&gt;
+&lt;/fvar&gt;</code></pre><figcaption>var-wght400-800.ttf: fvar (TTX)</figcaption></figure>
+<p id="ix-19">The coordinates every variation table uses are normalized (<a href="design-space.html#from-user-coordinates-to-normalized-ones">Design space</a>): −1 at the axis minimum, 0 at the default, +1 at the maximum. In the new font, +1 means weight 800, not 900. So the instancer must <strong>renormalize</strong> every coordinate that refers to the axis: positions in the old normalized space, such as 0.8 for weight 800, become positions in the new one, 1. A region that ran past the new maximum has to be rewritten, and a region that lies wholly outside the new range is dropped. That is the solver’s job, described two sections down.</p>
+<p id="ix-20">The instance still varies like the original inside its range. At weights 600 and 775:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=600</td><td class="out"><code>[I=0+340|H=1+648|V=2+388]</code></td></tr><tr><td class="font">var-wght400-800.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=600</td><td class="out"><code>[I=0+340|H=1+648|V=2+388]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=775,wdth=80</td><td class="out"><code>[I=0+377|H=1+560|V=2+482]</code></td></tr><tr><td class="font">var-wght400-800.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=775,wdth=80</td><td class="out"><code>[I=0+377|H=1+560|V=2+482]</code></td></tr></tbody></table></div>
+<p id="ix-21">Outside it, the instance clamps, as any variable font does: asked for weight 900, it gives weight 800.</p>
+<h2 id="what-the-plan-works-out">What the plan works out</h2>
+<p id="ix-22">The plan (<a href="subsetting.html#the-plan">Subsetting</a>) turns the user’s triples into everything the tables will need before any table is written. <code>normalize_axes_location</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan-var.cc#L465"><code>hb-subset-plan-var.cc:465</code></a>) runs first, and fills these members of the plan:</p>
+<ul>
+<li id="ix-23"><code>user_axes_location</code>: the user’s triples, in user coordinates. <code>fvar</code>, <code>STAT</code> and <code>OS/2</code> read these.</li>
+<li id="ix-24"><code>axes_location</code>: the same triples normalized, through <code>fvar</code> and then <code>avar</code>. Every table that rebases deltas reads these.</li>
+<li id="ix-25"><code>normalized_coords</code>: the new default, as a full set of old normalized coordinates. The deltas that are folded into the default values are evaluated here.</li>
+<li><code>axes_index_map</code> and <code>axis_tags</code>: which axes survive, and their new order.</li>
+<li id="ix-26"><code>axes_triple_distances</code>: each limited axis’s old distances from default to minimum and to maximum, in user units, for renormalizing (below).</li>
+<li><code>all_axes_pinned</code> and <code>pinned_at_default</code>, two flags that let most tables skip work.</li>
+</ul>
+<p id="ix-27">The normalization isn’t quite the one shaping uses. Shaping normalizes in 16.16 fixed point, applies <code>avar</code>, and rounds to 2.14 last (<a href="design-space.html#from-user-coordinates-to-normalized-ones">Design space</a>). The plan rounds to 2.14 <em>before</em> <code>avar</code>, and a comment explains why (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan-var.cc#L529"><code>hb-subset-plan-var.cc:529</code></a>):</p>
+<pre><code class="language-c++">// TODO(behdad): Spec says axis normalization should be done in 16.16;
+// We used to do it in 2.14, but that's not correct.  I fixed this in
+// the fvar/avar code, but keeping 2.14 here for now to keep tests
+// happy. We might need to adjust fonttools as well.
+</code></pre>
+<p id="ix-28">The tests are comparisons with fontTools’ output, and fontTools rounds the same way. The outlines don’t use this path: <code>glyf</code> makes its new default outlines with an <code>hb_font_t</code> given the user’s values through <code>hb_font_set_variations</code>, the same call <code>hb-shape --variations</code> makes, so a pinned outline is computed exactly as shaping would compute it (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh#L722"><code>OT/glyf/glyf.hh:722</code></a>). The research for this chapter pinned <code>var.ttf</code> and <code>var-avar.ttf</code> at sixty-two weights and compared advances, extents and x-heights with the originals’, and found no case where the two normalizations gave different results; with a steep <code>avar</code> segment and an unlucky value, a difference of one 2.14 unit is possible (inferred).</p>
+<p id="ix-29">Some work is done per glyph in the plan as well. For a partial instance, <code>get_instance_glyphs_contour_points</code> (<code>:802</code>) reads every kept glyph’s default points, which <code>gvar</code> will need; for CFF2, <code>update_instance_metrics_map_from_cff2</code> (<code>:699</code>) works out each glyph’s new advance and side bearing from its instanced outline. The rest happens table by table, in the loop that <a href="subsetting.html#writing-the-tables">Subsetting</a> describes, where <code>hmtx</code>, <code>vmtx</code>, <code>maxp</code> and <code>OS/2</code> wait for <code>glyf</code>, whose outlines give their numbers.</p>
+<h2 id="how-the-solver-rewrites-a-region">How the solver rewrites a region</h2>
+<p id="ix-30">A delta applies over a <strong>tent</strong> on each axis: a start, a peak and an end, in normalized coordinates (<a href="deltas.html#regions-and-scalars">Deltas</a>). When the axis range shrinks or the default moves, each tent must be re-expressed in the new coordinates so that, at every position the new font can reach, the deltas add up to what they did before. <code>rebase_tent</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-instancer-solver.cc#L419"><code>hb-subset-instancer-solver.cc:419</code></a>) does this for one tent on one axis. Its file begins:</p>
+<pre><code class="language-c++">/* This file is a straight port of the following:
+ *
+ * https://github.com/fonttools/fonttools/blob/f73220816264fc383b8a75f2146e8d69e455d398/Lib/fontTools/varLib/instancer/solver.py
+</code></pre>
+<p id="ix-31">It returns a list of pairs: a scalar to multiply the deltas by, and a new tent. A pair with no tent is the <strong>gain</strong>: the part of the delta that applies everywhere in the new font, which is the tent’s value at the new default. The gain is folded into the default values (into the outlines, the advances, the <code>OS/2</code> metrics) and the other pairs are kept as variations.</p>
+<p>The core, <code>_solve</code>, first mirrors the problem so that the new default lies at or below the peak, then works through cases. Here is the part that matters for the example, trimmed:</p>
+<pre><code class="language-c++">float gain = supportScalar (axisDef, tent);
+out.push(hb_pair (gain, Triple{}));
+
+// outGain is the scalar of axisMax at the tent.
+float outGain = supportScalar (axisMax, tent);
+if (gain &gt;= outGain)
+  { /* Case 3a: the down-slope crosses the new maximum: split in two or three */ }
+else
+{
+  /* Case 4: New limit doesn't fit; we need to chop into two tents,
+   * because the shape of a triangle with part of one side cut off
+   * cannot be represented as a triangle itself. */
+  Triple loc1 {hb_max (axisDef, lower), peak, axisMax};
+  float scalar1 = 1.f;
+  Triple loc2 {peak, axisMax, axisMax};
+  float scalar2 = outGain;
+  out.push (hb_pair (scalar1 - gain, loc1));
+  // Don't add a dirac delta!
+  if (peak &lt; axisMax)
+    out.push (hb_pair (scalar2 - gain, loc2));
+}
+</code></pre>
+<p id="ix-32"><code>var.ttf</code> has three tents on the weight axis: (−1, −1, 0) for the light master, (0, 0.5, 1) for the intermediate master at 650, and (0.5, 1, 1) for the heavy one. Limiting weight to 400–800 makes the axis limit (0, 0, 0.8) in old coordinates. Take the intermediate tent:</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Arithmetic</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>value at the new default, 0</td>
+<td id="ix-33">the tent starts there: gain = 0</td>
+</tr>
+<tr>
+<td>value at the new maximum, 0.8</td>
+<td>on the down-slope: outGain = (1 − 0.8) / (1 − 0.5) = 0.4</td>
+</tr>
+<tr>
+<td id="ix-34">gain &lt; outGain: case 4</td>
+<td>(0, 0.5, 0.8) × 1, and (0.5, 0.8, 0.8) × 0.4</td>
+</tr>
+<tr>
+<td>the negative side</td>
+<td id="ix-35">below the default there is nothing left: a pair with scalar 0, which is dropped</td>
+</tr>
+<tr>
+<td id="ix-36">renormalize, dividing by 0.8</td>
+<td>(0, 0.625, 1) × 1, and (0.625, 1, 1) × 0.4</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-37">The old tent, cut off at 0.8, is no longer a triangle: it rises to 1 at 0.5 and falls only to 0.4 at the edge. The sum of a full tent that falls to 0 at the edge and a second one that rises from 0 to 0.4 follows the same line. The heavy master’s tent, (0.5, 1, 1), peaks beyond the new maximum, so it takes case 2: it is scaled by its value at 0.8, (0.8 − 0.5) / 0.5 = 0.6, and becomes (0.5, 0.8, 0.8), which renormalizes to (0.625, 1, 1). The light master’s tent lies wholly below the new default and is dropped (case 1).</p>
+<p id="ix-38">Two of the new tents are the same, (0.625, 1, 1), and <code>merge_tuple_variations</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-common.hh#L1179"><code>hb-ot-var-common.hh:1179</code></a>) adds them: 0.4 of the intermediate master’s deltas plus 0.6 of the heavy one’s. <code>V</code>’s top-right point moves 160 units at the intermediate master and 300 at the heavy one, so the merged delta is 0.4 × 160 + 0.6 × 300 = 244:</p>
+<figure class="views ttx"><pre><code>&lt;glyphVariations glyph=&quot;V&quot;&gt;
+  &lt;tuple&gt;
+    &lt;coord axis=&quot;wght&quot; min=&quot;0.0&quot; value=&quot;0.625&quot; max=&quot;1.0&quot;/&gt;
+    &lt;delta pt=&quot;0&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;1&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;2&quot; x=&quot;160&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;3&quot; x=&quot;145&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;4&quot; x=&quot;130&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;5&quot; x=&quot;115&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;6&quot; x=&quot;100&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;7&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;8&quot; x=&quot;160&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;9&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;10&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+  &lt;/tuple&gt;
+  &lt;tuple&gt;
+    &lt;coord axis=&quot;wght&quot; min=&quot;0.625&quot; value=&quot;1.0&quot; max=&quot;1.0&quot;/&gt;
+    &lt;delta pt=&quot;0&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;1&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;2&quot; x=&quot;244&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;3&quot; x=&quot;215&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;4&quot; x=&quot;187&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;5&quot; x=&quot;159&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;6&quot; x=&quot;130&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;7&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;8&quot; x=&quot;244&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;9&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;10&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+  &lt;/tuple&gt;
+  &lt;tuple&gt;
+    &lt;coord axis=&quot;wdth&quot; value=&quot;-1.0&quot;/&gt;
+    &lt;delta pt=&quot;0&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;1&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;2&quot; x=&quot;-10&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;3&quot; x=&quot;-10&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;4&quot; x=&quot;-10&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;5&quot; x=&quot;-10&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;6&quot; x=&quot;-10&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;7&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;8&quot; x=&quot;-10&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;9&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;10&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+  &lt;/tuple&gt;
+&lt;/glyphVariations&gt;</code></pre><figcaption>var-wght400-800.ttf: gvar, glyph V (TTX)</figcaption></figure>
+<p id="ix-39">The same regions appear in <code>HVAR</code>, whose advances are rewritten the same way: <code>V</code>’s is item 4, 160 and 244 again, since its advance grows as its corner does. At the new maximum the instance gives 0.4 × 160 + 0.6 × 300, which is what the original gave at 0.8.</p>
+<p id="ix-40">Two details of the port. The case the code calls “case 3”, which would keep a cut tent as one triangle by stretching its far end beyond +1, is disabled with <code>if (false &amp;&amp; …)</code> (<code>:261</code>), because the OpenType Sanitizer rejected the result (“ots doesn’t like us”, citing fontTools issue 3350); the solver always splits instead. And when the new default moves across the old one, renormalizing has to measure in user units, because the two sides of the old default had different scales: in <code>var.ttf</code>, normalized −1 is 300 weight units from the default and +1 is 500. <code>renormalizeValue</code> (<code>:369</code>) uses <code>axes_triple_distances</code> for that case. The solver works in <code>float</code>, where fontTools uses Python’s double precision; in the larger fonts compared below, a few deltas came out one unit apart, probably for that reason (inferred).</p>
+<p id="ix-41"><code>change_tuple_variations_axis_limits</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-common.hh#L1131"><code>hb-ot-var-common.hh:1131</code></a>) runs the solver axis by axis, in order of tag, over every tuple; a tuple whose tent crosses zero or is out of order, which shaping would treat as constant, is dropped instead (<code>:390</code>).</p>
+<h2 id="outlines-and-gvar">Outlines and gvar</h2>
+<p id="ix-42">The new default outlines are made by drawing each kept glyph at the new default, with its variations applied, and writing the points back into <code>glyf</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/Glyph.hh#L239"><code>OT/glyf/Glyph.hh:239</code></a>). The four phantom points come along, and <code>update_mtx</code> (<code>:139</code>) turns them into the glyph’s new advance and side bearings for <code>hmtx</code> and <code>vmtx</code>. The glyph’s bounding box, and the font-wide maxima in <code>head</code> and <code>maxp</code>, are recomputed from the same points. This drawing is done for every kept glyph, and composite components are drawn again for each glyph that uses them, so the whole table shares one budget of work, <code>HB_BUDGET_SUBSET_GLYF</code>, 2²⁸ units, across retries too (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L250"><code>hb-limits.hh:250</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.hh#L64"><code>hb-subset.hh:64</code></a>); running out fails the table. Its comment says the largest variable font in HarfBuzz’s tests uses about 1.2 million.</p>
+<p id="ix-43">For a partial instance, <code>gvar</code> is then rebuilt (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-gvar-table.hh#L142"><code>hb-ot-var-gvar-table.hh:142</code></a>). Each glyph’s tuples are decompiled, rebased as above, and merged. Before merging, <code>calc_inferred_deltas</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-common.hh#L662"><code>hb-ot-var-common.hh:662</code></a>) fills in every point a tuple left out, by the same <a href="varying-outlines.html#points-that-arent-there-iup">IUP</a> interpolation a renderer would use: two tuples with different sets of points can only be added point by point. The result is a <code>gvar</code> with every delta written out, even in tuples the instancing didn’t change. The width tuple of <code>V</code> above had three explicit points in <code>var.ttf</code>; it now has eleven.</p>
+<p id="ix-44"><code>HB_SUBSET_FLAGS_OPTIMIZE_IUP_DELTAS</code> (8.5.0; <code>--optimize</code> in <code>hb-subset</code>) runs the reverse: the IUP optimizer, a port of fontTools’ <code>iup.py</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-instancer-iup.cc#L31"><code>hb-subset-instancer-iup.cc:31</code></a>), finds the fewest points whose deltas, interpolated, reproduce all the others within half a unit. <code>var-wght400-800-iup.ttf</code> was made with it:</p>
+<figure class="views ttx"><pre><code>&lt;glyphVariations glyph=&quot;V&quot;&gt;
+  &lt;tuple&gt;
+    &lt;coord axis=&quot;wght&quot; min=&quot;0.0&quot; value=&quot;0.625&quot; max=&quot;1.0&quot;/&gt;
+    &lt;delta pt=&quot;0&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;1&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;2&quot; x=&quot;160&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;3&quot; x=&quot;145&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;4&quot; x=&quot;130&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;5&quot; x=&quot;115&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;6&quot; x=&quot;100&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;7&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;8&quot; x=&quot;160&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;9&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;10&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+  &lt;/tuple&gt;
+  &lt;tuple&gt;
+    &lt;coord axis=&quot;wght&quot; min=&quot;0.625&quot; value=&quot;1.0&quot; max=&quot;1.0&quot;/&gt;
+    &lt;delta pt=&quot;0&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;1&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;2&quot; x=&quot;244&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;3&quot; x=&quot;215&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;4&quot; x=&quot;187&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;5&quot; x=&quot;159&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;6&quot; x=&quot;130&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;7&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;8&quot; x=&quot;244&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;9&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;10&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+  &lt;/tuple&gt;
+  &lt;tuple&gt;
+    &lt;coord axis=&quot;wdth&quot; value=&quot;-1.0&quot;/&gt;
+    &lt;delta pt=&quot;1&quot; x=&quot;0&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;6&quot; x=&quot;-10&quot; y=&quot;0&quot;/&gt;
+    &lt;delta pt=&quot;8&quot; x=&quot;-10&quot; y=&quot;0&quot;/&gt;
+  &lt;/tuple&gt;
+&lt;/glyphVariations&gt;</code></pre><figcaption>var-wght400-800-iup.ttf: gvar, glyph V (TTX)</figcaption></figure>
+<p id="ix-45">The flag is off by default, where fontTools’ instancer has it on. It costs time, and it works one contour at a time: a contour of more than 512 points keeps all its deltas (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-instancer-iup.cc#L364"><code>hb-subset-instancer-iup.cc:364</code></a>).</p>
+<blockquote>
+<p id="ix-46">For programmers: instancing a font without <code>OPTIMIZE_IUP_DELTAS</code> can make its <code>gvar</code> bigger than the original’s, though the font has less variation in it. If size matters, set the flag.</p>
+</blockquote>
+<h2 id="the-other-tables">The other tables</h2>
+<p id="ix-47">Most other variation data lives in <a href="deltas.html#item-variation-stores">item variation stores</a>, and <code>item_variations_t::instantiate</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-common.hh#L1851"><code>hb-ot-var-common.hh:1851</code></a>) handles them all the same way: each <code>VarData</code> row becomes a set of tuples, one per region, which are rebased and merged like <code>gvar</code>’s, and then packed back into rows, with a port of fontTools’ row-encoding optimizer choosing how. Unused regions are pruned. What becomes of the gain depends on the table:</p>
+<ul>
+<li id="ix-48"><strong>HVAR and VVAR.</strong> The new advances are already in <code>hmtx</code> and <code>vmtx</code>, from the outlines, so the gain is dropped.</li>
+<li id="ix-49"><strong>MVAR.</strong> <code>OS/2</code>, <code>hhea</code>, <code>vhea</code> and <code>post</code> add each metric’s delta at the new default to the stored value.</li>
+<li id="ix-50"><strong>GDEF, GPOS and BASE.</strong> The plan evaluates every variation index used by a kept value record or anchor, and makes a map from old index to (new index, delta) (<code>remap_variation_indices</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan-var.cc#L384"><code>hb-subset-plan-var.cc:384</code></a>). Each value is serialized with its delta added, and its device table pointed at the new index, or dropped when nothing varies any more.</li>
+<li id="ix-51"><strong>COLR.</strong> COLR v1’s variable paints get the same treatment through a map of their own.</li>
+<li id="ix-52"><strong>cvar.</strong> <code>cvar</code> is rebased like <code>gvar</code>, and its gain is added to <code>cvt </code> whenever the default moves (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.cc#L347"><code>hb-subset.cc:347</code></a>), for partial instances as well as full ones.</li>
+</ul>
+<p id="ix-53"><code>STAT</code> keeps its axis records and drops axis values outside the new ranges (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-stat-table.hh#L60"><code>hb-ot-stat-table.hh:60</code></a>).</p>
+<h2 id="avar">avar</h2>
+<p id="ix-54">An <code>avar</code> segment map is rewritten by the same renormalization (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-avar-table.hh#L263"><code>hb-ot-var-avar-table.hh:263</code></a>). Its “from” side is in the new font’s default normalization and its “to” side in the new mapped space, so each is renormalized against its own range, and the three fixed mappings (−1, 0, +1) are added back. <code>var-avar.ttf</code> maps weight 600 (normalized 0.4) to the design at 750 (0.7). Limited to 400–800, weight 600 is 0.5 in the new font, and the new maximum, which <code>avar</code> maps to 0.9, becomes 1, so 0.7 becomes 0.7 / 0.9 = 0.7778:</p>
+<figure class="views ttx"><pre><code>&lt;avar&gt;
+  &lt;version major=&quot;1&quot; minor=&quot;0&quot;/&gt;
+  &lt;segment axis=&quot;wght&quot;&gt;
+    &lt;mapping from=&quot;-1.0&quot; to=&quot;-1.0&quot;/&gt;
+    &lt;mapping from=&quot;0.0&quot; to=&quot;0.0&quot;/&gt;
+    &lt;mapping from=&quot;0.5&quot; to=&quot;0.7778&quot;/&gt;
+    &lt;mapping from=&quot;1.0&quot; to=&quot;1.0&quot;/&gt;
+  &lt;/segment&gt;
+  &lt;segment axis=&quot;wdth&quot;&gt;
+    &lt;mapping from=&quot;-1.0&quot; to=&quot;-1.0&quot;/&gt;
+    &lt;mapping from=&quot;0.0&quot; to=&quot;0.0&quot;/&gt;
+    &lt;mapping from=&quot;1.0&quot; to=&quot;1.0&quot;/&gt;
+  &lt;/segment&gt;
+&lt;/avar&gt;</code></pre><figcaption>var-avar-wght400-800.ttf: avar (TTX)</figcaption></figure>
+<p id="ix-55">The <code>gvar</code> tents are renormalized in the mapped space, so the intermediate master’s peak is now 0.5 / 0.9 = 0.5556. Rounding in this chain can move a coordinate by one 2.14 unit and an advance by one unit. At weight 570:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var-avar.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=570</td><td class="out"><code>[I=0+369]</code></td></tr><tr><td class="font">var-avar-wght400-800.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=570</td><td class="out"><code>[I=0+370]</code></td></tr></tbody></table></div>
+<p id="ix-56">fontTools’ instance of the same font gives 369 there: it stores the mapping as from 0.50006, not 0.5, because it renormalizes the 2.14 value of 0.4 against the 2.14 value of weight 800, 0.79999, where HarfBuzz unmaps the mapped limit through <code>avar</code> and gets 0.8. The function’s own comment calls this approach temporary: “unmap_axis_range needs to be killed.”</p>
+<h3 id="avar-2">avar 2</h3>
+<p id="ix-57"><a href="design-space.html#avar-version-2">avar 2</a> is supported, not refused. Full instancing has worked since 12.3.0 and partial instancing since 14.3.0 (NEWS), with fixes in 14.4.0. It is the hardest case, because an <code>avar</code> 2 table can make one axis’s final coordinate depend on others: in <code>var-avar2.ttf</code>, the weight that is drawn depends on the width. Pinning weight can’t simply bake its contribution in, since what weight 700 means still changes with width.</p>
+<p id="ix-58">So for a partial instance of an <code>avar</code> 2 font, HarfBuzz follows a fontTools design called offset compensation (described in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/AVAR2-INSTANCING.md"><code>AVAR2-INSTANCING.md</code></a> at the top of the source tree). The plan normalizes through the <code>avar</code> 1 maps only (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan-var.cc#L572"><code>hb-subset-plan-var.cc:572</code></a>) and rebases the <code>avar</code> 2 variation store, adding deltas so that the final coordinates stay in the <em>old</em> coordinate space. A pinned axis stays in <code>fvar</code>, hidden, with minimum, default and maximum all at the pinned value, and an identity segment map; the other tables keep their variations unchanged, apart from regions the instance can never reach, which are dropped. Only a <strong>self-contained</strong> pinned axis, one whose final coordinate the plan can prove is constant, is removed and baked in like an ordinary pin (<code>:322</code>). Weight in <code>var-avar2.ttf</code> isn’t one:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">var-avar2-wght700.ttf</td><td class="opt">--list-variations</td><td class="out"><pre><code>Variations information:
+
+Varitation axes:
+
+Tag	Minimum	Default	Maximum	Name
+------------------------------------
+wght*	700	700	700	Weight
+wdth	75	100	100	Width
+
+[*] Hidden axis
+
+
+Named instances:
+
+Index	Name				Position
+------------------------------------------------
+0	Bold                            700, 100,</code></pre></td></tr></tbody></table></div>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var-avar2.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=700,wdth=80</td><td class="out"><code>[I=0+322|H=1+522|V=2+364]</code></td></tr><tr><td class="font">var-avar2-wght700.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wdth=80</td><td class="out"><code>[I=0+322|H=1+522|V=2+364]</code></td></tr></tbody></table></div>
+<p id="ix-59">fontTools 4.68 makes the same choice, a hidden axis.</p>
+<h2 id="feature-variations">Feature variations</h2>
+<p id="ix-60">GSUB and GPOS can swap a feature’s lookups in part of the design space (<a href="from-features-to-lookups.html">From features to lookups</a>). <code>var-rvrn.ttf</code>, built by <code>fonts/instancing/build-instancing-fonts.py</code>, is <code>var.ttf</code> with one more glyph, <code>I.serif</code>, and an <code>rvrn</code> feature variation that substitutes it for <code>I</code> from weight 600 up, as a font might change a dollar sign’s design at heavy weights. HarfBuzz turns <code>rvrn</code> on by itself. <code>var-rvrn-wght700.ttf</code> pins weight at 700, and <code>var-rvrn-500-700-900.ttf</code> limits it to 500–900 and moves the default to 700, inside the condition:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">var-rvrn.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=550</td><td class="out"><code>[I=0+320]</code></td></tr><tr><td class="font">var-rvrn-500-700-900.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=550</td><td class="out"><code>[I=0+320]</code></td></tr><tr><td class="font">var-rvrn.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=650</td><td class="out"><code>[I.serif=0+480]</code></td></tr><tr><td class="font">var-rvrn-500-700-900.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=650</td><td class="out"><code>[I.serif=0+480]</code></td></tr><tr><td class="font">var-rvrn-wght700.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt"></td><td class="out"><code>[I.serif=0+490]</code></td></tr></tbody></table></div>
+<p id="ix-61">No HarfBuzz tool prints feature variations, so <code>build.sh</code> writes a summary with fontTools (<code>fonts/instancing/featvars-summary.txt</code>):</p>
+<pre><code>var-rvrn.ttf
+  rvrn: no lookups
+  record 0, when wght 0.400024 to 1: rvrn -&gt; lookup 0
+var-rvrn-wght700.ttf
+  rvrn: lookup 0
+  record 0, when always: rvrn -&gt; lookup 0
+var-rvrn-500-700-900.ttf
+  rvrn: lookup 0
+  record 0, when wght -0.499939 to 1: rvrn -&gt; lookup 0
+  record 1, when always: rvrn -&gt; no lookups
+</code></pre>
+<p id="ix-62">Each condition is checked against the new limits (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L4374"><code>hb-ot-layout-common.hh:4374</code></a>): one that can never be met drops its record; one that is always met on a pinned axis is dropped from the record; any other is renormalized. Then the record that applies at the new default, if any, has its substitute features copied into the feature list itself. That changes what applies where no record does, so a <strong>catch-all record</strong>, with no conditions, is appended to restore the original features there. In the limited font, record 0 still swaps in the serif from 600 up, and below it the catch-all gives <code>rvrn</code> back its empty lookup list. In the pinned font, width is still variable, so the record survives with its condition gone: redundant, but harmless.</p>
+<p>At weight 600 exactly, the original and the limited font disagree:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">var-rvrn.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=600</td><td class="out"><code>[I.serif=0+460]</code></td></tr><tr><td class="font">var-rvrn-500-700-900.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=600</td><td class="out"><code>[I=0+340]</code></td></tr></tbody></table></div>
+<p id="ix-63">The condition’s minimum, 0.4, is stored in 2.14 as 0.400024, which is weight 600.012. In the original, weight 600 normalizes to 0.4, which rounds to the same 2.14 value, and the condition holds. In the instance, 600 is exactly −0.5 and the renormalized minimum is −0.499939, so it doesn’t. fontTools’ instance has the same GSUB, and does the same. Thresholds that sit exactly on a value users ask for, as this one does, are worth testing after instancing.</p>
+<h2 id="cff2-and-varc">CFF2 and VARC</h2>
+<p id="ix-64">CFF2 outlines keep their deltas inside the charstrings, as <code>blend</code> operators. Instancing always desubroutinizes them (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-cff2.cc#L1185"><code>hb-subset-cff2.cc:1185</code></a>). A full instance evaluates every blend; <code>HB_SUBSET_FLAGS_DOWNGRADE_CFF2</code> (13.0.0) then writes a CFF table instead, for renderers that can’t read CFF2. Partial instancing, added in 14.3.0, is a port of fontTools’ <code>instantiateCFF2</code> with one simplification its comment describes (<code>:44</code>): it rebases each <code>VarData</code>’s regions once, as a linear map, and rewrites every blend through it. Since 15.1.0, a CFF2 font with nested blends makes partial instancing fail, where before it changed the outlines.</p>
+<p id="ix-65">A <a href="variable-components.html">VARC</a> table can’t be instanced on any axis its components use: the component coordinates and their variation data would need rewriting (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC-subset.hh#L101"><code>OT/Var/VARC/VARC-subset.hh:101</code></a>). Since 15.0.0, axes VARC doesn’t use can be pinned or limited. Pinning weight in <code>varc-ac00-ac01.ttf</code> makes <code>hb-subset</code> fail, unless VARC is dropped.</p>
+<h2 id="compared-with-fonttools">Compared with fontTools</h2>
+<p id="ix-66">The research for this chapter instanced the same fonts with <code>hb-subset</code> and with fontTools 4.68’s instancer (unoptimized deltas on both sides unless stated): the fonts on this page, and from HarfBuzz’s tests a Roboto and a Roboto Flex subset, a Muli subset with <code>cvar</code>, two CFF2 fonts, and a COLR v1 font, with pins and limits. Apart from the subsetter’s own defaults (HarfBuzz empties <code>.notdef</code> and drops Macintosh <code>name</code> records unless asked), most tables came out identical, and where they didn’t, the outlines and metrics agreed. These were the differences:</p>
+<table>
+<thead>
+<tr>
+<th>Where</th>
+<th>HarfBuzz</th>
+<th>fontTools</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IUP optimization</td>
+<td id="ix-67">off unless <code>OPTIMIZE_IUP_DELTAS</code>; with it, the same <code>gvar</code></td>
+<td>on by default</td>
+</tr>
+<tr>
+<td id="ix-68">full instances</td>
+<td id="ix-69"><code>glyf</code> overlap flags left alone (<code>SET_OVERLAPS_FLAG</code> sets them)</td>
+<td id="ix-70">sets <code>OVERLAP_SIMPLE</code> on every simple glyph</td>
+</tr>
+<tr>
+<td>a variation table left with no variation</td>
+<td id="ix-71">dropped (<code>HVAR</code>, <code>MVAR</code>)</td>
+<td>kept, empty</td>
+</tr>
+<tr>
+<td id="ix-72"><code>avar</code> maps after limiting</td>
+<td>can differ by one 2.14 unit (above)</td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-73"><code>gvar</code> deltas</td>
+<td>a few one unit apart in Roboto Flex (<code>float</code> arithmetic, inferred)</td>
+<td id="ix-74">double precision</td>
+</tr>
+<tr>
+<td id="ix-75">CFF2 partial instances</td>
+<td id="ix-76"><code>hmtx</code> side bearings recomputed from the new outlines</td>
+<td>the old default’s kept</td>
+</tr>
+<tr>
+<td id="ix-77"><code>avar</code> 2, weight pinned in <code>var-avar2.ttf</code></td>
+<td id="ix-78">one more, unreachable region kept in <code>MVAR</code></td>
+<td></td>
+</tr>
+<tr>
+<td id="ix-79">GPOS value formats</td>
+<td>device-table bits with nothing left dropped</td>
+<td>kept</td>
+</tr>
+</tbody>
+</table>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-input.cc"><code>src/hb-subset-input.cc</code></a></td>
+<td>pinning and range functions, <code>hb_subset_axis_range_from_string</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/helper-subset.hh"><code>util/helper-subset.hh</code></a></td>
+<td><code>hb-subset --variations</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-plan-var.cc"><code>src/hb-subset-plan-var.cc</code></a></td>
+<td><code>normalize_axes_location</code>, avar 2 reachable ranges and self-contained axes, variation-index maps, CFF2 metrics</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-subset-instancer-solver.{hh,cc}</code></a></td>
+<td><code>Triple</code>, <code>rebase_tent</code>, <code>renormalizeValue</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-common.hh"><code>src/hb-ot-var-common.hh</code></a></td>
+<td><code>tuple_delta_t</code>, tuple variations (rebasing, inferred deltas, merging), <code>item_variations_t</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-subset-instancer-iup.{hh,cc}</code></a></td>
+<td>the IUP optimizer</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-gvar-table.hh"><code>src/hb-ot-var-gvar-table.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh"><code>src/OT/glyf/glyf.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/Glyph.hh"><code>src/OT/glyf/Glyph.hh</code></a></td>
+<td><code>gvar</code> rebuilding; new default outlines and metrics</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-fvar-table.hh"><code>src/hb-ot-var-fvar-table.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-avar-table.hh"><code>src/hb-ot-var-avar-table.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-stat-table.hh"><code>src/hb-ot-stat-table.hh</code></a></td>
+<td>axes, named instances, segment maps, avar 2, STAT</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh"><code>src/hb-ot-layout-common.hh</code></a></td>
+<td>conditions and feature variations under new limits</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-cff2.cc"><code>src/hb-subset-cff2.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Var/VARC/VARC-subset.hh"><code>src/OT/Var/VARC/VARC-subset.hh</code></a></td>
+<td>CFF2 instancing; VARC’s refusal</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset.cc"><code>src/hb-subset.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>src/hb-limits.hh</code></a></td>
+<td>dropped tables, table order, <code>cvt </code>; <code>HB_BUDGET_SUBSET_GLYF</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/AVAR2-INSTANCING.md"><code>AVAR2-INSTANCING.md</code></a></td>
+<td>the design of avar 2 partial instancing</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Instancing is part of subsetting: axis settings go in the subset input, and each table instances itself as it is subset.</li>
+<li>Pinning removes an axis and bakes its position into the default; limiting keeps it with a new range, and perhaps a new default, so every coordinate that refers to it is renormalized.</li>
+<li>The solver, ported from fontTools, rewrites each tent for the new limits: a gain folded into the default, plus new tents. A tent cut off by the new range becomes two.</li>
+<li>New default outlines are drawn with shaping’s own normalization, so a pinned outline matches the original up to rounding to integers, and <code>hmtx</code>, <code>head</code> and <code>maxp</code> follow from them. Other tables normalize in 2.14 first, as fontTools does.</li>
+<li>Rebuilt <code>gvar</code> deltas are written out in full unless <code>OPTIMIZE_IUP_DELTAS</code> is set.</li>
+<li>avar 2 is supported, fully and partially; a pinned axis usually stays as a hidden axis.</li>
+<li>Feature variations are rewritten, with the default’s substitutions copied into the feature list and a catch-all record to undo them elsewhere.</li>
+<li>VARC axes can’t be instanced, and CFF2 with nested blends can’t be partially instanced.</li>
+<li>Against fontTools, the results are the same or within a unit, with different defaults for IUP optimization and overlap flags.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="writing-tables.html">← Writing tables</a><a rel="next" href="hb-depend.html">hb-depend: the glyph dependency graph →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

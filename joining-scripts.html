@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Joining scripts · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part VI · Scripts</p>
+<h1 id="joining-scripts">23. Joining scripts</h1>
+<p id="ix-1">In a joining script, a letter’s shape depends on whether it connects to its neighbors. <a href="why-shaping-exists.html#one-character-many-shapes-joining-and-contextual-forms">Why shaping exists</a> showed beh taking four forms, and <a href="pipeline-step-by-step.html#masks">The pipeline, step by step</a> showed where the decision is made: in the Arabic shaper’s <code>setup_masks</code> hook, before any glyph exists, a state machine reads each character’s joining type and sets one feature bit in its mask. This chapter takes that machine apart, then covers the rest of the Arabic shaper: its feature order, Syriac Alaph, mark reordering, <code>stch</code>, and shaping from presentation forms when a font has no Arabic <code>GSUB</code>.</p>
+<p id="ix-2">Only Arabic and Syriac get the Arabic shaper (<a href="choosing-a-script-shaper.html#arabic-and-syriac">Choosing a script shaper</a>). Mongolian, N’Ko and the other joining scripts go to the Universal Shaping Engine, which borrows the same state machine; the last section is about that.</p>
+<p id="ix-3">The test fonts are built by <code>fonts/joining-scripts/build-fonts.py</code>: <code>joining.ttf</code> (from <code>joining.fea</code>) has Arabic, Syriac and Mongolian letters in their joining forms, <code>presentation.ttf</code> has no layout tables, only presentation-form glyphs, and <code>stch.ttf</code> has Syriac letters and an abbreviation mark. Every result was produced by HarfBuzz 15.1.0 when the page was built.</p>
+<h2 id="joining-types">Joining types</h2>
+<p id="ix-4">Each character has a <strong>joining type</strong>, from Unicode’s <code>ArabicShaping.txt</code>: <strong>dual-joining</strong> (D) letters join on both sides, <strong>right-joining</strong> (R) letters only to the letter before them, <strong>left-joining</strong> (L) letters only to the letter after, <strong>join-causing</strong> (C) characters such as the tatweel and ZWJ make their neighbors join without having forms of their own, <strong>non-joining</strong> (U) characters join nothing, and <strong>transparent</strong> (T) characters, mostly marks, are passed over as though they weren’t there. “Right” and “left” are named for right-to-left text: an R letter joins the letter before it in logical order.</p>
+<p id="ix-5"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-table.py"><code>gen-arabic-table.py</code></a> packs the file into a table with eight values (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc#L73"><code>hb-ot-shaper-arabic.cc:73</code></a>):</p>
+<pre><code class="language-c++">enum hb_arabic_joining_type_t {
+  JOINING_TYPE_U            = 0,
+  JOINING_TYPE_L            = 1,
+  JOINING_TYPE_R            = 2,
+  JOINING_TYPE_D            = 3,
+  JOINING_TYPE_C            = JOINING_TYPE_D,
+  JOINING_GROUP_ALAPH       = 4,
+  JOINING_GROUP_DALATH_RISH = 5,
+  NUM_STATE_MACHINE_COLS    = 6,
+
+  JOINING_TYPE_T = 6,
+  JOINING_TYPE_X = 7  /* means: use general-category to choose between U or T. */
+};
+</code></pre>
+<p id="ix-6">Three things in it differ from the file. C is folded into D: for the machine, a join-causing character is a letter that joins both ways and has no forms. Two Syriac joining groups replace the joining type of their letters: Alaph, and Dalath and Rish, are R letters with special behavior, so the generator writes their group instead (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-table.py"><code>gen-arabic-table.py</code></a>, <code>print_joining_table</code>). And characters the file doesn’t list get X, which <code>get_joining_type</code> (<code>:89</code>) turns at run time into T for non-spacing and enclosing marks and format characters, and into U for everything else.</p>
+<p id="ix-7">The table was made from <code>ArabicShaping-18.0.0.txt</code> and covers every script that file covers, which is how the same code serves the joining scripts under USE. The generator also reads <code>Blocks.txt</code>, but nothing it prints uses it (read from the code).</p>
+<h2 id="the-joining-state-machine">The joining state machine</h2>
+<p id="ix-8"><code>arabic_joining</code> (<code>:302</code>) walks the buffer once, in logical order. Its state says what the last non-transparent character was and whether it is willing to join the next one. Each step looks up the current state and the current character’s column, and gets three things: an action for the <em>previous</em> character, an action for this one, and the next state. Here is the table, without its blank lines (<code>:140</code>):</p>
+<pre><code class="language-c++">/*   jt_U,          jt_L,          jt_R,          jt_D,          jg_ALAPH,      jg_DALATH_RISH */
+
+/* State 0: prev was U, not willing to join. */
+{ {NONE,NONE,0}, {NONE,ISOL,2}, {NONE,ISOL,1}, {NONE,ISOL,2}, {NONE,ISOL,1}, {NONE,ISOL,6}, },
+/* State 1: prev was R or ISOL/ALAPH, not willing to join. */
+{ {NONE,NONE,0}, {NONE,ISOL,2}, {NONE,ISOL,1}, {NONE,ISOL,2}, {NONE,FIN2,5}, {NONE,ISOL,6}, },
+/* State 2: prev was D/L in ISOL form, willing to join. */
+{ {NONE,NONE,0}, {NONE,ISOL,2}, {INIT,FINA,1}, {INIT,FINA,3}, {INIT,FINA,4}, {INIT,FINA,6}, },
+/* State 3: prev was D in FINA form, willing to join. */
+{ {NONE,NONE,0}, {NONE,ISOL,2}, {MEDI,FINA,1}, {MEDI,FINA,3}, {MEDI,FINA,4}, {MEDI,FINA,6}, },
+/* State 4: prev was FINA ALAPH, not willing to join. */
+{ {NONE,NONE,0}, {NONE,ISOL,2}, {MED2,ISOL,1}, {MED2,ISOL,2}, {MED2,FIN2,5}, {MED2,ISOL,6}, },
+/* State 5: prev was FIN2/FIN3 ALAPH, not willing to join. */
+{ {NONE,NONE,0}, {NONE,ISOL,2}, {ISOL,ISOL,1}, {ISOL,ISOL,2}, {ISOL,FIN2,5}, {ISOL,ISOL,6}, },
+/* State 6: prev was DALATH/RISH, not willing to join. */
+{ {NONE,NONE,0}, {NONE,ISOL,2}, {NONE,ISOL,1}, {NONE,ISOL,2}, {NONE,FIN3,5}, {NONE,ISOL,6}, }
+</code></pre>
+<p id="ix-9">Every joining letter starts out isolated, because nothing is known yet about the letter after it. The previous-letter action is how that is corrected. A D letter in state 0 is ISOL and moves to state 2, “willing to join”. If an R or D letter follows, the entry in state 2 says INIT for the previous letter and FINA for this one: the first letter is changed after the fact. A D letter after that moves to state 3, and the next joining letter turns it from FINA into MEDI. An R letter in states 2 or 3 is final and goes to state 1, where nothing joins it from the left. A U character goes back to state 0 and touches nothing. An L letter is always ISOL itself, since it can’t join backwards, and goes to state 2, so the letter after it can make it INIT. States 4 to 6 are for Alaph, in the next section.</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[beh.fina=2+650|beh.medi=1+400|beh.init=0+400]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">بابب</span><span class="cps">U+0628 U+0627 U+0628 U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[beh.fina=3+650|beh.init=2+400|alef.fina=1+350|beh.init=0+400]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ببءب</span><span class="cps">U+0628 U+0628 U+0621 U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[beh=3+600|hamza=2+400|beh.fina=1+650|beh.init=0+400]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">بـب</span><span class="cps">U+0628 U+0640 U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[beh.fina=2+650|tatweel=1+200|beh.init=0+400]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">بَب</span><span class="cps">U+0628 U+064E U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[beh.fina=2+650|fatha=0@100,-19+0|beh.init=0+400]</code></td></tr></tbody></table></div>
+<p id="ix-10">Read each result from the right. Alef, an R letter, ends the first word, so the beh after it starts again as initial. Hamza (U) breaks the chain: the beh before it is final, the one after isolated. The tatweel (C) joins its neighbors like a letter. The fatha (T) is skipped, so the behs on either side of it join.</p>
+<p id="ix-11">The actions are stored in a byte of each glyph’s scratch space, <code>arabic_shaping_action()</code> (<a href="buffers.html#eight-bytes-of-scratch-space">Buffers</a>). A transparent character gets NONE (<code>:326</code>), and is otherwise skipped: neither <code>prev</code> nor the state changes. Then <code>setup_masks_arabic_plan</code> (<code>:391</code>) ORs each glyph’s mask with <code>mask_array[action]</code>, the one-bit mask of the feature of the same number. <code>mask_array[NONE]</code> is zero, so marks and non-joining characters get no joining feature at all.</p>
+<h3 id="the-ends-of-the-text">The ends of the text</h3>
+<p id="ix-12">Before the first character, the machine reads the buffer’s pre-context, the text before the item (<a href="buffers.html#adding-text">Buffers</a>). It skips transparent characters and lets the first other one set the starting state, with no actions, since that character isn’t in the buffer (<code>:308</code>). After the last character it does the same with the post-context, and here the previous-letter action is applied: a letter at the end of the buffer becomes initial or medial if the text after it joins. So a word split across two shaping calls gets the forms it would have had in one.</p>
+<h3 id="joiners">Joiners</h3>
+<p id="ix-13">ZWJ is a C character and ZWNJ a U character, so they need no special case:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ب⟨ZWJ⟩</span><span class="cps">U+0628 U+200D</span></td><td class="opt">--language=ar</td><td class="out"><code>[space=0+0|beh.init=0+400]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">⟨ZWJ⟩ب</span><span class="cps">U+200D U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[beh.fina=1+650|space=0+0]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ب⟨ZWNJ⟩ب</span><span class="cps">U+0628 U+200C U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[beh=2+600|space=1+0|beh=0+600]</code></td></tr></tbody></table></div>
+<p id="ix-14">A beh before a ZWJ is initial and after one final; with a ZWNJ between them two behs stay isolated. That ZWJ also blocks Arabic <em>ligatures</em> is the flag <code>F_MANUAL_ZWJ</code> (<a href="from-features-to-lookups.html#the-flags">From features to lookups</a>), not the machine.</p>
+<p id="ix-15">The machine also sets glyph flags (<a href="buffers.html#glyph-flags">Buffers</a>): <code>safe_to_insert_tatweel</code> wherever a previous-letter action joins two letters (<code>:335</code>), and unsafe-to-concat wherever a later character could still have changed an earlier one’s form (<code>:342</code>–<code>:348</code>, <code>:373</code>).</p>
+<h2 id="syriac-and-alaph">Syriac and Alaph</h2>
+<p id="ix-16">Syriac has more forms than Arabic. Alaph, an R letter, has five: isolated, final when it joins the letter before it, and three more, each with a feature of its own: <code>fin2</code>, <code>fin3</code> and <code>med2</code>. In HarfBuzz’s table, an Alaph is:</p>
+<ul>
+<li id="ix-17"><strong>final</strong> (<code>fina</code>) after a letter that joins it, in states 2 and 3;</li>
+<li id="ix-18"><strong><code>fin2</code></strong> at the end of a word after a letter that doesn’t join it, in state 1 (after an R letter or an isolated Alaph) or state 5;</li>
+<li id="ix-19"><strong><code>fin3</code></strong> after Dalath or Rish, in state 6;</li>
+<li id="ix-20"><strong><code>med2</code></strong>, when it was final and another letter follows: state 4 changes the previous Alaph from FINA to MED2;</li>
+<li id="ix-21"><strong>isolated</strong> otherwise, and also when a <code>fin2</code> or <code>fin3</code> Alaph is followed by another letter: state 5 changes it back to ISOL.</li>
+</ul>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ܐ</span><span class="cps">U+0710</span></td><td class="opt">--language=syr</td><td class="out"><code>[alaph=0+300]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ܒܐ</span><span class="cps">U+0712 U+0710</span></td><td class="opt">--language=syr</td><td class="out"><code>[alaph.fina=1+350|beth.init=0+450]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ܒܐܒ</span><span class="cps">U+0712 U+0710 U+0712</span></td><td class="opt">--language=syr</td><td class="out"><code>[beth=2+600|alaph.med2=1+380|beth.init=0+450]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ܘܐ</span><span class="cps">U+0718 U+0710</span></td><td class="opt">--language=syr</td><td class="out"><code>[alaph.fin2=1+360|waw=0+450]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ܕܐ</span><span class="cps">U+0715 U+0710</span></td><td class="opt">--language=syr</td><td class="out"><code>[alaph.fin3=1+370|dalath=0+450]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ܕܐܒ</span><span class="cps">U+0715 U+0710 U+0712</span></td><td class="opt">--language=syr</td><td class="out"><code>[beth=2+600|alaph=1+300|dalath=0+450]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ܒܐܐ</span><span class="cps">U+0712 U+0710 U+0710</span></td><td class="opt">--language=syr</td><td class="out"><code>[alaph.fin2=2+360|alaph.med2=1+380|beth.init=0+450]</code></td></tr></tbody></table></div>
+<p id="ix-22">Beth (D) joins the Alaph after it, which is final; with another beth after that, the Alaph is <code>med2</code> and the second beth is isolated, since Alaph never joins forwards. After waw, an ordinary R letter, it is <code>fin2</code>; after dalath, <code>fin3</code>; and that <code>fin3</code> turns back to isolated when beth follows. In the last line the second Alaph is <code>fin2</code>, after an Alaph, and the first is <code>med2</code>.</p>
+<p id="ix-23"><code>FEATURE_IS_SYRIAC</code> (<code>:102</code>) recognizes the three by the digit at the end of their tags: they are the joining features with no fallback.</p>
+<h2 id="the-features-in-order">The features, in order</h2>
+<p id="ix-24"><code>collect_features_arabic</code> (<code>:187</code>) asks for the shaper’s features, separated by pauses. In order:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-25">Stage</th>
+<th id="ix-26">Features</th>
+<th id="ix-27">Pause function at its end</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td></td>
+<td id="ix-28"><code>stch</code> (with the common <code>rtla</code>, <code>rtlm</code>, <code>frac</code>, <code>numr</code>, <code>dnom</code>, <code>rand</code>, <code>Harf</code>)</td>
+<td><code>record_stch</code></td>
+</tr>
+<tr>
+<td></td>
+<td id="ix-29"><code>ccmp</code>, <code>locl</code></td>
+<td></td>
+</tr>
+<tr>
+<td>one each</td>
+<td id="ix-30"><code>isol</code>, <code>fina</code>, <code>fin2</code>, <code>fin3</code>, <code>medi</code>, <code>med2</code>, <code>init</code></td>
+<td></td>
+</tr>
+<tr>
+<td>(empty)</td>
+<td></td>
+<td><code>deallocate_buffer_var</code></td>
+</tr>
+<tr>
+<td></td>
+<td id="ix-31"><code>rlig</code></td>
+<td><code>arabic_fallback_shape</code>, for Arabic only</td>
+</tr>
+<tr>
+<td></td>
+<td id="ix-32"><code>calt</code></td>
+<td id="ix-33">none if the font has <code>rclt</code></td>
+</tr>
+<tr>
+<td></td>
+<td id="ix-34"><code>liga</code>, <code>clig</code>, <code>mset</code>, then <code>Buzz</code> and the common and horizontal features</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-35"><a href="feature-order.html#arabic">Feature order</a> lists these stages beside the other shapers’.</p>
+<p id="ix-36">The joining features are added with <code>add_feature</code>, not <code>enable_feature</code>: none is on globally, and each glyph gets the bit of at most one. All but <code>stch</code> have <code>F_MANUAL_ZWJ</code>. <code>cswh</code> is no longer on, because Windows 8 and later don’t turn it on (<code>:244</code>); <code>mset</code> is.</p>
+<p id="ix-37">Why so many stages? The comment at <code>:192</code> gives the reasons. The pause between the joining features and <code>rlig</code> is required: <code>rlig</code> must see the joining forms, because lam-alef is a ligature of an <em>initial or medial</em> lam and a <em>final</em> alef (the bug it cites is Mozilla’s 644184). The pauses between the joining features themselves “are not necessarily needed as only one of those features is applied to any character”; they make a difference only to contextual lookups, which see the forms of earlier features but not of later ones, and HarfBuzz follows the order of the specification, as giving “better experience if that’s what Uniscribe is doing”. <a href="from-features-to-lookups.html#harf-and-buzz-seen-through-the-arabic-shapers-stages">From features to lookups</a> shows these stages running.</p>
+<p id="ix-38">The pause between <code>rlig</code> and <code>calt</code> is for Arabic script only. Uniscribe was found to have it for Arabic, since without it the IranNastaliq font’s ALLAH ligature doesn’t form, and found not to have it for Mongolian (then shaped by this shaper). Syriac, the one other script here, therefore runs <code>rlig</code> and <code>calt</code> together. In <code>joining.ttf</code>, <code>calt</code> is lookup 0 and turns a ligature that <code>rlig</code>, lookup 8, makes into an alternate:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">لا</span><span class="cps">U+0644 U+0627</span></td><td class="opt">--language=ar</td><td class="out"><code>[lam_alef.calt=0+600]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ܠܐ</span><span class="cps">U+0720 U+0710</span></td><td class="opt">--language=syr</td><td class="out"><code>[lamadh_alaph=0+600]</code></td></tr></tbody></table></div>
+<p id="ix-39">The Arabic lam-alef reaches <code>calt</code> and is changed. The Syriac lamadh-alaph is made in the same stage as <code>calt</code>, after <code>calt</code>’s lookup has run, and stays as it is.</p>
+<p id="ix-40">The pause after <code>calt</code> (issue 1573) is left out if the font has an <code>rclt</code> feature (<code>:238</code>): <code>has_feature</code> asks the font, not the plan.</p>
+<blockquote>
+<p id="ix-41">For type designers: “Arabic, Urdu and Sindhi” in Simon Cozens’ <a href="https://simoncozens.github.io/fonts-and-layout/localisation.html#arabic-urdu-and-sindhi"><em>Fonts and Layout for Global Scripts</em></a> shows how a calligraphic Arabic font uses chained contextual substitutions where ligatures would get in each other’s way, with Amiri as the example.</p>
+</blockquote>
+<h2 id="reordering-marks">Reordering marks</h2>
+<p id="ix-42">Unicode’s canonical ordering sorts a run of marks by combining class, and <a href="normalization.html">Normalization</a> explains that HarfBuzz sorts by its own modified classes. For Arabic, this puts a hamza above, class 230, after a fatha or a shadda, whose classes are in the 27–35 range. But a hamza above is part of the letter: it should be drawn next to it, under any vowel. Unicode Technical Report #53, <em>Unicode Arabic Mark Rendering</em>, names such marks <strong>modifier combining marks</strong> and asks for them to be moved to the front of the run. <code>reorder_marks_arabic</code> (<code>:721</code>), the shaper’s <code>reorder_marks</code> hook, does that, straight after each run has been sorted.</p>
+<p id="ix-43">Its list has fourteen marks (<code>:692</code>): hamza above and below, noon ghunna, small high and low seen, small high yeh and noon, and seven from the Arabic Extended-A block. For class 220, then for 230, it finds the first mark of that class in the run. If it and those right after it are on the list, it moves them to the front of the run, merges the clusters of everything it moved past, and renumbers them. Only marks at the head of their class are moved: a hamza above after a madda, both 230, stays behind the madda (read from the code).</p>
+<div class="trace"><div class="trace-head"><code>hb-shape joining.ttf "بَٔ" --language=ar --trace</code></div><table><tbody><tr><td class="what">start reorder</td><td class="buf"><code>&lt;U+0628=0|U+064E=0|U+0654=0&gt;</code></td></tr><tr><td class="what">end reorder</td><td class="buf"><code>&lt;U+0628=0|U+0654=0|U+064E=0&gt;</code></td></tr><tr><td class="what">start compose</td><td class="buf"><code>&lt;U+0628=0|U+0654=0|U+064E=0&gt;</code></td></tr><tr><td class="what">end compose</td><td class="buf"><code>&lt;U+0628=0|U+0654=0|U+064E=0&gt;</code></td></tr></tbody></table></div>
+<p id="ix-44">The renumbering is the subtle part. The modifier marks are given modified classes 25 or 26, values HarfBuzz otherwise uses for Hebrew points (<code>HB_MODIFIED_COMBINING_CLASS_CCC22</code> and <code>CCC26</code>), which are lower than every Arabic class, so the run still looks sorted. The normalizer’s CGJ handling needs that (issue 554). The fallback mark positioner maps 25 to below and 26 to above, as it does for the Hebrew points (<a href="fallbacks.html#recategorizing-marks">Fallbacks</a>).</p>
+<p id="ix-45">The comment admits the cost: a mark renumbered to 26 no longer blocks a later 230 mark from composing with the base. In “alef, hamza above, madda”, the hamza should keep the madda from composing with the alef. <code>joining.ttf</code> has a glyph for U+0622 ALEF WITH MADDA ABOVE but not for U+0623 ALEF WITH HAMZA ABOVE:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape joining.ttf "أٓ" --language=ar --trace</code></div><table><tbody><tr><td class="what">start compose</td><td class="buf"><code>&lt;U+0627=0|U+0654=0|U+0653=0&gt;</code></td></tr><tr><td class="what">end compose</td><td class="buf"><code>&lt;U+0622=0|U+0654=0&gt;</code></td></tr></tbody></table></div>
+<p>The alef and the madda compose across the hamza. Canonically, that text is not equivalent to U+0622 U+0654. HarfBuzz accepts this, in the comment at <code>:771</code>, as the price of keeping the CGJ logic right.</p>
+<h2 id="stretching-stch">Stretching: <code>stch</code></h2>
+<p id="ix-46">The Syriac abbreviation mark, U+070F, is a line drawn over the letters of an abbreviation, as long as they are. A font draws it with the feature <code>stch</code>, which replaces the mark with a sequence of glyphs, some of fixed length and some to be repeated; the comment above HarfBuzz’s code points to Microsoft’s Syriac script development specification for an example. HarfBuzz implements it “in a generic way, such that the Arabic subtending marks can use it as well” (<code>:448</code>), so any font can use it under the Arabic shaper. <code>stch.ttf</code> breaks the mark into an end, a repeating bar and another end:</p>
+<figure class="views"><div class="tabs" role="tablist" aria-label="Views of stch.ttf, lookup 0"><button type="button" role="tab" data-view="spec">Spec-like</button><button type="button" role="tab" data-view="fea">Feature file</button><button type="button" role="tab" data-view="ttx">TTX</button><button type="button" role="tab" data-view="cpp">HarfBuzz C++</button></div><div class="pane print" data-view="spec" data-label="Spec-like" role="tabpanel"><pre><code>Lookup 0: Multiple substitution (type 2)
+  lookupFlag: none
+  subtable 0: MultipleSubstFormat1
+    coverage: [sam]
+    sequence:
+      sam → sam.end sam.rep sam.end</code></pre></div><div class="pane" data-view="fea" data-label="Feature file" role="tabpanel"><pre><code>feature stch {
+    sub sam by sam.end sam.rep sam.end;
+} stch;</code></pre></div><div class="pane" data-view="ttx" data-label="TTX" role="tabpanel"><pre><code>&lt;Lookup index=&quot;0&quot;&gt;
+  &lt;LookupType value=&quot;2&quot;/&gt;
+  &lt;LookupFlag value=&quot;0&quot;/&gt;
+  &lt;!-- SubTableCount=1 --&gt;
+  &lt;MultipleSubst index=&quot;0&quot;&gt;
+    &lt;Substitution in=&quot;sam&quot; out=&quot;sam.end,sam.rep,sam.end&quot;/&gt;
+  &lt;/MultipleSubst&gt;
+&lt;/Lookup&gt;</code></pre></div><div class="pane" data-view="cpp" data-label="HarfBuzz C++" role="tabpanel"><pre><code>template &lt;typename Types&gt;
+struct Sequence
+{
+  protected:
+  Array16Of&lt;typename Types::HBGlyphID&gt;
+                substitute;             /* String of GlyphIDs to substitute */
+  public:
+  DEFINE_SIZE_ARRAY (2, substitute);
+  /* … */
+};</code></pre><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/Sequence.hh#L10-L17">src/OT/Layout/GSUB/Sequence.hh:10</a></div><figcaption>stch.ttf, lookup 0</figcaption></figure>
+<p id="ix-47"><strong>Recording.</strong> <code>stch</code> is the first of the shaper’s features, and <code>record_stch</code> (<code>:456</code>) runs right after it. It looks for every glyph that a multiple substitution has <em>multiplied</em> (a property GSUB sets, <a href="gsub.html#glyph-properties">GSUB</a>), and gives it an action that the joining machine never uses: STCH_FIXED if its component number is even and STCH_REPEATING if odd (<code>:475</code>). It is the same byte as the joining action (“We abuse the same byte for other things”, <code>:131</code>), which is free again by then, since the joining masks were set before GSUB. The comment warns that <code>rtlm</code>, <code>frac</code> and the other features in the same stage could also multiply a glyph, and assumes they don’t.</p>
+<p id="ix-48"><strong>Measuring.</strong> Nothing more happens until the very end of shaping. <code>apply_stch</code> (<code>:482</code>), run from <code>postprocess_glyphs</code>, after GPOS and in visual order, finds each run of tiles and measures the “rest of the word”: the glyphs after it in logical order whose general category is a letter other than upper-, lower- or titlecase, a mark, a number, a symbol, private use or unassigned, or which are default ignorables (<code>HB_ARABIC_GENERAL_CATEGORY_IS_WORD</code>, <code>:45</code>). Spaces and punctuation end it. The tiles’ advances are read from the font and kept in the position’s scratch field, <code>stch_advance()</code> (<code>:39</code>). Then it works out how many extra copies of the repeating tiles fill the width left after the fixed ones (<code>:586</code>). If that leaves a gap, it adds one more copy and overlaps all the copies a little to take up the excess (<code>:589</code>).</p>
+<p id="ix-49"><strong>Cutting.</strong> A second pass makes room, copies each repeating tile that many times, sets every tile’s advance to zero, and gives each an offset, so that the tiles lie over the word without taking any space. The range is marked unsafe to break.</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">stch.ttf</td><td class="in"><span class="txt">܏ܒ</span><span class="cps">U+070F U+0712</span></td><td class="opt">--language=syr</td><td class="out"><code>[beth=1+500|sam.end=0@-500,0+0|sam.rep=0@-400,0+0|sam.rep=0@-300,0+0|sam.end=0@-100,0+0]</code></td></tr><tr><td class="font">stch.ttf</td><td class="in"><span class="txt">܏ܒܒܒ</span><span class="cps">U+070F U+0712 U+0712 U+0712</span></td><td class="opt">--language=syr</td><td class="out"><code>[beth=3+500|beth=2+500|beth=1+500|sam.end=0@-1504,0+0|sam.rep=0@-1404,0+0|sam.rep=0@-1220,0+0|sam.rep=0@-1036,0+0|sam.rep=0@-852,0+0|sam.rep=0@-668,0+0|sam.rep=0@-484,0+0|sam.rep=0@-300,0+0|sam.end=0@-100,0+0]</code></td></tr><tr><td class="font">stch.ttf</td><td class="in"><span class="txt">܏ܒܒܒ</span><span class="cps">U+070F U+0712 U+0712 U+0712</span></td><td class="opt">--language=syr --features=-stch</td><td class="out"><code>[beth=3+500|beth=2+500|beth=1+500|sam=0+0]</code></td></tr></tbody></table></div>
+<p id="ix-50">One beth is 500 units wide. The ends are 100 each and the bar 200, so 300 is left for bars: one bar is too short and two too long, so there are two, overlapping by 100, and the tiles run from −500 to 0, exactly over the beth. Three beths get seven bars, each overlapping the next by 16 units. Integer division leaves 4 units over, so the line starts at −1504 over a word 1500 wide. Without <code>stch</code> the mark is one zero-width glyph.</p>
+<p id="ix-51">The fit is not always that close. When the bars fit with no gap, no extra copy is added and the variable <code>w_remaining</code> is not set to zero, so the tiles start at half the word’s width less the ends (<code>:625</code>), not at the word’s edge. With two beths, a 1000-unit word, the line runs from −600 to 400:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">stch.ttf</td><td class="in"><span class="txt">܏ܒܒ</span><span class="cps">U+070F U+0712 U+0712</span></td><td class="opt">--language=syr</td><td class="out"><code>[beth=2+500|beth=1+500|sam.end=0@-600,0+0|sam.rep=0@-500,0+0|sam.rep=0@-300,0+0|sam.rep=0@-100,0+0|sam.rep=0@100,0+0|sam.end=0@300,0+0]</code></td></tr></tbody></table></div>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -840 2280 1080" role="img" aria-label="܏ܒܒ␣܏ܒ at default">
+<g transform="scale(1,-1)">
+<path d="M50,0L50,500L450,500L450,0L50,0Z" fill="currentColor"/>
+<path d="M50,600L50,760L150,760L150,600L50,600Z" fill="currentColor"/>
+<path d="M150,600L150,660L350,660L350,600L150,600Z" fill="currentColor"/>
+<path d="M250,600L250,660L450,660L450,600L250,600Z" fill="currentColor"/>
+<path d="M450,600L450,760L550,760L550,600L450,600Z" fill="currentColor"/>
+<path d="M800,0L800,500L1200,500L1200,0L800,0Z" fill="currentColor"/>
+<path d="M1300,0L1300,500L1700,500L1700,0L1300,0Z" fill="currentColor"/>
+<path d="M1200,600L1200,760L1300,760L1300,600L1200,600Z" fill="currentColor"/>
+<path d="M1300,600L1300,660L1500,660L1500,600L1300,600Z" fill="currentColor"/>
+<path d="M1500,600L1500,660L1700,660L1700,600L1500,600Z" fill="currentColor"/>
+<path d="M1700,600L1700,660L1900,660L1900,600L1700,600Z" fill="currentColor"/>
+<path d="M1900,600L1900,660L2100,660L2100,600L1900,600Z" fill="currentColor"/>
+<path d="M2100,600L2100,760L2200,760L2200,600L2100,600Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[beth=5+500|sam.end=4@-500,0+0|sam.rep=4@-400,0+0|sam.rep=4@-300,0+0|sam.end=4@-100,0+0|space=3+250|beth=2+500|beth=1+500|sam.end=0@-600,0+0|sam.rep=0@-500,0+0|sam.rep=0@-300,0+0|sam.rep=0@-100,0+0|sam.rep=0@100,0+0|sam.end=0@300,0+0]</code></div></div><figcaption><code>hb-vector stch.ttf "܏ܒܒ␣܏ܒ"</code></figcaption></figure>
+<p>In the drawing, the word on the right has one beth, and its line fits it. The word on the left has two, and its line is moved 400 units right, across the space and into the other word. This looks like a bug: the exact fit is the one case where the result is worse than an approximate one. When the word is narrower than the two ends and a bar, the line is also off center, by half the width left after the ends.</p>
+<p id="ix-52">Two limits keep a hostile font from making the buffer huge. A run of tiles is never repeated past 256 glyphs in all (<code>STCH_MAX_GLYPHS</code>, <code>:572</code>), and the arithmetic uses 64-bit integers and saturating additions; NEWS records fixes for overflows here in 13.1.0 and 13.1.1.</p>
+<h2 id="shaping-without-gsub">Shaping without GSUB</h2>
+<p id="ix-53">Older Arabic fonts often map the <strong>presentation forms</strong>, Unicode’s compatibility characters for each joining form of each letter (U+FB50–U+FDFF, U+FE70–U+FEFF): they have a glyph for U+FE91 ARABIC LETTER BEH INITIAL FORM but no <code>init</code> feature. HarfBuzz shapes them by synthesizing the lookups they lack. This is why Arabic gets the Arabic shaper even when the font has no Arabic script tag (<a href="choosing-a-script-shaper.html#arabic-and-syriac">Choosing a script shaper</a>).</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">presentation.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[uniFE90=2+650|uniFE92=1+400|uniFE91=0+400]</code></td></tr><tr><td class="font">presentation.ttf</td><td class="in"><span class="txt">بلا</span><span class="cps">U+0628 U+0644 U+0627</span></td><td class="opt">--language=ar</td><td class="out"><code>[uniFEFC=1+650|uniFE91=0+400]</code></td></tr><tr><td class="font">presentation.ttf</td><td class="in"><span class="txt">لمب</span><span class="cps">U+0644 U+0645 U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[uniFE90=2+650|uniFCCC=0+700]</code></td></tr><tr><td class="font">presentation.ttf</td><td class="in"><span class="txt">لمب</span><span class="cps">U+0644 U+0645 U+0628</span></td><td class="opt">--language=ar --features=-rlig</td><td class="out"><code>[uniFE90=2+650|uniFEE4=1+400|uniFEDF=0+300]</code></td></tr><tr><td class="font">presentation.ttf</td><td class="in"><span class="txt">بَّ</span><span class="cps">U+0628 U+0651 U+064E</span></td><td class="opt">--language=ar</td><td class="out"><code>[uniFC60=0@200,-19+0|uniFE8F=0+600]</code></td></tr></tbody></table></div>
+<p id="ix-54">Each beh becomes the glyph the font maps to its presentation form. Lam and alef become U+FEFC, the final lam-alef. Lam and meem make U+FCCC, LAM WITH MEEM INITIAL FORM, because that ligature is in HarfBuzz’s tables too, and like every ligature here it is applied as <code>rlig</code>, so turning <code>rlig</code> off is the only way to stop it. A shadda and a fatha become one mark, U+FC60.</p>
+<h3 id="when">When</h3>
+<p id="ix-55">Three conditions, all decided when the plan is made. The script must be Arabic: Syriac and the others have no fallback. Each of <code>isol</code>, <code>fina</code>, <code>medi</code>, <code>init</code> and <code>rlig</code> is added with <code>F_HAS_FALLBACK</code> (<code>:221</code>, <code>:231</code>), so it keeps a mask bit even if the font doesn’t have it, and the joining machine’s actions still reach the masks. And <code>data_create_arabic</code> (<code>:273</code>) turns fallback on only if <em>none</em> of <code>isol</code>, <code>fina</code>, <code>medi</code> and <code>init</code> was found in the font’s GSUB, for the chosen script and language. One is enough to turn it off:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">presentation-init.ttf</td><td class="in"><span class="txt">ببب</span><span class="cps">U+0628 U+0628 U+0628</span></td><td class="opt">--language=ar</td><td class="out"><code>[beh=2+600|beh=1+600|uniFE91=0+400]</code></td></tr><tr><td class="font">presentation-init.ttf</td><td class="in"><span class="txt">بلا</span><span class="cps">U+0628 U+0644 U+0627</span></td><td class="opt">--language=ar</td><td class="out"><code>[alef=2+300|lam=1+500|uniFE91=0+400]</code></td></tr></tbody></table></div>
+<p id="ix-56"><code>presentation-init.ttf</code> is <code>presentation.ttf</code> with a GSUB whose only feature is <code>init</code>. The initial beh comes from the font; nothing else is formed, and no lam-alef is made either. A font’s own <code>rlig</code> doesn’t count: if it has one, the synthesized ligatures run after it.</p>
+<h3 id="how">How</h3>
+<p id="ix-57">The lookups can only be made with a font, which the plan doesn’t have, so they are made the first time the plan is used, by <code>arabic_fallback_shape</code> (<code>:417</code>), and kept in the plan (<a href="shape-plans-and-their-cache.html">Shape plans and their cache</a>). <code>arabic_fallback_plan_init_unicode</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic-fallback.hh#L295"><code>hb-ot-shaper-arabic-fallback.hh:295</code></a>) makes up to seven, in the order of <code>arabic_fallback_features</code> (<code>:42</code>):</p>
+<ol>
+<li id="ix-58">Four single substitutions, for <code>init</code>, <code>medi</code>, <code>fina</code> and <code>isol</code>. Each is made from a column of <code>shaping_table</code>, which gives the four presentation forms of each character from U+0621 to U+06D3. A pair is kept if the font has a glyph for both characters, the two glyphs differ, and both IDs are below 65536 (<code>:72</code>).</li>
+<li id="ix-59">Three ligature substitutions, all for <code>rlig</code>: three-part ligatures, such as LAM WITH MEEM WITH HAH, then two-part ones, such as lam-alef, then mark ligatures, shadda with a vowel. The first two ignore marks; the mark ligatures, of course, don’t.</li>
+</ol>
+<p id="ix-60">They are real GSUB lookups, written into a stack buffer by the serializer, copied, and given accelerators like any font’s; an empty one is dropped. <code>arabic_fallback_plan_shape</code> (<code>:367</code>) then applies them in order, each with its feature’s mask, in the pause after the font’s <code>rlig</code>. Since they don’t come from the font’s lookup list, a trace shows their substitutions with no “start lookup” around them:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape presentation.ttf "بلا" --language=ar --trace</code></div><table><tbody><tr><td class="what">start table GSUB script tag &#x27;&#x27;</td><td class="buf"><code>[beh=0|lam=1|alef=2]</code></td></tr><tr><td class="what">replacing glyph at 0 (single substitution)</td><td class="buf"><code>[beh=0|lam=1|alef=2]</code></td></tr><tr><td class="what">replaced glyph at 0 (single substitution)</td><td class="buf"><code>[uniFE91=0|lam=1|alef=2]</code></td></tr><tr><td class="what">replacing glyph at 1 (single substitution)</td><td class="buf"><code>[uniFE91=0|lam=1|alef=2]</code></td></tr><tr><td class="what">replaced glyph at 1 (single substitution)</td><td class="buf"><code>[uniFE91=0|uniFEE0=1|alef=2]</code></td></tr><tr><td class="what">replacing glyph at 2 (single substitution)</td><td class="buf"><code>[uniFE91=0|uniFEE0=1|alef=2]</code></td></tr><tr><td class="what">replaced glyph at 2 (single substitution)</td><td class="buf"><code>[uniFE91=0|uniFEE0=1|uniFE8E=2]</code></td></tr><tr><td class="what">ligating glyphs at 1,2</td><td class="buf"><code>[uniFE91=0|uniFEE0=1|uniFE8E=2]</code></td></tr><tr><td class="what">ligated glyph at 1</td><td class="buf"><code>[uniFE91=0|uniFEFC=1]</code></td></tr><tr><td class="what">end table GSUB script tag &#x27;&#x27;</td><td class="buf"><code>[uniFE91=0|uniFEFC=1]</code></td></tr></tbody></table></div>
+<p id="ix-61">The ligature tables are in presentation forms, not in letters: lam-alef is U+FEDF U+FE8E or U+FEE0 U+FE8E, because by then the single substitutions have run. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-table.py"><code>gen-arabic-table.py</code></a> builds them from the compatibility decompositions in <code>UnicodeData.txt</code>, so that <code>&lt;initial&gt; 0644 0645</code> for U+FCCC becomes initial lam then medial meem. It doesn’t take all of them, only those on its <code>LIGATURES</code> list (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-table.py#L139"><code>gen-arabic-table.py:139</code></a>). It also adds three made-up entries for Private Use code points (<code>:156</code>), LELLAH, a lam-meem-jeem, and shadda with fathatan, for the legacy fonts below. The components of a ligature must each have a <em>nominal</em> glyph in the font, or the ligature is left out (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic-fallback.hh#L164"><code>hb-ot-shaper-arabic-fallback.hh:164</code></a>); NEWS for 15.1.0 lists a fix to wrong ligatures “when a component is missing from the font”.</p>
+<blockquote>
+<p id="ix-62">For type designers: a modern Arabic font gets none of this, as long as it has any one of the four joining features for the script and language in use. A font with presentation forms in its <code>cmap</code> but only, say, <code>init</code> in GSUB gets no other forms and no lam-alef.</p>
+</blockquote>
+<h3 id="legacy-encodings">Legacy encodings</h3>
+<p id="ix-63">If no lookup can be synthesized, because the font has no presentation forms either, HarfBuzz tries two older conventions.</p>
+<p id="ix-64">The first is a font whose glyph IDs are Windows code page 1256 byte values. <code>arabic_fallback_plan_init_win1256</code> (<code>:251</code>) checks five: alef must be glyph 199, lam 225, alef maksura 236, yeh 237 and sukun 250. If they all are, HarfBuzz uses a hand-written set of five lookups compiled into the library, in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic-win1256.hh"><code>hb-ot-shaper-arabic-win1256.hh</code></a>. That file writes its OpenType bytes with C macros, and includes itself twice: once to measure each piece and once to emit it (“First we measure, then we cut.”). It was written for Firefox (NEWS for 0.9.34, Mozilla bug 1045139) and was built only on Windows until 14.4.0. <code>win1256.ttf</code> has 256 glyphs and maps the letters to those IDs:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">win1256.ttf</td><td class="in"><span class="txt">ببلا</span><span class="cps">U+0628 U+0628 U+0644 U+0627</span></td><td class="opt">--language=ar --no-glyph-names</td><td class="out"><code>[170=2+500|4=1+500|4=0+500]</code></td></tr><tr><td class="font">win1256.ttf</td><td class="in"><span class="txt">با</span><span class="cps">U+0628 U+0627</span></td><td class="opt">--language=ar --no-glyph-names</td><td class="out"><code>[0=1+500|4=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-65">Both behs become glyph 4: these lookups give initial and medial beh the same glyph. Lam and alef become glyph 165, which the <code>medi</code> lookup then makes 170, the final lam-alef. The final alef is glyph 0, which in such fonts was presumably a real glyph, at the unused position of the NUL byte (inferred).</p>
+<p id="ix-66">The second is fonts in the legacy Simplified and Traditional Arabic encodings, which use Private Use code points. This is handled in <code>cmap</code>, not the shaper (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cmap-table.hh#L2219"><code>hb-ot-cmap-table.hh:2219</code></a>). If the <code>cmap</code> is a symbol (3,0) subtable and the <code>OS/2</code> table is version 0 with an <code>fsSelection</code> high byte of 0xB2 or 0xB3 (the Windows 3.1 “font pages” of those encodings), a character not found as it is is looked up again through a map from Unicode to the encoding’s PUA codes, made by <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-pua.py"><code>gen-arabic-pua.py</code></a> from <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/ArabicPUASimplified.txt"><code>ArabicPUASimplified.txt</code></a> and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/ArabicPUATraditional.txt"><code>ArabicPUATraditional.txt</code></a>. FreeType’s font funcs do the same (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L450"><code>hb-ft.cc:450</code></a>). Presentation forms are mapped too, so fallback shaping works as for any font. <code>pua.ttf</code> maps only PUA code points:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">pua.ttf</td><td class="in"><span class="txt">بلا</span><span class="cps">U+0628 U+0644 U+0627</span></td><td class="opt">--language=ar</td><td class="out"><code>[lam_alef.fina=1+500|beh.init=0+500]</code></td></tr></tbody></table></div>
+<p id="ix-67">The three made-up ligatures are found by looking their PUA code points up directly, since the encoding maps no Unicode character to them.</p>
+<h2 id="joining-scripts-under-use">Joining scripts under USE</h2>
+<p id="ix-68"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-joining-list.py"><code>gen-arabic-joining-list.py</code></a> writes <code>has_arabic_joining</code>, from <code>ArabicShaping.txt</code> and <code>Scripts.txt</code>: the scripts with characters whose joining type is neither T nor U. They are Adlam, Arabic, Chorasmian, Hanifi Rohingya, Mandaic, Manichaean, Mongolian, N’Ko, Old Uyghur, Phags-pa, Psalter Pahlavi, Sogdian and Syriac. All but Arabic and Syriac are shaped by the Universal Shaping Engine (NEWS for 2.8.0 records the move). For these, <code>data_create_use</code> makes an Arabic plan of its own (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use.cc#L156"><code>hb-ot-shaper-use.cc:156</code></a>), and <code>setup_masks_use</code> first calls <code>setup_masks_arabic_plan</code> with it (<code>:189</code>): the same state machine, with the same context and joiners.</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ᠠᠠᠠ</span><span class="cps">U+1820 U+1820 U+1820</span></td><td class="opt">--language=mn</td><td class="out"><code>[mongA.init=0+450|mongA.medi=1+400|mongA.fina=2+550]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ᠠ᠋ᠠ</span><span class="cps">U+1820 U+180B U+1820</span></td><td class="opt">--language=mn</td><td class="out"><code>[mongA.init.fvs1=0+460|mongA.fina=2+550]</code></td></tr><tr><td class="font">joining.ttf</td><td class="in"><span class="txt">ᠠ ᠠ</span><span class="cps">U+1820 U+202F U+1820</span></td><td class="opt">--language=mn</td><td class="out"><code>[mongA=0+500|nnbsp=1+200|mongA=2+500]</code></td></tr><tr><td class="font">joining-DFLT.ttf</td><td class="in"><span class="txt">ᠠᠠᠠ</span><span class="cps">U+1820 U+1820 U+1820</span></td><td class="opt">--language=mn</td><td class="out"><code>[mongA=0+500|mongA=1+500|mongA=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-69">Mongolian A takes its three forms. Mongolian is the one script the machine knows: after joining, <code>mongolian_variation_selectors</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc#L380"><code>hb-ot-shaper-arabic.cc:380</code></a>) copies each character’s action onto a free variation selector, U+180B to U+180D or U+180F, after it. A variation selector is transparent, so otherwise it would get no mask, and a lookup in <code>init</code> matching the letter and the selector together, as <code>joining.ttf</code> has for FVS1, would fail at the selector. The narrow no-break space Mongolian uses before suffixes is non-joining in HarfBuzz’s data, and so the letters on either side of it are isolated. The last line is the same lookups under <code>DFLT</code> only, which sends Mongolian to the default shaper (<a href="choosing-a-script-shaper.html#from-tags-to-a-shaper">Choosing a script shaper</a>): there is no joining at all.</p>
+<p id="ix-70">The same machine, but less around it. USE adds only <code>isol</code>, <code>init</code>, <code>medi</code> and <code>fina</code> (<code>:62</code>), in one stage after its reordering, so they run in LookupList order, with no pause between them and nothing for <code>fin2</code>, <code>fin3</code> or <code>med2</code>. It has no <code>stch</code>, no fallback from presentation forms (<code>do_fallback</code> needs Arabic script), and no pause between <code>rlig</code> and <code>calt</code>. Scripts not on the list get USE’s own topographical forms, from syllables rather than joining types (<code>setup_topographical_masks</code>, <code>:232</code>); that, and the rest of USE, is in <a href="universal-shaping-engine.html">The Universal Shaping Engine</a>.</p>
+<h2 id="configuration">Configuration</h2>
+<p id="ix-71"><code>HB_NO_OT_SHAPER_ARABIC_FALLBACK</code> (implied by <code>HB_NO_OT_SHAPE_FALLBACK</code>) turns off shaping from presentation forms and the PUA <code>cmap</code> maps; <code>HB_NO_WIN1256</code> only the Windows-1256 tables.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic.cc"><code>src/hb-ot-shaper-arabic.cc</code></a></td>
+<td>joining types, the state machine, the features and pauses, <code>stch</code>, mark reordering</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic-table.hh"><code>src/hb-ot-shaper-arabic-table.hh</code></a></td>
+<td>generated: joining types, <code>shaping_table</code> and the ligature tables</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-table.py"><code>src/gen-arabic-table.py</code></a></td>
+<td>its generator, from <code>ArabicShaping.txt</code>, <code>UnicodeData.txt</code> and <code>Blocks.txt</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic-fallback.hh"><code>src/hb-ot-shaper-arabic-fallback.hh</code></a></td>
+<td>lookups synthesized from presentation forms, and the Windows-1256 detection</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic-win1256.hh"><code>src/hb-ot-shaper-arabic-win1256.hh</code></a></td>
+<td>the hand-written Windows-1256 lookups</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic-pua.hh"><code>src/hb-ot-shaper-arabic-pua.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-pua.py"><code>src/gen-arabic-pua.py</code></a></td>
+<td>maps from Unicode to the legacy PUA encodings</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cmap-table.hh"><code>src/hb-ot-cmap-table.hh</code></a></td>
+<td>where those maps are used, for symbol <code>cmap</code>s</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-arabic-joining-list.hh"><code>src/hb-ot-shaper-arabic-joining-list.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/gen-arabic-joining-list.py"><code>src/gen-arabic-joining-list.py</code></a></td>
+<td><code>has_arabic_joining</code>, from <code>ArabicShaping.txt</code> and <code>Scripts.txt</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shaper-use.cc"><code>src/hb-ot-shaper-use.cc</code></a></td>
+<td>USE’s use of the Arabic plan, and its own topographical forms</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Joining types come from <code>ArabicShaping.txt</code>; C is treated as D, and Syriac Alaph and Dalath-Rish have columns of their own.</li>
+<li>A seven-state machine walks the text once, from pre-context to post-context, skipping transparent characters and correcting each letter’s form when it sees the next. Each action sets one feature’s mask bit.</li>
+<li>Syriac Alaph has <code>fin2</code>, <code>fin3</code> and <code>med2</code> forms. Each joining feature has its own stage, before <code>rlig</code>; for Arabic only, <code>calt</code> is a stage after <code>rlig</code>.</li>
+<li>Modifier combining marks such as hamza above are moved to the front of their mark run and renumbered 25 or 26, which can let a later mark compose across them.</li>
+<li><code>stch</code> turns a mark into fixed and repeating tiles, which are repeated and laid over the following word after positioning. An exact fit misplaces them.</li>
+<li>Arabic in a font with none of <code>isol</code>, <code>fina</code>, <code>medi</code> and <code>init</code> is shaped with lookups synthesized from the presentation forms in its <code>cmap</code>, or built-in ones for Windows-1256 fonts.</li>
+<li>Mongolian, N’Ko and the other joining scripts are shaped by USE with the same state machine, but only the four basic forms, in one stage, and with no fallback or <code>stch</code>.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="vertical-text.html">← Vertical text</a><a rel="next" href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

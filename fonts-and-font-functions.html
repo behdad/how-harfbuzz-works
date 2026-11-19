@@ -1,0 +1,863 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Fonts and font functions · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part II · Foundations</p>
+<h1 id="fonts-and-font-functions">8. Fonts and font functions</h1>
+<p id="ix-1">A face is a font file’s tables, read lazily and shared. It has no size. It can’t say how wide a glyph is at 12 points, or which glyph a character maps to, without someone doing the arithmetic and reading the right table. That is the job of the <strong>font</strong>, <code>hb_font_t</code>: a face at a particular scale, with particular variation coordinates and, if asked, synthetic bold and slant. Every question the shaper asks about glyphs goes to the font, not the face.</p>
+<p id="ix-2">The font doesn’t answer those questions itself either. It passes each one to a table of callbacks, the <strong>font functions</strong> (“font funcs”). HarfBuzz’s own implementation, <em>hb-ot</em>, reads the font’s OpenType tables. Others ask FreeType, Core Text, DirectWrite or the Rust Fontations crates. An application can supply its own, or override just one callback and leave the rest alone. The shaper never knows which it is talking to. This split, between asking about glyphs and shaping with the answers, is one of HarfBuzz’s central design choices, and this chapter is about the layer that makes it work: what a font holds, how the callbacks are organized, how a font can delegate to a parent, and where synthetic bold and slant are applied.</p>
+<p id="ix-3">How hb-ot actually works out an advance or a bounding box is the subject of the <a href="where-metrics-come-from.html">next chapter</a>. The face underneath, and how its tables are loaded, is the subject of the <a href="blobs-faces-and-lazy-tables.html">previous one</a>. The examples here use a small test font, <code>funcs.ttf</code>, built by <code>fonts/fonts-and-font-functions/build-font.py</code>. Its em is 1000 units, and its glyphs have deliberately awkward advances: H is 625 units wide and I is 275. It has a GPOS mark rule for a combining acute and one kerning pair, H I, of −25. Every result on this page was produced by HarfBuzz 15.1.0 when the page was built.</p>
+<h2 id="what-a-font-holds">What a font holds</h2>
+<p id="ix-4"><code>hb_font_t</code> is defined in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L111"><code>hb-font.hh:111</code></a>. Leaving out the object header and the plumbing, it is this (trimmed):</p>
+<pre><code class="language-c++">struct hb_font_t
+{
+  hb_atomic_t&lt;unsigned&gt; serial;
+  hb_atomic_t&lt;unsigned&gt; serial_coords;
+
+  hb_font_t *parent;
+  hb_face_t *face;
+
+  int32_t x_scale;
+  int32_t y_scale;
+
+  bool is_synthetic;
+  float x_embolden, y_embolden;
+  bool embolden_in_place;
+  int32_t x_strength, y_strength;   /* x_embolden, in scaled units. */
+  float slant;
+  float slant_xy;
+
+  float x_multf, y_multf;
+  int64_t x_mult, y_mult;
+
+  unsigned int x_ppem, y_ppem;
+  float ptem;
+
+  unsigned int instance_index;      /* Font variation coordinates. */
+  bool has_nonzero_coords;
+  unsigned int num_coords;
+  int *coords;
+  float *design_coords;
+
+  hb_font_funcs_t   *klass;
+  void              *user_data;
+  hb_destroy_func_t  destroy;
+
+  hb_shaper_object_dataset_t&lt;hb_font_t&gt; data;
+};
+</code></pre>
+<p id="ix-5">The fields fall into a few groups: three kinds of size, the synthetic settings, the variation coordinates, the font funcs (<code>klass</code>, with <code>user_data</code> as the per-font data they work on), and <code>data</code>, which is where each shaper keeps its own per-font state. The rest of this chapter takes them in turn.</p>
+<h3 id="three-kinds-of-size">Three kinds of size</h3>
+<p>HarfBuzz has three separate notions of how big a font is, and they do different things.</p>
+<p id="ix-6"><strong>Scale</strong> is the one that matters. <code>x_scale</code> and <code>y_scale</code> are the number of output units in one em. Every advance, offset and extent HarfBuzz returns is in those units. The documentation for <code>hb_font_set_scale</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2814"><code>hb-font.cc:2814</code></a>) is clear that HarfBuzz attaches no meaning to them: 20 could be 20 pixels, 20 points or 20 millimeters. A client that wants fractions usually multiplies: <code>hb_font_set_scale (font, 20 * 64, 20 * 64)</code> gives a 20-unit font with 6 bits of sub-unit precision, which is what FreeType’s 26.6 numbers expect. A new font’s scale is the face’s units per em, so out of the box HarfBuzz reports positions in font units. <code>hb-shape</code> does the same unless it is given <code>--font-size</code>, which sets the scale directly:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HIH</span><span class="cps">U+0048 U+0049 U+0048</span></td><td class="opt"></td><td class="out"><code>[H=0+600|I=1+275|H=2+625]</code></td></tr><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HIH</span><span class="cps">U+0048 U+0049 U+0048</span></td><td class="opt">--font-size=2000</td><td class="out"><code>[H=0+1200|I=1+550|H=2+1250]</code></td></tr><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HIH</span><span class="cps">U+0048 U+0049 U+0048</span></td><td class="opt">--font-size=13</td><td class="out"><code>[H=0+8|I=1+4|H=2+8]</code></td></tr><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HIH</span><span class="cps">U+0048 U+0049 U+0048</span></td><td class="opt">--font-size=-1000</td><td class="out"><code>[H=0+-600|I=1+-275|H=2+-625]</code></td></tr></tbody></table></div>
+<p id="ix-7">The first H is 600, not 625, because of the kerning pair. At a scale of 13, the kerning (−0.325 of a unit) rounds away. A negative scale is allowed and simply flips the sign, which is how a client working with a y-down coordinate system can get y values it can use directly. The synthetic code takes care to keep its adjustments pointing the right way when a scale is negative.</p>
+<p id="ix-8"><strong>Pixels per em</strong>, <code>x_ppem</code> and <code>y_ppem</code>, are zero unless a client sets them, and nearly nothing reads them. They exist for the few parts of OpenType that are defined in pixels: the hinting Device tables that GPOS value records and anchors can carry, anchors that name a contour point (AnchorFormat2, which needs a hinted outline to mean anything), and the choice of bitmap strike in <code>sbix</code> and <code>CBDT</code>. The test font’s kerning pair has a Device table saying “at 12 ppem, one pixel less”:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HI</span><span class="cps">U+0048 U+0049</span></td><td class="opt"></td><td class="out"><code>[H=0+600|I=1+275]</code></td></tr><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HI</span><span class="cps">U+0048 U+0049</span></td><td class="opt">--font-ppem=12</td><td class="out"><code>[H=0+517|I=1+275]</code></td></tr><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HI</span><span class="cps">U+0048 U+0049</span></td><td class="opt">--font-ppem=13</td><td class="out"><code>[H=0+600|I=1+275]</code></td></tr><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HI</span><span class="cps">U+0048 U+0049</span></td><td class="opt">--font-size=12 --font-ppem=12</td><td class="out"><code>[H=0+6|I=1+3]</code></td></tr></tbody></table></div>
+<p id="ix-9"><code>HintingDevice::get_delta</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L6239"><code>hb-ot-layout-common.hh:6239</code></a>) turns the pixel delta into scaled units as <code>pixels * scale / ppem</code>. At a scale of 1000 and 12 ppem, one pixel is 83 units, so H’s advance drops from 600 to 517. At 13 ppem the table has nothing to say. At a scale of 12 and 12 ppem, one pixel is one unit. With no ppem set, the Device table isn’t even looked at (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/ValueFormat.hh#L123"><code>ValueFormat.hh:123</code></a>; the same field can instead hold a variation index, which is why a variable font with non-default coordinates reads it anyway).</p>
+<p id="ix-10"><strong>Point size</strong>, <code>ptem</code>, is also zero unless set. It is the size in typographic points, and only three things read it: AAT’s <code>trak</code> table, whose tracking values are given per point size (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-aat-layout-trak-table.hh#L224"><code>hb-aat-layout-trak-table.hh:224</code></a>); the Core Text integration, which needs a real size to create a <code>CTFont</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext-shape.cc#L68"><code>hb-coretext-shape.cc:68</code></a>); and <code>hb_style_get_value</code>, which reports <code>ptem</code> as the optical size of a font that has no <code>opsz</code> axis (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-style.cc#L89"><code>hb-style.cc:89</code></a>). When it isn’t set, the first two use 12 points, Core Text’s own default. Setting <code>ptem</code> does <em>not</em> set an <code>opsz</code> axis: choosing an optical size is left to the client.</p>
+<blockquote>
+<p id="ix-11">For programmers: the three are independent. Setting the scale doesn’t set ppem, and setting ppem doesn’t change the scale. A client that wants hinting Device tables to apply has to set both.</p>
+</blockquote>
+<h3 id="the-mults-and-rounding">The mults, and rounding</h3>
+<p id="ix-12">Every time a setting changes, the font recomputes its scale factors in <code>hb_font_t::changed</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L1143"><code>hb-font.hh:1143</code></a>):</p>
+<pre><code class="language-c++">void changed ()
+{
+  float upem = face-&gt;get_upem ();
+
+  x_multf = x_scale / upem;
+  y_multf = y_scale / upem;
+  x_mult = (int64_t) x_scale * 0x10000 / upem;
+  y_mult = (int64_t) y_scale * 0x10000 / upem;
+
+  is_synthetic =  x_embolden || y_embolden || slant;
+
+  x_strength = roundf (abs (x_scale) * x_embolden);
+  y_strength = roundf (abs (y_scale) * y_embolden);
+
+  slant_xy = y_scale ? slant * x_scale / y_scale : 0.f;
+
+  data.fini ();
+
+  serial++;
+}
+</code></pre>
+<p id="ix-13">There are two multipliers for each direction. <code>x_mult</code> is a 16.16 fixed-point number, and <code>x_multf</code> is a float. The font offers a small family of conversions built on them (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L161-L170"><code>hb-font.hh:161–170</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Takes</th>
+<th>Gives</th>
+<th>How</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>em_scale_x</code></td>
+<td>integer font units</td>
+<td>integer</td>
+<td><code>(v * x_mult + 32768) &gt;&gt; 16</code></td>
+</tr>
+<tr>
+<td><code>em_scalef_x</code></td>
+<td>float font units</td>
+<td>integer</td>
+<td><code>roundf (v * x_multf)</code></td>
+</tr>
+<tr>
+<td><code>em_fscale_x</code></td>
+<td>integer font units</td>
+<td>float</td>
+<td><code>v * x_multf</code>, unrounded</td>
+</tr>
+<tr>
+<td><code>em_fscalef_x</code></td>
+<td>float font units</td>
+<td>float</td>
+<td><code>v * x_multf</code>, unrounded</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-14">Integer metrics such as <code>hmtx</code> advances go through <code>em_scale_x</code>. Values that are already fractional, such as the result of applying variation deltas, go through <code>em_scalef_x</code>. GPOS anchors are scaled to floats with <code>em_fscale_x</code> and only rounded when the final offset is worked out, so two anchors don’t each pick up a rounding error.</p>
+<p id="ix-15">The fixed-point path has a quirk worth knowing. The multiplier itself is truncated when it is computed: at a scale of 12 and 1000 units per em, the exact multiplier is 786.432/65536 and the stored one is 786/65536. The rounding afterward is round-half-up. So an advance that should come out at exactly one half can fall just short of it:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">H</span><span class="cps">U+0048</span></td><td class="opt">--font-size=12</td><td class="out"><code>[H=0+7]</code></td></tr><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">H</span><span class="cps">U+0048</span></td><td class="opt">--font-size=13</td><td class="out"><code>[H=0+8]</code></td></tr></tbody></table></div>
+<p id="ix-16">625 × 12/1000 is exactly 7.5, which would round to 8. With the truncated multiplier it is 625 × 786/65536 = 7.496, a hair under the half, so it rounds to 7. At 13, 8.125 rounds to 8 either way. Nobody should depend on which way a half goes, but it explains results that look one unit off. Glyph extents are scaled differently again, in floats, and rounded outwards across but not up and down (<code>scale_glyph_extents</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L201"><code>hb-font.hh:201</code></a>); the <a href="where-metrics-come-from.html#scaling-and-rounding">next chapter</a> shows the difference.</p>
+<blockquote>
+<p id="ix-17">For type designers: at small integer scales, the rounding of each advance can add up across a line. That’s why clients that care set a scale with fractional bits (a multiple of 64, say) rather than the pixel size itself.</p>
+</blockquote>
+<h3 id="serial-numbers">Serial numbers</h3>
+<p id="ix-18"><code>changed()</code> ends by freeing every shaper’s per-font data and incrementing <code>serial</code>. Every setter that alters the font (<code>hb_font_set_scale</code>, <code>set_ppem</code>, <code>set_ptem</code>, <code>set_synthetic_bold</code>, <code>set_synthetic_slant</code>, <code>set_funcs</code>, <code>set_parent</code> and the variation setters) checks first whether the value is actually different, and calls <code>changed()</code> only if it is. A client whose font data changes behind HarfBuzz’s back can call <code>hb_font_changed</code> to bump the serial itself. <code>hb_font_get_serial</code> returns it.</p>
+<p id="ix-19">The serial is how font funcs know when their caches are stale. hb-ot compares it at the start of each call that uses a cache (<code>check_serial</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L290"><code>hb-ot-font.cc:290</code></a>). There is a second serial, <code>serial_coords</code>, that changes only when the variation coordinates do (<code>_hb_font_adopt_var_coords</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2166"><code>hb-font.cc:2166</code></a>). hb-ot caches advances in font units, before scaling, so a change of scale needn’t throw them away: those caches are keyed on <code>serial_coords</code>, and only the vertical-origin cache, which holds scaled values, is keyed on <code>serial</code>. The <code>fontations</code> funcs use the public serial in the same way to decide when to rebuild their Rust-side instance (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/rust/font.rs#L75"><code>rust/font.rs:75</code></a>).</p>
+<p id="ix-20">Because <code>changed()</code> frees shared state, changing a font while another thread is shaping with it isn’t safe. A font can be made immutable with <code>hb_font_make_immutable</code>, which also freezes its parents (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2357"><code>hb-font.cc:2357</code></a>). After that every setter is a no-op, and the font can be shared between threads freely.</p>
+<h2 id="the-font-funcs">The font funcs</h2>
+<h3 id="one-list-of-callbacks">One list of callbacks</h3>
+<p id="ix-21">The callbacks a font can have are listed once, in a macro at <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L46"><code>hb-font.hh:46</code></a>:</p>
+<pre><code class="language-c++">#define HB_FONT_FUNCS_IMPLEMENT_CALLBACKS \
+  HB_FONT_FUNC_IMPLEMENT (get_,font_h_extents) \
+  HB_FONT_FUNC_IMPLEMENT (get_,font_v_extents) \
+  HB_FONT_FUNC_IMPLEMENT (get_,nominal_glyph) \
+  HB_FONT_FUNC_IMPLEMENT (get_,nominal_glyphs) \
+  HB_FONT_FUNC_IMPLEMENT (get_,variation_glyph) \
+  HB_FONT_FUNC_IMPLEMENT (get_,glyph_h_advance) \
+  HB_FONT_FUNC_IMPLEMENT (get_,glyph_v_advance) \
+  HB_FONT_FUNC_IMPLEMENT (get_,glyph_h_advances) \
+  HB_FONT_FUNC_IMPLEMENT (get_,glyph_v_advances) \
+  HB_FONT_FUNC_IMPLEMENT (get_,glyph_h_origin) \
+  HB_FONT_FUNC_IMPLEMENT (get_,glyph_v_origin) \
+  HB_FONT_FUNC_IMPLEMENT (get_,glyph_h_origins) \
+  HB_FONT_FUNC_IMPLEMENT (get_,glyph_v_origins) \
+  HB_FONT_FUNC_IMPLEMENT (get_,glyph_h_kerning) \
+  HB_IF_NOT_DEPRECATED (HB_FONT_FUNC_IMPLEMENT (get_,glyph_v_kerning)) \
+  HB_FONT_FUNC_IMPLEMENT (get_,glyph_extents) \
+  HB_FONT_FUNC_IMPLEMENT (get_,glyph_contour_point) \
+  HB_FONT_FUNC_IMPLEMENT (get_,glyph_name) \
+  HB_FONT_FUNC_IMPLEMENT (get_,glyph_from_name) \
+  HB_FONT_FUNC_IMPLEMENT (,draw_glyph_or_fail) \
+  HB_FONT_FUNC_IMPLEMENT (,paint_glyph_or_fail) \
+  /* ^--- Add new callbacks here */
+</code></pre>
+<p id="ix-22">This is an <em>X macro</em>. The file defines <code>HB_FONT_FUNC_IMPLEMENT</code> to mean one thing, expands the list, undefines it, and does the same again with another meaning. <code>hb_font_funcs_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L70"><code>hb-font.hh:70</code></a>) is built that way three times over: once for a struct of user-data pointers, once for a struct of destroy callbacks, and once for the function pointers themselves, which sit in a union with a plain array so that a slot can be found by its index. In <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc"><code>hb-font.cc</code></a> the same list generates every public <code>hb_font_funcs_set_*_func</code> setter, and the nil and default tables described next. Adding a callback to HarfBuzz means adding a line here.</p>
+<p>What they answer, in groups:</p>
+<table>
+<thead>
+<tr>
+<th>Callbacks</th>
+<th>The question</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>font_h_extents</code>, <code>font_v_extents</code></td>
+<td id="ix-23">ascender, descender and line gap for the font as a whole</td>
+</tr>
+<tr>
+<td><code>nominal_glyph(s)</code>, <code>variation_glyph</code></td>
+<td id="ix-24">which glyph a character maps to, alone or with a variation selector: the <code>cmap</code></td>
+</tr>
+<tr>
+<td><code>glyph_h_advance(s)</code>, <code>glyph_v_advance(s)</code></td>
+<td id="ix-25">how far the pen moves after a glyph</td>
+</tr>
+<tr>
+<td><code>glyph_h_origin(s)</code>, <code>glyph_v_origin(s)</code></td>
+<td id="ix-26">where a glyph’s origin is for that direction, relative to its horizontal origin</td>
+</tr>
+<tr>
+<td><code>glyph_h_kerning</code>, <code>glyph_v_kerning</code></td>
+<td id="ix-27">a kerning value for a pair: only for the fallback <code>kern</code> path, and the vertical one is deprecated</td>
+</tr>
+<tr>
+<td><code>glyph_extents</code></td>
+<td id="ix-28">a glyph’s ink bounding box</td>
+</tr>
+<tr>
+<td><code>glyph_contour_point</code></td>
+<td id="ix-29">the position of one outline point, for AnchorFormat2</td>
+</tr>
+<tr>
+<td><code>glyph_name</code>, <code>glyph_from_name</code></td>
+<td>names to IDs and back</td>
+</tr>
+<tr>
+<td><code>draw_glyph_or_fail</code>, <code>paint_glyph_or_fail</code></td>
+<td id="ix-30">the outline, or the color glyph, for the <a href="drawing-outlines.html">drawing</a> and <a href="color.html">color</a> APIs</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-31">Several came later than the rest. The batch forms of the cmap and advance callbacks were added so that a shaper can ask for a whole buffer at once. The batch origin callbacks are from 11.3.0, and the <code>_or_fail</code> draw and paint callbacks from 11.2.0, when the earlier <code>draw_glyph</code> and <code>paint_glyph</code> ones were deprecated (<code>NEWS</code>).</p>
+<p id="ix-32">The shaper never calls a slot directly. A comment in the struct says so: “Don’t access these directly. Call <code>font-&gt;get_*()</code> instead.” Those wrapper methods in <code>hb_font_t</code> are where synthetic bold and slant are applied, after the callback has answered, which is why they work whichever funcs are installed.</p>
+<h3 id="the-nil-tier-and-the-default-tier">The nil tier and the default tier</h3>
+<p id="ix-33"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc"><code>hb-font.cc</code></a> has two complete implementations of the list, and every slot of every font funcs object holds a function from one of them or a real implementation.</p>
+<p id="ix-34">The <strong>nil</strong> functions answer “nothing”. They are named <code>hb_font_get_*_nil</code> and live in the Null <code>hb_font_funcs_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L812"><code>hb-font.cc:812</code></a>). Most return false and zeros. A few return something more useful: the horizontal advance is a full em (<code>return font-&gt;x_scale;</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L220"><code>hb-font.cc:220</code></a>), the vertical advance is minus one em, and the horizontal origin is (0, 0), returned as success.</p>
+<p id="ix-35">The <strong>default</strong> functions, <code>hb_font_get_*_default</code>, delegate. They ask the font’s <em>parent</em> and rescale the answer. They fill <code>_hb_font_funcs_default</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L827"><code>hb-font.cc:827</code></a>), and every new funcs object starts as a copy of that table (<code>hb_font_funcs_create</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L852"><code>hb-font.cc:852</code></a>). Setting a callback to <code>NULL</code> puts the default back (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L1072"><code>hb-font.cc:1072</code></a>). Confusingly, <code>hb_font_funcs_get_empty</code> returns the <em>default</em> table, not the nil one (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L874"><code>hb-font.cc:874</code></a>).</p>
+<p id="ix-36">The two tiers meet at the bottom of a chain of parents. A font made with <code>hb_font_create</code> has as its parent the empty font, <code>hb_font_get_empty</code>, which is the static Null <code>hb_font_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2061"><code>hb-font.cc:2061</code></a>), with a scale of 1000 and the nil funcs. So any question that a font’s own funcs don’t answer goes up to its parent, and so on, until it reaches the Null font, where the nil functions answer it. A font with no real funcs at all still works: every glyph is .notdef, and every advance is one em.</p>
+<h3 id="single-and-batch-forms-fall-back-on-each-other">Single and batch forms fall back on each other</h3>
+<p id="ix-37">Five callbacks come in pairs: <code>nominal_glyph</code>/<code>nominal_glyphs</code>, the two advance pairs and the two origin pairs. An implementation needs to provide only one of each pair, because the default of each calls the other if that one is set. Here is the single advance (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L229"><code>hb-font.cc:229</code></a>):</p>
+<pre><code class="language-c++">static hb_position_t
+hb_font_get_glyph_h_advance_default (hb_font_t *font, void *font_data,
+                                     hb_codepoint_t glyph, void *user_data)
+{
+  if (font-&gt;has_glyph_h_advances_func_set ())
+  {
+    hb_position_t ret;
+    font-&gt;get_glyph_h_advances (1, &amp;glyph, 0, &amp;ret, 0, false);
+    return ret;
+  }
+  return font-&gt;parent_scale_x_distance (font-&gt;parent-&gt;get_glyph_h_advance (glyph, false));
+}
+</code></pre>
+<p id="ix-38">The batch default does the mirror image, looping over the single callback if <em>that</em> is set, and otherwise asking the parent for the whole batch. hb-ot provides only the batch advances (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L974"><code>hb-ot-font.cc:974</code></a>), so a client calling <code>hb_font_get_glyph_h_advance</code> for one glyph goes through the default, which calls the batch with a count of one.</p>
+<p id="ix-39"><code>has_func_set</code> decides whether a slot is “set” by comparing it with the default table (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L1084"><code>hb-font.cc:1084</code></a>):</p>
+<pre><code class="language-c++">bool hb_font_t::has_func_set (unsigned int i)
+{ return this-&gt;klass-&gt;get.array[i] != _hb_font_funcs_default.get.array[i]; }
+
+bool hb_font_t::has_func (unsigned int i)
+{
+  return has_func_set (i) ||
+         (parent &amp;&amp; parent != &amp;_hb_Null_hb_font_t &amp;&amp; parent-&gt;has_func (i));
+}
+</code></pre>
+<p id="ix-40">The first asks whether <em>this</em> font implements a slot. The second asks whether anything in the chain above it does, short of the Null font. The pair fallback uses the first. The shaper uses the second, to skip work: <code>hb_ot_position_default</code> only applies horizontal origins if some font in the chain provides them (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L1014"><code>hb-ot-shape.cc:1014</code></a>), since without them every horizontal origin is zero.</p>
+<p id="ix-41">There is one more detail that stops the pairs from recursing for ever. For the batch slots, the nil function <em>is</em> the default function (<code>#define hb_font_get_nominal_glyphs_nil hb_font_get_nominal_glyphs_default</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L165"><code>hb-font.cc:165</code></a>, and the same for advances and origins). On the Null font, the single nil function counts as “set”, because it isn’t the default one, so the batch default loops over it. The chain always ends.</p>
+<blockquote>
+<p id="ix-42">For programmers: when you write your own funcs, implement the batch forms of the cmap and advance callbacks if you can. The shaper asks for whole buffers at once (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L1011"><code>hb-ot-shape.cc:1011</code></a>), and a batch implementation can keep its lookups and caches warm across the loop.</p>
+</blockquote>
+<h2 id="parents-and-sub-fonts">Parents and sub-fonts</h2>
+<p id="ix-43">The parent pointer is more than a way to reach the nil functions. <code>hb_font_create_sub_font</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2195"><code>hb-font.cc:2195</code></a>) makes a new font whose parent is an existing one. It copies the parent’s scale, ppem, ptem, synthetic settings and variation coordinates, and its funcs are the default table, so at first every question goes straight through to the parent.</p>
+<p id="ix-44">The point is to override a little and inherit the rest. A client that wants to map characters through its own table, but get everything else from the font, makes a sub-font, gives it funcs with only <code>nominal_glyph</code> set, and shapes with the sub-font. Every other question still reaches the parent’s hb-ot funcs.</p>
+<p id="ix-45">A sub-font can also have a different scale from its parent. Each default function converts the parent’s answer with <code>parent_scale_x_distance</code> and friends (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L173"><code>hb-font.hh:173</code></a>):</p>
+<pre><code class="language-c++">hb_position_t parent_scale_x_distance (hb_position_t v)
+{
+  if (unlikely (parent &amp;&amp; parent-&gt;x_scale &amp;&amp; parent-&gt;x_scale != x_scale))
+    return (hb_position_t) (v * (int64_t) this-&gt;x_scale / this-&gt;parent-&gt;x_scale);
+  return v;
+}
+</code></pre>
+<p id="ix-46">The parent’s value has already been rounded to the parent’s scale, and this division truncates. So a sub-font at a different scale doesn’t give quite the same answers as a font made at that scale directly. <code>hb-shape</code> has a hidden <code>--sub-font</code> option that shows it: it makes a sub-font, then sets the <em>parent</em> to twice the scale (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/font-options.hh#L136"><code>util/font-options.hh:136</code></a>), so every answer is worked out at double size and halved:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HIH</span><span class="cps">U+0048 U+0049 U+0048</span></td><td class="opt">--font-size=13</td><td class="out"><code>[H=0+8|I=1+4|H=2+8]</code></td></tr><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HIH</span><span class="cps">U+0048 U+0049 U+0048</span></td><td class="opt">--font-size=13 --sub-font</td><td class="out"><code>[H=0+8|I=1+3|H=2+8]</code></td></tr></tbody></table></div>
+<p id="ix-47">Directly, I is 275 × 13/1000 = 3.575, which rounds to 4. Through the parent, it is 7.15 at a scale of 26, which rounds to 7, and 7 × 13/26 = 3.5 truncates to 3. Outlines and color glyphs are rescaled in floats instead, by wrapping the client’s draw funcs in an adaptor that multiplies every coordinate (<code>hb_font_draw_glyph_or_fail_default</code>), or by pushing a scale transform onto the paint funcs.</p>
+<p id="ix-48">When a default function delegates, it asks the parent <em>without</em> synthetic settings (the <code>false</code> in <code>get_glyph_h_advance (glyph, false)</code>), and the sub-font’s own wrapper then applies its own. Since 11.2.0 that is the rule for advances, extents, contour points, font extents and outlines, so a sub-font’s synthetic bold and slant are the ones that count, not its parent’s (<code>NEWS</code>). HarfBuzz uses this itself: when it paints a COLR glyph for a synthetic font, it makes a sub-font with bold and slant turned off, so that the synthetic settings, already applied to the glyph as a whole, aren’t applied again to each of its layers (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L115"><code>OT/Color/COLR/COLR.hh:115</code></a>).</p>
+<p id="ix-49">A sub-font copies its parent’s coordinates but not its named-instance index. <code>hb_font_set_parent</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2431"><code>hb-font.cc:2431</code></a>) replaces a font’s parent later, and refuses to make a cycle.</p>
+<h2 id="synthetic-bold-and-slant">Synthetic bold and slant</h2>
+<p id="ix-50">A family that has no bold or italic can still be shown in one, by thickening or shearing the regular outlines. HarfBuzz can do both, and since 11.0.1 it does them in the font layer, in the <code>hb_font_t</code> wrappers, rather than in hb-ot or hb-ft, so they work with any funcs (<code>NEWS</code>). They are set with <code>hb_font_set_synthetic_bold</code> and <code>hb_font_set_synthetic_slant</code>. The question for a type designer is what they change, and the answer is: rather more than the outlines.</p>
+<h3 id="bold-and-grade">Bold, and grade</h3>
+<p id="ix-51"><code>hb_font_set_synthetic_bold (font, x_embolden, y_embolden, in_place)</code> takes two fractions of the em. <code>changed()</code> turns them into <code>x_strength</code> and <code>y_strength</code>, rounded to whole units of the current scale. The outline is made that much wider and taller: the drawing code is a port of FreeType’s <code>FT_Outline_EmboldenXY</code>, with permission (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-outline.cc#L122"><code>hb-outline.cc:122</code></a>), which moves each edge outwards by half the strength.</p>
+<p id="ix-52">The <code>in_place</code> flag decides what happens to the spacing. If it is false, the glyph is bold in the usual sense: its advance grows by the strength, and the outline is shifted right by half the strength so that the left side bearing stays the same. If it is true, the advance is left alone and the outline grows equally in both directions about where it was. That second mode simulates <strong>grade</strong>, a heavier weight that doesn’t reflow text. <code>hb-shape</code> has an option for each: <code>--font-bold</code> sets bold with <code>in_place</code> false, and <code>--font-grade</code> sets it with <code>in_place</code> true (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/font-options.hh#L262-L280"><code>util/font-options.hh:262–280</code></a>). (The C API’s own default, for a font nobody has set, is <code>in_place</code> true.)</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HI◌́</span><span class="cps">U+0048 U+0049 U+0301</span></td><td class="opt">--show-extents</td><td class="out"><code>[H=0+600&lt;80,700,465,-700&gt;|I=1+275&lt;80,700,115,-700&gt;|acutecomb=1@12,-50+0&lt;-200,900,100,-150&gt;]</code></td></tr><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HI◌́</span><span class="cps">U+0048 U+0049 U+0301</span></td><td class="opt">--font-bold=0.02 --show-extents</td><td class="out"><code>[H=0+620&lt;80,720,485,-720&gt;|I=1+295&lt;80,720,135,-720&gt;|acutecomb=1@-8,-50+0&lt;-200,920,120,-170&gt;]</code></td></tr><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HI◌́</span><span class="cps">U+0048 U+0049 U+0301</span></td><td class="opt">--font-grade=0.02 --show-extents</td><td class="out"><code>[H=0+600&lt;70,720,485,-720&gt;|I=1+275&lt;70,720,135,-720&gt;|acutecomb=1@12,-50+0&lt;-210,920,120,-170&gt;]</code></td></tr></tbody></table></div>
+<p id="ix-53">The strength is 0.02 × 1000 = 20 units. With <code>--font-bold</code>, H and I are 20 units wider, but the acute, whose advance is zero, isn’t: the wrappers add the strength only to advances that aren’t zero (<code>advance += advance ? strength : 0</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L365"><code>hb-font.hh:365</code></a>), so that marks stay on their bases. The ink boxes are 20 wider and 20 taller, and their left edge hasn’t moved. With <code>--font-grade</code>, the advances are unchanged, and each box has grown 10 units to the left and 10 to the right. In both, the bottom of each box stays on the baseline and the top rises by 20.</p>
+<p id="ix-54">The mark’s offset changes too, from 12 to −8, though nothing about the mark’s anchor did. GPOS places it relative to the I’s anchor, measured back from the pen position after the I, and the I’s advance is now 20 units longer. When the glyphs are drawn, both the I and the mark are shifted right by 10, so the two anchors still meet. Grading changes nothing in the positions at all.</p>
+<p id="ix-55">Here is everything synthetic bold touches, from the wrappers in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh"><code>hb-font.hh</code></a>:</p>
+<table>
+<thead>
+<tr>
+<th>What</th>
+<th>Bold (<code>in_place</code> false)</th>
+<th id="ix-56">Grade (<code>in_place</code> true)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-57">horizontal advances</td>
+<td>+ x strength, if not zero (<code>:361</code>)</td>
+<td>unchanged</td>
+</tr>
+<tr>
+<td id="ix-58">vertical advances</td>
+<td>+ y strength, if not zero (<code>:378</code>)</td>
+<td>unchanged</td>
+</tr>
+<tr>
+<td id="ix-59">glyph origins, when the funcs supply them</td>
+<td>moved by the strength (<code>:452</code>)</td>
+<td>unchanged</td>
+</tr>
+<tr>
+<td id="ix-60">glyph extents</td>
+<td>wider by x strength, taller by y strength (<code>:233</code>)</td>
+<td>the same, centered horizontally</td>
+</tr>
+<tr>
+<td>contour points</td>
+<td>moved right by x strength (<code>:659</code>)</td>
+<td>unchanged</td>
+</tr>
+<tr>
+<td>font h-extents</td>
+<td>ascender + y strength (<code>:286</code>)</td>
+<td>the same</td>
+</tr>
+<tr>
+<td>font v-extents</td>
+<td>ascender + x strength (<code>:303</code>)</td>
+<td>split between ascender and descender</td>
+</tr>
+<tr>
+<td>outlines</td>
+<td>emboldened and shifted (<code>:732</code>)</td>
+<td>emboldened in place</td>
+</tr>
+</tbody>
+</table>
+<h3 id="slant">Slant</h3>
+<p id="ix-61"><code>hb_font_set_synthetic_slant (font, slant)</code> takes a ratio: 0.2 means x moves right by 0.2 units for every unit of y, about 11.3°. <code>changed()</code> stores it as <code>slant_xy</code>, adjusted for the ratio of the two scales so that it shears correctly when x and y are scaled differently. Slant never changes an advance. What it does change is spread more widely than bold’s effects:</p>
+<ul>
+<li>
+<p id="ix-62"><strong>Outlines.</strong> <code>draw_glyph_or_fail</code> shears every point (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L723"><code>hb-font.hh:723</code></a>). It does so around the glyph’s horizontal origin, which for nearly every font is (0, 0), so the baseline stays put. That has been the rule in the draw API since 12.3.0 (<code>NEWS</code>). It slants before it emboldens, which, says a comment, “produces nicer results”. Color glyphs get the same shear as a paint transform (<code>:757</code>).</p>
+</li>
+<li>
+<p id="ix-63"><strong>Extents</strong>, of which more below.</p>
+</li>
+<li>
+<p><strong>Contour points</strong>, sheared like the outline (<code>:655</code>).</p>
+</li>
+<li>
+<p id="ix-64"><strong>Mark positions after GPOS.</strong> At the very end of GPOS, in <code>GPOS::position_finish_offsets</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/GPOS.hh#L189"><code>OT/Layout/GPOS/GPOS.hh:189</code></a>), which <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L1082"><code>hb-ot-shape.cc:1082</code></a> calls whether or not the font has GPOS, every glyph with a vertical offset in horizontal text has its horizontal offset adjusted to match:</p>
+<pre><code class="language-c++">if (unlikely (font-&gt;slant_xy) &amp;&amp;
+    HB_DIRECTION_IS_HORIZONTAL (direction))
+{
+  /* Slanting shaping results is only supported for horizontal text,
+   * as it gets weird otherwise. */
+  for (unsigned i = 0; i &lt; len; i++)
+    if (unlikely (pos[i].y_offset))
+      pos[i].x_offset = hb_clamp_to&lt;hb_position_t&gt; ((double) pos[i].x_offset +
+                                                    (double) roundf (font-&gt;slant_xy * pos[i].y_offset));
+}
+</code></pre>
+</li>
+<li>
+<p id="ix-65"><strong>Caret slope</strong>, in <code>hb_ot_metrics_get_position</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-metrics.cc#L180"><code>hb-ot-metrics.cc:180</code></a>): the horizontal caret run is increased to match the slant, scaled up first if the font’s caret rise is small, so that the ratio survives in integers.</p>
+</li>
+<li>
+<p id="ix-66"><strong>Slant angle.</strong> <code>hb_style_get_value</code> adds the synthetic slant to the angle in <code>post</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-style.cc#L114"><code>hb-style.cc:114</code></a>), but only when it falls back to <code>post</code>: a <code>slnt</code> axis or a STAT value is returned first, without it (<a href="other-tables.html">Other tables</a>). The same total, as a ratio, is reported under the tag <code>Slnt</code>.</p>
+</li>
+</ul>
+<p id="ix-67">Glyph origins are expressly not slanted: “Slant is ignored as it does not affect glyph origin” (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L449"><code>hb-font.hh:449</code></a>). Before 12.2.0 they were, which shifted slanted glyphs sideways (<code>NEWS</code>).</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HI◌́</span><span class="cps">U+0048 U+0049 U+0301</span></td><td class="opt">--show-extents</td><td class="out"><code>[H=0+600&lt;80,700,465,-700&gt;|I=1+275&lt;80,700,115,-700&gt;|acutecomb=1@12,-50+0&lt;-200,900,100,-150&gt;]</code></td></tr><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HI◌́</span><span class="cps">U+0048 U+0049 U+0301</span></td><td class="opt">--font-slant=0.2 --show-extents</td><td class="out"><code>[H=0+600&lt;80,700,605,-700&gt;|I=1+275&lt;80,700,255,-700&gt;|acutecomb=1@2,-50+0&lt;-50,900,130,-150&gt;]</code></td></tr></tbody></table></div>
+<p id="ix-68">The advances are the same. The ink boxes are 140 units wider, which is 0.2 × 700, the cap height: the tops of the letters have moved right. The acute’s offset has gone from 12 to 2. Its anchor puts it 50 units lower than where it is drawn in the font, and lower, on a slanted line, is further left: 0.2 × −50 = −10.</p>
+<p>The caret and style values change in the same way:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">funcs.ttf</td><td class="opt">--get-metric=hcrs --get-metric=hcrn --get-style=slnt</td><td class="out"><pre><code>Style slnt: 0
+Metric hcrs: 1	
+Metric hcrn: 0</code></pre></td></tr><tr><td class="font">funcs.ttf</td><td class="opt">--get-metric=hcrs --get-metric=hcrn --get-style=slnt --font-slant=0.2</td><td class="out"><pre><code>Style slnt: -11.3099
+Metric hcrs: 256	
+Metric hcrn: 51</code></pre></td></tr></tbody></table></div>
+<p id="ix-69">The font’s <code>hhea</code> caret is upright (rise 1, run 0). With slant, the rise is multiplied up to 256 and the run is 0.2 of that, and the slant angle is −11.3°: negative for a lean to the right, as in <code>post</code>.</p>
+<blockquote>
+<p id="ix-70">For type designers: a synthetically slanted font keeps its upright spacing. Its marks stay attached to their bases, because both the GPOS result and the drawing are sheared by the same amount, and its caret leans with it. What it can’t do is anything a real italic does differently: cursive forms, different spacing, narrower letters.</p>
+</blockquote>
+<h3 id="extents-of-a-synthetic-font">Extents of a synthetic font</h3>
+<p id="ix-71">Working out the ink box of a slanted or emboldened glyph is harder than adjusting a box: a sheared rectangle has a different bounding box from a sheared circle. So <code>get_glyph_extents</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh#L586"><code>hb-font.hh:586</code></a>) takes a different route for a synthetic font. It doesn’t ask the funcs for extents at all. It first tries to <em>paint</em> the glyph into a context that only measures, then to <em>draw</em> it into one, and only if both fail does it ask the funcs for extents and adjust the box arithmetically with <code>synthetic_glyph_extents</code> (<code>:214</code>):</p>
+<pre><code class="language-c++">if (!is_synthetic &amp;&amp;
+    klass-&gt;get.f.glyph_extents (this, user_data, glyph, extents, ...))
+  return true;
+
+/* Try getting extents from paint(), then draw(), *then* get_extents()
+ * and apply synthetic settings in the last case. */
+</code></pre>
+<p id="ix-72">Painting and drawing both go through the synthetic wrappers, so the box is measured from the outline as it would actually be drawn. This has been the case since 11.2.0, whose <code>NEWS</code> says extents for synthetic fonts “are now accurately calculated”. It costs an outline decode per glyph, which matters to anything that asks for extents often. One thing that does is HarfBuzz’s own fallback mark positioning, used when a font has no GPOS, which centers each mark’s ink box over its base. The same glyphs in <code>funcs-nogpos.ttf</code>, which has no GPOS:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">funcs-nogpos.ttf</td><td class="in"><span class="txt">HI◌́</span><span class="cps">U+0048 U+0049 U+0301</span></td><td class="opt"></td><td class="out"><code>[H=0+625|I=1+275|acutecomb=1@12,12+0]</code></td></tr><tr><td class="font">funcs-nogpos.ttf</td><td class="in"><span class="txt">HI◌́</span><span class="cps">U+0048 U+0049 U+0301</span></td><td class="opt">--font-slant=0.2</td><td class="out"><code>[H=0+625|I=1+275|acutecomb=1@-153,12+0]</code></td></tr></tbody></table></div>
+<p>Slanted, the acute’s ink box is measured from the sheared outline. The acute sits high, at 750 to 900 units, so shearing moves its box about 165 units right, and the positioner moves the mark 165 units left to center it again (12 − 165 = −153). When it is drawn, the shear moves it back.</p>
+<h2 id="hb-ot-the-default-funcs">hb-ot, the default funcs</h2>
+<p id="ix-73"><code>hb_font_create</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2145"><code>hb-font.cc:2145</code></a>) makes a font in four steps. <code>_hb_font_create</code> sets the scale to the face’s units per em, makes the empty font its parent and the default table its funcs. Then <code>hb_font_set_funcs_using (font, nullptr)</code> installs the default funcs. Then, if the face index has anything in its top 16 bits, that number minus one is taken as a named instance and applied; otherwise <code>hb_font_set_variations (font, nullptr, 0)</code> puts the font at the default position in its design space.</p>
+<p id="ix-74">For nearly every build, the default funcs are hb-ot. They are made once, lazily, as a static immutable <code>hb_font_funcs_t</code> shared by every font (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L963"><code>hb-ot-font.cc:963</code></a>). What varies per font is the data handed to them, an <code>hb_ot_font_t</code> holding a pointer to the face’s tables and the font’s caches (<code>hb_ot_font_set_funcs</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L1030"><code>hb-ot-font.cc:1030</code></a>). Here is what hb-ot sets, and what it leaves to the default tier:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-75">Set by hb-ot</th>
+<th>Left to the defaults</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>nominal_glyph</code>, <code>nominal_glyphs</code>, <code>variation_glyph</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>font_h_extents</code>, <code>font_v_extents</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>glyph_h_advances</code>, <code>glyph_v_advances</code></td>
+<td>the single forms, which call these</td>
+</tr>
+<tr>
+<td><code>glyph_v_origins</code></td>
+<td><code>glyph_v_origin</code>, which calls it</td>
+</tr>
+<tr>
+<td></td>
+<td><code>glyph_h_origin(s)</code>: every horizontal origin is (0, 0)</td>
+</tr>
+<tr>
+<td></td>
+<td id="ix-76"><code>glyph_h_kerning</code>: hb-ot applies <code>kern</code> in the shaper instead</td>
+</tr>
+<tr>
+<td><code>glyph_extents</code></td>
+<td></td>
+</tr>
+<tr>
+<td></td>
+<td id="ix-77"><code>glyph_contour_point</code>: commented out (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L991"><code>hb-ot-font.cc:991</code></a>), so AnchorFormat2 falls back to its coordinates</td>
+</tr>
+<tr>
+<td><code>glyph_name</code>, <code>glyph_from_name</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>draw_glyph_or_fail</code>, <code>paint_glyph_or_fail</code></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p id="ix-78">The blank rows go up the parent chain to the Null font. How each of the set callbacks gets its answer, from <code>cmap</code>, <code>hmtx</code>, <code>HVAR</code>, <code>gvar</code>, <code>glyf</code>, <code>CFF</code> and the rest, is the subject of the <a href="where-metrics-come-from.html">next chapter</a>.</p>
+<h2 id="the-other-funcs">The other funcs</h2>
+<p>HarfBuzz 15.1.0 has four more implementations of the same list, each optional at build time:</p>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Source</th>
+<th>Build option</th>
+<th>What it asks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ot</code></td>
+<td id="ix-79"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc"><code>hb-ot-font.cc</code></a></td>
+<td id="ix-80">on unless <code>HB_NO_OT_FONT</code></td>
+<td>HarfBuzz’s own table code</td>
+</tr>
+<tr>
+<td><code>ft</code></td>
+<td id="ix-81"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc"><code>hb-ft.cc</code></a></td>
+<td><code>-Dfreetype</code> (auto)</td>
+<td>FreeType</td>
+</tr>
+<tr>
+<td><code>fontations</code></td>
+<td id="ix-82"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/rust/font.rs"><code>rust/font.rs</code></a></td>
+<td><code>-Dfontations</code> (off)</td>
+<td id="ix-83">the Rust crates read-fonts and skrifa</td>
+</tr>
+<tr>
+<td><code>coretext</code></td>
+<td id="ix-84"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext-font.cc"><code>hb-coretext-font.cc</code></a></td>
+<td><code>-Dcoretext</code> (off)</td>
+<td>Apple’s Core Text</td>
+</tr>
+<tr>
+<td><code>directwrite</code></td>
+<td id="ix-85"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-directwrite-font.cc"><code>hb-directwrite-font.cc</code></a></td>
+<td><code>-Ddirectwrite</code> (off)</td>
+<td>Microsoft’s DirectWrite</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-86"><strong>hb-ft</strong> is the oldest. For a long time it was the usual way to use HarfBuzz, and the <code>hb-shape</code> and <code>hb-view</code> tools only switched their default from FreeType to <code>ot</code> in 4.0.0 (<code>NEWS</code>). It sets FreeType’s character size from the font’s scale whenever the serial changes (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L255"><code>hb-ft.cc:255</code></a>), and takes a lock around its FreeType calls (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L432"><code>hb-ft.cc:432</code></a> and on), since FreeType itself isn’t thread-safe. It is the only implementation that sets <code>glyph_h_kerning</code> and <code>glyph_contour_point</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L1164"><code>hb-ft.cc:1164</code></a>), so it is the only one that can feed HarfBuzz’s fallback kerning. That is for kerning HarfBuzz can’t read as a table, such as a Type 1 font’s (<code>NEWS</code> 2.5.2): a font with a <code>kern</code> table has it applied directly, and the fallback never runs (<a href="fallbacks.html">Fallbacks</a>, <a href="legacy-kern.html">Legacy kern</a>). It can wrap an <code>FT_Face</code> the client already has (<code>hb_ft_font_create</code>), or make its own from the face’s blob (<code>hb_ft_font_set_funcs</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L1918"><code>hb-ft.cc:1918</code></a>).</p>
+<p id="ix-87"><strong><code>fontations</code></strong> is a font-funcs backend, not a shaper. It was added in 11.0.0, along with the DirectWrite funcs, and <code>NEWS</code> for that release announces the Core Text funcs with them, describing all three as “mostly useful for performance and correctness testing” (the Core Text function itself, <code>hb_coretext_font_set_funcs</code>, had appeared in 10.1.0: <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext-font.cc#L522"><code>hb-coretext-font.cc:522</code></a>). <a href="integrations.html">Integrations</a> covers what each of these layers offers an application. It wraps the face’s blob in a read-fonts <code>Font</code>, draws outlines with skrifa, and implements the cmap, advance, vertical origin, extents, font extents, draw, paint and name callbacks, built into a static funcs object on first use (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/rust/font.rs#L1395"><code>rust/font.rs:1395</code></a>). Paired with the HarfRust shaper, which is covered in <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a>, it gives an all-Rust path through HarfBuzz.</p>
+<p id="ix-88"><strong>Core Text</strong> and <strong>DirectWrite</strong> funcs ask the platform. Both use the per-font data of the matching <em>shaper</em> to get their native font object (<code>font-&gt;data.coretext</code>, <code>font-&gt;data.directwrite</code>), which is why Core Text needs <code>ptem</code>. One detail shows how much the two layers have to agree: Core Text applies AAT tracking to the advances it reports, and HarfBuzz’s shaper applies <code>trak</code> itself, so the Core Text funcs subtract the tracking from Core Text’s advances to stop it being applied twice (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext-font.cc#L213"><code>hb-coretext-font.cc:213</code></a>).</p>
+<h3 id="choosing-funcs">Choosing funcs</h3>
+<p id="ix-89">Since 11.0.0, funcs can be chosen by name. The compiled-in names are in a table, in order of preference (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2608"><code>hb-font.cc:2608</code></a>):</p>
+<pre><code class="language-c++">static const struct supported_font_funcs_t {
+	char name[16];
+	void (*func) (hb_font_t *);
+} supported_font_funcs[] =
+{
+#ifndef HB_NO_OT_FONT
+  {&quot;ot&quot;,	hb_ot_font_set_funcs},
+#endif
+#ifdef HAVE_FREETYPE
+  {&quot;ft&quot;,	hb_ft_font_set_funcs},
+#endif
+  /* ... fontations, coretext, directwrite, each under its own #ifdef */
+};
+</code></pre>
+<p id="ix-90"><code>hb_font_list_funcs</code> returns those names. <code>hb_font_set_funcs_using (font, name)</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2692"><code>hb-font.cc:2692</code></a>) installs the one with that name, and returns false if there is none. With a null or empty name, it reads the environment variable <code>HB_FONT_FUNCS</code> (once, at first use, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2638"><code>hb-font.cc:2638</code></a>) and uses that name instead. If that names an entry, the entry is used, even if it fails. If it is unset or names nothing in the table, HarfBuzz walks the table and keeps the first entry that works. An implementation that fails, as hb-ft does when FreeType can’t open the blob, leaves the font with the empty funcs (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L1934"><code>hb-ft.cc:1934</code></a>), and that is how the loop can tell. So the default is <code>ot</code>, unless <code>HB_FONT_FUNCS</code> says otherwise, and a misspelt <code>HB_FONT_FUNCS</code> is silently ignored.</p>
+<p id="ix-91"><code>hb-shape</code> exposes the same choice as <code>--font-funcs</code>, and <code>--list-font-funcs</code> prints the table. The HarfBuzz this book is built with is configured with FreeType turned off and the other optional backends left at their defaults (<code>tools/build-harfbuzz.sh</code>), so it lists only <code>ot</code>:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">funcs.ttf</td><td class="in"><span class="txt">HI</span><span class="cps">U+0048 U+0049</span></td><td class="opt">--font-funcs=ot</td><td class="out"><code>[H=0+600|I=1+275]</code></td></tr></tbody></table></div>
+<p id="ix-92"><code>hb_font_set_funcs</code> itself, the lower-level call, takes any funcs object and the data that goes with it. It is how an application installs its own funcs, or puts the default table back with a null <code>klass</code>. <code>hb_font_set_face</code>, deprecated in 15.0.0, swaps a font’s face and, because the old funcs may point into the old face, now throws them away and runs <code>hb_font_set_funcs_using</code> again (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2489"><code>hb-font.cc:2489</code></a>).</p>
+<h2 id="variation-coordinates-as-the-font-holds-them">Variation coordinates, as the font holds them</h2>
+<p id="ix-93">A variable font’s position in its design space belongs to the font, not the face, so one face can back fonts at several positions at once. The font keeps it in two forms: <code>design_coords</code>, one float per <code>fvar</code> axis in the axis’s own units, and <code>coords</code>, the same position normalized to −1…1 in 2.14 fixed point after <code>avar</code>, which is what every variation table uses. <code>has_nonzero_coords</code> is true if any normalized coordinate isn’t zero, and the hb-ot funcs check it first so that a font at its default position takes the fast, non-variable paths. <code>instance_index</code> holds a named-instance number, or <code>HB_FONT_NO_VAR_NAMED_INSTANCE</code>.</p>
+<p>The setters differ in a way that catches people out:</p>
+<ul>
+<li id="ix-94"><code>hb_font_set_variations</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L3099"><code>hb-font.cc:3099</code></a>) is not additive. It starts every axis from its default, or from the named instance if one is set, then applies the list it is given. Axes not in the list go back to the base.</li>
+<li id="ix-95"><code>hb_font_set_variation</code> (<code>:3161</code>), singular, <em>is</em> additive: it starts from the font’s current design coordinates and changes one axis.</li>
+<li id="ix-96"><code>hb_font_set_var_coords_design</code> sets every axis from a list in axis order.</li>
+<li id="ix-97"><code>hb_font_set_var_coords_normalized</code> sets the normalized coordinates directly and fills <code>design_coords</code> with NaN, since there is no way back through <code>avar</code>.</li>
+<li id="ix-98"><code>hb_font_set_var_named_instance</code> records the index and calls <code>hb_font_set_variations</code> with an empty list.</li>
+</ul>
+<p id="ix-99">All of them end in <code>_hb_font_adopt_var_coords</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L2166"><code>hb-font.cc:2166</code></a>), which swaps in the new arrays, calls <code>changed()</code>, and copies the new serial into <code>serial_coords</code>. How the coordinates are normalized, and what avar does to them, is the subject of <a href="design-space.html">Design space</a>.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh"><code>src/hb-font.hh</code></a></td>
+<td><code>hb_font_t</code>, the callback list, the <code>em_scale</code> family, <code>parent_scale_*</code>, every synthetic wrapper, <code>changed()</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc"><code>src/hb-font.cc</code></a></td>
+<td>the nil and default tiers, <code>has_func</code>, the public setters, <code>hb_font_create</code>, <code>hb_font_create_sub_font</code>, <code>hb_font_set_funcs_using</code>, <code>hb_font_list_funcs</code>, variation setters</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.h"><code>src/hb-font.h</code></a></td>
+<td>the public API, with the callback typedefs</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc"><code>src/hb-ot-font.cc</code></a></td>
+<td>the hb-ot funcs, their caches and <code>check_serial</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc"><code>src/hb-ft.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/rust/font.rs"><code>src/rust/font.rs</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-coretext-font.cc"><code>src/hb-coretext-font.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-directwrite-font.cc"><code>src/hb-directwrite-font.cc</code></a></td>
+<td>the other funcs</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-outline.cc"><code>src/hb-outline.cc</code></a></td>
+<td>recording outlines, slanting and emboldening them</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GPOS/GPOS.hh"><code>src/OT/Layout/GPOS/GPOS.hh</code></a></td>
+<td><code>position_finish_offsets</code>, where slant adjusts mark offsets</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-metrics.cc"><code>src/hb-ot-metrics.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-style.cc"><code>src/hb-style.cc</code></a></td>
+<td>caret slope and slant angle under synthetic slant</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/util/font-options.hh"><code>util/font-options.hh</code></a></td>
+<td>how <code>hb-shape</code> sets up a font: <code>--font-size</code>, <code>--font-bold</code>, <code>--font-grade</code>, <code>--font-slant</code>, <code>--font-funcs</code>, <code>--sub-font</code></td>
+</tr>
+</tbody>
+</table>
+<p>The user manual’s chapter on fonts and faces (<code>docs/usermanual-fonts-and-faces.xml</code>) walks through sub-fonts and custom funcs from the client’s side.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A font is a face at a scale. Scale sets the output units; ppem matters only to hinting Device tables, contour-point anchors and bitmap strikes; ptem only to <code>trak</code>, Core Text and the reported optical size.</li>
+<li>Scaling integer metrics uses a truncated 16.16 multiplier and rounds half up, so exact halves can round down.</li>
+<li>Every setter bumps the font’s serial and frees shaper data. Funcs compare serials to know when their caches are stale.</li>
+<li>Every callback slot holds a real function, a default that asks the parent and rescales, or a nil that answers “nothing” (one em, for advances). Single and batch forms fall back on each other.</li>
+<li>A sub-font inherits everything and overrides what it sets. Rescaling through a parent truncates, so it can differ by a unit.</li>
+<li>Synthetic bold changes advances (unless in place), extents, font extents and outlines. Slant changes outlines, extents, caret slope, the slant angle, and mark offsets after GPOS, but never advances or origins. Extents of a synthetic font are measured from the drawn outline.</li>
+<li>hb-ot is the default funcs, chosen as the first working entry in a table, unless <code>HB_FONT_FUNCS</code> names another.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="blobs-faces-and-lazy-tables.html">← Blobs, faces and lazy tables</a><a rel="next" href="where-metrics-come-from.html">Where metrics come from →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

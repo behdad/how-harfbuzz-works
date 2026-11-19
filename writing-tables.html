@@ -1,0 +1,664 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Writing tables · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part X · Writing fonts</p>
+<h1 id="writing-tables">41. Writing tables</h1>
+<p id="ix-1">Every chapter so far has been about reading fonts. HarfBuzz also writes them. The subsetter writes a smaller copy of each table it keeps, the instancer writes tables with their variations pinned, the <a href="blobs-faces-and-lazy-tables.html">face builder</a> writes a whole font file from a set of tables, and the Arabic shaper writes GSUB lookups of its own when a font has none (<a href="joining-scripts.html">Joining scripts</a>). All of them write through one object, <code>hb_serialize_context_t</code>, the <strong>serializer</strong>.</p>
+<p id="ix-2">Writing has two problems that reading doesn’t. A table is a tree of subtables joined by offsets, and an offset can’t be written until both ends have a place in the file. And most offsets are 16 bits, so every child must end up within 65,535 bytes of where its offset counts from. The serializer solves the first: a table’s code writes objects and the links between them, and the serializer lays them out, sharing identical objects, and fills the offsets in at the end. When an offset doesn’t fit, the <strong>repacker</strong> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-repacker.hh"><code>hb-repacker.hh</code></a> and <code>src/graph/</code>) looks for another layout, and changes the graph if it has to.</p>
+<p id="ix-3">The examples use two test fonts made with fontTools, <code>forty.ttf</code> and <code>sixty.ttf</code>, and their subsets, made by <code>hb-subset</code> 15.1.0 when the fonts were built. The <code>hb-info</code> listing and the shaping results were produced by running HarfBuzz on them when the page was built. The other listings were not: each says what made it.</p>
+<h2 id="the-head-and-the-tail">The head and the tail</h2>
+<p id="ix-4">A serializer is made over a buffer that someone else owns: <code>hb_serialize_context_t (buf, size)</code>. It keeps four pointers into it: <code>start</code> and <code>end</code>, the buffer’s bounds, and <code>head</code> and <code>tail</code>, the two ends of the free space between them. Writing at <code>head</code> is what the simplest code does. <code>allocate_size&lt;Type&gt; (size)</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-serialize.hh#L666"><code>hb-serialize.hh:666</code></a>) hands out the next <code>size</code> bytes, zeroed, and moves <code>head</code> on. There is no growing: if the bytes aren’t there, it returns <code>nullptr</code> and records an error.</p>
+<p>A table writer rarely calls <code>allocate_size</code> itself. The idiom, all through HarfBuzz’s table code, is to take a pointer to where the struct will start and then extend it:</p>
+<pre><code class="language-c++">auto *out = c-&gt;start_embed (*this);
+if (unlikely (!c-&gt;extend_min (out))) return_trace (false);
+out-&gt;format = format;
+</code></pre>
+<p id="ix-5"><code>start_embed</code> is just <code>head</code>, cast to the struct’s type. <code>extend_min</code> (<code>:757</code>) allocates the struct’s fixed part, its <code>min_size</code>; <code>extend</code> and <code>extend_size</code> (<code>:740</code>–<code>766</code>) allocate a size the struct works out or the caller gives. The struct sits on the buffer’s bytes, so writing its fields, in the big-endian types of <a href="fonts-as-bytes.html#numbers">Fonts as bytes</a>, is writing the table. Arrays fill themselves from an iterator (<code>ArrayOf::serialize (c, items)</code>). <code>embed</code> copies an object’s bytes as they are, and <code>copy</code> (<code>:724</code>) calls the object’s own <code>copy</code> method if it has one.</p>
+<p id="ix-6">This is all a table without offsets needs. The face builder’s font file is written this way (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-face-builder.cc#L120"><code>hb-face-builder.cc:120</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-file.hh#L123"><code>hb-open-file.hh:123</code></a>): the 12-byte header, the table directory, then each table’s bytes, 4-byte aligned, with each directory record’s offset worked out from where the table landed. That offset is set with <code>check_assign</code> (<code>:277</code>), which assigns a value and checks it survived the narrowing:</p>
+<pre><code class="language-c++">if (unlikely (!c-&gt;check_assign (rec.offset,
+                                (unsigned) ((char *) start - (char *) this),
+                                HB_SERIALIZE_ERROR_OFFSET_OVERFLOW)))
+  return_trace (false);
+</code></pre>
+<h2 id="objects-and-links">Objects and links</h2>
+<p id="ix-7">Most tables have offsets, and for those the serializer uses the other end of the buffer too. The bytes between <code>start</code> and <code>head</code> are a stack of objects being written; the bytes between <code>tail</code> and <code>end</code> are a stack of finished ones, growing down from the end.</p>
+<p id="ix-8">An <strong>object</strong> is a contiguous run of bytes holding zero or more offsets. <code>push</code> starts one at <code>head</code>, on top of whatever object was being written before. When the object is complete, <code>pop_pack</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-serialize.hh#L370"><code>hb-serialize.hh:370</code></a>) moves its bytes from the head side to the tail side, rewinds <code>head</code> to where the object began, and returns the object’s <strong>object index</strong>, its place in the stack of packed objects, counting from 1 (object 0 is the nil object, meaning “nothing”). <code>pop_discard</code> drops an object instead, as if it had never been started.</p>
+<p id="ix-9">An offset to an object can only be written after the object is packed, since only then does it have an index. The parent doesn’t write a number into its offset field: it calls <code>add_link (field, objidx)</code> (<code>:533</code>), which records a <strong>link</strong> on the parent: where in the parent the field is, how wide it is (the size of the field’s type: 2, 3 or 4 bytes), whether it is signed, and which object it points to. The field itself stays zero. Only <code>end_serialize</code> (<code>:300</code>), once the root object is packed, works out every offset, in <code>resolve_links</code> (<code>:577</code>).</p>
+<p id="ix-10">What an offset counts from varies between tables, as <a href="fonts-as-bytes.html#offsets-that-know-their-targets">Fonts as bytes</a> explains, so a link also has a <strong>whence</strong>: what its offset is relative to.</p>
+<table>
+<thead>
+<tr>
+<th><code>whence</code></th>
+<th id="ix-11">Offset counts from</th>
+<th>Used by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-12"><code>Head</code> (the default)</td>
+<td id="ix-13">the start of the parent object</td>
+<td>nearly everything</td>
+</tr>
+<tr>
+<td id="ix-14"><code>Tail</code></td>
+<td id="ix-15">the end of the parent object</td>
+<td id="ix-16">the <code>name</code> table, whose string offsets count from the string storage after the records (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/name/name.hh#L199"><code>OT/name/name.hh:199</code></a>)</td>
+</tr>
+<tr>
+<td><code>Absolute</code></td>
+<td>the start of the buffer, which is the start of the table</td>
+<td id="ix-17">CFF, whose offsets in DICTs count from the start of the CFF table (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-cff-common.hh#L307"><code>hb-subset-cff-common.hh:307</code></a>)</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-18">A link can also have a <strong>bias</strong>, subtracted from the offset, for a field whose base is not the start of the object being written but somewhere inside it. In GDEF, a CaretValue’s Device-table offset counts from the CaretValue, and when the CaretValue is part of a larger object, <code>to_bias</code> (<code>:568</code>) gives the distance between the two (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GDEF/GDEF.hh#L227"><code>OT/Layout/GDEF/GDEF.hh:227</code></a>).</p>
+<p id="ix-19"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh"><code>hb-open-type.hh</code></a> wraps the push–write–pack–link sequence into methods on <code>OffsetTo</code> itself. Here is the one subsetting uses most, trimmed (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh#L450"><code>hb-open-type.hh:450</code></a>):</p>
+<pre><code class="language-c++">bool serialize_subset (hb_subset_context_t *c, const OffsetTo&amp; src,
+                       const Base *src_base, Ts&amp;&amp;... ds)
+{
+  *this = 0;
+  if (src.is_null ())
+    return false;
+
+  auto *s = c-&gt;serializer;
+  s-&gt;push ();
+  bool ret = c-&gt;dispatch (src_base+src, std::forward&lt;Ts&gt; (ds)...);
+  if (ret || !has_null)
+    s-&gt;add_link (*this, s-&gt;pop_pack ());
+  else
+    s-&gt;pop_discard ();
+  return ret;
+}
+</code></pre>
+<p id="ix-20">Called on an offset field in the new table, it follows the same offset in the old one, has the subset context write the target’s subset as a new object, and links the field to it; if that subset is empty, the object is discarded and the offset stays null. <code>serialize_serialize</code> (<code>:473</code>) does the same around a struct’s <code>serialize</code> method, for building a table from data, and <code>serialize_copy</code> (<code>:493</code>) around <code>copy</code>. What each table’s <code>subset</code> method keeps is the subject of <a href="subsetting.html">Subsetting</a>; this chapter is about how it writes it.</p>
+<h3 id="a-small-graph-packed">A small graph, packed</h3>
+<p id="ix-21">Here is the smallest graph that shows everything: a root A with two 16-bit offsets, to B and to C, which each have a 16-bit offset to a one-byte object D. The code that writes it, in <code>fonts/writing-tables/serialize-example.cc</code>, uses three structs of 5, 3 and 1 bytes and a 32-byte buffer. It writes A, then B; then D, which it packs; it links B to D and packs B; then C, and D again; then it links A’s two offsets and calls <code>end_serialize</code>. After each step it printed where <code>head</code> and <code>tail</code> were:</p>
+<pre><code>A written              head= 5  tail=32
+B written              head= 8  tail=32
+D packed               head= 8  tail=31
+                       object 1
+B packed               head= 5  tail=28
+                       object 2
+second D packed        head= 8  tail=28
+                       object 1
+C packed               head= 5  tail=25
+                       object 3
+end_serialize          head= 0  tail=20
+result, 12 bytes: 61 00 08 00 05 63 00 06 62 00 03 64
+</code></pre>
+<p id="ix-22">(Output of <code>serialize-example.cc</code>, compiled against the HarfBuzz 15.1.0 source; it isn’t run when the book is built.)</p>
+<p id="ix-23">While B is being written, A is still open below it. Packing D moves its byte to the end of the buffer, and packing B moves B’s three bytes in front of it; each time <code>head</code> goes back, so the next object reuses the space. The second D is never stored: <code>pop_pack</code> finds an identical object already packed and returns its index, 1, so B and C share one D. Finally <code>end_serialize</code> packs A and resolves the four links. The 12 bytes, annotated by hand:</p>
+<pre><code> at   bytes            object   offsets
+  0   61 00 08 00 05   A        child1 = 8 → B,  child2 = 5 → C
+  5   63 00 06         C        leaf = 6, so 5 + 6 = 11 → D
+  8   62 00 03         B        leaf = 3, so 8 + 3 = 11 → D
+ 11   64               D
+</code></pre>
+<p id="ix-24">Packed objects pile up backwards from the end, so in the finished table every parent comes before its children, and of two siblings, the one written later comes first: C sits between A and B. Here nobody chose the layout. It fell out of the order the code wrote things in, and that matters for the rest of this chapter.</p>
+<h3 id="sharing">Sharing</h3>
+<p id="ix-25"><strong>Sharing</strong>, or deduplication, is automatic: <code>pop_pack</code> returns the index of an identical object if one is already packed. Identical means the same bytes and the same links, to the same objects at the same positions (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-serialize.hh#L124"><code>hb-serialize.hh:124</code></a>). The serializer keeps a hash map from packed objects to their indices, <code>packed_map</code>, and hashes at most the first 128 bytes of an object, with its links (<code>:133</code>); a longer object that hashes the same is told apart by the full comparison. Because a link is to an object index, and children are packed before parents, equality propagates upwards: two LigatureSets whose Ligatures were shared are themselves identical, and are shared in turn.</p>
+<p id="ix-26"><code>pop_pack (false)</code> packs without trying to share. The root is always packed that way, and so are objects not worth hashing, such as CFF’s CharStrings (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-cff1.cc#L906"><code>hb-subset-cff1.cc:906</code></a>), which <code>start_zerocopy</code> (<code>:646</code>) even lets the code write straight onto the tail side.</p>
+<h3 id="order-on-request">Order on request</h3>
+<p id="ix-27">Sometimes the order the code writes things in isn’t enough, and a table needs a guarantee. A <strong>virtual link</strong>, added by <code>add_virtual_link</code> (<code>:487</code>), is a link with no offset field. It is never written to the font, and it doesn’t count when objects are compared for sharing (<code>:126</code>), but it tells the repacker that its target must come after its source, whatever else it moves.</p>
+<p id="ix-28">LigatureSubst is the example (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/LigatureSubstFormat1.hh#L166"><code>OT/Layout/GSUB/LigatureSubstFormat1.hh:166</code></a>). Because of a bug in some versions of Windows 7, a comment says, its Coverage table must come after its LigatureSets and Ligatures. So <code>subset</code> packs the new Coverage table <em>first</em>, which puts it at the end, then writes the LigatureSets, and every LigatureSet and Ligature it keeps adds a virtual link to the Coverage table (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/Ligature.hh#L216"><code>OT/Layout/GSUB/Ligature.hh:216</code></a>), so the repacker can’t move it in front of them.</p>
+<h2 id="when-writing-fails">When writing fails</h2>
+<p id="ix-29">The serializer has no exceptions to throw. It keeps a set of error flags (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-serialize.hh#L45"><code>hb-serialize.hh:45</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Set when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-30"><code>HB_SERIALIZE_ERROR_OTHER</code></td>
+<td>an allocation fails, or something else unrecoverable happens</td>
+</tr>
+<tr>
+<td id="ix-31"><code>HB_SERIALIZE_ERROR_OFFSET_OVERFLOW</code></td>
+<td id="ix-32">an offset doesn’t fit its field</td>
+</tr>
+<tr>
+<td id="ix-33"><code>HB_SERIALIZE_ERROR_OUT_OF_ROOM</code></td>
+<td>the buffer is full</td>
+</tr>
+<tr>
+<td id="ix-34"><code>HB_SERIALIZE_ERROR_INT_OVERFLOW</code></td>
+<td id="ix-35">a value doesn’t fit its field (<code>check_assign</code>, used for counts, glyph IDs, coordinates)</td>
+</tr>
+<tr>
+<td id="ix-36"><code>HB_SERIALIZE_ERROR_ARRAY_OVERFLOW</code></td>
+<td id="ix-37">an array has more items than its count field can hold</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-38"><code>err</code> sets a flag and returns false. Once any flag is set, nearly every method does nothing: <code>allocate_size</code> returns <code>nullptr</code>, <code>add_link</code> and <code>resolve_links</code> return at once. Table code checks results where it must and otherwise carries on, and the caller looks at the flags at the end. After a pure overflow (<code>only_overflow()</code>, <code>:231</code>), though, <code>push</code>, <code>pop_pack</code> and <code>pop_discard</code> keep working, so every push is still matched by its pop.</p>
+<p id="ix-39"><code>snapshot()</code> and <code>revert (snap)</code> (<code>:437</code>) roll the serializer back, errors and all. The cmap subsetter uses them when a format 4 subtable overflows, and writes the table again without one (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-cmap-table.hh#L1965"><code>hb-ot-cmap-table.hh:1965</code></a>).</p>
+<p id="ix-40">The subsetter starts each table in a buffer of a guessed size (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-table.hh#L73"><code>hb-subset-table.hh:73</code></a>): the source table’s size, scaled by the square root of the fraction of glyphs kept (or unscaled, for GSUB, GPOS, GDEF and <code>name</code>), plus 8 KB. When a table runs out of room, it doubles the buffer and starts the table again, up to 256 times the size of the source table (<code>:61</code>). That is usually generous, but not always. A font tried while making this chapter had a 72-byte GSUB, one SingleSubst format 1 over 20,000 glyphs; subset like the fonts below, it outgrew its first buffer of 8 KB, the next would have passed 256 × 72 = 18,432 bytes, and <code>hb-subset</code> failed.</p>
+<p id="ix-41">The flag that leads to the rest of this chapter is <code>OFFSET_OVERFLOW</code>. <code>resolve_links</code> sets it when a link’s offset doesn’t fit, through <code>check_assign</code>. The subsetter sends a table to the repacker only when that flag is the only one set (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-table.hh#L172"><code>hb-subset-table.hh:172</code></a>, <code>:116</code>). An overflow found before the links are resolved, as in the font-file writer above, is beyond the repacker’s help: <code>end_serialize</code> turns it into <code>OTHER</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-serialize.hh#L313"><code>hb-serialize.hh:313</code></a>).</p>
+<h2 id="offsets-that-dont-fit">Offsets that don’t fit</h2>
+<p id="ix-42">A GSUB table points from its LookupList to each Lookup, from each Lookup to its subtables and from each subtable to its Coverage and other tables, nearly all with 16-bit offsets. Large fonts have GSUB and GPOS tables far bigger than 64 KB, and the <a href="gsub.html#extension">Extension</a> lookup type exists only so that some offsets can be 32 bits. Whether a table fits is a matter of layout: the same objects in one order can have every offset under 65,536, and in another not.</p>
+<p id="ix-43">The serializer’s layout is the order the table’s code wrote things in, reversed. A LookupList is written lookup by lookup, each with its whole subtree, so lookup 0 and everything under it are packed first and end up at the end of the table. The LookupList’s offset to lookup 0 then spans nearly the whole table. (That is read from the code; the last listing on this page shows it in a table small enough to keep the serializer’s layout.) So, by our reading, any GSUB much over 64 KB overflows in the serializer’s own order, whether or not a better order exists.</p>
+<p id="ix-44">Here is a case. <code>forty.ttf</code> has 1,500 glyphs and 40 lookups, each mapping every glyph to one a fixed number of places further on, so each is a SingleSubst format 1: one glyph-ID difference and a one-range Coverage table. The subset keeps every character except those whose glyph number is a multiple of 5 or 7, without layout closure. With glyphs missing from between the others, one difference no longer works for most lookups, so they become SingleSubst format 2, listing every substitute, with Coverage tables that list glyphs. GSUB grows sixty-fold:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">forty.ttf</td><td class="opt">--list-tables</td><td class="out"><pre><code>Table information:
+
+Tag	Size
+------------
+GSUB     1632 bytes
+OS/2       96 bytes
+cmap       52 bytes
+glyf        1 bytes
+head       54 bytes
+hhea       36 bytes
+hmtx     3004 bytes
+loca     3004 bytes
+maxp       32 bytes
+name      138 bytes
+post    10929 bytes</code></pre></td></tr><tr><td class="font">forty-subset.ttf</td><td class="opt">--list-tables</td><td class="out"><pre><code>Table information:
+
+Tag	Size
+------------
+GSUB    99758 bytes
+OS/2       96 bytes
+cmap     3132 bytes
+glyf        1 bytes
+head       54 bytes
+hhea       36 bytes
+hmtx     2060 bytes
+loca     2060 bytes
+maxp       32 bytes
+name       86 bytes
+post     7499 bytes</code></pre></td></tr></tbody></table></div>
+<p id="ix-45"><code>hb-subset</code> printed this about it, when built with <code>HB_DEBUG_SUBSET</code> and <code>HB_DEBUG_SUBSET_REPACK</code>:</p>
+<pre><code>OT::GSUB initial estimated table size: 9824 bytes.
+OT::GSUB ran out of room; reallocating to 20764 bytes.
+OT::GSUB ran out of room; reallocating to 41544 bytes.
+OT::GSUB ran out of room; reallocating to 83104 bytes.
+OT::GSUB ran out of room; reallocating to 166224 bytes.
+Repacking GSUB.
+OT::GSUB final subset table size: 99758 bytes.
+OT::GSUB::subset success
+</code></pre>
+<p id="ix-46">(<code>fonts/writing-tables/forty-subset.repack-log.txt</code>, made by <code>build.sh</code> with a debugging build of <code>hb-subset</code> 15.1.0; not run when the book is built.)</p>
+<p id="ix-47">The buffer doubled four times; then the serializer’s layout overflowed and the repacker found one that doesn’t. Where it put things was printed by <code>fonts/writing-tables/layout.py</code>, a Python script that reads the GSUB bytes, not HarfBuzz:</p>
+<pre><code>forty-subset.ttf: GSUB, 99,758 bytes, 40 lookups
+  kind         count   first starts   last ends
+  LookupList       1             18         100
+  Lookup          40            346         666
+  SingleSubst     40            906      50,850
+  Coverage        40         50,850      99,758
+  longest 16-bit offset: 60,784 (SingleSubst to Coverage, lookup 27; 120 offsets of this width)
+</code></pre>
+<p id="ix-48">The repacked table is in layers: the LookupList, then all 40 Lookups, then all 40 subtables, then all 40 Coverage tables. Every offset fits, the longest with under 5,000 bytes to spare.</p>
+<h3 id="the-graph">The graph</h3>
+<p id="ix-49"><code>hb_resolve_overflows</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-repacker.hh#L480"><code>hb-repacker.hh:480</code></a>) starts from what the serializer leaves behind: its stack of packed objects, with their bytes and links. <code>graph_t::create</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/graph.hh#L575"><code>graph/graph.hh:575</code></a>) turns them into an <strong>object graph</strong>: a vertex for each object, an edge for each link, real or virtual. The repacker needs only each object’s size and links, and looks inside objects only for GSUB and GPOS, below. A graph is refused if it has more than <code>HB_REPACKER_MAX_VERTICES</code> (800,000) objects, if some object can’t be reached from the root, or if it has a cycle (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/graph-result.hh"><code>graph/graph-result.hh</code></a> lists the errors).</p>
+<h3 id="sorting-by-distance">Sorting by distance</h3>
+<p id="ix-50">The layout is a <strong>topological order</strong> of the graph: an order in which every object comes after all the objects that point to it, so that every offset is positive. There are many, and <code>sort_shortest_distance</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/graph.hh#L740"><code>graph/graph.hh:740</code></a>) picks one by distance from the root.</p>
+<p id="ix-51">First it gives each object a <strong>distance</strong>, with Dijkstra’s algorithm (<code>update_distances</code>, <code>:1865</code>). Following a link costs the size of the object it points to plus 2<sup>16</sup> for a 16-bit link, 2<sup>24</sup> for a 24-bit one and 2<sup>32</sup> for a 32-bit one (<code>:1911</code>). The power of two dominates, so distance mostly counts how many offsets deep an object is, and how wide those offsets are; size breaks the ties. Then it lays the objects out with Kahn’s algorithm, using a priority queue: an object becomes ready once every object that points to it has been placed, and of the ready objects, the nearest goes next. Objects at the same distance go in the order their parents’ links name them (<code>:787</code>).</p>
+<p id="ix-52">That is the layering in <code>forty-subset.ttf</code>: every Lookup is one 16-bit offset from the LookupList, every subtable two, every Coverage table three.</p>
+<p id="ix-53"><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/repacker.md"><code>docs/repacker.md</code></a> says plain Kahn’s algorithm is tried first, being faster. In 15.1.0 there is only the distance sort.</p>
+<blockquote>
+<p id="ix-54">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/4d41c69d42fa9e73885a93a6396acbb582c9dee8"><code>4d41c69</code></a> (17 November 2026), so main’s <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/repacker.md"><code>docs/repacker.md</code></a> describes only the distance sort.</p>
+</blockquote>
+<h3 id="round-by-round">Round by round</h3>
+<p id="ix-55">After sorting, <code>will_overflow</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/serialize.hh#L93"><code>graph/serialize.hh:93</code></a>) works out each object’s position from the sizes and checks every real link against its width and signedness, collecting the ones that overflow. If there are none, the repacker is done. If there are, <code>hb_resolve_graph_overflows</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-repacker.hh#L402"><code>hb-repacker.hh:402</code></a>) changes the graph and sorts again, round after round. In each round, starting with the overflow furthest down the table, it tries:</p>
+<ul>
+<li id="ix-56"><strong>Isolating a space.</strong> If the overflowing link is inside a space (next section) that more than one 32-bit offset points into, it moves up to half of those entry points into a new space of their own, and the round is over (<code>_try_isolating_subgraphs</code>, <code>:191</code>).</li>
+<li id="ix-57"><strong>Duplicating a shared child.</strong> If the child has several parents, a copy is made for the parents whose links overflow, so the copy can be placed near them (<code>_resolve_shared_overflow</code>, <code>:246</code>). A child with an incoming virtual link isn’t duplicated (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/graph.hh#L1494"><code>graph/graph.hh:1494</code></a>), since the repacker can’t tell whether the original would be left with only virtual links.</li>
+<li id="ix-58"><strong>Moving a leaf closer.</strong> If the child points to nothing, the parent’s children get a higher <strong>priority</strong> (<code>raise_childrens_priority</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/graph.hh#L1594"><code>graph/graph.hh:1594</code></a>). Priority lowers the distance the sort uses: by half the object’s size at priority 1, by its whole size at 2, and at 3, the maximum, the distance becomes zero, so the object is placed as soon as its parents are (<code>:473</code>–<code>499</code>).</li>
+</ul>
+<p id="ix-59">If nothing can be done for any overflow, the loop stops. Otherwise it stops after <code>max_rounds</code> rounds without isolation (32 for the subsetter), or 500 rounds in all (<code>HB_REPACKER_MAX_ITERATIONS</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh#L283"><code>hb-limits.hh:283</code></a>). Duplication undoes some of the serializer’s sharing, so the table grows, but it means the same to anything that reads it.</p>
+<h3 id="32-bit-offsets-and-spaces">32-bit offsets and spaces</h3>
+<p id="ix-60">A 32-bit offset (or a 24-bit one, in the beyond-64k formats) can reach anywhere in the table. A part of the graph reached only through such offsets needn’t be near its parents, and is better kept together: if the distance sort interleaved two such parts, each one’s 16-bit offsets would have to jump over the other’s objects (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/repacker.md"><code>docs/repacker.md</code></a> has an example).</p>
+<p id="ix-61">So before the rounds start, <code>assign_spaces</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/graph.hh#L939"><code>graph/graph.hh:939</code></a>) finds the objects that wide offsets point to, the roots of <strong>spaces</strong>. Roots whose subgraphs touch are put in the same space. Any object in a space that is also reachable from outside it, by a path with no wide offset, is duplicated, so that the space is entirely its own (<code>isolate_subgraph</code>, <code>:1011</code>). Each space then gets a number, 1 upwards, which multiplies the cost of the wide link into it, so the sort lays out all of space 0 first, then all of space 1, and so on. There can be at most <code>HB_REPACKER_MAX_SPACES</code> (8,000) spaces.</p>
+<h3 id="gsub-and-gpos">GSUB and GPOS</h3>
+<p id="ix-62">Reordering and duplication can’t fix everything. When the part of a GSUB reached through 16-bit offsets is simply too big, no order and no copy helps. For GSUB and GPOS, the repacker has two more remedies, which change what the table <em>says</em>, not only where things are:</p>
+<ul>
+<li id="ix-63"><strong>Splitting subtables.</strong> A subtable that is too big for its own offsets to work, such as one whose Coverage table, packed last, is more than 64 KB from its start, is split into two or more subtables of the same type in the same lookup (<code>split_subtables_if_needed</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/gsubgpos-graph.hh#L135"><code>graph/gsubgpos-graph.hh:135</code></a>). Only some types can be split: in GPOS, PairPos and MarkBasePos; in GSUB, LigatureSubst (<code>:383</code>–<code>394</code>). The split points are worked out from the sizes, as in <code>compute_split_points</code> for ligatures (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/ligature-graph.hh#L128"><code>graph/ligature-graph.hh:128</code></a>), which keeps each piece’s data under 64 KB. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/repacker.md"><code>docs/repacker.md</code></a> still says only GPOS subtables can be split.</li>
+<li id="ix-64"><strong>Promoting lookups to Extension.</strong> A lookup is rewritten as an Extension lookup: each of its subtables gets an 8-byte Extension subtable in front of it, holding the lookup type and a 32-bit offset (<code>make_extension</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/gsubgpos-graph.hh#L99"><code>graph/gsubgpos-graph.hh:99</code></a>). <code>_promote_extensions_if_needed</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-repacker.hh#L102"><code>hb-repacker.hh:102</code></a>) decides which. It sorts the lookups by subtables per byte, most first, then keeps lookups as they are, in that order, while three totals stay under 64 KB: the LookupList and the Lookups; the Lookups and their subtables; and the subtables and everything below them. Once one doesn’t, it promotes every lookup still to come. A comment calls this “v1”, and describes a better algorithm, by connected components, that isn’t written yet.</li>
+</ul>
+<p id="ix-65">Neither is tried at first. The first pass runs with <code>always_recalculate_extensions</code> false, so for GSUB and GPOS it only assigns spaces before the rounds. If that pass ends with overflows still there, the repacker runs again, on the graph as the first pass left it, with splitting and promotion on (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-repacker.hh#L451"><code>hb-repacker.hh:451</code></a>). <code>sixty.ttf</code> is <code>forty.ttf</code> with 60 lookups instead of 40, subset the same way:</p>
+<pre><code>OT::GSUB initial estimated table size: 10624 bytes.
+  … four reallocations …
+Repacking GSUB.
+Applying GSUB/GPOS repacking specializations.
+Assigning spaces to 32 bit subgraphs.
+=== Overflow resolution round 0 ===
+  overflow from   14 (   1 in,    1 out, space  0) =&gt;   13 (   1 in,    1 out, space  0)
+  … nine more, plus 54 more overflows; then priorities raised …
+=== Overflow resolution round 1 ===
+=== Overflow resolution round 2 ===
+=== Overflow resolution round 3 ===
+No resolution available :(
+Failed to find a resolution. Re-running with extension promotion and table splitting enabled.
+Repacking GSUB.
+Applying GSUB/GPOS repacking specializations.
+Splitting subtables if needed.
+Promoting lookups to extensions if needed.
+Promoting lookup type 1 (obj 56) to extension.
+Promoting lookup type 1 (obj 68) to extension.
+  … 30 more …
+OT::GSUB final subset table size: 152548 bytes.
+OT::GSUB::subset success
+</code></pre>
+<p id="ix-66">(<code>fonts/writing-tables/sixty-subset.repack-log.txt</code>, cut down by hand; made with the same debugging build, not when the book is built.)</p>
+<p id="ix-67">Three rounds of raising priorities didn’t help, and in the fourth there was nothing left to try. The second pass promoted 32 lookups (numbered here as objects, not lookups), after which a sort was enough. <code>layout.py</code> found:</p>
+<pre><code>sixty.ttf: GSUB, 2,432 bytes, 60 lookups
+  kind         count   first starts   last ends
+  LookupList       1            870         992
+  Lookup          60            992       2,416
+  SingleSubst     60          1,000       2,422
+  Coverage        60          1,006       2,432
+  longest 16-bit offset: 1,538 (LookupList to Lookup, lookup 59; 180 offsets of this width)
+sixty-subset.ttf: GSUB, 152,548 bytes, 60 lookups
+  kind         count   first starts   last ends
+  LookupList       1             18         140
+  Lookup          60            506         986
+  Extension       32          5,310       5,566
+  SingleSubst     60          1,346     149,446
+  Coverage        60          1,352     152,548
+  longest 16-bit offset: 62,574 (Lookup to SingleSubst, lookup 21; 180 offsets of this width)
+  longest 32-bit offset: 142,400 (Extension to SingleSubst, lookup 4; 32 offsets of this width)
+  Extension lookups: 32 of 60: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 22 24 27 29 39 41 44 48 49 54 55 59
+</code></pre>
+<p id="ix-68">(Printed by <code>layout.py</code>, not by HarfBuzz.)</p>
+<p id="ix-69">fontTools wrote the source with each lookup, its subtable and its Coverage table side by side. In the subset, the 28 lookups left alone have their subtables and Coverage tables in the first 65 KB, each Coverage table right after its subtable (put there by the first pass’s raised priorities, by our reading). The 32 Extension subtables are near the front too, and the promoted lookups’ subtables fill the rest, reached by 32-bit offsets. Lookup 4 (<code>ss05</code>) is a promoted one, and works the same through its Extension subtable:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">sixty.ttf</td><td class="in"><span class="txt">丁丂七</span><span class="cps">U+4E01 U+4E02 U+4E03</span></td><td class="opt">--features=ss05</td><td class="out"><code>[g6=0+1000|g7=1+1000|g8=2+1000]</code></td></tr><tr><td class="font">sixty-subset.ttf</td><td class="in"><span class="txt">丁丂七</span><span class="cps">U+4E01 U+4E02 U+4E03</span></td><td class="opt">--features=ss05</td><td class="out"><code>[g6=0+1000|g2=1+1000|g8=2+1000]</code></td></tr></tbody></table></div>
+<p id="ix-70">The second glyph differs because the subset has no <code>g7</code> to substitute (7 is a multiple of 7), not because of the repacking.</p>
+<p id="ix-71">The repacker never turns an Extension lookup back into an ordinary one, and the subsetter copies an Extension subtable as an Extension subtable (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-gsubgpos.hh#L6109"><code>hb-ot-layout-gsubgpos.hh:6109</code></a>). So a font keeps its Extension lookups through a subset, however small. <code>sixty-small.ttf</code> is <code>sixty-subset.ttf</code> cut down to its first 64 characters:</p>
+<pre><code>sixty-small.ttf: GSUB, 5,752 bytes, 60 lookups
+  kind         count   first starts   last ends
+  LookupList       1            870         992
+  Lookup          60            992       5,688
+  Extension       32          1,000       5,566
+  SingleSubst     60          1,008       5,694
+  Coverage        59          1,034       5,752
+  longest 16-bit offset: 4,810 (LookupList to Lookup, lookup 0; 180 offsets of this width)
+  longest 32-bit offset: 8 (Extension to SingleSubst, lookup 1; 32 offsets of this width)
+  Extension lookups: 32 of 60: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 22 24 27 29 39 41 44 48 49 54 55 59
+</code></pre>
+<p id="ix-72">(Printed by <code>layout.py</code>, not by HarfBuzz.)</p>
+<p id="ix-73">Its 32 Extension lookups each point eight bytes ahead, to a subtable that is now tiny. Nothing overflowed, so this is the serializer’s own layout, and it shows the order described earlier: lookup 0, written first, is at the end, 4,810 bytes after the LookupList, and lookup 59 is at the front. It also shows sharing: 60 lookups, but 59 Coverage tables, because two of the subsets’ Coverage tables came out identical.</p>
+<h3 id="writing-the-result">Writing the result</h3>
+<p id="ix-74">When the graph has no overflows, <code>graph::serialize</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/serialize.hh#L234"><code>graph/serialize.hh:234</code></a>) writes it with a new serializer: each object, in reverse of the sorted order, is pushed, copied, given its real links again and packed with sharing off, since the graph already says what is shared. If an offset still overflows, <code>hb_resolve_overflows</code> returns nothing, and <code>_hb_subset_repack</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-table.hh#L114"><code>hb-subset-table.hh:114</code></a>) fails the table.</p>
+<h2 id="for-other-writers-hb_subset_serialize_or_fail">For other writers: <code>hb_subset_serialize_or_fail</code></h2>
+<p id="ix-75">The repacker is also public, in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-serialize.h"><code>hb-subset-serialize.h</code></a>, for programs that have built an object graph of their own and want HarfBuzz to lay it out:</p>
+<pre><code class="language-c">hb_blob_t *
+hb_subset_serialize_or_fail (hb_tag_t                      table_tag,
+                             hb_subset_serialize_object_t *hb_objects,
+                             unsigned                      num_hb_objs);
+</code></pre>
+<p id="ix-76">Each <code>hb_subset_serialize_object_t</code> is an object as the serializer would have it: <code>head</code> and <code>tail</code> pointers to its bytes, and arrays of real and virtual links. A <code>hb_subset_serialize_link_t</code> has a <code>width</code> in bytes, a <code>position</code> in the object, and an <code>objidx</code>: the target’s place in <code>hb_objects</code>, plus 1, since the function puts the nil object in front (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-serialize.cc#L52"><code>hb-subset-serialize.cc:52</code></a>). Children come before parents, and the last object is the root. There is no <code>whence</code> or <code>bias</code>: every link is unsigned and counts from the start of its object (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-serialize.hh#L152"><code>hb-serialize.hh:152</code></a>).</p>
+<p id="ix-77">It runs at most 20 rounds, with GSUB and GPOS splitting and promotion on from the start (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-serialize.cc#L56"><code>hb-subset-serialize.cc:56</code></a>); <code>HB_TAG_NONE</code> as the tag turns off what is specific to a table. It returns <code>NULL</code> on failure. It has been public since HarfBuzz 10.2.0; before that it was the experimental <code>hb_subset_repack_or_fail</code>, added in 4.1.0 (<code>NEWS</code>).</p>
+<blockquote>
+<p id="ix-78">For programmers: fontTools is one user. When a table it compiles overflows, fontTools 4.38 hands the objects to HarfBuzz’s repacker through uharfbuzz, if that is installed, and falls back to its own splitting and promotion if it fails (<code>fontTools/ttLib/tables/otBase.py</code>, option <code>USE_HARFBUZZ_REPACKER</code>). This chapter’s fonts were built with it off, so they don’t depend on uharfbuzz.</p>
+</blockquote>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-serialize.hh"><code>src/hb-serialize.hh</code></a></td>
+<td><code>hb_serialize_context_t</code>: the buffer, objects and links, <code>pop_pack</code> and sharing, <code>resolve_links</code>, the error flags, snapshots</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-type.hh"><code>src/hb-open-type.hh</code></a></td>
+<td><code>serialize</code> methods for arrays, and <code>OffsetTo::serialize_subset</code>, <code>serialize_serialize</code>, <code>serialize_copy</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-open-file.hh"><code>src/hb-open-file.hh</code></a></td>
+<td>writing a font file’s header and directory, used by the face builder</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Layout/GSUB/LigatureSubstFormat1.hh"><code>src/OT/Layout/GSUB/LigatureSubstFormat1.hh</code></a></td>
+<td>a <code>subset</code> method that writes objects in a chosen order and adds virtual links</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-table.hh"><code>src/hb-subset-table.hh</code></a></td>
+<td>the subsetter’s buffer estimate and retries, and the call to the repacker</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-repacker.hh"><code>src/hb-repacker.hh</code></a></td>
+<td><code>hb_resolve_overflows</code>: the passes, the rounds, isolation, duplication, priorities, extension promotion</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/graph.hh"><code>src/graph/graph.hh</code></a></td>
+<td><code>graph_t</code>: distances, the sort, spaces, duplication</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/serialize.hh"><code>src/graph/serialize.hh</code></a></td>
+<td>checking for overflows, and writing the graph back out</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/gsubgpos-graph.hh"><code>src/graph/gsubgpos-graph.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/pairpos-graph.hh"><code>pairpos-graph.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/markbasepos-graph.hh"><code>markbasepos-graph.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/graph/ligature-graph.hh"><code>ligature-graph.hh</code></a></td>
+<td>GSUB and GPOS as graphs: splitting subtables and making Extension lookups</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-serialize.h"><code>src/hb-subset-serialize.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-subset-serialize.cc"><code>src/hb-subset-serialize.cc</code></a></td>
+<td>the public repacker</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-limits.hh"><code>src/hb-limits.hh</code></a></td>
+<td><code>HB_REPACKER_MAX_ITERATIONS</code>, <code>HB_REPACKER_MAX_VERTICES</code>, <code>HB_REPACKER_MAX_SPACES</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/serializer.md"><code>docs/serializer.md</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/docs/repacker.md"><code>docs/repacker.md</code></a></td>
+<td>the design notes; the repacker’s is partly out of date</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/4d41c69d42fa9e73885a93a6396acbb582c9dee8"><code>4d41c69</code></a> (17 November 2026), which brings both design notes up to date (the table’s last row).</p>
+</blockquote>
+<p>The fonts and scripts are in <code>fonts/writing-tables/</code>: <code>build-fonts.py</code> makes <code>forty.ttf</code> and <code>sixty.ttf</code>, <code>build.sh</code> subsets them and runs <code>layout.py</code>, and <code>serialize-example.cc</code> is the program behind the walk-through above.</p>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>Everything in HarfBuzz that writes font data writes it through <code>hb_serialize_context_t</code>, into a fixed buffer: simple data at the head, finished objects stacked at the tail.</li>
+<li><code>push</code> starts an object, <code>pop_pack</code> packs it and returns its index, and <code>add_link</code> records an offset to it, with a width, a <code>whence</code> and a bias; <code>end_serialize</code> fills the offsets in.</li>
+<li><code>pop_pack</code> shares an object with an identical one already packed. The layout is the writing order reversed; virtual links ask the repacker to keep an order.</li>
+<li>Errors are flags, and once one is set writing stops quietly. The subsetter doubles the buffer when it runs out of room, up to 256 times the source table, and repacks when the only error is an offset overflow.</li>
+<li>The repacker sorts the object graph by distance from the root, then, round by round, isolates 32-bit spaces, duplicates shared children and raises priorities.</li>
+<li>For GSUB and GPOS, if that fails, it runs again, splitting PairPos, MarkBasePos and LigatureSubst subtables and promoting lookups to Extension.</li>
+<li><code>hb_subset_serialize_or_fail</code> offers the repacker to other font compilers, such as fontTools.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="subsetting.html">← Subsetting</a><a rel="next" href="instancing.html">Instancing →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

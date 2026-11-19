@@ -1,0 +1,1200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Color · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part IX · Drawing</p>
+<h1 id="color">36. Color</h1>
+<p id="ix-1">A font can hold more than one picture of a glyph. Besides the outline there may be a set of colored layers, a graph of gradients, clips and transforms, a PNG image at one or more sizes, or a whole SVG document. OpenType has five tables for these: <code>COLR</code> (in two very different versions) with its palettes in <code>CPAL</code>, <code>sbix</code>, <code>CBDT</code> with its index <code>CBLC</code>, and <code>SVG </code>. They were added at different times by different companies, and a font usually has one of them, sometimes two.</p>
+<p id="ix-2">HarfBuzz doesn’t shape with any of them: shaping only needs glyph IDs and advances. What it offers is a way of <em>painting</em> a glyph, the paint API, which turns whichever color data a font has into one sequence of calls to the client: push a transform, clip to this glyph, fill with this gradient, composite this group. The client turns those calls into pixels, PDF operators or SVG elements. HarfBuzz’s own renderers are clients like any other (<a href="hb-raster.html">hb-raster</a>, <a href="hb-vector.html">hb-vector</a> and <a href="hb-gpu.html">hb-gpu</a>), and so is the extents code that <a href="where-metrics-come-from.html#glyph-extents">Where metrics come from</a> described.</p>
+<p id="ix-3">The drawings on this page come from four small fonts built with fontTools from <code>fonts/color/build-color-fonts.py</code>, and one from HarfBuzz’s own test suite. Each color glyph in the chapter’s fonts also has an ordinary outline, a black square with one corner cut off, so that a drawing shows at once when HarfBuzz has fallen back to it.</p>
+<h2 id="the-paint-api">The paint API</h2>
+<p id="ix-4"><code>hb_paint_funcs_t</code> is a table of callbacks, built the same way as the font functions of <a href="fonts-and-font-functions.html">Fonts and font functions</a>: <code>hb_paint_funcs_create</code>, one setter per callback, each with its own user data, then <code>hb_paint_funcs_make_immutable</code>. A callback left unset does nothing, or returns false. The list is in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint.hh#L33"><code>hb-paint.hh:33</code></a>:</p>
+<table>
+<thead>
+<tr>
+<th>Callback</th>
+<th>Since</th>
+<th>What the client does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>push_transform</code>, <code>pop_transform</code></td>
+<td>7.0.0</td>
+<td id="ix-5">multiply the current transform by a 2×3 matrix; restore it</td>
+</tr>
+<tr>
+<td><code>push_clip_glyph</code>, <code>push_clip_rectangle</code>, <code>pop_clip</code></td>
+<td>7.0.0</td>
+<td id="ix-6">intersect the clip with a glyph’s outline or a rectangle; restore it</td>
+</tr>
+<tr>
+<td><code>color</code></td>
+<td>7.0.0</td>
+<td>fill everything inside the current clip with one color</td>
+</tr>
+<tr>
+<td><code>linear_gradient</code>, <code>radial_gradient</code>, <code>sweep_gradient</code></td>
+<td>7.0.0</td>
+<td>fill everything inside the clip with a gradient</td>
+</tr>
+<tr>
+<td><code>image</code></td>
+<td>7.0.0</td>
+<td>paint a PNG, BGRA or SVG image</td>
+</tr>
+<tr>
+<td><code>push_group</code>, <code>pop_group</code></td>
+<td>7.0.0</td>
+<td>paint into a new layer; composite it onto the one below with a given mode</td>
+</tr>
+<tr>
+<td><code>custom_palette_color</code></td>
+<td>7.0.0</td>
+<td id="ix-7">optionally replace a palette entry</td>
+</tr>
+<tr>
+<td><code>color_glyph</code></td>
+<td>8.2.0</td>
+<td id="ix-8">optionally paint a whole color glyph itself</td>
+</tr>
+<tr>
+<td><code>push_group_for</code></td>
+<td>14.2.0</td>
+<td id="ix-9"><code>push_group</code>, but told the compositing mode in advance</td>
+</tr>
+<tr>
+<td><code>push_clip_path_start</code>, <code>push_clip_path_end</code></td>
+<td>14.2.0</td>
+<td id="ix-10">clip to an arbitrary path, drawn through the returned draw funcs</td>
+</tr>
+<tr>
+<td><code>fill_glyph</code></td>
+<td>14.3.0</td>
+<td id="ix-11">fill a glyph’s outline with one color</td>
+</tr>
+<tr>
+<td><code>set_budget</code>, <code>get_budget</code>, <code>get_budget_remaining</code></td>
+<td>14.5.0</td>
+<td id="ix-12">share a work budget with HarfBuzz</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-13">The calls are always properly nested, as the header comment in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint.h"><code>hb-paint.h</code></a> promises, so a client can keep transforms, clips and groups on a single stack. Nothing in the API is a scene description that the client could inspect as a whole: HarfBuzz walks the font’s data and calls back as it goes, and the client renders, or measures, as the calls arrive.</p>
+<p id="ix-14">Two entry points start the walk. <strong><code>hb_font_paint_glyph_or_fail</code></strong> (11.2.0) paints the glyph’s color version and returns false if there is none. <strong><code>hb_font_paint_glyph</code></strong> (7.0.0) does the same but never fails: if there is no color version, it calls <code>fill_glyph</code> with the outline and the foreground color (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L1687"><code>hb-font.cc:1687</code></a>). So every glyph with an outline can be painted, and a client that only wants one code path for text can paint everything. Both take a palette index and a <strong>foreground color</strong>, the color the text would be in if it had no color of its own.</p>
+<p id="ix-15">Colors are <code>hb_color_t</code>, 32 bits holding blue, green, red and alpha, with the components not premultiplied. Every color callback also gets an <code>is_foreground</code> flag. When it’s set, the color came from the font’s “use the text color” sentinel, and the color passed is already the foreground with the paint graph’s own alpha applied. A client that renders the same glyph in several text colors, or that leaves the color to CSS, can substitute its own foreground there, keeping the alpha, as the comment on <code>hb_paint_color_func_t</code> explains.</p>
+<p id="ix-16">Some callbacks have defaults that call others. The default <code>fill_glyph</code> is <code>push_clip_glyph</code>, <code>color</code> and <code>pop_clip</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint.cc#L64"><code>hb-paint.cc:64</code></a>); a client implements <code>fill_glyph</code> itself only to fill an outline more cheaply than by clipping. The default <code>push_group_for</code> calls <code>push_group</code> (<code>:145</code>). <code>push_clip_glyph</code> hands over only a glyph ID and the font: the client fetches the outline itself, through the draw API of <a href="drawing-outlines.html">Drawing outlines</a>, at the font’s scale and through the current transform.</p>
+<blockquote>
+<p id="ix-17">For programmers: what a client must implement depends on what it will meet. An outline glyph needs only <code>fill_glyph</code> or the clip and color callbacks. COLR version 0 needs no more. Version 1 needs transforms, rectangle clips, gradients and groups. <code>image</code> is needed only for bitmap and SVG fonts. The rest are optional.</p>
+</blockquote>
+<p id="ix-18">Not everything in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint.h"><code>hb-paint.h</code></a> is for fonts. Nothing in HarfBuzz’s font code calls <code>push_clip_path_start</code>: it’s for clients that drive a renderer themselves, such as the extents overlay in <code>util/</code>. And three functions from 14.2.0 help renderers turn COLR’s gradients into the forms other graphics libraries expect: <code>hb_paint_reduce_linear_anchors</code>, <code>hb_paint_normalize_color_line</code> and <code>hb_paint_sweep_gradient_tiles</code>. They come up with the gradients below.</p>
+<p id="ix-19">Two other paint-funcs implementations live inside HarfBuzz and aren’t public. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint-extents.cc"><code>hb-paint-extents.cc</code></a> keeps a stack of clip boxes and transforms and records the box that paint would cover, which is how a COLR glyph without a ClipBox gets its extents. <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint-bounded.cc"><code>hb-paint-bounded.cc</code></a> only answers whether a paint graph is bounded, a question that comes up with ClipBoxes below.</p>
+<h2 id="which-picture-gets-painted">Which picture gets painted</h2>
+<p id="ix-20">The hb-ot font functions paint a glyph with <code>hb_ot_paint_glyph_or_fail</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L939"><code>hb-ot-font.cc:939</code></a>). Trimmed of its <code>#ifdef</code>s, and with <code>font-&gt;face-&gt;table</code> shortened, it is a list:</p>
+<pre><code class="language-c++">auto &amp;t = font-&gt;face-&gt;table;
+if (t.COLR-&gt;paint_glyph (font, glyph, paint_funcs, paint_data,
+                         palette, foreground)) return true;
+if (t.SVG-&gt;paint_glyph (font, glyph, paint_funcs, paint_data)) return true;
+if (t.CBDT-&gt;paint_glyph (font, glyph, paint_funcs, paint_data)) return true;
+if (t.sbix-&gt;paint_glyph (font, glyph, paint_funcs, paint_data)) return true;
+return false;
+</code></pre>
+<p id="ix-21">COLR first, then SVG, then the two bitmap tables. COLR answers for itself. The other three answer with whatever the client’s <code>image</code> callback returns (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/svg/svg.hh#L233"><code>svg.hh:233</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/CBDT/CBDT.hh#L1066"><code>CBDT.hh:1066</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/sbix/sbix.hh#L246"><code>sbix.hh:246</code></a>). An <code>image</code> callback that returns false is saying “I can’t paint this”, and HarfBuzz goes on to the next table, then, in <code>hb_font_paint_glyph</code>, to the outline. That makes refusing an image part of the protocol, not an error.</p>
+<p id="ix-22">The font <code>images.ttf</code> shows it. <code>S</code> has an SVG document, <code>T</code> has an SVG document and an <code>sbix</code> bitmap, <code>P</code> has only the bitmap, and <code>N</code> has nothing but its outline:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 4080 1180" role="img" aria-label="STPN at default">
+<g transform="scale(1,-1)">
+<path d="M100,0L100,800L650,800L900,550L900,0L100,0Z" fill="currentColor"/>
+<g transform="matrix(1,0,0,1,1000,0)">
+<g transform="translate(100,800) scale(10,-10)">
+<image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAYAAACOEfKtAAAA2klEQVR42u3buw3CAAxFUU/EQEzHptBBQxHE59nmXMkLnCZRYldJkiTdO13O12dD5iDUqwPtgwMOZBZuDWQabjRkN7wxiF3hRkBOwWuJOA2vFeJUvBaI0/GiiFvwIojb8H6OCBBeBnE73tcRAcLLIQKEl0MECC+HCBBgDvDf8d5GhAcQIECABl4CERpAgAABGk9i74EAAQIECNBXaf9EAAL0b9hmgv0YeADtCNpQtScND6I7EddK7uXgQXQz7God3jzE6h64hYg1NXBDIWtr4Bpilo7BkpEkSY9uq9nwDFWRuVYAAAAASUVORK5CYII=" width="80" height="80"/>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,2000,0)">
+<g transform="translate(100,800) scale(10,-10)">
+<image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAYAAACOEfKtAAAA2klEQVR42u3buw3CAAxFUU/EQEzHptBBQxHE59nmXMkLnCZRYldJkiTdO13O12dD5iDUqwPtgwMOZBZuDWQabjRkN7wxiF3hRkBOwWuJOA2vFeJUvBaI0/GiiFvwIojb8H6OCBBeBnE73tcRAcLLIQKEl0MECC+HCBBgDvDf8d5GhAcQIECABl4CERpAgAABGk9i74EAAQIECNBXaf9EAAL0b9hmgv0YeADtCNpQtScND6I7EddK7uXgQXQz7God3jzE6h64hYg1NXBDIWtr4Bpilo7BkpEkSY9uq9nwDFWRuVYAAAAASUVORK5CYII=" width="80" height="80"/>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,3000,0)">
+<path d="M100,0L100,800L650,800L900,550L900,0L100,0Z" fill="currentColor"/>
+</g>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[S=0+1000|T=1+1000|P=2+1000|N=3+1000]</code></div></div><figcaption><code>hb-vector images.ttf "STPN"</code></figcaption></figure>
+<p id="ix-23">hb-vector, like hb-raster, refuses SVG images (since 14.2.0, below), so <code>S</code> falls back to its outline and <code>T</code> to its bitmap, the green disc. The order isn’t the same everywhere. Glyph extents are tried from <code>sbix</code>, <code>CBDT</code>, then <code>COLR</code> (<a href="where-metrics-come-from.html#glyph-extents">Where metrics come from</a>), and <code>hb_ot_color_glyph_reference_png</code> tries <code>sbix</code> before <code>CBDT</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-color.cc#L417"><code>hb-ot-color.cc:417</code></a>). They only disagree for a glyph that is in more than one of these tables, which few fonts have.</p>
+<blockquote>
+<p id="ix-24">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/7e97cd8a182651f2ca3d2311f0910ca0ce64e927"><code>7e97cd8</code></a> (17 November 2026), so main paints from <code>sbix</code> before <code>CBDT</code>, the order the other two use.</p>
+</blockquote>
+<h2 id="palettes-cpal">Palettes: CPAL</h2>
+<p id="ix-25"><code>COLR</code> doesn’t store colors. It stores indices into a <strong>palette</strong>, and <code>CPAL</code> holds the palettes: a font may have several, each with the same number of entries, so that a glyph can be drawn in another color scheme by choosing another palette. Each entry is four bytes, blue, green, red, alpha. HarfBuzz reads it as a big-endian 32-bit number, which is exactly <code>hb_color_t</code>’s layout, so a palette is an array of colors with no conversion (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/CPAL/CPAL.hh#L190"><code>CPAL.hh:190</code></a>). Version 1 of the table adds, for each palette, a type (usable on a light background, on a dark one, or neither stated) and a name ID in the <code>name</code> table, and a name ID for each entry. <code>hb-info</code> lists them:</p>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">colr0.ttf</td><td class="opt">--list-palettes</td><td class="out"><pre><code>Color palettes information:
+
+Palettes:
+
+Index	Flags	Name
+--------------------
+0	Light	Daylight
+1	Dark	Night
+
+Colors:
+
+Index	Name
+------------
+0	Ground
+1	Disc</code></pre></td></tr></tbody></table></div>
+<p id="ix-26">The palettes aren’t stored one by one. <code>CPAL</code> has a single array of color records, and each palette is a starting index into it (<code>colorRecordIndices</code>), so every palette has the same number of entries, and two palettes could start at the same record or overlap to share colors. In <code>colr0.ttf</code> there are four records, and the two palettes start at records 0 and 2. TTX shows the palettes as a reader would think of them, each with its own colors:</p>
+<figure class="views ttx"><pre><code>&lt;CPAL&gt;
+  &lt;version value=&quot;1&quot;/&gt;
+  &lt;numPaletteEntries value=&quot;2&quot;/&gt;
+  &lt;palette index=&quot;0&quot; label=&quot;256&quot; type=&quot;1&quot;&gt;
+    &lt;!-- Daylight --&gt;
+    &lt;color index=&quot;0&quot; value=&quot;#E8A33DFF&quot;/&gt;
+    &lt;color index=&quot;1&quot; value=&quot;#2A6FDBFF&quot;/&gt;
+  &lt;/palette&gt;
+  &lt;palette index=&quot;1&quot; label=&quot;257&quot; type=&quot;2&quot;&gt;
+    &lt;!-- Night --&gt;
+    &lt;color index=&quot;0&quot; value=&quot;#3B2E5AFF&quot;/&gt;
+    &lt;color index=&quot;1&quot; value=&quot;#F25C54FF&quot;/&gt;
+  &lt;/palette&gt;
+  &lt;paletteEntryLabels&gt;
+    &lt;label index=&quot;0&quot; value=&quot;258&quot;/&gt;&lt;!-- Ground --&gt;
+    &lt;label index=&quot;1&quot; value=&quot;259&quot;/&gt;&lt;!-- Disc --&gt;
+  &lt;/paletteEntryLabels&gt;
+&lt;/CPAL&gt;</code></pre><figcaption>colr0.ttf: CPAL (TTX)</figcaption></figure>
+<p id="ix-27">The API is <code>hb_ot_color_has_palettes</code>, <code>hb_ot_color_palette_get_count</code>, <code>hb_ot_color_palette_get_colors</code>, <code>hb_ot_color_palette_get_flags</code>, <code>hb_ot_color_palette_get_name_id</code> and <code>hb_ot_color_palette_color_get_name_id</code>, all from 2.1.0. They report what the font says and choose nothing. The palette a glyph is painted with is the index the client passes to <code>hb_font_paint_glyph</code>. HarfBuzz doesn’t look at the types to choose one for a dark background: that is the client’s job, and HarfBuzz’s own tools use palette 0 unless told otherwise. A palette index the font doesn’t have also means palette 0 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L104"><code>COLR.hh:104</code></a>, after HarfBuzz issue #5116). An entry index past the end of the palette reads as zero, which is transparent black (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-array.hh#L88"><code>hb-array.hh:88</code></a>).</p>
+<p id="ix-28">Here is <code>colr0.ttf</code> with palette 0, and then with palette 1, the one marked for a dark background, chosen with hb-vector’s <code>--font-palette</code>:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 2080 1180" role="img" aria-label="AB at default">
+<g transform="scale(1,-1)">
+<path d="M100,0L100,800L900,800L900,0L100,0Z" fill="#E8A33D"/>
+<path d="M777.5,515Q825,400 777.5,285Q730,170 615,122.5Q500,75 385,122.5Q270,170 222.5,285Q175,400 222.5,515Q270,630 385,677.5Q500,725 615,677.5Q730,630 777.5,515Z" fill="#2A6FDB"/>
+<path d="M100,330L100,470L900,470L900,330L100,330Z" fill="currentColor"/>
+<g transform="matrix(1,0,0,1,1000,0)">
+<path d="M777.5,515Q825,400 777.5,285Q730,170 615,122.5Q500,75 385,122.5Q270,170 222.5,285Q175,400 222.5,515Q270,630 385,677.5Q500,725 615,677.5Q730,630 777.5,515Z" fill="#2A6FDB"/>
+<path d="M100,330L100,470L900,470L900,330L100,330Z" fill="currentColor"/>
+<path d="M100,0L100,800L900,800L900,0L100,0Z" fill="#E8A33D"/>
+</g>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[A=0+1000|B=1+1000]</code></div></div><figcaption><code>hb-vector colr0.ttf "AB"</code></figcaption></figure>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 2080 1180" role="img" aria-label="AB at default">
+<g transform="scale(1,-1)">
+<path d="M100,0L100,800L900,800L900,0L100,0Z" fill="#3B2E5A"/>
+<path d="M777.5,515Q825,400 777.5,285Q730,170 615,122.5Q500,75 385,122.5Q270,170 222.5,285Q175,400 222.5,515Q270,630 385,677.5Q500,725 615,677.5Q730,630 777.5,515Z" fill="#F25C54"/>
+<path d="M100,330L100,470L900,470L900,330L100,330Z" fill="currentColor"/>
+<g transform="matrix(1,0,0,1,1000,0)">
+<path d="M777.5,515Q825,400 777.5,285Q730,170 615,122.5Q500,75 385,122.5Q270,170 222.5,285Q175,400 222.5,515Q270,630 385,677.5Q500,725 615,677.5Q730,630 777.5,515Z" fill="#F25C54"/>
+<path d="M100,330L100,470L900,470L900,330L100,330Z" fill="currentColor"/>
+<path d="M100,0L100,800L900,800L900,0L100,0Z" fill="#3B2E5A"/>
+</g>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[A=0+1000|B=1+1000]</code></div></div><figcaption><code>hb-vector colr0.ttf "AB" --font-palette=1</code></figcaption></figure>
+<p id="ix-29">The client can also override single entries. Before it reads a palette entry, HarfBuzz calls <code>custom_palette_color</code> with the entry’s index, and uses the color the client gives if it returns true (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L138"><code>COLR.hh:138</code></a>). hb-vector’s <code>--custom-palette</code> works this way: here entry 1, “Disc”, is replaced with green in palette 0, and entry 0 keeps the palette’s color:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 2080 1180" role="img" aria-label="AB at default">
+<g transform="scale(1,-1)">
+<path d="M100,0L100,800L900,800L900,0L100,0Z" fill="#E8A33D"/>
+<path d="M777.5,515Q825,400 777.5,285Q730,170 615,122.5Q500,75 385,122.5Q270,170 222.5,285Q175,400 222.5,515Q270,630 385,677.5Q500,725 615,677.5Q730,630 777.5,515Z" fill="#2E8B57"/>
+<path d="M100,330L100,470L900,470L900,330L100,330Z" fill="currentColor"/>
+<g transform="matrix(1,0,0,1,1000,0)">
+<path d="M777.5,515Q825,400 777.5,285Q730,170 615,122.5Q500,75 385,122.5Q270,170 222.5,285Q175,400 222.5,515Q270,630 385,677.5Q500,725 615,677.5Q730,630 777.5,515Z" fill="#2E8B57"/>
+<path d="M100,330L100,470L900,470L900,330L100,330Z" fill="currentColor"/>
+<path d="M100,0L100,800L900,800L900,0L100,0Z" fill="#E8A33D"/>
+</g>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[A=0+1000|B=1+1000]</code></div></div><figcaption><code>hb-vector colr0.ttf "AB" --custom-palette=1=#2E8B57</code></figcaption></figure>
+<p id="ix-30">Entry 0xFFFF is never looked up: it is the foreground.</p>
+<blockquote>
+<p id="ix-31">For type designers: palette 0 is what a client gets unless it chooses another, so it should be the palette that works on the most common background. The light and dark flags in CPAL version 1 are information for an application to act on; HarfBuzz itself passes them on and does nothing else with them.</p>
+</blockquote>
+<h2 id="colr-version-0-layers">COLR version 0: layers</h2>
+<p id="ix-32">Version 0 of <code>COLR</code> is a list of base glyphs, each with a run of layer records, and each layer record is a glyph ID and a palette entry. The base glyph is drawn by filling each layer glyph’s outline, in order, bottom first. In <code>colr0.ttf</code>, <code>A</code> is a square in entry 0, a disc in entry 1 and a bar in entry 0xFFFF; <code>B</code> has the same layers with the square last, so it covers the others, as the drawings above show.</p>
+<p id="ix-33">HarfBuzz paints a version 0 glyph with one <code>fill_glyph</code> per layer (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L3274"><code>COLR.hh:3274</code></a>), each with the layer’s color, or with the foreground color and <code>is_foreground</code> set for entry 0xFFFF. The bar takes the foreground color, which hb-vector draws as black and this book shows in the color of its text. Nothing else is called: no transform, no clip, no group. <code>hb_ot_color_glyph_get_layers</code> returns the same layer list for clients that want to do it all themselves, as they had to before 7.0.0.</p>
+<h2 id="colr-version-1-the-paint-graph">COLR version 1: the paint graph</h2>
+<p id="ix-34">Version 1 keeps version 0’s lists, for older readers, and adds a <strong>paint graph</strong> for each base glyph. Each node is a Paint table, one of 33 formats, and most have a child offset, so the graph is a tree that can share subtrees. Five lists hang off the table header: the BaseGlyphList, from base glyph to root Paint; the LayerList, of Paints shared between glyphs; the <strong>ClipList</strong>, of boxes per glyph range; and, for variable fonts, a DeltaSetIndexMap and an ItemVariationStore. A glyph in the BaseGlyphList is painted from its graph, and only a glyph that isn’t is looked up in the version 0 list (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L3223"><code>COLR.hh:3223</code></a>).</p>
+<p>The formats come in families, nearly all in pairs of a fixed format and a variable one:</p>
+<table>
+<thead>
+<tr>
+<th>Formats</th>
+<th>Paint</th>
+<th>Callbacks HarfBuzz makes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>ColrLayers</td>
+<td>its layers from the LayerList, painted in turn</td>
+</tr>
+<tr>
+<td>2, 3</td>
+<td>Solid</td>
+<td><code>color</code></td>
+</tr>
+<tr>
+<td>4, 5</td>
+<td>LinearGradient</td>
+<td><code>linear_gradient</code></td>
+</tr>
+<tr>
+<td>6, 7</td>
+<td>RadialGradient</td>
+<td><code>radial_gradient</code></td>
+</tr>
+<tr>
+<td>8, 9</td>
+<td>SweepGradient</td>
+<td><code>sweep_gradient</code></td>
+</tr>
+<tr>
+<td>10, 33</td>
+<td id="ix-35">Glyph</td>
+<td><code>push_clip_glyph</code> … <code>pop_clip</code>, or <code>fill_glyph</code></td>
+</tr>
+<tr>
+<td>11</td>
+<td>ColrGlyph</td>
+<td id="ix-36"><code>color_glyph</code>, or the other glyph’s graph</td>
+</tr>
+<tr>
+<td>12–31</td>
+<td id="ix-37">Transform, Translate, Scale (four kinds), Rotate (two), Skew (two)</td>
+<td><code>push_transform</code> … <code>pop_transform</code></td>
+</tr>
+<tr>
+<td>32</td>
+<td>Composite</td>
+<td>two groups</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-38">Format 33 is PaintGlyph with a 24-bit glyph ID, for fonts beyond 65,535 glyphs; a build with <code>HB_NO_BEYOND_64K</code> leaves it out. In the <code>Paint</code> union (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L2267"><code>COLR.hh:2267</code></a>) each variable format is the fixed one wrapped in <code>Variable&lt;T&gt;</code>, which adds one field, <code>varIdxBase</code>; the fixed one is wrapped in <code>NoVariable&lt;T&gt;</code>, which supplies <code>0xFFFFFFFF</code>, “no variation”, so that one <code>paint_glyph</code> serves both.</p>
+<h3 id="the-walk">The walk</h3>
+<p id="ix-39"><code>COLR::paint_glyph</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L3200"><code>COLR.hh:3200</code></a>) starts every version 1 glyph the same way. It pushes the font transform, a scale from font units to the font’s scale, so the whole graph can be painted in font units. If the glyph has a ClipBox, it pushes a rectangle clip. Then it calls <code>recurse</code> on the root Paint, which dispatches on the format, and each format calls back and recurses into its children. A transform, say, is a push, a recursion and a pop:</p>
+<pre><code class="language-c++">void paint_glyph (hb_paint_context_t *c, uint32_t varIdxBase) const
+{
+  float ddx = dx + c-&gt;instancer (varIdxBase, 0);
+  float ddy = dy + c-&gt;instancer (varIdxBase, 1);
+
+  c-&gt;funcs-&gt;push_translate (c-&gt;data, ddx, ddy);
+  c-&gt;recurse (this+src);
+  c-&gt;funcs-&gt;pop_transform (c-&gt;data);
+}
+</code></pre>
+<p id="ix-40">(<code>PaintTranslate</code>, trimmed.) The other transforms are the same, with <code>push_scale</code>, <code>push_rotate</code>, <code>push_skew</code> or their “around center” forms, which conjugate the transform with a translation. Angles are F2DOT14 numbers in half-turns: 0.5 is 90°. An Affine2x3 is passed through as six numbers.</p>
+<p id="ix-41"><strong>PaintGlyph</strong> is where an outline enters, and where the <a href="drawing-outlines.html">Drawing outlines</a> chapter takes over. <code>push_clip_glyph</code> expects the outline at the font’s scale, not in font units, so HarfBuzz pushes the inverse font transform around it, then pushes the font transform again for the child (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L3323"><code>COLR.hh:3323</code></a>). When the child is a PaintSolid, as it is for most layers, it calls <code>fill_glyph</code> instead of a clip, a fill and a pop.</p>
+<p id="ix-42"><strong>PaintColrGlyph</strong> paints another color glyph inside this one, as a component. HarfBuzz first offers it to the client through <code>color_glyph</code>, so that a client that has cached that glyph’s rendering can use it; if the client returns false, HarfBuzz paints the other glyph’s graph itself, inside that glyph’s ClipBox (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L3364"><code>COLR.hh:3364</code></a>).</p>
+<p id="ix-43"><strong>PaintComposite</strong> paints its backdrop in one group and its source in a second group, inside the first, then pops the source with the composite mode and the backdrop with ordinary source-over (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L1961"><code>COLR.hh:1961</code></a>). The modes are the 28 of the W3C compositing specification, numbered as in <code>hb_paint_composite_mode_t</code>; a number HarfBuzz doesn’t know becomes CLEAR, as a comment on the struct says it should.</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 3080 1180" role="img" aria-label="XMG at default">
+<defs>
+<clipPath id="d298-c0"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d298-c1"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d298-c2"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d298-c3"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d298-p0" d="M250,150L250,650L750,650L750,150L250,150Z"/>
+<clipPath id="d298-clip-p0"><use href="#d298-p0"/></clipPath>
+<linearGradient id="d298-gr0" gradientUnits="userSpaceOnUse" x1="3.91" y1="2.34" x2="11.72" y2="2.34" spreadMethod="pad">
+<stop offset="0" stop-color="rgb(215,38,61)"/>
+<stop offset="0.5" stop-color="rgb(244,162,89)"/>
+<stop offset="1" stop-color="rgb(27,152,224)"/>
+</linearGradient>
+</defs>
+<g transform="scale(1,-1)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d298-c0)">
+<g style="mix-blend-mode:normal">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M638.5,507Q683,400 638.5,293Q594,186 487,141.5Q380,97 273,141.5Q166,186 121.5,293Q77,400 121.5,507Q166,614 273,658.5Q380,703 487,658.5Q594,614 638.5,507Z" fill="#1B98E0"/>
+</g>
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M878.5,507Q923,400 878.5,293Q834,186 727,141.5Q620,97 513,141.5Q406,186 361.5,293Q317,400 361.5,507Q406,614 513,658.5Q620,703 727,658.5Q834,614 878.5,507Z" fill="#D7263D"/>
+</g>
+</g>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,1000,0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d298-c1)">
+<g style="mix-blend-mode:normal">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M638.5,507Q683,400 638.5,293Q594,186 487,141.5Q380,97 273,141.5Q166,186 121.5,293Q77,400 121.5,507Q166,614 273,658.5Q380,703 487,658.5Q594,614 638.5,507Z" fill="#1B98E0"/>
+</g>
+<g style="mix-blend-mode:multiply">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<path d="M878.5,507Q923,400 878.5,293Q834,186 727,141.5Q620,97 513,141.5Q406,186 361.5,293Q317,400 361.5,507Q406,614 513,658.5Q620,703 727,658.5Q834,614 878.5,507Z" fill="#D7263D"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,2000,0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d298-c2)">
+<g transform="matrix(0.8659934,0.5000554,-0.5000554,0.8659934,4.17,-3.07)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+</g>
+<g clip-path="url(#d298-c3)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d298-clip-p0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="url(#d298-gr0)"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[X=0+1000|M=1+1000|G=2+1000]</code></div></div><figcaption><code>hb-vector colr1.ttf "XMG"</code></figcaption></figure>
+<p id="ix-44"><code>X</code> and <code>M</code> are the same two discs composited with DEST_OUT and with MULTIPLY. MULTIPLY darkens the overlap. DEST_OUT should leave only the part of the blue disc the red one doesn’t cover, a crescent, but the drawing shows both discs: HarfBuzz asked for DEST_OUT, and hb-vector’s SVG writer has no way to say it. SVG’s <code>mix-blend-mode</code> has the blend modes but none of the Porter–Duff ones, so it draws them as ordinary source-over, except PLUS and XOR, which it approximates with <code>screen</code> and <code>difference</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-vector-paint-svg.cc#L75"><code>hb-vector-paint-svg.cc:75</code></a>, and <a href="hb-vector.html#compositing-modes">hb-vector</a>). <code>G</code> is a PaintColrGlyph of <code>L</code>, below, inside a PaintRotateAroundCenter of 30°.</p>
+<h3 id="gradients-and-color-lines">Gradients and color lines</h3>
+<p id="ix-45">A gradient’s colors are a <strong>color line</strong>: a list of stops, each an offset, a palette entry and an alpha, plus an <strong>extend mode</strong> that says what happens beyond the first and last stop: pad with the end colors, repeat, or reflect. HarfBuzz doesn’t copy the stops for the client. It passes an <code>hb_color_line_t</code>, which the client reads with <code>hb_color_line_get_color_stops</code> and <code>hb_color_line_get_extend</code> during the callback, and only then: the stops are resolved against the palette, the custom palette and the variation coordinates as they are read (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L631"><code>COLR.hh:631</code></a>). The offsets needn’t lie between 0 and 1, nor be sorted. <code>hb_paint_normalize_color_line</code> sorts them and rescales them to 0–1 for libraries that need that. The stops are given unpremultiplied, but, as the documentation of <code>hb_color_stop_t</code> notes, the specification says to interpolate between them in premultiplied color.</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 5080 1180" role="img" aria-label="LPRFS at default">
+<defs>
+<clipPath id="d299-c0"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d299-p0" d="M250,150L250,650L750,650L750,150L250,150Z"/>
+<clipPath id="d299-clip-p0"><use href="#d299-p0"/></clipPath>
+<linearGradient id="d299-gr0" gradientUnits="userSpaceOnUse" x1="3.91" y1="2.34" x2="11.72" y2="2.34" spreadMethod="pad">
+<stop offset="0" stop-color="rgb(215,38,61)"/>
+<stop offset="0.5" stop-color="rgb(244,162,89)"/>
+<stop offset="1" stop-color="rgb(27,152,224)"/>
+</linearGradient>
+<clipPath id="d299-c1"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d299-p1" d="M100,0L100,800L900,800L900,0L100,0Z"/>
+<clipPath id="d299-clip-p1"><use href="#d299-p1"/></clipPath>
+<radialGradient id="d299-gr1" gradientUnits="userSpaceOnUse" cx="7.81" cy="6.25" r="2.5" fx="7.81" fy="6.25" spreadMethod="pad">
+<stop offset="0" stop-color="rgb(244,162,89)"/>
+<stop offset="1" stop-color="rgb(27,152,224)"/>
+</radialGradient>
+<clipPath id="d299-c2"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d299-p2" d="M100,0L100,800L900,800L900,0L100,0Z"/>
+<clipPath id="d299-clip-p2"><use href="#d299-p2"/></clipPath>
+<radialGradient id="d299-gr2" gradientUnits="userSpaceOnUse" cx="7.81" cy="6.25" r="2.5" fx="7.81" fy="6.25" spreadMethod="repeat">
+<stop offset="0" stop-color="rgb(244,162,89)"/>
+<stop offset="1" stop-color="rgb(27,152,224)"/>
+</radialGradient>
+<clipPath id="d299-c3"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d299-p3" d="M100,0L100,800L900,800L900,0L100,0Z"/>
+<clipPath id="d299-clip-p3"><use href="#d299-p3"/></clipPath>
+<radialGradient id="d299-gr3" gradientUnits="userSpaceOnUse" cx="7.81" cy="6.25" r="2.5" fx="7.81" fy="6.25" spreadMethod="reflect">
+<stop offset="0" stop-color="rgb(244,162,89)"/>
+<stop offset="1" stop-color="rgb(27,152,224)"/>
+</radialGradient>
+<clipPath id="d299-c4"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d299-p4" d="M100,0L100,800L900,800L900,0L100,0Z"/>
+<clipPath id="d299-clip-p4"><use href="#d299-p4"/></clipPath>
+</defs>
+<g transform="scale(1,-1)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d299-c0)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d299-clip-p0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="url(#d299-gr0)"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,1000,0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d299-c1)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d299-clip-p1)">
+<g transform="matrix(64,0,0,64,0,0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="url(#d299-gr1)"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,2000,0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d299-c2)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d299-clip-p2)">
+<g transform="matrix(64,0,0,64,0,0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="url(#d299-gr2)"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,3000,0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d299-c3)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d299-clip-p3)">
+<g transform="matrix(64,0,0,64,0,0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="url(#d299-gr3)"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,4000,0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d299-c4)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d299-clip-p4)">
+<g transform="matrix(64,0,0,64,0,0)">
+<path d="M7.81,6.25L32774.81,6.25C32774.81,2066.68 32580.46,4122.57 32194.36,6146.49Z" fill="#D82C3E"/>
+<path d="M7.81,6.25L32194.36,6146.49C31808.26,8170.39 31232.09,10153.47 30473.56,12069.18Z" fill="#DB3741"/>
+<path d="M7.81,6.25L30473.56,12069.18C29715.02,13984.93 28777.49,15824.83 27673.39,17564.5Z" fill="#DE4243"/>
+<path d="M7.81,6.25L27673.39,17564.5C26569.3,19304.14 25303.56,20935.81 23893.05,22437.74Z" fill="#E04D46"/>
+<path d="M7.81,6.25L23893.05,22437.74C22482.57,23939.63 20933.41,25305.28 19266.48,26516.25Z" fill="#E35948"/>
+<path d="M7.81,6.25L19266.48,26516.25C17599.49,27727.26 15821.98,28778.35 13957.58,29655.54Z" fill="#E6644B"/>
+<path d="M7.81,6.25L13957.58,29655.54C12093.19,30532.72 10150.21,31232.09 8154.46,31744.37Z" fill="#E86F4E"/>
+<path d="M7.81,6.25L8154.46,31744.37C6158.72,32256.65 4119.11,32579.54 2062.71,32708.75Z" fill="#EB7B50"/>
+<path d="M7.81,6.25L2062.71,32708.75C6.31,32837.96 -2057.66,32772.93 -4101.84,32514.51Z" fill="#ED8653"/>
+<path d="M7.81,6.25L-4101.84,32514.51C-6146.01,32256.09 -8161.25,31805.44 -10120.79,31168.53Z" fill="#F09155"/>
+<path d="M7.81,6.25L-10120.79,31168.53C-12080.29,30531.64 -13975.46,29711.29 -15780.89,28718.49Z" fill="#F39C58"/>
+<path d="M7.81,6.25L-15780.89,28718.49C-17586.03,27725.86 -19293.55,26565.19 -20880.74,25251.94Z" fill="#EFA45A"/>
+<path d="M7.81,6.25L-20880.74,25251.94C-22467.92,23938.69 -23927.75,22478.65 -25240.79,20891.28Z" fill="#E6A95B"/>
+<path d="M7.81,6.25L-25240.79,20891.28C-26553.83,19303.9 -27714.26,17596.21 -28706.63,15790.95Z" fill="#DCAE5C"/>
+<path d="M7.81,6.25L-28706.63,15790.95C-29699.03,13985.66 -30518.94,12090.86 -31155.53,10131.59Z" fill="#D3B35D"/>
+<path d="M7.81,6.25L-31155.53,10131.59C-31792.11,8172.35 -32242.51,6157.42 -32500.74,4113.63Z" fill="#C9B85F"/>
+<path d="M7.81,6.25L-32500.74,4113.63C-32758.96,2069.84 -32823.88,6.2 -32694.62,-2049.8Z" fill="#C0BD60"/>
+<path d="M7.81,6.25L-32694.62,-2049.8C-32565.35,-4105.79 -32242.48,-6145.06 -31730.31,-8140.41Z" fill="#B7C261"/>
+<path d="M7.81,6.25L-31730.31,-8140.41C-31218.14,-10135.75 -30518.9,-12078.45 -29641.96,-13942.5Z" fill="#ADC763"/>
+<path d="M7.81,6.25L-29641.96,-13942.5C-28765.01,-15806.56 -27714.2,-17583.81 -26503.53,-19250.57Z" fill="#A4CC64"/>
+<path d="M7.81,6.25L-26503.53,-19250.57C-25292.84,-20917.35 -23927.68,-22466.23 -22426.17,-23876.65Z" fill="#9AD165"/>
+<path d="M7.81,6.25L-22426.17,-23876.65C-20924.64,-25287.08 -19293.48,-26552.75 -17554.29,-27656.88Z" fill="#91D666"/>
+<path d="M7.81,6.25L-17554.29,-27656.88C-15761.94,-28794.76 -13863.24,-29755.77 -11884.98,-30526.32Z" fill="#87D56D"/>
+<path d="M7.81,6.25L-11884.98,-30526.32C-9906.73,-31296.87 -7858.25,-31873.35 -5768.46,-32247.6Z" fill="#7DCF78"/>
+<path d="M7.81,6.25L-5768.46,-32247.6C-3678.69,-32621.86 -1557.45,-32792.13 565.27,-32756.01Z" fill="#72C983"/>
+<path d="M7.81,6.25L565.27,-32756.01C2688.02,-32719.89 4802.17,-32477.56 6878.04,-32032.42Z" fill="#68C48E"/>
+<path d="M7.81,6.25L6878.04,-32032.42C8953.89,-31587.28 10981.55,-30941.46 12932.46,-30104.04Z" fill="#5EBE99"/>
+<path d="M7.81,6.25L12932.46,-30104.04C14883.36,-29266.63 16748.25,-28241.6 18500.86,-27043.4Z" fill="#54B8A4"/>
+<path d="M7.81,6.25L18500.86,-27043.4C20253.46,-25845.2 21885.45,-24479.51 23373.84,-22965.59Z" fill="#49B2AF"/>
+<path d="M7.81,6.25L23373.84,-22965.59C24862.22,-21451.67 26199.97,-19796.64 27368.17,-18023.93Z" fill="#3FACBA"/>
+<path d="M7.81,6.25L27368.17,-18023.93C28536.38,-16251.2 29529.54,-14369.12 30333.63,-12404.26Z" fill="#35A7C5"/>
+<path d="M7.81,6.25L30333.63,-12404.26C31137.73,-10439.42 31748.97,-8401.03 32158.73,-6317.91Z" fill="#2AA1D0"/>
+<path d="M7.81,6.25L32158.73,-6317.91C32568.48,-4234.8 32774.81,-2116.76 32774.81,6.26Z" fill="#209BDB"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[L=0+1000|P=1+1000|R=2+1000|F=3+1000|S=4+1000]</code></div></div><figcaption><code>hb-vector colr1.ttf "LPRFS"</code></figcaption></figure>
+<p id="ix-46"><em>Linear</em> (<code>L</code>, a smaller square than the others, so that it stays inside the ClipBox when <code>G</code> and <code>V</code> turn it): three points. The gradient runs from P0 to P1, and P2 sets the angle of the lines of equal color, which run parallel to P0–P2, so a skewed gradient needs no transform. Most graphics libraries want two points instead, and <code>hb_paint_reduce_linear_anchors</code> computes them. <em>Radial</em> (<code>P</code>, <code>R</code>, <code>F</code>): two circles, color 0 on the first and color 1 on the second. Here the first has radius 0 and the second radius 160, so the extend mode decides everything outside the second circle: pad, repeat and reflect, from left to right. <em>Sweep</em> (<code>S</code>): a center and two angles. The font stores each angle less 180°, in half-turns, so that the F2DOT14 range covers 0° to 360°; HarfBuzz adds the half-turn back and passes radians (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L1212"><code>COLR.hh:1212</code></a>). <code>hb_paint_sweep_gradient_tiles</code> cuts a sweep into wedges, for renderers that have no conic gradient.</p>
+<h3 id="clipboxes-and-unbounded-paint">ClipBoxes, and unbounded paint</h3>
+<p id="ix-47">A ClipBox is a rectangle per glyph range, in the ClipList. It does two jobs: it tells a renderer how big a surface the glyph needs, and it gives the glyph its extents without painting it (<a href="where-metrics-come-from.html#glyph-extents">Where metrics come from</a>). It has a variable form, whose deltas are rounded outwards. HarfBuzz clips to it whenever it exists. The Null ClipRecord isn’t all zeros, for the reason <a href="fonts-as-bytes.html">Fonts as bytes</a> gives.</p>
+<p id="ix-48">A glyph without one may have a graph that paints everywhere: a PaintSolid with no PaintGlyph above it fills the whole plane. Before painting such a glyph, HarfBuzz runs its graph through the bounded-paint context first, which follows the specification’s rules for boundedness: a fill is unbounded unless a clip is active, and each composite mode combines its two sides in its own way (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint-bounded.hh#L71"><code>hb-paint-bounded.hh:71</code></a>). If the graph is unbounded, HarfBuzz paints nothing at all, but still reports success. <code>U</code> is a PaintSolid with no ClipBox; <code>C</code> is the same PaintSolid with one:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 2080 1180" role="img" aria-label="UC at default">
+<defs>
+<clipPath id="d300-c0"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+</defs>
+<g transform="scale(1,-1)">
+<g transform="matrix(64,0,0,64,0,0)">
+</g>
+<g transform="matrix(1,0,0,1,1000,0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d300-c0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="#8CD867"/>
+</g>
+</g>
+</g>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[U=0+1000|C=1+1000]</code></div></div><figcaption><code>hb-vector colr1.ttf "UC"</code></figcaption></figure>
+<p id="ix-49"><code>U</code> paints nothing. Its extents are zero, too, because COLR answers for them before the outline is asked:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">colr1.ttf</td><td class="in"><span class="txt">UC</span><span class="cps">U+0055 U+0043</span></td><td class="opt">--show-extents</td><td class="out"><code>[U=0+1000&lt;0,0,0,0&gt;|C=1+1000&lt;100,800,800,-800&gt;]</code></td></tr></tbody></table></div>
+<blockquote>
+<p id="ix-50">For type designers: give every COLR version 1 glyph a ClipBox. It costs a few bytes and saves every renderer a walk of the graph just to find out how big the glyph is. fontTools’ <code>buildCOLR</code> takes them as <code>clipBoxes</code>.</p>
+</blockquote>
+<h3 id="variable-paints">Variable paints</h3>
+<p id="ix-51">In a variable format, <code>varIdxBase</code> is the index of the first delta set; the paint’s varying fields use consecutive ones, in order. <code>PaintVarTranslate</code> has two, dx at <code>varIdxBase</code> and dy at <code>varIdxBase + 1</code>, which is what the <code>instancer (varIdxBase, 1)</code> above reads. Each color stop of a variable color line has a base of its own, for its offset and alpha. If the table has a DeltaSetIndexMap, each index is mapped through it first; if not, it is used as an index into the item variation store directly (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L4248"><code>hb-ot-layout-common.hh:4248</code></a>). At the default location no deltas are applied at all. The store is the same machinery as everywhere else (<a href="deltas.html">Deltas</a>), and the deltas are in the units of the field: an angle’s delta of 8192 is half a turn of F2DOT14, 90°.</p>
+<p><code>V</code> in <code>colr1.ttf</code> is <code>L</code> inside a PaintVarRotateAroundCenter whose angle is 0, plus a delta of 8192 at the end of the SPIN axis:</p>
+<figure class="draw slider"><div class="frames"><div class="frame print" data-value="0"><svg viewBox="-40 -940 1080 1180" role="img" aria-label="V at SPIN=0">
+<defs>
+<clipPath id="d301-c0"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d301-c1"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d301-p0" d="M250,150L250,650L750,650L750,150L250,150Z"/>
+<clipPath id="d301-clip-p0"><use href="#d301-p0"/></clipPath>
+<linearGradient id="d301-gr0" gradientUnits="userSpaceOnUse" x1="3.91" y1="2.34" x2="11.72" y2="2.34" spreadMethod="pad">
+<stop offset="0" stop-color="rgb(215,38,61)"/>
+<stop offset="0.5" stop-color="rgb(244,162,89)"/>
+<stop offset="1" stop-color="rgb(27,152,224)"/>
+</linearGradient>
+</defs>
+<g transform="scale(1,-1)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d301-c0)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+</g>
+<g clip-path="url(#d301-c1)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d301-clip-p0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="url(#d301-gr0)"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</svg><div class="frame-label">SPIN=0</div><code class="frame-shape">[V=0+1000]</code></div><div class="frame" data-value="0.125" hidden><svg viewBox="-40 -940 1080 1180" role="img" aria-label="V at SPIN=0.125">
+<defs>
+<clipPath id="d302-c0"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d302-c1"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d302-p0" d="M250,150L250,650L750,650L750,150L250,150Z"/>
+<clipPath id="d302-clip-p0"><use href="#d302-p0"/></clipPath>
+<linearGradient id="d302-gr0" gradientUnits="userSpaceOnUse" x1="3.91" y1="2.34" x2="11.72" y2="2.34" spreadMethod="pad">
+<stop offset="0" stop-color="rgb(215,38,61)"/>
+<stop offset="0.5" stop-color="rgb(244,162,89)"/>
+<stop offset="1" stop-color="rgb(27,152,224)"/>
+</linearGradient>
+</defs>
+<g transform="scale(1,-1)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d302-c0)">
+<g transform="matrix(0.9807853,0.1950903,-0.1950903,0.9807853,1.37,-1.4)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+</g>
+<g clip-path="url(#d302-c1)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d302-clip-p0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="url(#d302-gr0)"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</svg><div class="frame-label">SPIN=0.125</div><code class="frame-shape">[V=0+1000]</code></div><div class="frame" data-value="0.25" hidden><svg viewBox="-40 -940 1080 1180" role="img" aria-label="V at SPIN=0.25">
+<defs>
+<clipPath id="d303-c0"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d303-c1"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d303-p0" d="M250,150L250,650L750,650L750,150L250,150Z"/>
+<clipPath id="d303-clip-p0"><use href="#d303-p0"/></clipPath>
+<linearGradient id="d303-gr0" gradientUnits="userSpaceOnUse" x1="3.91" y1="2.34" x2="11.72" y2="2.34" spreadMethod="pad">
+<stop offset="0" stop-color="rgb(215,38,61)"/>
+<stop offset="0.5" stop-color="rgb(244,162,89)"/>
+<stop offset="1" stop-color="rgb(27,152,224)"/>
+</linearGradient>
+</defs>
+<g transform="scale(1,-1)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d303-c0)">
+<g transform="matrix(0.9238795,0.3826835,-0.3826835,0.9238795,2.99,-2.51)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+</g>
+<g clip-path="url(#d303-c1)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d303-clip-p0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="url(#d303-gr0)"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</svg><div class="frame-label">SPIN=0.25</div><code class="frame-shape">[V=0+1000]</code></div><div class="frame" data-value="0.375" hidden><svg viewBox="-40 -940 1080 1180" role="img" aria-label="V at SPIN=0.375">
+<defs>
+<clipPath id="d304-c0"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d304-c1"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d304-p0" d="M250,150L250,650L750,650L750,150L250,150Z"/>
+<clipPath id="d304-clip-p0"><use href="#d304-p0"/></clipPath>
+<linearGradient id="d304-gr0" gradientUnits="userSpaceOnUse" x1="3.91" y1="2.34" x2="11.72" y2="2.34" spreadMethod="pad">
+<stop offset="0" stop-color="rgb(215,38,61)"/>
+<stop offset="0.5" stop-color="rgb(244,162,89)"/>
+<stop offset="1" stop-color="rgb(27,152,224)"/>
+</linearGradient>
+</defs>
+<g transform="scale(1,-1)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d304-c0)">
+<g transform="matrix(0.8314696,0.5555702,-0.5555702,0.8314696,4.79,-3.29)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+</g>
+<g clip-path="url(#d304-c1)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d304-clip-p0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="url(#d304-gr0)"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</svg><div class="frame-label">SPIN=0.375</div><code class="frame-shape">[V=0+1000]</code></div><div class="frame print" data-value="0.5" hidden><svg viewBox="-40 -940 1080 1180" role="img" aria-label="V at SPIN=0.5">
+<defs>
+<clipPath id="d305-c0"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d305-c1"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d305-p0" d="M250,150L250,650L750,650L750,150L250,150Z"/>
+<clipPath id="d305-clip-p0"><use href="#d305-p0"/></clipPath>
+<linearGradient id="d305-gr0" gradientUnits="userSpaceOnUse" x1="3.91" y1="2.34" x2="11.72" y2="2.34" spreadMethod="pad">
+<stop offset="0" stop-color="rgb(215,38,61)"/>
+<stop offset="0.5" stop-color="rgb(244,162,89)"/>
+<stop offset="1" stop-color="rgb(27,152,224)"/>
+</linearGradient>
+</defs>
+<g transform="scale(1,-1)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d305-c0)">
+<g transform="matrix(0.7071068,0.7071068,-0.7071068,0.7071068,6.71,-3.69)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+</g>
+<g clip-path="url(#d305-c1)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d305-clip-p0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="url(#d305-gr0)"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</svg><div class="frame-label">SPIN=0.5</div><code class="frame-shape">[V=0+1000]</code></div><div class="frame" data-value="0.625" hidden><svg viewBox="-40 -940 1080 1180" role="img" aria-label="V at SPIN=0.625">
+<defs>
+<clipPath id="d306-c0"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d306-c1"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d306-p0" d="M250,150L250,650L750,650L750,150L250,150Z"/>
+<clipPath id="d306-clip-p0"><use href="#d306-p0"/></clipPath>
+<linearGradient id="d306-gr0" gradientUnits="userSpaceOnUse" x1="3.91" y1="2.34" x2="11.72" y2="2.34" spreadMethod="pad">
+<stop offset="0" stop-color="rgb(215,38,61)"/>
+<stop offset="0.5" stop-color="rgb(244,162,89)"/>
+<stop offset="1" stop-color="rgb(27,152,224)"/>
+</linearGradient>
+</defs>
+<g transform="scale(1,-1)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d306-c0)">
+<g transform="matrix(0.5555702,0.8314697,-0.8314697,0.5555702,8.67,-3.72)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+</g>
+<g clip-path="url(#d306-c1)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d306-clip-p0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="url(#d306-gr0)"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</svg><div class="frame-label">SPIN=0.625</div><code class="frame-shape">[V=0+1000]</code></div><div class="frame" data-value="0.75" hidden><svg viewBox="-40 -940 1080 1180" role="img" aria-label="V at SPIN=0.75">
+<defs>
+<clipPath id="d307-c0"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d307-c1"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d307-p0" d="M250,150L250,650L750,650L750,150L250,150Z"/>
+<clipPath id="d307-clip-p0"><use href="#d307-p0"/></clipPath>
+<linearGradient id="d307-gr0" gradientUnits="userSpaceOnUse" x1="3.91" y1="2.34" x2="11.72" y2="2.34" spreadMethod="pad">
+<stop offset="0" stop-color="rgb(215,38,61)"/>
+<stop offset="0.5" stop-color="rgb(244,162,89)"/>
+<stop offset="1" stop-color="rgb(27,152,224)"/>
+</linearGradient>
+</defs>
+<g transform="scale(1,-1)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d307-c0)">
+<g transform="matrix(0.3826834,0.9238795,-0.9238795,0.3826834,10.6,-3.36)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+</g>
+<g clip-path="url(#d307-c1)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d307-clip-p0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="url(#d307-gr0)"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</svg><div class="frame-label">SPIN=0.75</div><code class="frame-shape">[V=0+1000]</code></div><div class="frame" data-value="0.875" hidden><svg viewBox="-40 -940 1080 1180" role="img" aria-label="V at SPIN=0.875">
+<defs>
+<clipPath id="d308-c0"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d308-c1"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d308-p0" d="M250,150L250,650L750,650L750,150L250,150Z"/>
+<clipPath id="d308-clip-p0"><use href="#d308-p0"/></clipPath>
+<linearGradient id="d308-gr0" gradientUnits="userSpaceOnUse" x1="3.91" y1="2.34" x2="11.72" y2="2.34" spreadMethod="pad">
+<stop offset="0" stop-color="rgb(215,38,61)"/>
+<stop offset="0.5" stop-color="rgb(244,162,89)"/>
+<stop offset="1" stop-color="rgb(27,152,224)"/>
+</linearGradient>
+</defs>
+<g transform="scale(1,-1)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d308-c0)">
+<g transform="matrix(0.1950902,0.9807853,-0.9807853,0.1950902,12.42,-2.63)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+</g>
+<g clip-path="url(#d308-c1)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d308-clip-p0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="url(#d308-gr0)"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</svg><div class="frame-label">SPIN=0.875</div><code class="frame-shape">[V=0+1000]</code></div><div class="frame print" data-value="1" hidden><svg viewBox="-40 -940 1080 1180" role="img" aria-label="V at SPIN=1">
+<defs>
+<clipPath id="d309-c0"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<clipPath id="d309-c1"><rect x="1.56" y="0" width="12.5" height="12.5"/></clipPath>
+<path id="d309-p0" d="M250,150L250,650L750,650L750,150L250,150Z"/>
+<clipPath id="d309-clip-p0"><use href="#d309-p0"/></clipPath>
+<linearGradient id="d309-gr0" gradientUnits="userSpaceOnUse" x1="3.91" y1="2.34" x2="11.72" y2="2.34" spreadMethod="pad">
+<stop offset="0" stop-color="rgb(215,38,61)"/>
+<stop offset="0.5" stop-color="rgb(244,162,89)"/>
+<stop offset="1" stop-color="rgb(27,152,224)"/>
+</linearGradient>
+</defs>
+<g transform="scale(1,-1)">
+<g transform="matrix(64,0,0,64,0,0)">
+<g clip-path="url(#d309-c0)">
+<g transform="matrix(0,1,-1,0,14.06,-1.56)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+</g>
+<g clip-path="url(#d309-c1)">
+<g transform="matrix(0.015625,0,0,0.015625,0,0)">
+<g clip-path="url(#d309-clip-p0)">
+<g transform="matrix(64,0,0,64,0,0)">
+<rect x="-32767" y="-32767" width="65534" height="65534" fill="url(#d309-gr0)"/>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</g>
+</svg><div class="frame-label">SPIN=1</div><code class="frame-shape">[V=0+1000]</code></div></div><label class="control"><span>SPIN</span><input type="range" min="0" max="1" step="0.125" value="0"><output>0</output></label><figcaption><code>hb-vector colr1.ttf "V" --variations=SPIN=…</code>, drawn at every 0.125 from 0 to 1</figcaption></figure>
+<p>The square turns from 0° at SPIN 0 to 45° at 0.5 and 90° at 1.</p>
+<h3 id="guards">Guards</h3>
+<p id="ix-52">A paint graph is a graph, and fonts can make it cyclic or enormous. The <a href="trust-nothing-the-sanitizer.html">sanitizer</a> checks Paint tables to a depth of 64 and charges PaintComposite against its operation budget, but it can’t see cycles that go through a glyph ID, so painting has guards of its own, in <code>hb_paint_context_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L65"><code>COLR.hh:65</code></a>):</p>
+<ul>
+<li id="ix-53"><code>recurse</code> stops at a depth of 64 (<code>HB_MAX_NESTING_LEVEL</code>) and after 16,384 Paints in all (<code>HB_MAX_GRAPH_EDGE_COUNT</code>) (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L3313"><code>COLR.hh:3313</code></a>).</li>
+<li id="ix-54">Two cycle detectors, one for glyph IDs reached through PaintColrGlyph and one for layer indices reached through PaintColrLayers, refuse to enter one twice on the same path. They are <code>hb_decycler_t</code>: Floyd’s tortoise and hare, adapted to a depth-first walk, which needs no memory beyond the stack (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-decycler.hh"><code>hb-decycler.hh</code></a>).</li>
+<li id="ix-55">A work budget, shared with the client. If the paint funcs offer <code>get_budget_remaining</code>, HarfBuzz charges the client’s counter, so outline drawing, painting and the client’s own work share one limit; otherwise it uses its own, <code>HB_BUDGET_GLYPH</code>, 2<sup>24</sup>. Each color stop read costs 16, and once the budget is spent, <code>recurse</code> paints no more. <a href="drawing-outlines.html">Drawing outlines</a> describes the budgets.</li>
+</ul>
+<p id="ix-56">Version 1 glyphs and synthetic bold and slant meet in <a href="fonts-and-font-functions.html#slant">Fonts and font functions</a>: the slant is one transform pushed around the whole glyph, and the glyph’s layers are painted with a sub-font that has the synthetic settings turned off (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh#L115"><code>COLR.hh:115</code></a>), so that nothing is slanted twice.</p>
+<h2 id="bitmaps-sbix-and-cbdt">Bitmaps: sbix and CBDT</h2>
+<p id="ix-57"><code>sbix</code>, Apple’s table, and <code>CBDT</code> with <code>CBLC</code>, Google’s, store bitmaps in <strong>strikes</strong>, one per size in pixels per em. HarfBuzz chooses the strike as <a href="where-metrics-come-from.html#glyph-extents">Where metrics come from</a> describes: the smallest at least as big as the font’s ppem, or the largest if none is, or if the font has no ppem set (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/sbix/sbix.hh#L280"><code>sbix.hh:280</code></a>). <code>P</code> in <code>images.ttf</code> has a strike at 10 ppem, with an 8-pixel image, and one at 100 ppem, with an 80-pixel image. The first drawing has no ppem set, the second <code>--font-ppem=10</code>:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 1080 1180" role="img" aria-label="P at default">
+<g transform="scale(1,-1)">
+<g transform="translate(100,800) scale(10,-10)">
+<image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAYAAACOEfKtAAAA2klEQVR42u3buw3CAAxFUU/EQEzHptBBQxHE59nmXMkLnCZRYldJkiTdO13O12dD5iDUqwPtgwMOZBZuDWQabjRkN7wxiF3hRkBOwWuJOA2vFeJUvBaI0/GiiFvwIojb8H6OCBBeBnE73tcRAcLLIQKEl0MECC+HCBBgDvDf8d5GhAcQIECABl4CERpAgAABGk9i74EAAQIECNBXaf9EAAL0b9hmgv0YeADtCNpQtScND6I7EddK7uXgQXQz7God3jzE6h64hYg1NXBDIWtr4Bpilo7BkpEkSY9uq9nwDFWRuVYAAAAASUVORK5CYII=" width="80" height="80"/>
+</g>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[P=0+1000]</code></div></div><figcaption><code>hb-vector images.ttf "P"</code></figcaption></figure>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -940 1080 1180" role="img" aria-label="P at default">
+<g transform="scale(1,-1)">
+<g transform="translate(100,800) scale(100,-100)">
+<image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAHElEQVR42mNgIBZcV7P9j4zxSmIoooMCgo7EBwCmtEchnfCtbgAAAABJRU5ErkJggg==" width="8" height="8"/>
+</g>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[P=0+1000]</code></div></div><figcaption><code>hb-vector images.ttf "P" --font-ppem=10</code></figcaption></figure>
+<p id="ix-58">The <code>image</code> callback gets the image, untouched, in a blob; its width and height in pixels; the format tag; and the glyph’s extents at the font’s scale. HarfBuzz pushes no transform for an image. The client scales the pixels to fill the extents, which already include the origin offsets and the strike’s scale. Only PNG is handed over, as <code>HB_PAINT_IMAGE_FORMAT_PNG</code>:</p>
+<ul>
+<li id="ix-59">From <code>sbix</code>, only images whose graphic type is <code>png </code>. A <code>dupe</code> record, which says “the same image as glyph <em>n</em>”, is followed, up to eight times (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/sbix/sbix.hh#L121"><code>sbix.hh:121</code></a>). JPEG, TIFF and the rest are ignored, as is the table’s flag that asks for the outline to be drawn as well.</li>
+<li id="ix-60">From <code>CBDT</code>, the PNG image formats, 17, 18 and 19 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/CBDT/CBDT.hh#L1015"><code>CBDT.hh:1015</code></a>), found through CBLC index subtables of formats 1 and 3, the only ones HarfBuzz reads (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/CBDT/CBDT.hh#L345"><code>CBDT.hh:345</code></a>). The uncompressed bitmap formats <code>CBDT</code> inherits from <code>EBDT</code> aren’t read. HarfBuzz paints an image only if it can also find its extents, and of the PNG formats only 17 and 18 carry their metrics beside the image; format 19 keeps them in the index, which HarfBuzz doesn’t read yet (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/CBDT/CBDT.hh#L334"><code>CBDT.hh:334</code></a>). So a format 19 image can be fetched, but isn’t painted. The CBLC index HarfBuzz builds is capped at 65,536 entries (<code>HB_CBDT_MAX_INDEX_ENTRIES</code>).</li>
+</ul>
+<p id="ix-61"><code>HB_PAINT_IMAGE_FORMAT_BGRA</code>, raw premultiplied pixels, never comes from the hb-ot font functions. FreeType’s functions (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc"><code>hb-ft.cc</code></a>) produce it, from what FreeType has already decoded. A <code>CBDT</code> font from HarfBuzz’s test suite, a subset of Noto Color Emoji with a single 109-ppem strike:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -1940 7735.3 2487.3" role="img" aria-label="89® at default">
+<g transform="scale(1,-1)">
+<g transform="translate(0,1897.69) scale(18.79,-18.79)">
+<image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIgAAACACAMAAADnN9ENAAAANlBMVEVMaXFAQEBAQEBAQEBAQEBAQEBxcXHDw8Pf39/v7+/09PT6+vrQ0ND4+Pi2trbn5+eQkJCmpqatQUPRAAAAEnRSTlMAChMeKTNAc57I3/+E8mazTVnnFTi8AAADBElEQVR4Ae2awbKdIAyGC/ApAqK+/8t2Oj1zq6FeTxfJWZRv7Yy/SQJJzI/BYDAYDAaDwWAwsMf5ECMvYgzefURFiHTEYK3FRW6Izl7GNKcllxd5SfNkLCUAUJfSsVQAgo2OCFBz+StrAohWOlout+QGRBsdqXxLAqKFjq08sE3qSoLQccOiHbHuzi+SDXC6jpnLW8yqzvEw5fIW6wRe0yCpOzfmHfY5rX3qRMUImdbudS+m1JvE6aVMvb7s4MR8FVkh6HlmKWcaEL37VZlEpMqs5xug84s/mUsEkJpvHDQZBSfjBxlBTStvvDD+JmwfxaGbtIIkCNvP4IXQZiNEfPEOTp7/4sKJJkkDdMG8fl6IfOB/ECKC9dk1Vlmzg5NCTLLGw/wv6VvBq12+DwdabzEVIuRy4nrEe3HEZ8CoDEiclHggyTLAqjCq1zLg0CuMBFGYZJ05cax6paLAIaKkpOmmVMyAV20n9rWcWbe5wSGL5/WAqNxgtTfbGlTHJB6o5ZEKeP3mt60PzVWzGNYEYF/KNyy7og6hhHprlFyx0eF5MMm2AzgLHdMbEyO8vo4jlwfyBHh1HWt5ZD10veOkjk8pib2OnFqDNqcslGjO83x35y2NL1o2u/W6fj9xYTMaGXnYuxuF8LswCiCLlV3LJH23D9Fd/lhssri2KOLzpXYWAxLNYlGWzrX74Ng/EfRb3xVwvc1U5hLPQ4dnrSohsved7XN3rD7Km8E/dcdNX4h8iXxmCDEW8nRIeKjmQrbnrFETsstrXr4FyDJ99X8JtM4kQV7PgMF0cwG8sBmbPOItfhtV5OiKJh8IFnXRevzZGHE+0o0stCojYOmabTEykr7Tanpb314iR0b60zwHLP3GSAM46vYyh8hvLZMc5W0O1fEmtbxJ0mz1vDwp7tmA8KmtDaEj2u+xmOkQSurTMK+a7Pa8N8yLRsO8ditlaWabaB6APeXSkdMBgDddzWOv1xXBuoOyOSQucIv1AqcP9BD8pxZr+eIzi7WDwWAwGAwGg8Fg8BPlW3gbW9X9WgAAAABJRU5ErkJggg==" width="136" height="128"/>
+</g>
+<g transform="matrix(1,0,0,1,2550,0)">
+<g transform="translate(0,1897.69) scale(18.79,-18.79)">
+<image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIgAAACACAMAAADnN9ENAAAAOVBMVEVMaXFAQEBAQEBAQEBAQEBAQEBAQECmpqbV1dXs7Oz09PT6+vr4+Pjv7+/d3d3Kysp+fn62trbn5+cnEqoKAAAAE3RSTlMADRcoMyAEWYy/4P/yzJt7RWazM6aTZwAAAwRJREFUeAHtmsty8yoQBg00kiwkBH7/hz2pxHUSf4X/ZDOwobdRlTvMhRHoNhnAZDKZTCaTyWQycT4EnoTolzEWPqKE/i6Lp03sq/LUWLf7nr44znyV3ipLACh5T8K9AgTXK0UByiO1OCuA7xeWnN5xL0Ds5FH29J5jVRMzj/VI/+K4OkTHiUebC3Dm9aIe76JjWsVR8uMdR4FoHJh7+gunbXACXEk47jnnx56EDYLlgmhg9osv1lODY1g5AW1kj8L/XK9JnCEYZsjx6vEcRHwEtJzsliRqhjy+d7glAlenJQlSMnuBsHy3XP0zsFilqvbPsLz2mEP+7o12mUv/YyddN0vkglGKPP7ZKbws2QEYpcguVeHkCVFdbboroJH5JXgbeJNcXSUDYiOd9RETkSptwt8EXqN3QrAvmtpIgABn+gFgIpJ/E4nyTIFliEj7mTEi13iRRkJfRiKb7iR/ryz78h0vcofQyhFzkQVKa9zQ8jUQEXRQXME3GpqxSPtXQmOvMRPRddcXBp2M7EU8VP0Z3E1nRXuRRZPkWH+auAA8kpmIDmA6xhM/VVwE2FIXEQ9rUhOAEACemkYtXmNzNg6HntQ9KRWc0Rxfk7BfBaBsomEqsujyPzlFwkBE8FKgigLYHaHVISKKA670V3bDUyOPpomik4IVcg4iWHZ4JQD1SE0eZT10mrQjvrub2Cuw62u6IZ5PlaN5vqjHEqa4AMCVz/TkzCufVM3Vbjd69QO+ycanEg2VgBB9vxQRl/h66euh6klOP9wHS3NL3CDeRhChpAGRUTxwSs2M8thkFvGDPFa9OVq6a7iAXk7UAanqIkA9hi7I4mKgcTW+9loQ5z+IIfDFJeNz7rQgS+AHRTXSTqeS+eFRt3vz1jf0qtUrf3Dufe/BlQjb0C8D9OzovYe/jRLRr0eGi+xFPAaJZCQuY0TOguZpRxH99mu5DRXZc6FjWPRuXt9qfL/lkLP/88xbBdXohUOB6McM7C+E6JbbGDxfhBC9Skwmk8lkMplMJpNJX/4DE5ZsDykYZp0AAAAASUVORK5CYII=" width="136" height="128"/>
+</g>
+</g>
+<g transform="matrix(1,0,0,1,5100,0)">
+<g transform="translate(0,1897.69) scale(18.79,-18.79)">
+<image href="data:image/png;base64,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" width="136" height="128"/>
+</g>
+</g>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[gid1=0+2550|gid2=1+2550|gid3=2+2550]</code></div></div><figcaption><code>hb-vector hb:test/api/fonts/NotoColorEmoji.subset.ttf "89®"</code></figcaption></figure>
+<p id="ix-62">That font has no <code>glyf</code> table, so it has no outlines to fall back to. Outside painting, <code>hb_ot_color_has_png</code> and <code>hb_ot_color_glyph_reference_png</code> (2.1.0) fetch the same PNGs for clients that want them directly; set the font’s ppem first, or they return the largest.</p>
+<h2 id="svg">SVG</h2>
+<p id="ix-63">HarfBuzz doesn’t render SVG. When a glyph has a document in the <code>SVG </code> table, painting it is one call: <code>image</code>, with the format <code>HB_PAINT_IMAGE_FORMAT_SVG</code>, a width and height of zero, and no extents (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/svg/svg.hh#L233"><code>svg.hh:233</code></a>). The blob is the whole document as the font stores it. It may be gzip-compressed, and it may hold many glyphs, each in an element whose <code>id</code> is <code>glyph</code> and the glyph ID; finding the right one, and drawing it, is the client’s job. <code>hb_ot_color_glyph_reference_svg</code> returns the same blob, and since 12.1.0 and 13.0.0 <code>hb_ot_color_get_svg_document_count</code>, <code>hb_ot_color_glyph_get_svg_document_index</code> and <code>hb_ot_color_get_svg_document_glyph_range</code> say which document covers which glyphs.</p>
+<p id="ix-64">HarfBuzz’s own renderers rendered SVG glyphs for a while: 13.0.0 introduced them with SVG support, and 13.1.1 added gzip. 14.2.0 dropped it from both (<code>NEWS</code>), and their <code>image</code> callbacks now refuse SVG, which is why <code>S</code> above was drawn as its outline. Code to decompress and index documents is still in <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/svg/svg.hh"><code>svg.hh</code></a>, but nothing in 15.1.0 calls it. Nor does HarfBuzz read extents from an SVG document: an SVG glyph has its outline’s extents.</p>
+<h2 id="compiled-out">Compiled out</h2>
+<p id="ix-65">A build with <code>HB_NO_PAINT</code> has no paint API, and <code>HB_NO_DRAW</code> implies it. <code>HB_NO_COLOR</code> removes the color tables and <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-color.cc"><code>hb-ot-color.cc</code></a>; <code>HB_NO_SVG</code> removes only <code>SVG </code>; and <code>HB_NO_BITMAP</code> (through <code>HB_NO_OT_FONT_BITMAP</code>) removes <code>sbix</code> and <code>CBDT</code> from the font functions. <code>HB_LEAN</code> turns color, drawing and painting off unless the build also makes one of the cairo, raster, vector or GPU libraries (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh#L85"><code>hb-config.hh:85</code></a>). The <a href="compile-time-configuration.html">Compile-time configuration</a> appendix has the rest.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint.h"><code>src/hb-paint.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint.hh"><code>src/hb-paint.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-paint.cc"><code>src/hb-paint.cc</code></a></td>
+<td>the callbacks, their defaults, color lines, composite modes, and the gradient helpers</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-paint-extents.{hh,cc}</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-paint-bounded.{hh,cc}</code></a></td>
+<td>the internal paint funcs that measure a paint graph and decide whether it is bounded</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc"><code>src/hb-ot-font.cc</code></a></td>
+<td><code>hb_ot_paint_glyph_or_fail</code>: the order of the tables</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc"><code>src/hb-font.cc</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.hh"><code>src/hb-font.hh</code></a></td>
+<td><code>hb_font_paint_glyph</code> and its fallback to the outline; synthetic slant around paint</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/COLR/COLR.hh"><code>src/OT/Color/COLR/COLR.hh</code></a></td>
+<td>versions 0 and 1: every Paint format, color lines, ClipList, the paint context and its guards</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/CPAL/CPAL.hh"><code>src/OT/Color/CPAL/CPAL.hh</code></a></td>
+<td>palettes, types and labels</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/sbix/sbix.hh"><code>src/OT/Color/sbix/sbix.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/CBDT/CBDT.hh"><code>src/OT/Color/CBDT/CBDT.hh</code></a></td>
+<td>strikes and PNG images</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/Color/svg/svg.hh"><code>src/OT/Color/svg/svg.hh</code></a></td>
+<td>SVG documents</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-color.h"><code>src/hb-ot-color.h</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-color.cc"><code>src/hb-ot-color.cc</code></a></td>
+<td>the <code>hb_ot_color_*</code> API</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-decycler.hh"><code>src/hb-decycler.hh</code></a></td>
+<td>the cycle detector</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>The paint API turns any kind of color glyph into one nested sequence of callbacks: transforms, clips, fills, gradients, images and groups. The client renders; HarfBuzz walks the font’s data.</li>
+<li>HarfBuzz tries COLR, then SVG, then CBDT, then sbix. An <code>image</code> callback that returns false passes the glyph on to the next table, and <code>hb_font_paint_glyph</code> ends with the outline.</li>
+<li>CPAL palettes are arrays of <code>hb_color_t</code>. The client chooses the palette; HarfBuzz defaults to none of them except 0, and entry 0xFFFF is the foreground color.</li>
+<li>COLR version 0 is a <code>fill_glyph</code> per layer. Version 1 is a graph of 33 Paint formats, walked in font units under the font transform, clipped to its ClipBox, and painted not at all if it is unbounded.</li>
+<li>Variable paints read consecutive delta sets from <code>varIdxBase</code>. Depth, size, cycles and work are all limited while painting.</li>
+<li>Bitmaps are handed over as PNG blobs from the chosen strike, with their extents. SVG documents are handed over whole, and HarfBuzz’s own renderers refuse them.</li>
+</ul>
+<blockquote>
+<p>Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/7e97cd8a182651f2ca3d2311f0910ca0ce64e927"><code>7e97cd8</code></a> (17 November 2026), so main tries <code>sbix</code> before <code>CBDT</code> (the item on the order).</p>
+</blockquote>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="drawing-outlines.html">← Drawing outlines</a><a rel="next" href="hb-raster.html">hb-raster: rendering to pixels →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,691 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Deltas · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part VIII · Variations</p>
+<h1 id="deltas">32. Deltas</h1>
+<p id="ix-1">A position in the design space, as <a href="design-space.html">the previous chapter</a> showed, is a list of normalized coordinates. What a variable font stores is not the font at every position but the font at its default, plus <strong>deltas</strong>: numbers to add, each tied to a part of the design space where it applies, and weighted by how far into that part the position is. This chapter is about how HarfBuzz finds those weights and adds up the deltas. The machinery is the same everywhere in a variable font, with one exception that gets its own chapter, the glyph outlines in <code>gvar</code>.</p>
+<h2 id="regions-and-scalars">Regions and scalars</h2>
+<p id="ix-2">A delta belongs to a <strong>region</strong>: for each axis, a start, a peak and an end, in normalized coordinates. At the peak, the delta counts in full. Between the start and the peak, and between the peak and the end, it counts in proportion. Outside the start and end, it doesn’t count at all. On one axis, that weight, the <strong>scalar</strong>, is a tent. On several, it’s the product of the tents, so a region that peaks at (+1, +1) counts in full only at that corner.</p>
+<p id="ix-3">Here is the tent, <code>VarRegionAxis::evaluate</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L2549"><code>hb-ot-layout-common.hh:2549</code></a>):</p>
+<pre><code class="language-c++">float evaluate (int coord) const
+{
+  int peak = peakCoord.to_int ();
+  if (peak == 0 || coord == peak)
+    return 1.f;
+  else if (coord == 0) // Faster
+    return 0.f;
+
+  int start = startCoord.to_int (), end = endCoord.to_int ();
+
+  /* TODO Move these to sanitize(). */
+  if (unlikely (start &gt; peak || peak &gt; end))
+    return 1.f;
+  if (unlikely (start &lt; 0 &amp;&amp; end &gt; 0))
+    return 1.f;
+
+  if (coord &lt;= start || end &lt;= coord)
+    return 0.f;
+
+  /* Interpolate */
+  if (coord &lt; peak)
+    return float (coord - start) / (peak - start);
+  else
+    return float (end - coord) / (end - peak);
+}
+</code></pre>
+<p id="ix-4">The comparisons are on 2.14 integers, and there is one division, in floating point. A peak of 0 means the region doesn’t depend on this axis, so the factor is 1. The checks for a region whose start, peak and end are out of order, or that crosses 0, look like robustness code, but they are exactly what the specification says to do: such an axis is ignored, which means a factor of 1, not 0. The <code>TODO</code> is still there: those checks are made every time a region is evaluated, not once when the table is loaded.</p>
+<p id="ix-5">The test font <code>var.ttf</code> has masters at weights 100, 400, 650 and 900, and at width 75. Its HVAR table, which holds the deltas for advances, has four regions: one for the light master, peaking at −1; one for each of the two heavier masters; and one for the narrow master.</p>
+<figure class="views ttx"><pre><code>&lt;HVAR&gt;
+  &lt;Version value=&quot;0x00010000&quot;/&gt;
+  &lt;VarStore Format=&quot;1&quot;&gt;
+    &lt;Format value=&quot;1&quot;/&gt;
+    &lt;VarRegionList&gt;
+      &lt;!-- RegionAxisCount=2 --&gt;
+      &lt;!-- RegionCount=4 --&gt;
+      &lt;Region index=&quot;0&quot;&gt;
+        &lt;VarRegionAxis index=&quot;0&quot;&gt;
+          &lt;StartCoord value=&quot;-1.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;-1.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+        &lt;VarRegionAxis index=&quot;1&quot;&gt;
+          &lt;StartCoord value=&quot;0.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;0.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+      &lt;/Region&gt;
+      &lt;Region index=&quot;1&quot;&gt;
+        &lt;VarRegionAxis index=&quot;0&quot;&gt;
+          &lt;StartCoord value=&quot;0.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;0.5&quot;/&gt;
+          &lt;EndCoord value=&quot;1.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+        &lt;VarRegionAxis index=&quot;1&quot;&gt;
+          &lt;StartCoord value=&quot;0.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;0.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+      &lt;/Region&gt;
+      &lt;Region index=&quot;2&quot;&gt;
+        &lt;VarRegionAxis index=&quot;0&quot;&gt;
+          &lt;StartCoord value=&quot;0.5&quot;/&gt;
+          &lt;PeakCoord value=&quot;1.0&quot;/&gt;
+          &lt;EndCoord value=&quot;1.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+        &lt;VarRegionAxis index=&quot;1&quot;&gt;
+          &lt;StartCoord value=&quot;0.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;0.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+      &lt;/Region&gt;
+      &lt;Region index=&quot;3&quot;&gt;
+        &lt;VarRegionAxis index=&quot;0&quot;&gt;
+          &lt;StartCoord value=&quot;0.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;0.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+        &lt;VarRegionAxis index=&quot;1&quot;&gt;
+          &lt;StartCoord value=&quot;-1.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;-1.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+      &lt;/Region&gt;
+    &lt;/VarRegionList&gt;
+    &lt;!-- VarDataCount=1 --&gt;
+    &lt;VarData index=&quot;0&quot;&gt;
+      &lt;!-- ItemCount=5 --&gt;
+      &lt;NumShorts value=&quot;3&quot;/&gt;
+      &lt;!-- VarRegionCount=4 --&gt;
+      &lt;VarRegionIndex index=&quot;0&quot; value=&quot;1&quot;/&gt;
+      &lt;VarRegionIndex index=&quot;1&quot; value=&quot;2&quot;/&gt;
+      &lt;VarRegionIndex index=&quot;2&quot; value=&quot;3&quot;/&gt;
+      &lt;VarRegionIndex index=&quot;3&quot; value=&quot;0&quot;/&gt;
+      &lt;Item index=&quot;0&quot; value=&quot;[0, 0, 0, 0]&quot;/&gt;
+      &lt;Item index=&quot;1&quot; value=&quot;[0, 0, 0, 0]&quot;/&gt;
+      &lt;Item index=&quot;2&quot; value=&quot;[60, 100, -150, -40]&quot;/&gt;
+      &lt;Item index=&quot;3&quot; value=&quot;[100, 150, -10, -60]&quot;/&gt;
+      &lt;Item index=&quot;4&quot; value=&quot;[160, 300, -10, -60]&quot;/&gt;
+    &lt;/VarData&gt;
+  &lt;/VarStore&gt;
+&lt;/HVAR&gt;</code></pre><figcaption>variations/var.ttf: HVAR (TTX)</figcaption></figure>
+<p id="ix-6">The 650 master is an <strong>intermediate</strong> one: its region on the weight axis starts at 0, peaks at 0.5 and ends at 1, rather than running all the way from 0 to the end. Without it, the advances would change in one straight line from 400 to 900. With it, there are two:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=400</td><td class="out"><code>[I=0+260]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=525</td><td class="out"><code>[I=0+310]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=650</td><td class="out"><code>[I=0+360]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=775</td><td class="out"><code>[I=0+385]</code></td></tr><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=900</td><td class="out"><code>[I=0+410]</code></td></tr></tbody></table></div>
+<p id="ix-7"><code>I</code> is glyph 3, so its deltas are item 3 in the store’s only <code>VarData</code>: 100 for the (0, 0.5, 1) region and 150 for the (0.5, 1, 1) one, among others. At weight 775, normalized 0.75, the first region’s tent has come halfway down and the second’s has gone halfway up, so the delta is 0.5 × 100 + 0.5 × 150 = 125, and the advance is 260 + 125 = 385.</p>
+<h2 id="item-variation-stores">Item variation stores</h2>
+<p id="ix-8">Regions and deltas are kept in an <strong>item variation store</strong>, a structure shared by every variation table except gvar. It has a list of regions, and one or more <code>VarData</code> tables of rows. Each row is one <strong>item</strong>, such as one glyph’s advance or one metric, with a delta for each region the <code>VarData</code> uses. To save space, the first columns of a row can be 16-bit and the rest 8-bit, or, with the <code>LONG_WORDS</code> bit, 32-bit and 16-bit. An item is addressed by two numbers, <em>outer</em> (which <code>VarData</code>) and <em>inner</em> (which row).</p>
+<p id="ix-9"><code>VarData::_get_delta</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L3073"><code>hb-ot-layout-common.hh:3073</code></a>) walks a row in its runs of long, short and byte values, multiplying each by its region’s scalar and skipping regions whose scalar is 0. A <code>VarData</code> with no regions returns at once, with a comment that “This is quite common.”</p>
+<h3 id="no-rounding-in-the-store">No rounding in the store</h3>
+<p>The store returns a <code>float</code>, and never rounds. Rounding is left to whoever asked, and they don’t all do it the same way:</p>
+<ul>
+<li id="ix-10">Advances, from HVAR or VVAR (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-hmtx-table.hh#L353"><code>hb-ot-hmtx-table.hh:353</code></a>) and from phantom points (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/OT/glyf/glyf.hh#L492"><code>OT/glyf/glyf.hh:492</code></a>), are rounded <strong>in font units</strong>, before the font’s size is applied.</li>
+<li id="ix-11">MVAR metrics, device tables and VORG are scaled first and rounded after.</li>
+</ul>
+<p id="ix-12">So an advance is always a whole number of font units, even when the text is enormous. At a weight where <code>I</code>’s exact advance is 345.2 units, a font size 100 times its units per em gives 34500, not 34520:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">I</span><span class="cps">U+0049</span></td><td class="opt">--variations=wght=613 --font-size=100000</td><td class="out"><code>[I=0+34500]</code></td></tr></tbody></table></div>
+<p id="ix-13">The specification only recommends rounding as late as possible. Most of the time the difference is too small to see. But it means the spacing of very large text moves in steps of whole font units as a slider moves, and it means that HarfBuzz’s advances and positioning deltas aren’t rounded at the same stage.</p>
+<p id="ix-14">The addition itself is in floating point, too: the advance from <code>hmtx</code> plus the rounded delta. A float has 24 bits of precision, so for huge values the sum is inexact. A HarfBuzz test font with deltas of two billion shows it: an advance that should be 500,000,500 comes out as 500,000,512, and one that would overflow comes out as −1, which an API test now asserts.</p>
+<h3 id="the-scalar-cache">The scalar cache</h3>
+<p id="ix-15">A glyph’s advance usually depends on only a few regions, but a run of text asks for many glyphs, at the same position. So HarfBuzz keeps a cache of region scalars, <code>hb_scalar_cache_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L2637"><code>hb-ot-layout-common.hh:2637</code></a>): one float per region, with NaN meaning “not worked out yet”. The values are stored as relaxed atomics. A scalar depends only on the region and the position, so two threads that fill in the same entry at once write the same number, and no lock is needed.</p>
+<p id="ix-16">That matters for GPOS. The cache used for GDEF’s store, which holds the deltas for GPOS device tables and anchors, is the OpenType shaper’s per-font data (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L433"><code>hb-ot-shape.cc:433</code></a>), shared by every shaping call on that font at once. The caches in HarfBuzz’s font functions, for advances and outlines, are handed to one caller at a time and thrown away when the position changes, as the previous chapter showed.</p>
+<p id="ix-17">If memory runs out, <code>create</code> returns the shared empty cache, and an empty cache answers 0 for every region. Variations quietly disappear: the font behaves as if it were at its default.</p>
+<h3 id="index-maps">Index maps</h3>
+<p id="ix-18">A table that needs many items can address them through a <strong>delta-set index map</strong>, <code>DeltaSetIndexMap</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L4015"><code>hb-ot-layout-common.hh:4015</code></a>), which maps item numbers (glyph IDs, for HVAR) to outer and inner indices. HarfBuzz follows the specification where it says what to do: an index past the end of the map uses the last entry (<code>if (v &gt;= mapCount) v = mapCount - 1;</code>). Where it doesn’t say, HarfBuzz chooses to keep going: a map with no entries, and a map in a format HarfBuzz doesn’t know, pass the index through unchanged, and an unknown format even passes the sanitizer.</p>
+<p id="ix-19">Without a map, HVAR’s glyph <em>n</em> is outer 0, inner <em>n</em>. <code>get_advance_delta_unscaled</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-hvar-table.hh#L436"><code>hb-ot-var-hvar-table.hh:436</code></a>) has a guard for fonts with more than 65,536 glyphs: “An oversized glyph id must not select another table.” Without it, glyph 65,536 would become outer 1, inner 0.</p>
+<h2 id="advances-hvar-or-the-outlines">Advances: HVAR or the outlines</h2>
+<p id="ix-20">A variable glyph’s advance can come from two places: from HVAR, or from the outlines, since gvar varies a glyph’s <strong>phantom points</strong>, the points that mark its advance, along with its real ones (see <a href="varying-outlines.html">Varying outlines</a>). The specification says HVAR is optional for TrueType fonts but makes them faster, and is required for CFF2 fonts, which have no phantom points.</p>
+<p id="ix-21">HarfBuzz’s choice is in <code>hb_ot_get_glyph_h_advances</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L382"><code>hb-ot-font.cc:382</code></a>):</p>
+<ol>
+<li id="ix-22">At the default position, <code>hmtx</code> alone, without looking at any variation table.</li>
+<li id="ix-23">Otherwise, if there is HVAR, <code>hmtx</code> plus HVAR’s delta.</li>
+<li id="ix-24">Otherwise, if there is gvar, the distance between the glyph’s varied phantom points.</li>
+<li id="ix-25">Otherwise, <code>hmtx</code> alone. A CFF2 font without HVAR doesn’t vary its advances at all.</li>
+</ol>
+<p id="ix-26">Vertical advances follow the same steps with VVAR, in a copy of the function whose comment says “Duplicated from h_advances. Ugly. Keep in sync'ish.”</p>
+<p id="ix-27"><code>var-nohvar.ttf</code> is <code>var.ttf</code> with HVAR removed, so its advances come from the phantom points. They agree, as they should, since varLib made both from the same masters:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=900</td><td class="out"><code>[I=0+410|H=1+700|V=2+560]</code></td></tr><tr><td class="font">variations/var-nohvar.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=900</td><td class="out"><code>[I=0+410|H=1+700|V=2+560]</code></td></tr></tbody></table></div>
+<p id="ix-28">But nothing makes a font’s HVAR and gvar agree, and HarfBuzz doesn’t check. <code>var-badhvar.ttf</code> has every HVAR delta doubled. Its outlines are the same as <code>var.ttf</code>’s, from gvar, but its advances come from HVAR:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=900</td><td class="out"><code>[I=0+410|H=1+700|V=2+560]</code></td></tr><tr><td class="font">variations/var-badhvar.ttf</td><td class="in"><span class="txt">IHV</span><span class="cps">U+0049 U+0048 U+0056</span></td><td class="opt">--variations=wght=900</td><td class="out"><code>[I=0+560|H=1+800|V=2+860]</code></td></tr></tbody></table></div>
+<figure class="draw slider"><div class="frames"><div class="frame print" data-value="100" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=100">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L120,700L120,0L80,0Z" fill="currentColor"/>
+<path d="M220,0L220,700L260,700L260,0L220,0ZM580,0L580,700L620,700L620,0L580,0ZM260,330L260,362L580,362L580,330L260,330Z" fill="currentColor"/>
+<path d="M740,0L740,700L780,700L780,525L780,350L780,175L780,0L740,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=100</div><code class="frame-shape">[I=0+140|H=1+520|V=2+140]</code></div><div class="frame" data-value="150" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=150">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L130,700L130,0L80,0Z" fill="currentColor"/>
+<path d="M240,0L240,700L290,700L290,0L240,0ZM596.67,0L596.67,700L646.67,700L646.67,0L596.67,0ZM290,330L290,370L596.67,370L596.67,330L290,330Z" fill="currentColor"/>
+<path d="M773,0L773,700L823,700L823,525L823,350L823,175L823,0L773,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=150</div><code class="frame-shape">[I=0+160|H=1+533|V=2+160]</code></div><div class="frame" data-value="200" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=200">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L140,700L140,0L80,0Z" fill="currentColor"/>
+<path d="M260,0L260,700L320,700L320,0L260,0ZM613.33,0L613.33,700L673.33,700L673.33,0L613.33,0ZM320,330L320,378L613.33,378L613.33,330L320,330Z" fill="currentColor"/>
+<path d="M807,0L807,700L867,700L867,525L867,350L867,175L867,0L807,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=200</div><code class="frame-shape">[I=0+180|H=1+547|V=2+180]</code></div><div class="frame" data-value="250" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=250">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L150,700L150,0L80,0Z" fill="currentColor"/>
+<path d="M280,0L280,700L350,700L350,0L280,0ZM630,0L630,700L700,700L700,0L630,0ZM350,330L350,386L630,386L630,330L350,330Z" fill="currentColor"/>
+<path d="M840,0L840,700L910,700L910,525L910,350L910,175L910,0L840,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=250</div><code class="frame-shape">[I=0+200|H=1+560|V=2+200]</code></div><div class="frame" data-value="300" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=300">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L160,700L160,0L80,0Z" fill="currentColor"/>
+<path d="M300,0L300,700L380,700L380,0L300,0ZM646.67,0L646.67,700L726.67,700L726.67,0L646.67,0ZM380,330L380,394L646.67,394L646.67,330L380,330Z" fill="currentColor"/>
+<path d="M873,0L873,700L953,700L953,525L953,350L953,175L953,0L873,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=300</div><code class="frame-shape">[I=0+220|H=1+573|V=2+220]</code></div><div class="frame" data-value="350" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=350">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L170,700L170,0L80,0Z" fill="currentColor"/>
+<path d="M320,0L320,700L410,700L410,0L320,0ZM663.33,0L663.33,700L753.33,700L753.33,0L663.33,0ZM410,330L410,402L663.33,402L663.33,330L410,330Z" fill="currentColor"/>
+<path d="M907,0L907,700L997,700L997,525L997,350L997,175L997,0L907,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=350</div><code class="frame-shape">[I=0+240|H=1+587|V=2+240]</code></div><div class="frame print" data-value="400"><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=400">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L180,700L180,0L80,0Z" fill="currentColor"/>
+<path d="M340,0L340,700L440,700L440,0L340,0ZM680,0L680,700L780,700L780,0L680,0ZM440,330L440,410L680,410L680,330L440,330Z" fill="currentColor"/>
+<path d="M940,0L940,700L1040,700L1040,525L1040,350L1040,175L1040,0L940,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=400</div><code class="frame-shape">[I=0+260|H=1+600|V=2+260]</code></div><div class="frame" data-value="450" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=450">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L200.01,700L200.01,0L80,0Z" fill="currentColor"/>
+<path d="M380,0L380,700L500.01,700L500.01,0L380,0ZM712,0L712,700L832,700L832,0L712,0ZM500.01,330L500.01,426.01L712,426.01L712,330L500.01,330Z" fill="currentColor"/>
+<path d="M1004,0L1004,700L1136.01,700L1133.01,525L1130.01,350L1127.01,175L1124.01,0L1004,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=450</div><code class="frame-shape">[I=0+300|H=1+624|V=2+324]</code></div><div class="frame" data-value="500" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=500">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L220,700L220,0L80,0Z" fill="currentColor"/>
+<path d="M420,0L420,700L560,700L560,0L420,0ZM744,0L744,700L884,700L884,0L744,0ZM560,330L560,442L744,442L744,330L560,330Z" fill="currentColor"/>
+<path d="M1068,0L1068,700L1232,700L1226,525L1220,350L1214,175L1208,0L1068,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=500</div><code class="frame-shape">[I=0+340|H=1+648|V=2+388]</code></div><div class="frame" data-value="550" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=550">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L240,700L240,0L80,0Z" fill="currentColor"/>
+<path d="M460,0L460,700L620,700L620,0L460,0ZM776,0L776,700L936,700L936,0L776,0ZM620,330L620,458L776,458L776,330L620,330Z" fill="currentColor"/>
+<path d="M1132,0L1132,700L1328,700L1319,525L1310,350L1301,175L1292,0L1132,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=550</div><code class="frame-shape">[I=0+380|H=1+672|V=2+452]</code></div><div class="frame" data-value="600" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=600">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L260,700L260,0L80,0Z" fill="currentColor"/>
+<path d="M500,0L500,700L680,700L680,0L500,0ZM808,0L808,700L988,700L988,0L808,0ZM680,330L680,474L808,474L808,330L680,330Z" fill="currentColor"/>
+<path d="M1196,0L1196,700L1424.01,700L1412.01,525L1400.01,350L1388.01,175L1376,0L1196,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=600</div><code class="frame-shape">[I=0+420|H=1+696|V=2+516]</code></div><div class="frame" data-value="650" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=650">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L280,700L280,0L80,0Z" fill="currentColor"/>
+<path d="M540,0L540,700L740,700L740,0L540,0ZM840,0L840,700L1040,700L1040,0L840,0ZM740,330L740,490L840,490L840,330L740,330Z" fill="currentColor"/>
+<path d="M1260,0L1260,700L1520,700L1505,525L1490,350L1475,175L1460,0L1260,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=650</div><code class="frame-shape">[I=0+460|H=1+720|V=2+580]</code></div><div class="frame" data-value="700" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=700">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L290,700L290,0L80,0Z" fill="currentColor"/>
+<path d="M560,0L560,700L770,700L770,0L560,0ZM858,0L858,700L1068,700L1068,0L858,0ZM770,330L770,498L858,498L858,330L770,330Z" fill="currentColor"/>
+<path d="M1296,0L1296,700L1584.01,700L1564.41,525L1545.01,350L1525.61,175L1506,0L1296,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=700</div><code class="frame-shape">[I=0+480|H=1+736|V=2+636]</code></div><div class="frame" data-value="750" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=750">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L300,700L300,0L80,0Z" fill="currentColor"/>
+<path d="M580,0L580,700L800,700L800,0L580,0ZM876,0L876,700L1096,700L1096,0L876,0ZM800,330L800,506L876,506L876,330L800,330Z" fill="currentColor"/>
+<path d="M1332,0L1332,700L1648,700L1623.8,525L1600,350L1576.2,175L1552,0L1332,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=750</div><code class="frame-shape">[I=0+500|H=1+752|V=2+692]</code></div><div class="frame" data-value="800" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=800">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L310,700L310,0L80,0Z" fill="currentColor"/>
+<path d="M600,0L600,700L830,700L830,0L600,0ZM894,0L894,700L1124,700L1124,0L894,0ZM830,330L830,514L894,514L894,330L830,330Z" fill="currentColor"/>
+<path d="M1368,0L1368,700L1712,700L1683.2,525L1655,350L1626.8,175L1598,0L1368,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=800</div><code class="frame-shape">[I=0+520|H=1+768|V=2+748]</code></div><div class="frame" data-value="850" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=850">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L320,700L320,0L80,0Z" fill="currentColor"/>
+<path d="M620,0L620,700L860,700L860,0L620,0ZM912,0L912,700L1152,700L1152,0L912,0ZM860,330L860,522L912,522L912,330L860,330Z" fill="currentColor"/>
+<path d="M1404,0L1404,700L1776.01,700L1742.61,525L1710,350L1677.4,175L1644,0L1404,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=850</div><code class="frame-shape">[I=0+540|H=1+784|V=2+804]</code></div><div class="frame print" data-value="900" hidden><svg viewBox="-40 -840 2300 1080" role="img" aria-label="IHV at wght=900">
+<g transform="scale(1,-1)">
+<path d="M80,0L80,700L330,700L330,0L80,0Z" fill="currentColor"/>
+<path d="M640,0L640,700L890,700L890,0L640,0ZM930,0L930,700L1180,700L1180,0L930,0ZM890,330L890,530L930,530L930,330L890,330Z" fill="currentColor"/>
+<path d="M1440,0L1440,700L1840,700L1802,525L1765,350L1728,175L1690,0L1440,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">wght=900</div><code class="frame-shape">[I=0+560|H=1+800|V=2+860]</code></div></div><label class="control"><span>wght</span><input type="range" min="100" max="900" step="50" value="400"><output>400</output></label><figcaption><code>hb-vector variations/var-badhvar.ttf "IHV" --variations=wght=…</code>, drawn at every 50 from 100 to 900</figcaption></figure>
+<p id="ix-29">At the default the font is fine, because no deltas are applied. Away from it the glyphs drift apart, or into each other. HarfBuzz trusts HVAR, which is what the specification intends: HVAR exists so that a shaper doesn’t have to touch the outlines. The research for this chapter found the same thing in a real font, one of HarfBuzz’s test fonts, <code>SourceSerifVariable-Roman-VVAR.abc.ttf</code>, whose VVAR and vertical phantom points disagree by up to 54 units at its heaviest weight. HarfBuzz uses VVAR.</p>
+<p id="ix-30">HVAR can also hold maps for left and right side bearings, and VVAR for top and bottom ones. HarfBuzz never reads them when shaping, only when subsetting. It doesn’t need them, since it gets glyph extents from the varied outlines themselves.</p>
+<p id="ix-31">The cache for advances has one more limit. <code>hb_ot_font_advance_cache_t</code> is <code>hb_cache_t&lt;24, 16&gt;</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc#L65"><code>hb-ot-font.cc:65</code></a>): 256 entries, each holding a glyph ID of up to 24 bits and an advance of up to 16 bits, in font units. An advance of 65,536 units or more is simply never cached.</p>
+<h2 id="metrics-mvar">Metrics: MVAR</h2>
+<p id="ix-32">Font-wide values vary too: the ascender and descender, the x-height and cap height, the underline’s position and thickness, the caret slope. MVAR lists them by four-letter tag, each with an item in its store. The test fonts vary only the x-height, from 480 at the lightest weight to 530 at the heaviest:</p>
+<figure class="views ttx"><pre><code>&lt;MVAR&gt;
+  &lt;Version value=&quot;0x00010000&quot;/&gt;
+  &lt;Reserved value=&quot;0&quot;/&gt;
+  &lt;ValueRecordSize value=&quot;8&quot;/&gt;
+  &lt;!-- ValueRecordCount=1 --&gt;
+  &lt;VarStore Format=&quot;1&quot;&gt;
+    &lt;Format value=&quot;1&quot;/&gt;
+    &lt;VarRegionList&gt;
+      &lt;!-- RegionAxisCount=2 --&gt;
+      &lt;!-- RegionCount=3 --&gt;
+      &lt;Region index=&quot;0&quot;&gt;
+        &lt;VarRegionAxis index=&quot;0&quot;&gt;
+          &lt;StartCoord value=&quot;-1.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;-1.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+        &lt;VarRegionAxis index=&quot;1&quot;&gt;
+          &lt;StartCoord value=&quot;0.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;0.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+      &lt;/Region&gt;
+      &lt;Region index=&quot;1&quot;&gt;
+        &lt;VarRegionAxis index=&quot;0&quot;&gt;
+          &lt;StartCoord value=&quot;0.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;0.5&quot;/&gt;
+          &lt;EndCoord value=&quot;1.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+        &lt;VarRegionAxis index=&quot;1&quot;&gt;
+          &lt;StartCoord value=&quot;0.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;0.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+      &lt;/Region&gt;
+      &lt;Region index=&quot;2&quot;&gt;
+        &lt;VarRegionAxis index=&quot;0&quot;&gt;
+          &lt;StartCoord value=&quot;0.5&quot;/&gt;
+          &lt;PeakCoord value=&quot;1.0&quot;/&gt;
+          &lt;EndCoord value=&quot;1.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+        &lt;VarRegionAxis index=&quot;1&quot;&gt;
+          &lt;StartCoord value=&quot;0.0&quot;/&gt;
+          &lt;PeakCoord value=&quot;0.0&quot;/&gt;
+          &lt;EndCoord value=&quot;0.0&quot;/&gt;
+        &lt;/VarRegionAxis&gt;
+      &lt;/Region&gt;
+    &lt;/VarRegionList&gt;
+    &lt;!-- VarDataCount=1 --&gt;
+    &lt;VarData index=&quot;0&quot;&gt;
+      &lt;!-- ItemCount=1 --&gt;
+      &lt;NumShorts value=&quot;0&quot;/&gt;
+      &lt;!-- VarRegionCount=3 --&gt;
+      &lt;VarRegionIndex index=&quot;0&quot; value=&quot;0&quot;/&gt;
+      &lt;VarRegionIndex index=&quot;1&quot; value=&quot;1&quot;/&gt;
+      &lt;VarRegionIndex index=&quot;2&quot; value=&quot;2&quot;/&gt;
+      &lt;Item index=&quot;0&quot; value=&quot;[-20, 15, 30]&quot;/&gt;
+    &lt;/VarData&gt;
+  &lt;/VarStore&gt;
+  &lt;ValueRecord index=&quot;0&quot;&gt;
+    &lt;ValueTag value=&quot;xhgt&quot;/&gt;
+    &lt;VarIdx value=&quot;0&quot;/&gt;
+  &lt;/ValueRecord&gt;
+&lt;/MVAR&gt;</code></pre><figcaption>variations/var.ttf: MVAR (TTX)</figcaption></figure>
+<div class="shape info"><table><thead><tr><th>Font</th><th>Options</th><th>hb-info output</th></tr></thead><tbody><tr><td class="font">variations/var.ttf</td><td class="opt">--get-metric=xhgt --variations=wght=100</td><td class="out"><pre><code>Metric xhgt: 480</code></pre></td></tr><tr><td class="font">variations/var.ttf</td><td class="opt">--get-metric=xhgt --variations=wght=400</td><td class="out"><pre><code>Metric xhgt: 500</code></pre></td></tr><tr><td class="font">variations/var.ttf</td><td class="opt">--get-metric=xhgt --variations=wght=900</td><td class="out"><pre><code>Metric xhgt: 530</code></pre></td></tr></tbody></table></div>
+<p id="ix-33">The tags of <code>hb_ot_metrics_tag_t</code>, the public API for these values, <em>are</em> the MVAR tags, so <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-metrics.cc"><code>hb-ot-metrics.cc</code></a> can look the variation up directly. There is one difference from the specification. MVAR’s <code>hasc</code>, <code>hdsc</code> and <code>hlgp</code> tags vary the typographic ascender, descender and line gap in the OS/2 table. HarfBuzz reports the <code>hhea</code> values instead when the font doesn’t set OS/2’s <code>USE_TYPO_METRICS</code> flag, and it applies the same MVAR deltas to them (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-metrics.cc#L85"><code>hb-ot-metrics.cc:85</code></a>). The research for this chapter checked it on a patched test font: an <code>hhea</code> ascender of 1000 with a <code>hasc</code> delta of 765 gave 1765.</p>
+<h2 id="everyone-else">Everyone else</h2>
+<p>The same store, read the same way, serves almost every other variable table:</p>
+<table>
+<thead>
+<tr>
+<th>Table</th>
+<th>What varies</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td id="ix-34">GDEF</td>
+<td id="ix-35">GPOS value records and anchors, ligature carets, through device tables; also MATH’s values, since MATH has no store of its own</td>
+</tr>
+<tr>
+<td id="ix-36">GSUB and GPOS FeatureVariations, version 1.1</td>
+<td id="ix-37">the values that conditions are compared with, through GDEF’s store</td>
+</tr>
+<tr>
+<td id="ix-38">BASE</td>
+<td>baseline values</td>
+</tr>
+<tr>
+<td id="ix-39">COLR version 1</td>
+<td id="ix-40">colors, positions, and transforms of paints</td>
+</tr>
+<tr>
+<td>avar version 2</td>
+<td id="ix-41">the axes themselves (see <a href="design-space.html">Design space</a>)</td>
+</tr>
+<tr>
+<td>CFF2</td>
+<td id="ix-42">blends in outlines, which use only the store’s region scalars, not its deltas</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-43">VARC uses a variant, the <strong>multiple item variation store</strong>, whose items are lists of deltas rather than single numbers, and whose regions name only the axes they use. It is in the 2026 ISO standard, not in Microsoft’s 1.9.1, and it comes up again in <a href="variable-components.html">Variable components</a>. One detail belongs here. An ordinary store applies no deltas at the default (<code>ItemVarStoreInstancer</code>: “treat explicit all-zero coordinates as the default instance, which uses unadjusted values (OFF 7.1)”, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh#L4219"><code>hb-ot-layout-common.hh:4219</code></a>). The multiple store does, because a region that names no axes has a scalar of 1 everywhere, even at the default.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-layout-common.hh"><code>src/hb-ot-layout-common.hh</code></a></td>
+<td>the stores: <code>VarRegionAxis</code>, 2549; <code>hb_scalar_cache_t</code>, 2637; <code>VarRegionList</code>, 2728; <code>VarData</code>, 3054; <code>ItemVariationStore</code>, 3553; <code>MultiItemVariationStore</code>, 3858; <code>DeltaSetIndexMap</code>, 4015</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-hvar-table.hh"><code>src/hb-ot-var-hvar-table.hh</code></a></td>
+<td>HVAR and VVAR</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-var-mvar-table.hh"><code>src/hb-ot-var-mvar-table.hh</code></a>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-metrics.cc"><code>src/hb-ot-metrics.cc</code></a></td>
+<td>MVAR, and the metrics API</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-font.cc"><code>src/hb-ot-font.cc</code></a></td>
+<td>where advances come from, 382 and 506; the caches</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-hmtx-table.hh"><code>src/hb-ot-hmtx-table.hh</code></a></td>
+<td><code>hmtx</code> plus HVAR, and where the advance is rounded</td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>A delta’s weight is the product of a tent on each axis. Regions that are malformed count as 1, which is what the specification asks for.</li>
+<li>The store returns unrounded floats. Advances are rounded in font units, before scaling; metrics and device deltas after.</li>
+<li>Advances come from HVAR when there is one, and from gvar’s phantom points otherwise. HarfBuzz trusts HVAR even when it disagrees with the outlines.</li>
+<li>MVAR’s ascender, descender and line gap deltas are also applied to <code>hhea</code>’s values.</li>
+<li>Region scalars are cached per font and position, in atomics, so shaping calls can share them without locks.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="design-space.html">← Design space</a><a rel="next" href="varying-outlines.html">Varying outlines →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

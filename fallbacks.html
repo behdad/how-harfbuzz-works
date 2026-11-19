@@ -1,0 +1,848 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Fallbacks · How HarfBuzz Works</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=Commissioner:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column of ~66ch; figures (views, shaping runs, traces)
+   break out to a wider measure, because code and buffers need the room. */
+:root {
+  --paper: #f6f7f9;
+  --ink: #1a1e27;
+  --muted: #5a6373;
+  --rule: #d8dce4;
+  --well: #eceff5;
+  --accent: #2c48c9;
+  --accent-soft: #dfe5fb;
+  --hit: #7a4b00;
+  --font-text: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-head: "Commissioner", "Helvetica Neue", Arial, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --measure: 620px;
+  --wide: 58rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+    --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #13161d; --ink: #e3e6ed; --muted: #9aa2b1; --rule: #2b313d;
+  --well: #1b2029; --accent: #93a6ff; --accent-soft: #252d4a; --hit: #f0c674;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.65 var(--font-text);
+  font-optical-sizing: auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+}
+.page { max-width: var(--wide); margin: 0 auto; display: grid; }
+.page > * { width: 100%; min-width: 0; }
+.flow { display: grid; min-width: 0; }
+.flow > * { width: 100%; max-width: var(--measure); justify-self: start; min-width: 0; }
+.flow > .views, .flow > .shape, .flow > .trace, .flow > table { max-width: var(--wide); }
+.flow > .macros, .flow > .listing, .flow > .command-run { max-width: var(--wide); }
+.macros table { display: table; table-layout: fixed; font-size: .85rem; }
+.macros th:nth-child(1) { width: 25%; }
+.macros th:nth-child(2) { width: 35%; }
+.macros th:nth-child(3) { width: 17%; }
+.macros th:nth-child(4) { width: 23%; }
+.macros td:nth-child(1) code { overflow-wrap: anywhere; }
+.macros td { overflow-wrap: break-word; }
+.flow > .bugs { max-width: var(--wide); }
+.bugs table { display: table; table-layout: fixed; font-size: .85rem; }
+.bugs th:nth-child(1) { width: 4%; }
+.bugs th:nth-child(2) { width: 36%; }
+.bugs th:nth-child(3) { width: 20%; }
+.bugs th:nth-child(4) { width: 9%; }
+.bugs th:nth-child(5) { width: 31%; }
+.bugs td { overflow-wrap: break-word; }
+
+/* Top: the book and the HarfBuzz version. */
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .5rem 1.5rem; padding-block: 1.5rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--font-head);
+}
+.masthead .book { font-weight: 700; letter-spacing: .01em; }
+.masthead .book a { color: inherit; text-decoration: none; }
+.masthead .sub { color: var(--muted); font-weight: 500; }
+.masthead .ver { color: var(--muted); font: 400 .8rem var(--font-code); }
+button {
+  font: inherit; color: var(--ink); background: none; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .2rem .6rem;
+}
+button[aria-selected="true"] {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--ink);
+}
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.contents { padding-block: .75rem 0; font: 500 .9rem var(--font-head); }
+details.contents summary { cursor: pointer; color: var(--muted); }
+/* The whole contents opens at full length (no inner scroll box), in two
+   columns where there's room, without splitting a part across them. */
+details.contents .toc { padding-bottom: .75rem; columns: 2 20rem; column-gap: 2.5rem; }
+details.contents .toc .toc-section { break-inside: avoid; }
+
+/* Contents: in the header, and in full on the title page */
+.toc .toc-section { margin-top: .9rem; }
+.toc .toc-head { margin: 0 0 .2rem; font: 600 .72rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; line-height: 1.7; }
+.toc li { display: grid; grid-template-columns: 2.2em 1fr; }
+.toc li > a { grid-column: 2; }
+.toc .num { grid-column: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+.toc li.planned > a { color: var(--muted); }
+.toc .summary { grid-column: 2; display: block; margin: -.1rem 0 .5rem; color: var(--muted); font: 400 .92rem/1.45 var(--font-text); }
+.toc.full { font: 500 1.05rem var(--font-head); }
+.toc .toc-sub { grid-column: 2; margin: 0 0 .4rem; font: 400 .9rem/1.5 var(--font-text); }
+.toc .toc-sub li { display: block; }
+.toc .toc-sub .toc-sub { margin: 0 0 .2rem 1.2em; font-size: .85rem; color: var(--muted); }
+.toc .toc-sub .toc-sub a { color: var(--muted); }
+.toc.full .toc-section { margin-top: 1.75rem; }
+.eyebrow { margin: 2.5rem 0 -1.5rem; font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.planned-note { color: var(--muted); font-style: italic; padding: .75rem 1rem; background: var(--well); border-radius: 6px; }
+
+/* Text */
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.2; text-wrap: balance; }
+h1 { font-size: 2.6rem; font-weight: 500; letter-spacing: -.01em; margin: 2.5rem 0 1rem; }
+h2 { font-size: 1.55rem; font-weight: 600; margin: 2.75rem 0 .5rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; font-weight: 600; margin: 1.75rem 0 .25rem; }
+p, ul, ol { margin: 0 0 1rem; }
+a { color: var(--accent); text-underline-offset: .15em; }
+code { font-family: var(--font-code); font-size: .86em; font-variant-ligatures: none; }
+p code, li code, td code { background: var(--well); padding: .05em .3em; border-radius: 3px; }
+blockquote {
+  margin: 1.25rem 0; padding: .25rem 0 .25rem 1.1rem; border-left: 3px solid var(--accent);
+  color: var(--ink);
+}
+blockquote p:last-child { margin-bottom: 0; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; margin: 0 0 1.25rem; display: block; overflow-x: auto; }
+th, td { text-align: left; vertical-align: top; padding: .35rem .75rem .35rem 0; border-bottom: 1px solid var(--rule); }
+th { font: 600 .78rem var(--font-head); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; }
+pre code { font-size: .82rem; line-height: 1.55; }
+/* In the PDF, each chapter is a <section> inside .flow. */
+.flow > pre, .flow > section > pre { background: var(--well); padding: .9rem 1rem; border-radius: 6px; margin-bottom: 1.25rem; }
+
+/* Figures: views of a lookup */
+.views { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.views .tabs { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem; border-bottom: 1px solid var(--rule); font: 500 .8rem var(--font-head); }
+.views .pane { padding: .9rem 1rem; }
+.views .pane:not(.on) { display: none; }
+.views .src { display: inline-block; margin-top: .6rem; font: 400 .78rem var(--font-code); }
+.views figcaption { padding: 0 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); }
+
+/* Figures: shaping runs and traces */
+.shape, .trace { margin: .5rem 0 1.75rem; overflow-x: auto; }
+.shape table, .trace table { display: table; margin: 0; font-size: .85rem; }
+.shape td.font, .shape td.opt { font: 400 .78rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.in .txt { display: block; font: 400 1.05rem var(--font-code); }
+.shape td.in .cps { display: block; font: 400 .7rem var(--font-code); color: var(--muted); white-space: nowrap; }
+.shape td.out code, .trace td.buf code { background: none; padding: 0; white-space: nowrap; color: var(--hit); font-weight: 600; }
+.shape td.out code { white-space: pre; }
+.trace { border: 1px solid var(--rule); border-radius: 6px; }
+.trace-head { padding: .5rem .75rem; border-bottom: 1px solid var(--rule); background: var(--well); }
+.trace-head code { background: none; font-size: .78rem; color: var(--muted); }
+.trace td { padding: .3rem .75rem; }
+.trace td.what { font: 400 .78rem var(--font-code); white-space: nowrap; color: var(--ink); }
+.trace tr:last-child td { border-bottom: 0; }
+
+/* Figures: example programs, their output, and live demos. The glyphs are
+   black on transparent, so they sit on white in dark mode too. */
+.listing { margin: .5rem 0 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--well); }
+.listing figcaption { padding: .45rem 1rem; border-bottom: 1px solid var(--rule); font: 400 .78rem var(--font-code); color: var(--muted); }
+.listing pre { padding: .9rem 1rem; }
+.example-output { margin: 0 0 1.75rem; }
+.example-output img { display: block; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); padding: .5rem; box-sizing: content-box; }
+.example-output img.vector { width: 24rem; }
+.example-output img.pixels { image-rendering: pixelated; }
+.flow > .example-output.text { max-width: var(--wide); }
+.example-output pre { background: var(--well); border: 1px solid var(--rule); border-radius: 6px; padding: .6rem 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.example-output figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+/* What kind of picture an output is: vector or raster */
+.kind { display: inline-block; margin-right: .4em; padding: 0 .45em; border: 1px solid var(--rule); border-radius: 3px; font: 600 .7rem var(--font-head); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.demo { margin: 0 0 1.75rem; padding: .75rem 1rem; border: 1px solid var(--rule); border-radius: 6px; font: 400 .85rem var(--font-head); }
+.demo input[type=text] { width: 16rem; max-width: 100%; font: inherit; }
+.demo input[type=number] { width: 4rem; font: inherit; }
+.demo-canvas { margin: .75rem 0 .25rem; overflow-x: auto; }
+.demo canvas { display: block; background: #fff; border: 1px solid var(--rule); }
+.demo-note { margin: 0; font-size: .78rem; color: var(--muted); }
+
+/* Figures: a command line, run when the page was built, and what it gives */
+.command-run { margin: .5rem 0 1.75rem; }
+.command-run pre { margin: 0; padding: .6rem 1rem; border-radius: 6px; background: var(--well); }
+.command-run pre.command-output { margin-top: .4rem; background: none; border: 1px solid var(--rule); }
+.command-run img { display: block; margin-top: .6rem; max-width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); }
+.command-run img.vector { width: 24rem; padding: .5rem; box-sizing: content-box; }
+.command-run img.pixels { image-rendering: pixelated; }
+.command-run figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+
+/* Figures: outlines drawn by hb-vector */
+.rasters { margin: .5rem 0 1.75rem; }
+.raster { margin: 0 0 .75rem; }
+.raster img { display: block; max-width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--rule); }
+.raster figcaption { font-size: .78rem; color: var(--muted); margin-top: .25rem; }
+.draw { margin: .5rem 0 1.75rem; border: 1px solid var(--rule); border-radius: 6px; padding: .75rem 1rem .5rem; }
+.draw .frames { display: flex; flex-wrap: wrap; gap: 1rem; }
+.draw.slider .frames { display: block; }
+.draw .frame { flex: 1 1 10rem; min-width: 0; }
+.draw .frame[hidden] { display: none; }
+.draw svg { display: block; width: 100%; height: auto; max-height: 14rem; color: var(--ink); }
+.draw.row svg { max-height: 9rem; }
+.draw .frame-label { font: 600 .75rem var(--font-code); color: var(--muted); margin-top: .35rem; }
+.draw .frame-shape { display: block; background: none; padding: 0; font-size: .78rem; color: var(--hit); font-weight: 600; white-space: nowrap; overflow-x: auto; }
+.draw.slider .frame-label { display: none; }
+.draw .control { display: flex; align-items: center; gap: .75rem; margin-top: .6rem; font: 600 .8rem var(--font-code); }
+.draw .control input { flex: 1; accent-color: var(--accent); }
+.draw .control output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; }
+.draw figcaption { margin-top: .5rem; color: var(--muted); font: 400 .75rem var(--font-code); }
+.draw figcaption code { background: none; padding: 0; }
+.ttx pre { padding: .9rem 1rem; max-height: 28rem; overflow: auto; }
+.ttx figcaption { padding: .5rem 1rem .6rem; color: var(--muted); font: 400 .78rem var(--font-code); border-top: 1px solid var(--rule); }
+.info td.out pre { margin: 0; }
+.info td.out code { white-space: pre; }
+
+footer.version { margin: 1.25rem 0 2rem; font: 400 .75rem var(--font-head); color: var(--muted); }
+footer.version a { color: inherit; }
+nav.pager { display: flex; justify-content: space-between; gap: 1rem; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid var(--rule); font: 500 .95rem var(--font-head); }
+
+@media (max-width: 600px) {
+  body { font-size: 1rem; }
+  h1 { font-size: 2rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+/* Text for one medium only: the screen hides print-only text, and print
+   (the PDF build, or printing a page) hides screen-only text. */
+.print-only { display: none !important; }
+@media print {
+  .screen-only { display: none !important; }
+  .print-only { display: revert !important; }
+}
+/* The two indexes. */
+.index .index-letter { margin-top: 1.25rem; }
+.index .index-letter h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+.index ul { list-style: none; margin: 0; padding: 0; columns: 2 16rem; column-gap: 2rem; }
+.index li { break-inside: avoid; margin: 0 0 .2rem; padding-left: 1.2em; text-indent: -1.2em; line-height: 1.4; }
+.index a.loc { font-variant-numeric: tabular-nums; }
+.index a.loc.def { font-weight: 700; }
+.index .term code { font-size: .9em; }
+</style>
+
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div><span class="book"><a href="title.html">How HarfBuzz Works</a></span> <span class="sub">From Unicode to positioned glyphs, and everything in between</span></div>
+    <span class="ver">HarfBuzz 15.1.0</span>
+  </header>
+  <details class="contents"><summary>Contents</summary><nav class="toc"><div class="toc-section"><ol><li><a href="title.html">How HarfBuzz Works</a></li><li><a href="foreword.html">Foreword</a></li><li><a href="preface.html">Preface</a></li><li><a href="introduction.html">Introduction</a></li><li><a href="notation.html">Reading this book</a></li></ol></div><div class="toc-section"><p class="toc-head">Part I: Getting started</p><ol><li><span class="num">1</span> <a href="why-shaping-exists.html">Why shaping exists</a></li><li><span class="num">2</span> <a href="building-harfbuzz.html">Building HarfBuzz</a></li><li><span class="num">3</span> <a href="command-line-tools.html">The command-line tools</a></li><li><span class="num">4</span> <a href="quick-start.html">Quick start: shaping text, then drawing it</a></li></ol></div><div class="toc-section"><p class="toc-head">Part II: Foundations</p><ol><li><span class="num">5</span> <a href="fonts-as-bytes.html">Fonts as bytes</a></li><li><span class="num">6</span> <a href="trust-nothing-the-sanitizer.html">Trust nothing: the sanitizer</a></li><li><span class="num">7</span> <a href="blobs-faces-and-lazy-tables.html">Blobs, faces and lazy tables</a></li><li><span class="num">8</span> <a href="fonts-and-font-functions.html">Fonts and font functions</a></li><li><span class="num">9</span> <a href="where-metrics-come-from.html">Where metrics come from</a></li></ol></div><div class="toc-section"><p class="toc-head">Part III: Text in</p><ol><li><span class="num">10</span> <a href="unicode-inside-harfbuzz.html">Unicode inside HarfBuzz</a></li><li><span class="num">11</span> <a href="buffers.html">Buffers</a></li><li><span class="num">12</span> <a href="hb_shape-and-its-backends.html">hb_shape and its backends</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IV: Planning</p><ol><li><span class="num">13</span> <a href="shape-plans-and-their-cache.html">Shape plans and their cache</a></li><li><span class="num">14</span> <a href="from-features-to-lookups.html">From features to lookups</a></li><li><span class="num">15</span> <a href="choosing-a-script-shaper.html">Choosing a script shaper</a></li></ol></div><div class="toc-section"><p class="toc-head">Part V: The pipeline</p><ol><li><span class="num">16</span> <a href="pipeline-step-by-step.html">The pipeline, step by step</a></li><li><span class="num">17</span> <a href="normalization.html">Normalization</a></li><li><span class="num">18</span> <a href="gsub.html">GSUB: substituting glyphs</a></li><li><span class="num">19</span> <a href="gpos.html">GPOS: positioning glyphs</a></li><li><span class="num">20</span> <a href="fallbacks.html">Fallbacks</a></li><li><span class="num">21</span> <a href="legacy-kern.html">Legacy kern</a></li><li><span class="num">22</span> <a href="vertical-text.html">Vertical text</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VI: Scripts</p><ol><li><span class="num">23</span> <a href="joining-scripts.html">Joining scripts</a></li><li><span class="num">24</span> <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a></li><li><span class="num">25</span> <a href="indic-model.html">The Indic model</a></li><li><span class="num">26</span> <a href="khmer-and-myanmar.html">Khmer and Myanmar</a></li><li><span class="num">27</span> <a href="universal-shaping-engine.html">The Universal Shaping Engine</a></li><li><span class="num">28</span> <a href="dotted-circles-and-broken-clusters.html">Dotted circles and broken clusters</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VII: Apple Advanced Typography</p><ol><li><span class="num">29</span> <a href="aat-inside-harfbuzz.html">AAT inside HarfBuzz</a></li><li><span class="num">30</span> <a href="aat-positioning.html">AAT positioning</a></li></ol></div><div class="toc-section"><p class="toc-head">Part VIII: Variations</p><ol><li><span class="num">31</span> <a href="design-space.html">Design space</a></li><li><span class="num">32</span> <a href="deltas.html">Deltas</a></li><li><span class="num">33</span> <a href="varying-outlines.html">Varying outlines</a></li><li><span class="num">34</span> <a href="variable-components.html">VARC: variable components</a></li></ol></div><div class="toc-section"><p class="toc-head">Part IX: Drawing</p><ol><li><span class="num">35</span> <a href="drawing-outlines.html">Drawing outlines</a></li><li><span class="num">36</span> <a href="color.html">Color</a></li><li><span class="num">37</span> <a href="hb-raster.html">hb-raster: rendering to pixels</a></li><li><span class="num">38</span> <a href="hb-vector.html">hb-vector: rendering to SVG and PDF</a></li><li><span class="num">39</span> <a href="hb-gpu.html">hb-gpu: rendering on the GPU</a></li></ol></div><div class="toc-section"><p class="toc-head">Part X: Writing fonts</p><ol><li><span class="num">40</span> <a href="subsetting.html">Subsetting</a></li><li><span class="num">41</span> <a href="writing-tables.html">Writing tables</a></li><li><span class="num">42</span> <a href="instancing.html">Instancing</a></li><li><span class="num">43</span> <a href="hb-depend.html">hb-depend: the glyph dependency graph</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XI: Using HarfBuzz</p><ol><li><span class="num">44</span> <a href="for-applications.html">For applications</a></li><li><span class="num">45</span> <a href="integrations.html">Integrations: FreeType, cairo, ICU and the platforms</a></li><li><span class="num">46</span> <a href="other-tables.html">Other tables</a></li></ol></div><div class="toc-section"><p class="toc-head">Part XII: HarfBuzz and its relatives</p><ol><li><span class="num">47</span> <a href="testing-harfbuzz.html">Testing HarfBuzz</a></li><li><span class="num">48</span> <a href="harfrust.html">HarfRust</a></li><li><span class="num">49</span> <a href="family.html">The family</a></li></ol></div><div class="toc-section"><p class="toc-head">Appendices</p><ol><li><span class="num">A</span> <a href="feature-order.html">Feature order</a></li><li><span class="num">B</span> <a href="reading-feature-files.html">Reading feature files</a></li><li><span class="num">C</span> <a href="reading-harfbuzz-cpp.html">Reading HarfBuzz’s C++</a></li><li><span class="num">D</span> <a href="limits.html">Limits</a></li><li><span class="num">E</span> <a href="compile-time-configuration.html">Compile-time configuration</a></li><li><span class="num">F</span> <a href="regenerating-the-unicode-and-shaping-tables.html">Regenerating the Unicode and shaping tables</a></li></ol></div><div class="toc-section"><ol><li><a href="glossary.html">Glossary</a></li><li><a href="bibliography.html">Bibliography</a></li><li><a href="credits.html">Credits</a></li><li><a href="general-index.html">Index</a></li><li><a href="code-index.html">Code index</a></li><li><a href="colophon.html">Colophon</a></li></ol></div></nav></details>
+  <main class="flow">
+<p class="eyebrow">Part V · The pipeline</p>
+<h1 id="fallbacks">20. Fallbacks</h1>
+<p id="ix-1">A font doesn’t have to have GPOS. Plenty of fonts in use have no layout tables at all, or a GSUB and no GPOS, or a <code>kern</code> table from the 1990s and nothing else. HarfBuzz still has to put the accent somewhere, give an em space its width and, where it can, kern. It does each of these itself, from Unicode properties and the font’s metrics, when the font doesn’t.</p>
+<p id="ix-2">This chapter is about those <strong>fallbacks</strong> inside the <code>ot</code> backend: what HarfBuzz does in place of a table the font lacks. There are four. Marks are placed over and under their bases from glyph extents (steps 10 and 20 in <a href="pipeline-step-by-step.html">The pipeline, step by step</a>). Marks lose their advance, and are moved back to make up for it (step 18). Space characters the font has no glyph for get suitable widths (step 15). And kerning can come from the font funcs (step 17). They are not the <code>fallback</code> <em>backend</em>, which maps characters to glyphs and does nothing else (<a href="hb_shape-and-its-backends.html#fallback">hb_shape and its backends</a>). Two other fallbacks belong to script shapers: Arabic shaped from the presentation forms in the <code>cmap</code> when GSUB lacks the joining features is in <a href="joining-scripts.html">Joining scripts</a>, and Thai shaped with the private-use glyphs of old Thai fonts is in <a href="hebrew-thai-lao-and-hangul.html">Hebrew, Thai, Lao and Hangul</a>.</p>
+<p id="ix-3">The examples use a test font, <code>fonts/fallbacks/fallback.ttf</code>, with no GDEF, no GPOS and no <code>kern</code>, and variants of it with one table added. Unlike the other chapters’ fonts, its marks have outlines, drawn where a designer might draw them, because fallback positioning works from the boxes around glyphs’ ink. Its bases are boxes of different heights: <code>o</code> is 500 units tall, <code>l</code> and <code>f</code> 750. Every result on this page was produced by HarfBuzz 15.1.0 when the page was built.</p>
+<h2 id="who-decides">Who decides</h2>
+<p id="ix-4">Which fallbacks run is decided once, when the shape plan is made, in <code>hb_ot_shape_planner_t::compile</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L106"><code>hb-ot-shape.cc:106</code></a>). Here are its decisions about positioning, trimmed of the <code>#ifdef</code>s that leave out AAT and <code>kern</code> in smaller builds:</p>
+<pre><code class="language-c++">bool disable_gpos = plan.shaper-&gt;gpos_tag &amp;&amp;
+                    plan.shaper-&gt;gpos_tag != plan.map.chosen_script[1];
+bool has_gpos = !disable_gpos &amp;&amp; hb_ot_layout_has_positioning (face);
+
+if (has_kerx &amp;&amp; !(has_gsub &amp;&amp; has_gpos)) plan.apply_kerx = true;
+else if (has_gpos)                        plan.apply_gpos = true;
+
+if (!plan.apply_kerx &amp;&amp; (!has_gpos_kern || !plan.apply_gpos))
+{
+  if (has_kerx) plan.apply_kerx = true;
+  else if (hb_ot_layout_has_kerning (face))
+    plan.apply_kern = script_fallback_position; // Not all shapers apply legacy `kern`
+}
+
+plan.apply_fallback_kern = script_fallback_position &amp;&amp;
+                           !(plan.apply_gpos || plan.apply_kerx || plan.apply_kern);
+
+plan.zero_marks = script_zero_marks &amp;&amp; !plan.apply_kerx &amp;&amp;
+                  (!plan.apply_kern || !hb_ot_layout_has_machine_kerning (face));
+
+plan.adjust_mark_positioning_when_zeroing = !plan.apply_gpos &amp;&amp; !plan.apply_kerx &amp;&amp;
+                  (!plan.apply_kern || !hb_ot_layout_has_cross_kerning (face));
+
+plan.fallback_mark_positioning = plan.adjust_mark_positioning_when_zeroing &amp;&amp;
+                                 script_fallback_position;
+
+if (plan.apply_morx)
+  plan.adjust_mark_positioning_when_zeroing = false;
+</code></pre>
+<p id="ix-5">Four plan flags come out of it, besides the choice of table:</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Means</th>
+<th>True when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>zero_marks</code></td>
+<td id="ix-6">marks lose their advance (step 18, or before GPOS)</td>
+<td id="ix-7">the shaper zeroes marks, and there is no <code>kerx</code> and no state-machine <code>kern</code></td>
+</tr>
+<tr>
+<td><code>adjust_mark_positioning_when_zeroing</code></td>
+<td id="ix-8">a zeroed mark is moved back by its old advance</td>
+<td id="ix-9">no GPOS, no <code>kerx</code>, no cross-stream <code>kern</code>, no <code>morx</code></td>
+</tr>
+<tr>
+<td><code>fallback_mark_positioning</code></td>
+<td id="ix-10">marks are recategorized (step 10) and placed from extents (step 20)</td>
+<td id="ix-11">the same, <code>morx</code> aside, and the shaper allows it</td>
+</tr>
+<tr>
+<td><code>apply_fallback_kern</code></td>
+<td>the font funcs are asked for kerning (step 17)</td>
+<td id="ix-12">the shaper allows it, and there is no GPOS, <code>kerx</code> or <code>kern</code> to apply</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-13">Two settings of the script shaper feed these: <code>zero_width_marks</code> and <code>fallback_position</code> (<a href="choosing-a-script-shaper.html#what-the-choice-decides">Choosing a script shaper</a>). They are copied into <code>script_zero_marks</code> and <code>script_fallback_position</code> when the planner is made (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L95"><code>hb-ot-shape.cc:95</code></a>), before an AAT font’s shaper is swapped for <code>dumber</code>. Read from the shapers’ source:</p>
+<table>
+<thead>
+<tr>
+<th>Shaper</th>
+<th>Zeroes marks</th>
+<th><code>fallback_position</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>default</td>
+<td>late</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>Arabic, Hebrew</td>
+<td>late</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>Hangul</td>
+<td>no</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>Thai (and Lao)</td>
+<td>late</td>
+<td>no</td>
+</tr>
+<tr>
+<td id="ix-14">USE, Myanmar</td>
+<td>early</td>
+<td>no</td>
+</tr>
+<tr>
+<td id="ix-15">Indic, Khmer, Zawgyi</td>
+<td>no</td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>dumber</code></td>
+<td>no</td>
+<td>no</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-16">So a font gets fallback mark positioning only if it has no GPOS at all. A GPOS that holds nothing but kerning turns it off as surely as one full of anchors: what is tested is whether the table has data (<code>hb_ot_layout_has_positioning</code>), not whether it has a <code>mark</code> feature. A <code>kern</code> table leaves it on, unless the table has cross-stream kerning, which moves glyphs up and down and so might be placing marks itself. Here is the same text in <code>fallback.ttf</code> and in three variants: one with a GPOS holding a single kerning pair, <code>o o</code>, and no <code>mark</code> feature; one with that pair in a <code>kern</code> table; and one whose <code>kern</code> subtable is marked cross-stream:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">oo◌́</span><span class="cps">U+006F U+006F U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|o=1+500|acutecomb=1@-25,12+0]</code></td></tr><tr><td class="font">with-gpos.ttf</td><td class="in"><span class="txt">oo◌́</span><span class="cps">U+006F U+006F U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+400|o=1+500|acutecomb=1+0]</code></td></tr><tr><td class="font">kern-table.ttf</td><td class="in"><span class="txt">oo◌́</span><span class="cps">U+006F U+006F U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+450|o=1@-50,0+450|acutecomb=1@25,12+0]</code></td></tr><tr><td class="font">cross-kern.ttf</td><td class="in"><span class="txt">oo◌́</span><span class="cps">U+006F U+006F U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|o=1@0,-100+500|acutecomb=1@0,-100+0]</code></td></tr></tbody></table></div>
+<p id="ix-17">Only <code>fallback.ttf</code> and <code>kern-table.ttf</code> place the acute. In the other two it keeps the position its outline gives it, with no advance.</p>
+<p id="ix-18">A trace shows the fallback running, as “start fallback mark”, after GSUB and after the advances are in place:</p>
+<div class="trace"><div class="trace-head"><code>hb-shape fallback.ttf "o◌́" --language=en --trace</code></div><table><tbody><tr><td class="what">end table GSUB script tag &#x27;latn&#x27;</td><td class="buf"><code>[o=0|acutecomb=0]</code></td></tr><tr><td class="what">start fallback mark</td><td class="buf"><code>[o=0+500|acutecomb=0+0]</code></td></tr><tr><td class="what">end fallback mark</td><td class="buf"><code>[o=0+500|acutecomb=0@-25,12+0]</code></td></tr></tbody></table></div>
+<p id="ix-19"><strong>Hebrew’s GPOS tag.</strong> The Hebrew shaper is the only one with a <code>gpos_tag</code>. If GPOS chose a script other than <code>hebr</code>, as a font with only <code>DFLT</code> does, <code>has_gpos</code> is false and the whole GPOS is ignored, kerning and all. Fallback mark positioning takes over, and a <code>kern</code> table, if there is one, or fallback kerning takes the GPOS kerning’s place. <a href="choosing-a-script-shaper.html#hebrew-and-its-gpos-tag">Choosing a script shaper</a> shows a hiriq losing its anchor this way.</p>
+<p id="ix-20"><strong>AAT fonts.</strong> A font shaped with <code>morx</code> gets the <code>dumber</code> shaper in place of any but the default one, and <code>dumber</code> neither zeroes marks nor allows fallback positioning. But the plan never reads <code>dumber</code>’s <code>fallback_position</code>: it uses the original shaper’s, copied before the swap. So an Arabic run in a <code>morx</code> font with no GPOS or <code>kerx</code> still has its marks placed from extents. <code>with-morx.ttf</code> is <code>fallback.ttf</code> with a <code>morx</code> table, whose one subtable changes <code>period</code> into <code>zero</code> and doesn’t touch this text:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">بَ</span><span class="cps">U+0628 U+064E</span></td><td class="opt">--language=ar</td><td class="out"><code>[fatha=0@600,-19+0|beh=0+600]</code></td></tr><tr><td class="font">with-morx.ttf</td><td class="in"><span class="txt">بَ</span><span class="cps">U+0628 U+064E</span></td><td class="opt">--language=ar</td><td class="out"><code>[fatha=0@600,-19+0|beh=0+600]</code></td></tr><tr><td class="font">with-morx.ttf</td><td class="in"><span class="txt">ก่ก</span><span class="cps">U+0E01 U+0E48 U+0E01</span></td><td class="opt">--language=th</td><td class="out"><code>[kokai=0+550|maiek=0+200|kokai=2+550]</code></td></tr></tbody></table></div>
+<p id="ix-21">The fatha is placed the same with <code>morx</code> as without. Thai, whose shaper doesn’t allow fallback positioning, gets <code>dumber</code>’s settings: the mark isn’t zeroed and keeps its 200-unit advance. What a <code>morx</code> font loses is the adjustment of zeroed marks, “because Apple Color Emoji assumes this will NOT be done when forming emoji sequences”, as the comment says (issue #2967).</p>
+<h2 id="zeroing-marks">Zeroing marks</h2>
+<p id="ix-22">A <strong>mark</strong> here is a glyph whose GDEF class is mark. If the font has no GDEF glyph classes, HarfBuzz makes them up from the general categories: a non-spacing mark (Mn) that isn’t a default ignorable is a mark, and everything else is a base (<a href="gsub.html#glyph-properties">GSUB</a>). A spacing mark (Mc) is a base, so it keeps its advance.</p>
+<p id="ix-23">Shapers that zero marks do it either “early”, before GPOS, or “late”, after it (<code>hb_ot_position_plan</code>, <a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L1029"><code>hb-ot-shape.cc:1029</code></a>). Either way it is <code>zero_mark_widths_by_gdef</code> (<code>:988</code>), which sets each mark’s advance to zero, and first, if asked, moves its offset back by the advance it had:</p>
+<pre><code class="language-c++">if (_hb_glyph_info_is_mark (&amp;info[i]))
+{
+  if (adjust_offsets)
+    adjust_mark_offsets (&amp;buffer-&gt;pos[i]);   /* offset -= advance */
+  zero_mark_width (&amp;buffer-&gt;pos[i]);        /* advance = 0 */
+}
+</code></pre>
+<p id="ix-24">The adjustment is made only when <code>adjust_mark_positioning_when_zeroing</code> is set and the run is forward, left to right or top to bottom (<code>:1040</code>). The comment there explains why:</p>
+<blockquote>
+<p id="ix-25">If the font has no GPOS and direction is forward, then when zeroing mark widths, we shift the mark with it, such that the mark is positioned hanging over the previous glyph. When direction is backward we don’t shift and it will end up hanging over the next glyph after the final reordering.</p>
+</blockquote>
+<p id="ix-26">A mark with an advance was probably drawn over that advance, so taking the advance away without moving it back would leave it over the next letter. With GPOS, no adjustment is made: GPOS is trusted to have placed the mark. In a right-to-left run the mark comes before its base once the buffer is reversed, and its zero advance puts it at the base’s origin, so it needs no adjustment.</p>
+<p id="ix-27">The Thai shaper zeroes marks but doesn’t allow fallback positioning, so it shows the adjustment on its own. The Thai MAI EK in the test fonts has an advance of 200 units and its outline over that advance:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">ก่ก</span><span class="cps">U+0E01 U+0E48 U+0E01</span></td><td class="opt">--language=th</td><td class="out"><code>[kokai=0+550|maiek=0@-200,0+0|kokai=2+550]</code></td></tr><tr><td class="font">with-gpos.ttf</td><td class="in"><span class="txt">ก่ก</span><span class="cps">U+0E01 U+0E48 U+0E01</span></td><td class="opt">--language=th</td><td class="out"><code>[kokai=0+550|maiek=0+0|kokai=2+550]</code></td></tr></tbody></table></div>
+<p id="ix-28">Without GPOS the tone mark is moved back 200 units, over its KO KAI. With a GPOS that has no anchors for it, it loses its advance and stays where it was drawn, over the start of the next letter.</p>
+<p id="ix-29">When fallback positioning runs, the offsets this step sets are replaced, as the comment at <code>:1037</code> says: “If fallback positioning happens, we don’t care about this as it will be overridden.”</p>
+<h2 id="recategorizing-marks">Recategorizing marks</h2>
+<p id="ix-30">Unicode’s canonical combining classes from 200 to 240 are named after positions: 220 is Below, 230 Above, 232 Above_Right, and so on. The classes from 10 to 199 are not. Each is a “fixed position” class for one or a few marks of one script, Hebrew’s from 10 to 26, Arabic’s from 27 to 35, Thai’s 103 and 107, chosen so that canonical ordering sorts them, and they say nothing about where the mark goes. The fallback positioner understands only positions. So before it can use them, <code>_hb_ot_shape_fallback_mark_position_recategorize_marks</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-fallback.cc#L169"><code>hb-ot-shape-fallback.cc:169</code></a>) rewrites the class of every non-spacing mark into one of the positional ones, through <code>recategorize_combining_class</code> (<code>:35</code>). This is <strong>recategorizing</strong>. Read from the code, with Unicode’s classes in place of HarfBuzz’s <a href="unicode-inside-harfbuzz.html#modified-combining-classes">modified</a> ones, which are what it actually switches on:</p>
+<table>
+<thead>
+<tr>
+<th id="ix-31">Script</th>
+<th>Unicode class</th>
+<th>Marks</th>
+<th>Becomes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hebrew</td>
+<td>10–18, 20, 22</td>
+<td>sheva to qamats, qubuts, meteg</td>
+<td>Below (220)</td>
+</tr>
+<tr>
+<td></td>
+<td>23</td>
+<td>rafe</td>
+<td>Attached_Above (214)</td>
+</tr>
+<tr>
+<td></td>
+<td>24</td>
+<td>shin dot</td>
+<td>Above_Right (232)</td>
+</tr>
+<tr>
+<td></td>
+<td>19, 25</td>
+<td>holam, sin dot</td>
+<td>Above_Left (228)</td>
+</tr>
+<tr>
+<td></td>
+<td>26</td>
+<td>point varika</td>
+<td>Above (230)</td>
+</tr>
+<tr>
+<td></td>
+<td>21</td>
+<td>dagesh</td>
+<td>unchanged</td>
+</tr>
+<tr>
+<td>Arabic, Syriac</td>
+<td>27, 28, 30, 31, 33–36</td>
+<td>fathatan, dammatan, fatha, damma, shadda, sukun, superscript alef and alaph</td>
+<td>Above</td>
+</tr>
+<tr>
+<td></td>
+<td>29, 32</td>
+<td>kasratan, kasra</td>
+<td>Below</td>
+</tr>
+<tr>
+<td>Thai</td>
+<td>103</td>
+<td>sara u, sara uu</td>
+<td>Below_Right (222)</td>
+</tr>
+<tr>
+<td></td>
+<td>107</td>
+<td id="ix-32">the tone marks</td>
+<td>Above_Right</td>
+</tr>
+<tr>
+<td></td>
+<td>9</td>
+<td>phinthu (U+0E3A)</td>
+<td>Below_Right</td>
+</tr>
+<tr>
+<td></td>
+<td>0</td>
+<td>U+0E31, U+0E34–0E37, U+0E47, U+0E4C–0E4E</td>
+<td>Above_Right</td>
+</tr>
+<tr>
+<td>Lao</td>
+<td>118</td>
+<td>sign u, sign uu</td>
+<td>Below</td>
+</tr>
+<tr>
+<td></td>
+<td>122</td>
+<td id="ix-33">the tone marks</td>
+<td>Above</td>
+</tr>
+<tr>
+<td></td>
+<td>0</td>
+<td>U+0EB1, U+0EB4–0EB7, U+0EBB, U+0ECC, U+0ECD; U+0EBC</td>
+<td>Above; Below</td>
+</tr>
+<tr>
+<td>Tibetan</td>
+<td>129, 132</td>
+<td>sign aa, sign u</td>
+<td>Below</td>
+</tr>
+<tr>
+<td></td>
+<td>130</td>
+<td>sign i</td>
+<td>Above</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-34">Any class of 200 or more is kept, and so is any other class, such as 1 (overlays), 7 (nuktas) and 9 (viramas, apart from Thai’s). Only marks with general category Mn are touched (<code>:180</code>).</p>
+<p id="ix-35">It runs in step 10 (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L895"><code>hb-ot-shape.cc:895</code></a>), in an odd place, as its own comment admits: “This is unfortunate to go here, but necessary...”. It has to come after normalization, which sorts marks by their classes and decides from them which marks may compose with a base. Positional classes would sort differently, and two marks given the same class would block each other’s composition (<a href="normalization.html#round-two-reorder">Normalization</a>). And it has to come before step 11, which replaces each character in the buffer with its glyph, because the Thai and Lao cases look at the character itself.</p>
+<p id="ix-36">Most rows of that table are rarely used. Thai and Lao always get the Thai shaper, which doesn’t allow fallback positioning: <code>NEWS</code> for 0.9.7 says “Disable fallback positioning for Indic and Thai shapers”, while 0.9.4’s had announced “Better fallback glyph positioning, specially with Thai / Lao marks”. Tibetan goes to the USE, which doesn’t allow it either, unless the font has a <code>DFLT</code> or <code>latn</code> script and no <code>tibt</code>, which sends it to the default shaper. So the Thai rows run only for Thai text given another script, as here:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">ก่</span><span class="cps">U+0E01 U+0E48</span></td><td class="opt">--language=th</td><td class="out"><code>[kokai=0+550|maiek=0@-200,0+0]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">ก่</span><span class="cps">U+0E01 U+0E48</span></td><td class="opt">--language=th --script=Latn</td><td class="out"><code>[kokai=0+550|maiek=0@-150,-19+0]</code></td></tr></tbody></table></div>
+<p id="ix-37">Under <code>Latn</code>, the default shaper places the tone mark at the right of the KO KAI, above it.</p>
+<h2 id="placing-marks">Placing marks</h2>
+<p id="ix-38">The positioner itself is <code>_hb_ot_shape_fallback_mark_position</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-fallback.cc#L470"><code>hb-ot-shape-fallback.cc:470</code></a>). It runs in step 20, after GPOS would have, after attachments have been resolved and default ignorables zeroed.</p>
+<h3 id="bases-and-their-marks">Bases and their marks</h3>
+<p id="ix-39">It divides the buffer into runs. A run starts at each glyph that is not a mark (by general category, Mn, Mc or Me), not hidden and not a default ignorable (<code>:487</code>). The buffer’s cluster numbers aren’t looked at. Within a run, the first glyph that isn’t a mark is the base, and the marks after it are its marks, passing over any hidden or ignorable glyphs on the way (<code>:442</code>). A ZWJ or a CGJ between a letter and its accent doesn’t separate them:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">o◌́</span><span class="cps">U+006F U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|acutecomb=0@-25,12+0]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">o⟨ZWJ⟩◌́</span><span class="cps">U+006F U+200D U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|space=0+0|acutecomb=0@-25,12+0]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">o◌͏◌́</span><span class="cps">U+006F U+034F U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|space=0+0|acutecomb=0@-25,12+0]</code></td></tr></tbody></table></div>
+<p id="ix-40">The ZWJ has become the space glyph with no advance (<a href="unicode-inside-harfbuzz.html#default-ignorables">Unicode inside HarfBuzz</a>), and the acute is still over the <code>o</code>. A run with no marks is left alone. One with marks is marked unsafe to break from the base to its last mark (<code>:334</code>).</p>
+<p id="ix-41">Here the mark’s <em>category</em> decides what is a mark, not its GDEF class, and its <em>combining class</em> decides how it is placed. A mark whose class is 0 isn’t placed at all: it keeps its offset, and its advance counts toward the distance back to the base for the marks after it (<code>:414</code>).</p>
+<h3 id="the-bases-box">The base’s box</h3>
+<p id="ix-42">The positioner asks the font funcs for the base’s extents (<a href="where-metrics-come-from.html#glyph-extents">Where metrics come from</a>), and then changes them (<code>:344</code>):</p>
+<pre><code class="language-c++">base_extents.y_bearing += buffer-&gt;pos[base].y_offset;
+/* Use horizontal advance for horizontal positioning.
+ * Generally a better idea.  Also works for zero-ink glyphs.  See:
+ * https://github.com/harfbuzz/harfbuzz/issues/1532 */
+base_extents.x_bearing = 0;
+base_extents.width = font-&gt;get_glyph_h_advance (buffer-&gt;info[base].codepoint);
+</code></pre>
+<p id="ix-43">(trimmed). So the box a mark is placed against is the base’s ink vertically and its advance horizontally. So a mark goes in the middle of the letter’s space even when its ink is off-center, and a base with no ink still has a width to center on. If the base has no extents, its marks are given no advance and left where they are (<code>:340</code>).</p>
+<h3 id="each-mark-by-its-class">Each mark, by its class</h3>
+<p id="ix-44">For each mark, <code>position_mark</code> (<code>:211</code>) asks for the mark’s own extents, and works out an offset that moves its ink to the right place against the box. Horizontally:</p>
+<table>
+<thead>
+<tr>
+<th>Classes</th>
+<th>The mark’s ink is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>233 Double_Below, 234 Double_Above</td>
+<td id="ix-45">centered on the base’s right edge, in a left-to-right run, or on its left edge, in a right-to-left one, so that it spans two letters; otherwise centered</td>
+</tr>
+<tr>
+<td>200 Attached_Below_Left, 218 Below_Left, 228 Above_Left</td>
+<td>aligned with the left edge</td>
+</tr>
+<tr>
+<td>216 Attached_Above_Right, 222 Below_Right, 232 Above_Right</td>
+<td>aligned with the right edge</td>
+</tr>
+<tr>
+<td>every other class</td>
+<td>centered</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-46">Vertically, with a <strong>gap</strong> of a sixteenth of the font’s y scale, 62 units in a 1000-unit font at its natural size:</p>
+<table>
+<thead>
+<tr>
+<th>Classes</th>
+<th>The mark’s ink is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>218, 220 Below, 222, 233</td>
+<td id="ix-47">a gap below the base</td>
+</tr>
+<tr>
+<td>200, 202 Attached_Below</td>
+<td>just below the base</td>
+</tr>
+<tr>
+<td>228, 230 Above, 232, 234</td>
+<td id="ix-48">a gap above the base</td>
+</tr>
+<tr>
+<td>214 Attached_Above, 216</td>
+<td>just above the base</td>
+</tr>
+<tr>
+<td>every other class</td>
+<td>where its outline puts it</td>
+</tr>
+</tbody>
+</table>
+<p>Two corrections follow. A below mark is never moved up: if its outline is already low enough, it stays (<code>:288</code>). An above mark drawn higher than it needs to be is moved down only half way (<code>:310</code>): “Don’t shift down &quot;above&quot; marks too much.” <code>fallback.ttf</code> has its acute drawn from 550 to 700 units, its grave from 800 to 950, and its dot below from −100 to −200:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">o◌́</span><span class="cps">U+006F U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|acutecomb=0@-25,12+0]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">l◌́</span><span class="cps">U+006C U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[l=0+250|acutecomb=0@100,262+0]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">o◌̀</span><span class="cps">U+006F U+0300</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|gravecomb=0@0,-119+0]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">o◌̣</span><span class="cps">U+006F U+0323</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|dotbelowcomb=0+0]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">o◌̧</span><span class="cps">U+006F U+0327</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|cedillacomb=0+0]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">o◌̛</span><span class="cps">U+006F U+031B</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|horncomb=0@0,100+0]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">o◌͡o</span><span class="cps">U+006F U+0361 U+006F</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|brevedbl=0@250,-19+0|o=2+500]</code></td></tr></tbody></table></div>
+<p id="ix-49">The acute moves up 12 units over the <code>o</code>, to 562, a gap above its top, and 262 over the taller <code>l</code>. The grave belongs at 562 too, 238 units below where it is drawn, and is moved down 119. The dot below is already lower than a gap below the <code>o</code>, so it isn’t moved. The cedilla, Attached_Below, goes just below the base, with no gap, which is where it is drawn already. The horn, Attached_Above_Right, goes on top of the <code>o</code> at its right edge, which is not where a horn belongs. The double inverted breve is centered on the join between the two <code>o</code>s.</p>
+<p id="ix-50">Every placed mark loses its advance, and gets an offset back to its base: in a forward run, the base’s advance plus those of any unplaced glyphs between them (<code>:411</code>). A right-to-left run needs no such offset, since after reversal the mark comes before its base.</p>
+<h3 id="stacking">Stacking</h3>
+<p>When a mark has been placed, the box is grown to include it, so that the next mark of the same class goes beyond it (<code>:294</code> and <code>:318</code>). The box is reset to the base’s whenever the class changes (<code>:401</code>):</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">o◌́◌́</span><span class="cps">U+006F U+0301 U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|acutecomb=0@-25,12+0|acutecomb=0@-25,224+0]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">o◌́◌̣◌́</span><span class="cps">U+006F U+0301 U+0323 U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|dotbelowcomb=0+0|acutecomb=0@-25,12+0|acutecomb=0@-25,224+0]</code></td></tr></tbody></table></div>
+<p id="ix-51">The second acute goes a gap above the first, at 224. In the second line the dot below sits between the two acutes as typed, but normalization has already sorted the marks by class, dot below (220) before the acutes (230), so the acutes are together and stack. That is a reason for running after normalization too: marks of one class are next to each other by then. Recategorizing can still separate them, since it gives several of Hebrew’s classes the same position while dagesh, between them in the sorted order, keeps a class of its own (inferred from the code). Drawn by hb-vector, which shapes before it draws:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -1002.5 3330 1242.5" role="img" aria-label="o◌́l◌́o◌̀o◌̣◌́◌́o◌̧o◌͡o at default">
+<g transform="scale(1,-1)">
+<path d="M50,0L50,500L450,500L450,0L50,0Z" fill="currentColor"/>
+<path d="M175,562.5L225,562.5L325,712.5L225,712.5L175,562.5Z" fill="currentColor"/>
+<path d="M550,0L550,750L700,750L700,0L550,0Z" fill="currentColor"/>
+<path d="M550,812.5L600,812.5L700,962.5L600,962.5L550,812.5Z" fill="currentColor"/>
+<path d="M800,0L800,500L1200,500L1200,0L800,0Z" fill="currentColor"/>
+<path d="M900,831.25L1000,831.25L1100,681.25L1050,681.25L900,831.25Z" fill="currentColor"/>
+<path d="M1300,0L1300,500L1700,500L1700,0L1300,0Z" fill="currentColor"/>
+<path d="M1450,-200L1450,-100L1550,-100L1550,-200L1450,-200Z" fill="currentColor"/>
+<path d="M1425,562.5L1475,562.5L1575,712.5L1475,712.5L1425,562.5Z" fill="currentColor"/>
+<path d="M1425,775L1475,775L1575,925L1475,925L1425,775Z" fill="currentColor"/>
+<path d="M1800,0L1800,500L2200,500L2200,0L1800,0Z" fill="currentColor"/>
+<path d="M1950,0L2050,0L2050,-150L1950,-150L1950,0Z" fill="currentColor"/>
+<path d="M2300,0L2300,500L2700,500L2700,0L2300,0Z" fill="currentColor"/>
+<path d="M2500,581.25L2500,631.25L3000,631.25L3000,581.25L2500,581.25Z" fill="currentColor"/>
+<path d="M2800,0L2800,500L3200,500L3200,0L2800,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[o=0+500|acutecomb=0@-25,12+0|l=2+250|acutecomb=2@100,262+0|o=4+500|gravecomb=4@0,-119+0|o=6+500|dotbelowcomb=6+0|acutecomb=6@-25,12+0|acutecomb=6@-25,224+0|o=10+500|cedillacomb=10+0|o=12+500|brevedbl=12@250,-19+0|o=14+500]</code></div></div><figcaption><code>hb-vector fallback.ttf "o◌́l◌́o◌̀o◌̣◌́◌́o◌̧o◌͡o"</code></figcaption></figure>
+<p id="ix-52">The same text in <code>with-gpos.ttf</code>, where every mark keeps its outline’s position:</p>
+<figure class="draw row"><div class="frames"><div class="frame"><svg viewBox="-40 -990 3330 1230" role="img" aria-label="o◌́l◌́o◌̀o◌̣◌́◌́o◌̧o◌͡o at default">
+<g transform="scale(1,-1)">
+<path d="M50,0L50,500L450,500L450,0L50,0Z" fill="currentColor"/>
+<path d="M200,550L250,550L350,700L250,700L200,550Z" fill="currentColor"/>
+<path d="M550,0L550,750L700,750L700,0L550,0Z" fill="currentColor"/>
+<path d="M450,550L500,550L600,700L500,700L450,550Z" fill="currentColor"/>
+<path d="M800,0L800,500L1200,500L1200,0L800,0Z" fill="currentColor"/>
+<path d="M900,950L1000,950L1100,800L1050,800L900,950Z" fill="currentColor"/>
+<path d="M1300,0L1300,500L1700,500L1700,0L1300,0Z" fill="currentColor"/>
+<path d="M1450,-200L1450,-100L1550,-100L1550,-200L1450,-200Z" fill="currentColor"/>
+<path d="M1450,550L1500,550L1600,700L1500,700L1450,550Z" fill="currentColor"/>
+<path d="M1450,550L1500,550L1600,700L1500,700L1450,550Z" fill="currentColor"/>
+<path d="M1800,0L1800,500L2200,500L2200,0L1800,0Z" fill="currentColor"/>
+<path d="M1950,0L2050,0L2050,-150L1950,-150L1950,0Z" fill="currentColor"/>
+<path d="M2300,0L2300,500L2700,500L2700,0L2300,0Z" fill="currentColor"/>
+<path d="M2250,600L2250,650L2750,650L2750,600L2250,600Z" fill="currentColor"/>
+<path d="M2800,0L2800,500L3200,500L3200,0L2800,0Z" fill="currentColor"/>
+</g>
+</svg><div class="frame-label">default</div><code class="frame-shape">[o=0+500|acutecomb=0+0|l=2+250|acutecomb=2+0|o=4+500|gravecomb=4+0|o=6+500|dotbelowcomb=6+0|acutecomb=6+0|acutecomb=6+0|o=10+500|cedillacomb=10+0|o=12+500|brevedbl=12+0|o=14+500]</code></div></div><figcaption><code>hb-vector with-gpos.ttf "o◌́l◌́o◌̀o◌̣◌́◌́o◌̧o◌͡o"</code></figcaption></figure>
+<h3 id="ligatures">Ligatures</h3>
+<p id="ix-53">A ligature carries the number of its components, and each mark that GSUB passed over while forming it carries the component it followed (<a href="gsub.html#ligature-substitution">GSUB</a>). The fallback positioner divides the ligature’s advance into that many equal parts, and places each mark against its own part (<code>:371</code>). A mark with no component, or with a different ligature ID, goes on the last part. In a right-to-left script the parts are counted from the right.</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">f◌́i</span><span class="cps">U+0066 U+0301 U+0069</span></td><td class="opt">--language=en</td><td class="out"><code>[f_i=0+650|acutecomb=0@-263,262+0]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">fi◌́</span><span class="cps">U+0066 U+0069 U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[f_i=0+650|acutecomb=0@62,262+0]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">f◌́f◌́i◌́</span><span class="cps">U+0066 U+0301 U+0066 U+0301 U+0069 U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[f_f_i=0+1050|acutecomb=0@-650,262+0|acutecomb=0@-300,262+0|acutecomb=0@50,262+0]</code></td></tr></tbody></table></div>
+<p id="ix-54">The acute over the first half of <code>f_i</code> is 325 units, half of 650, to the left of the one over the second half. The three on <code>f_f_i</code> are a third of 1050 apart. GPOS, with an anchor for each component, can do better, as <a href="gpos.html#mark-to-ligature">GPOS: positioning glyphs</a> shows.</p>
+<h3 id="hebrew-and-arabic">Hebrew and Arabic</h3>
+<p id="ix-55">The same rules place Hebrew and Arabic points, after recategorizing:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">בִּ</span><span class="cps">U+05D1 U+05BC U+05B4</span></td><td class="opt">--language=he</td><td class="out"><code>[hiriq=0@600,0+0|dagesh=0@600,0+0|bet=0+600]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">שׁ</span><span class="cps">U+05E9 U+05C1</span></td><td class="opt">--language=he</td><td class="out"><code>[shindot=0@750,12+0|shin=0+700]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">שׂ</span><span class="cps">U+05E9 U+05C2</span></td><td class="opt">--language=he</td><td class="out"><code>[sindot=0@650,12+0|shin=0+700]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">بِّ</span><span class="cps">U+0628 U+0651 U+0650</span></td><td class="opt">--language=ar</td><td class="out"><code>[kasra=0@600,0+0|shadda=0@600,-19+0|beh=0+600]</code></td></tr></tbody></table></div>
+<p>The dagesh keeps its class, so it is centered and left at its drawn height, inside the letter. The hiriq is centered below. The shin dot goes to the right, the sin dot to the left. The shadda goes above and the kasra below the beh, each against the beh’s own box, since their classes differ. Both the shadda and the fatha are drawn higher than they need to be, and are moved down only half way.</p>
+<h3 id="what-it-doesnt-take-into-account">What it doesn’t take into account</h3>
+<p id="ix-56"><strong>The base’s horizontal offset.</strong> The base’s vertical offset is added to its box, but its horizontal one isn’t. <code>kern</code> and fallback kerning split a pair’s kerning between the two glyphs’ advances and move the second glyph back by half (<a href="legacy-kern.html#how-the-kerning-is-applied">Legacy kern</a>). Its mark is then placed as if it hadn’t moved:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">oo◌́</span><span class="cps">U+006F U+006F U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|o=1+500|acutecomb=1@-25,12+0]</code></td></tr><tr><td class="font">kern-table.ttf</td><td class="in"><span class="txt">oo◌́</span><span class="cps">U+006F U+006F U+0301</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+450|o=1@-50,0+450|acutecomb=1@25,12+0]</code></td></tr></tbody></table></div>
+<p id="ix-57">The second <code>o</code> has an advance of 450 and is drawn 50 units left of its pen position, so its ink is centered 200 units from that position. The acute is centered 250 units from it, as if the <code>o</code> hadn’t moved. To be centered over the ink it would need an offset of −25, not 25. This looks like a bug.</p>
+<blockquote>
+<p id="ix-58">Since 15.1.0: fixed on HarfBuzz main by <a href="https://github.com/harfbuzz/harfbuzz/commit/641971dd14283a97f5e7cf8a7f12ac6337db74f7"><code>641971d</code></a> (17 November 2026), so main includes the base’s x offset, and the acute over the kerned <code>o</code> is at −25.</p>
+</blockquote>
+<p id="ix-59"><strong>Left and Right.</strong> The comment in <code>position_mark</code> says “We don’t position LEFT and RIGHT marks”, but classes 224 and 226 fall into the <code>default</code> case of the horizontal switch, which centers the mark, and every placed mark loses its advance. The few characters in those classes are spacing marks, Mc, such as the Hangul tone marks and U+1D16D MUSICAL SYMBOL COMBINING AUGMENTATION DOT, which should follow its note:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">o𝅭</span><span class="cps">U+006F U+1D16D</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|augdot=0@-350,0+0]</code></td></tr><tr><td class="font">with-gpos.ttf</td><td class="in"><span class="txt">o𝅭</span><span class="cps">U+006F U+1D16D</span></td><td class="opt">--language=en</td><td class="out"><code>[o=0+500|augdot=0+200]</code></td></tr></tbody></table></div>
+<p id="ix-60">Without GPOS the dot is centered on the <code>o</code> and loses its 200-unit advance; with GPOS it keeps both. That too looks like a bug, or at least a comment that no longer matches the code.</p>
+<p id="ix-61"><strong>Synthetic slant.</strong> Fallback positioning runs after <code>position_finish_offsets</code>, which is where a synthetically slanted font has its vertically offset glyphs moved sideways to follow the slant (<a href="fonts-and-font-functions.html#slant">Fonts and font functions</a>). So a fallback-placed mark doesn’t follow the slant. Its extents are measured from the slanted outline, as <a href="fonts-and-font-functions.html#extents-of-a-synthetic-font">Fonts and font functions</a> shows, and centring them on the upright advance puts the mark over the middle of the upright letter, not over its slanted top. Synthetic bold, which changes the extents, is taken into account:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">o◌́</span><span class="cps">U+006F U+0301</span></td><td class="opt">--language=en --show-extents</td><td class="out"><code>[o=0+500&lt;50,500,400,-500&gt;|acutecomb=0@-25,12+0&lt;-300,700,150,-150&gt;]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt">o◌́</span><span class="cps">U+006F U+0301</span></td><td class="opt">--language=en --show-extents --font-bold=0.1</td><td class="out"><code>[o=0+600&lt;50,600,500,-600&gt;|acutecomb=0@-137,112+0&lt;-319,800,312,-250&gt;]</code></td></tr></tbody></table></div>
+<h2 id="spaces">Spaces</h2>
+<p id="ix-62"><a href="normalization.html#spaces-and-one-hyphen">Normalization</a> maps a space character the font has no glyph for to the glyph for U+0020, records which kind of space it was in the byte that holds a mark’s combining class, and sets the buffer flag <code>HAS_SPACE_FALLBACK</code>. In step 15, after the default advances are read and only if that flag is set (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc#L1024"><code>hb-ot-shape.cc:1024</code></a>), <code>_hb_ot_shape_fallback_spaces</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-fallback.cc#L559"><code>hb-ot-shape-fallback.cc:559</code></a>) gives each such space its width. The <strong>space fallback types</strong> come from <code>space_fallback_type</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh#L219"><code>hb-unicode.hh:219</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th id="ix-63">Characters</th>
+<th>Width</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SPACE</code></td>
+<td>U+0020 SPACE, U+00A0 NO-BREAK SPACE</td>
+<td id="ix-64">the space glyph’s own</td>
+</tr>
+<tr>
+<td><code>SPACE_EM</code></td>
+<td>U+2001 EM QUAD, U+2003 EM SPACE, U+3000 IDEOGRAPHIC SPACE</td>
+<td>an em</td>
+</tr>
+<tr>
+<td><code>SPACE_EM_2</code></td>
+<td>U+2000 EN QUAD, U+2002 EN SPACE</td>
+<td>half an em</td>
+</tr>
+<tr>
+<td><code>SPACE_EM_3</code>, <code>_4</code>, <code>_6</code></td>
+<td id="ix-65">U+2004, U+2005, U+2006, the three-, four- and six-per-em spaces</td>
+<td>a third, a quarter, a sixth</td>
+</tr>
+<tr>
+<td><code>SPACE_EM_5</code></td>
+<td>U+2009 THIN SPACE</td>
+<td>a fifth</td>
+</tr>
+<tr>
+<td><code>SPACE_EM_16</code></td>
+<td>U+200A HAIR SPACE</td>
+<td>a sixteenth</td>
+</tr>
+<tr>
+<td><code>SPACE_4_EM_18</code></td>
+<td>U+205F MEDIUM MATHEMATICAL SPACE</td>
+<td>four eighteenths</td>
+</tr>
+<tr>
+<td><code>SPACE_FIGURE</code></td>
+<td>U+2007 FIGURE SPACE</td>
+<td id="ix-66">the advance of the first of the digits 0 to 9 the font has</td>
+</tr>
+<tr>
+<td><code>SPACE_PUNCTUATION</code></td>
+<td>U+2008 PUNCTUATION SPACE</td>
+<td id="ix-67">the advance of the full stop, or failing that the comma</td>
+</tr>
+<tr>
+<td><code>SPACE_NARROW</code></td>
+<td>U+202F NARROW NO-BREAK SPACE</td>
+<td id="ix-68">half the space glyph’s</td>
+</tr>
+</tbody>
+</table>
+<p id="ix-69">An em is the font’s scale, <code>x_scale</code> (<code>y_scale</code> in vertical text), not its units per em, and the fractions of an em are rounded to the nearest unit. Four eighteenths isn’t rounded, but cut short. U+1680 OGHAM SPACE MARK is the one Zs character left out. The figure and punctuation widths are asked of the font funcs: <code>get_nominal_glyph</code> for the characters, then the glyph’s advance. <code>fallback.ttf</code> has glyphs for U+0020, the digit zero, 560 units wide, and the full stop, 200:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt"> </span><span class="cps">U+2003</span></td><td class="opt">--language=en</td><td class="out"><code>[space=0+1000]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt"> </span><span class="cps">U+2002</span></td><td class="opt">--language=en</td><td class="out"><code>[space=0+500]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt"> </span><span class="cps">U+2004</span></td><td class="opt">--language=en</td><td class="out"><code>[space=0+333]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt"> </span><span class="cps">U+2006</span></td><td class="opt">--language=en</td><td class="out"><code>[space=0+167]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt"> </span><span class="cps">U+2009</span></td><td class="opt">--language=en</td><td class="out"><code>[space=0+200]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt"> </span><span class="cps">U+200A</span></td><td class="opt">--language=en</td><td class="out"><code>[space=0+63]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt"> </span><span class="cps">U+205F</span></td><td class="opt">--language=en</td><td class="out"><code>[space=0+222]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt"> </span><span class="cps">U+2007</span></td><td class="opt">--language=en</td><td class="out"><code>[space=0+560]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt"> </span><span class="cps">U+2008</span></td><td class="opt">--language=en</td><td class="out"><code>[space=0+200]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt"> </span><span class="cps">U+202F</span></td><td class="opt">--language=en</td><td class="out"><code>[space=0+125]</code></td></tr><tr><td class="font">fallback.ttf</td><td class="in"><span class="txt"> </span><span class="cps">U+2003</span></td><td class="opt">--language=en --font-size=2000</td><td class="out"><code>[space=0+2000]</code></td></tr></tbody></table></div>
+<p>The comment on the narrow space explains its choice: Unicode’s chart says about a quarter or a fifth of an em, “However, in my testing, many fonts have their regular space being about that size. To me, a percentage of the space width makes more sense. Half is as good as any.”</p>
+<p id="ix-70">If the font has no U+0020 either, normalization uses the buffer’s <strong>invisible glyph</strong>, if the application has set one with <code>hb_buffer_set_invisible_glyph</code>; otherwise the character gets the not-found glyph and no fallback at all. A space that became the invisible glyph is given a quarter of an em first (<code>:571</code>), and then its type’s width. <code>no-space.ttf</code> is <code>fallback.ttf</code> without U+0020 in its <code>cmap</code>; glyph 4 is <code>o</code>, 500 units wide, used here only because its width is easy to tell from a quarter of an em:</p>
+<div class="shape"><table><thead><tr><th>Font</th><th>Text</th><th>Options</th><th>hb-shape output</th></tr></thead><tbody><tr><td class="font">no-space.ttf</td><td class="in"><span class="txt">␣</span><span class="cps">U+0020</span></td><td class="opt">--language=en</td><td class="out"><code>[.notdef=0+500]</code></td></tr><tr><td class="font">no-space.ttf</td><td class="in"><span class="txt">␣</span><span class="cps">U+0020</span></td><td class="opt">--language=en --invisible-glyph=4</td><td class="out"><code>[o=0+250]</code></td></tr><tr><td class="font">no-space.ttf</td><td class="in"><span class="txt"> </span><span class="cps">U+2003</span></td><td class="opt">--language=en --invisible-glyph=4</td><td class="out"><code>[o=0+1000]</code></td></tr><tr><td class="font">no-space.ttf</td><td class="in"><span class="txt"> </span><span class="cps">U+202F</span></td><td class="opt">--language=en --invisible-glyph=4</td><td class="out"><code>[o=0+125]</code></td></tr></tbody></table></div>
+<p id="ix-71">The narrow space is half of the quarter em it was given first. A space that GSUB has made part of a ligature is skipped (<code>:568</code>). One that GSUB merely replaced keeps its type, since the type travels with the character’s properties, so the replacement glyph gets the width. Since all this happens before GPOS, GPOS can still kern against the space.</p>
+<h2 id="kerning-through-the-font-funcs">Kerning through the font funcs</h2>
+<p id="ix-72">The last fallback asks the font funcs for kerning. <code>_hb_ot_shape_fallback_kern</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-fallback.cc#L523"><code>hb-ot-shape-fallback.cc:523</code></a>) runs in step 17 when the plan has <code>apply_fallback_kern</code>: the shaper allows fallback positioning, and the font has no GPOS, <code>kerx</code> or <code>kern</code> that HarfBuzz will apply itself. Then it checks that the font funcs implement <code>glyph_h_kerning</code> (<code>glyph_v_kerning</code> in vertical text), in this font or any of its parents (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-font.cc#L1090"><code>hb-font.cc:1090</code></a>), and does nothing if they don’t. If they do, it sends “start fallback kern” to the trace, and runs the same kerning machine as the <code>kern</code> table, <code>hb_kern_machine_t</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-kern.hh#L39"><code>hb-kern.hh:39</code></a>), with a driver that asks the funcs for each pair:</p>
+<pre><code class="language-c++">hb_position_t get_kerning (hb_codepoint_t first, hb_codepoint_t second) const
+{
+  hb_position_t kern = 0;
+  font-&gt;get_glyph_kerning_for_direction (first, second, direction, &amp;kern, &amp;kern);
+  return kern;
+}
+</code></pre>
+<p id="ix-73">The machine skips marks, kerns only glyphs whose mask has the <code>kern</code> feature’s bit, and splits each value between the two glyphs (<a href="legacy-kern.html#how-the-kerning-is-applied">Legacy kern</a> has the details). <code>kern</code> is one of the features added with <code>F_HAS_FALLBACK</code>, so its bit exists even when no table has the feature (<a href="from-features-to-lookups.html#finding-the-features-in-the-font">From features to lookups</a>), and <code>--features=-kern</code> turns the fallback off. A right-to-left buffer is reversed around the call and back, so that pairs are asked for in visual order (<code>:540</code>).</p>
+<p id="ix-74">Only one font funcs implementation in HarfBuzz sets <code>glyph_h_kerning</code>: hb-ft, which asks FreeType’s <code>FT_Get_Kerning</code> (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc#L719"><code>hb-ft.cc:719</code></a>) (<a href="fonts-and-font-functions.html#the-other-funcs">Fonts and font functions</a>). hb-ot doesn’t, and doesn’t need to. Since 2.0.0, whose <code>NEWS</code> says “Apply TrueType kern table internally, instead of relying on hb_font_t callbacks”, the shaper reads the font’s <code>kern</code> table itself, and when there is one, the plan applies it and never gets as far as the fallback. The kerning callbacks were deprecated in that release. 2.5.2 undeprecated the horizontal one “and re-enable[d it] in hb-ft, such that Type1 fonts will continue kerning”. That is the case the fallback is for: a font whose kerning HarfBuzz can’t read as a table, but whose font funcs can supply.</p>
+<p id="ix-75">Our build has no FreeType, so <code>hb-shape</code> has only the <code>ot</code> funcs, and this fallback can’t be shown here. The trace above has no “start fallback kern”: the plan asked for it, and it returned at once, since the <code>ot</code> funcs have no kerning callback.</p>
+<blockquote>
+<p id="ix-76">For programmers: to give HarfBuzz kerning from your own source, for a font format it can’t read, implement <code>glyph_h_kerning</code> in your font funcs (<code>hb_font_funcs_set_glyph_h_kerning_func</code>). It is used only when the face has no GPOS, <code>kerx</code> or <code>kern</code> and the script’s shaper allows fallback positioning, which the Indic, Khmer, Myanmar, Thai and USE shapers don’t. In a build with <code>HB_DISABLE_DEPRECATED</code>, which <code>HB_LEAN</code> implies, <code>get_glyph_h_kerning</code> returns 0 and the fallback is compiled out, though the horizontal callback is no longer deprecated.</p>
+</blockquote>
+<blockquote>
+<p id="ix-77">For type designers: a font with no GPOS still gets its marks placed, but only roughly: centered on the advance, a sixteenth of an em from the ink, all ligature components equal. Any GPOS at all, even a lone <code>kern</code> feature, switches that off, and marks then sit exactly where their outlines put them. If a font has GPOS, it needs mark attachment too. And draw zero-width marks to the left of the origin, over the glyph before, because that is where they stay when nothing moves them.</p>
+</blockquote>
+<h2 id="configuration">Configuration</h2>
+<p id="ix-78"><code>HB_NO_OT_SHAPE_FALLBACK</code> empties the recategorizing, mark positioning and kerning functions (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-fallback.cc#L173"><code>hb-ot-shape-fallback.cc:173</code></a>, <code>:475</code>, <code>:527</code>), and removes hb-ft’s kerning callback. The plan’s flags are still computed, so marks are still zeroed and adjusted. The space fallback has no macro of its own. <code>HB_NO_OT_SHAPE_FALLBACK</code> also turns off the Arabic, Hebrew and Thai shapers’ fallbacks, vowel constraints and the Zawgyi shaper (<a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-config.hh#L174"><code>hb-config.hh:174</code></a>), and <code>HB_NO_LEGACY</code> implies it (<code>:156</code>). <code>HB_NO_OT_KERN</code> leaves out the <code>kern</code> table, so a font with one gets fallback kerning instead.</p>
+<h2 id="where-to-read-the-source">Where to read the source</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What’s there</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-fallback.cc"><code>src/hb-ot-shape-fallback.cc</code></a></td>
+<td>recategorizing, fallback mark positioning, fallback kerning, space widths</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.cc"><code>src/hb-ot-shape.cc</code></a></td>
+<td>the plan’s decisions (<code>compile</code>), step 10’s call, <code>zero_mark_widths_by_gdef</code>, <code>hb_ot_position_default</code> and <code>hb_ot_position_plan</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape.hh"><code>src/hb-ot-shape.hh</code></a></td>
+<td>the plan’s flags</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/tree/15.1.0/src"><code>src/hb-ot-shaper-*.cc</code></a></td>
+<td>each shaper’s <code>zero_width_marks</code> and <code>fallback_position</code></td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-kern.hh"><code>src/hb-kern.hh</code></a></td>
+<td><code>hb_kern_machine_t</code>, shared with the <code>kern</code> table</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-unicode.hh"><code>src/hb-unicode.hh</code></a></td>
+<td><code>space_fallback_type</code>, the modified combining classes</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ot-shape-normalize.cc"><code>src/hb-ot-shape-normalize.cc</code></a></td>
+<td>where spaces are mapped to the space glyph</td>
+</tr>
+<tr>
+<td><a class="src" href="https://github.com/harfbuzz/harfbuzz/blob/15.1.0/src/hb-ft.cc"><code>src/hb-ft.cc</code></a></td>
+<td><code>hb_ft_get_glyph_h_kerning</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="in-short">In short</h2>
+<ul>
+<li>The plan decides which fallbacks run, once: fallback mark positioning only with no GPOS and no <code>kerx</code> (and no cross-stream <code>kern</code>), and only if the script’s shaper allows it; fallback kerning only with no GPOS, <code>kerx</code> or <code>kern</code>.</li>
+<li>A GPOS with only kerning turns fallback mark positioning off. Hebrew’s GPOS is ignored unless its script is <code>hebr</code>. A <code>morx</code> font keeps the original shaper’s permission.</li>
+<li>Shapers zero marks by GDEF class, or by classes made up from Mn. Without GPOS, a zeroed mark in a forward run is moved back by its old advance.</li>
+<li>Recategorizing turns script-specific combining classes into positional ones, after normalization and before glyph mapping. Its Thai, Lao and Tibetan rows are rarely reached.</li>
+<li>The positioner places each mark from extents: against the base’s ink vertically and its advance horizontally, by class, a sixteenth of an em away, stacking marks of the same class, dividing ligatures equally.</li>
+<li>It ignores the base’s horizontal offset, centers Left and Right marks, and doesn’t follow synthetic slant.</li>
+<li>Missing space characters get widths from their kind: fractions of an em, a digit’s or full stop’s advance, or half a space.</li>
+<li>Fallback kerning asks the font funcs; only hb-ft implements it, for fonts like Type 1 whose kerning isn’t in a table HarfBuzz reads.</li>
+</ul>
+
+  </main>
+  <nav class="pager"><a rel="prev" href="gpos.html">← GPOS: positioning glyphs</a><a rel="next" href="legacy-kern.html">Legacy kern →</a></nav>
+  <footer class="version">Draft, <a href="https://github.com/Lorp/how-harfbuzz-works/commit/9fae9372037f9788105e9f11b73c70029a48a7ef">19 November 2026 · 9fae937</a>. It describes HarfBuzz 15.1.0.</footer>
+</div>
+
+<script>
+(function () {
+  // Each lookup's tabs change only that lookup. Every lookup starts on
+  // the spec-like view.
+  function show(fig, v) {
+    var has = fig.querySelector('.pane[data-view="' + v + '"]');
+    var s = has ? v : "spec";
+    fig.querySelectorAll(".pane").forEach(function (p) { p.classList.toggle("on", p.dataset.view === s); });
+    fig.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.view === s)); });
+  }
+  document.addEventListener("click", function (e) {
+    var tab = e.target.closest(".views .tabs button");
+    if (tab) show(tab.closest("figure.views"), tab.dataset.view);
+  });
+  document.querySelectorAll("figure.views").forEach(function (fig) { show(fig, "spec"); });
+
+  // Sliders on drawings: every frame was drawn when the book was built, so
+  // moving the slider shows the nearest one.
+  document.querySelectorAll(".draw.slider").forEach(function (fig) {
+    var input = fig.querySelector("input[type=range]");
+    var out = fig.querySelector("output");
+    var frames = Array.prototype.slice.call(fig.querySelectorAll(".frame"));
+    input.addEventListener("input", function () {
+      var v = Number(input.value), best = frames[0];
+      frames.forEach(function (f) {
+        if (Math.abs(f.dataset.value - v) < Math.abs(best.dataset.value - v)) best = f;
+      });
+      frames.forEach(function (f) { f.hidden = f !== best; });
+      out.textContent = best.dataset.value;
+    });
+  });
+})();
+</script>
+
+</body>
+</html>
